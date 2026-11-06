@@ -257,7 +257,8 @@ std::string RomFSProductVersion(const FileSys::VirtualDir& romfs_dir) {
 // Loose ExeFS dumps carry no control data, but icon/nacp sidecars can be dropped next to the
 // ExeFS or in the game folder above it (<game>/exefs/main, <game>/base/exefs/main and
 // <game>/updates/<title id>/exefs/main layouts).
-std::vector<FileSys::VirtualDir> FindSidecarDirs(const FileSys::VirtualDir& exefs_dir) {
+std::vector<FileSys::VirtualDir> FindSidecarDirs(const FileSys::VirtualDir& exefs_dir,
+                                              bool prefer_edition = false) {
     const auto equals_ignore_case = [](const std::string& a, std::string_view b) {
         return a.size() == b.size() &&
                std::equal(a.begin(), a.end(), b.begin(), [](char x, char y) {
@@ -267,18 +268,27 @@ std::vector<FileSys::VirtualDir> FindSidecarDirs(const FileSys::VirtualDir& exef
     };
 
     std::vector<FileSys::VirtualDir> dirs{exefs_dir};
-    for (auto dir = exefs_dir; dirs.size() < 4;) {
+    auto dir = exefs_dir;
+    for (std::size_t depth = 0; depth < 8; ++depth) {
         const auto parent = dir->GetParentDirectory();
         if (parent == nullptr) {
             break;
         }
         const auto& name = parent->GetName();
+        if (const auto control = parent->GetSubdirectory("control")) {
+            if (prefer_edition) {
+                if (const auto edition = control->GetSubdirectory("Acd_1")) {
+                    dirs.push_back(edition);
+                }
+            }
+            dirs.push_back(control);
+        }
         dirs.push_back(parent);
         const bool storage_level =
             equals_ignore_case(name, "base") || equals_ignore_case(name, "update") ||
-            equals_ignore_case(name, "updates") ||
-            (!name.empty() &&
-             name.find_first_not_of("0123456789abcdefABCDEF") == std::string::npos);
+            equals_ignore_case(name, "updates") || equals_ignore_case(name, "upgrade") ||
+            equals_ignore_case(name, "program") ||
+            (!name.empty() && name.find_first_not_of("0123456789abcdefABCDEF") == std::string::npos);
         if (!storage_level) {
             break;
         }
@@ -293,8 +303,6 @@ AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(FileSys
                                                                          bool override_update_)
     : AppLoader(std::move(file_)), override_update(override_update_) {
     const auto file_dir = file->GetContainingDirectory();
-    const auto sidecar_dirs = FindSidecarDirs(file_dir);
-
     // Title ID
     const auto npdm = file_dir->GetFile("main.npdm");
     if (npdm != nullptr) {
@@ -302,6 +310,8 @@ AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(FileSys
         if (res == ResultStatus::Success)
             title_id = metadata.GetTitleID();
     }
+
+    const auto sidecar_dirs = FindSidecarDirs(file_dir, metadata.IsSwitch2());
 
     // Icon
     FileSys::VirtualFile icon_file = nullptr;
