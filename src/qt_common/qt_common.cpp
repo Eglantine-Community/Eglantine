@@ -224,6 +224,24 @@ void Init(QWidget* root) {
 
     Common::Log::Initialize();
     Common::Log::Start();
+    Common::Log::InstallTerminateHandler();
+    // qFatal ends the process through a fail-fast in Qt6Core that leaves the log without a reason;
+    // keep Qt's own console output after logging.
+    static const QtMessageHandler qt_default_handler = qInstallMessageHandler(
+        [](QtMsgType type, const QMessageLogContext& context, const QString& message) {
+            const std::string text = message.toStdString();
+            if (type == QtFatalMsg) {
+                LOG_CRITICAL(Frontend, "Qt fatal: {}", text);
+                LOG_CRITICAL(Frontend, "Host resources: {}",
+                             Common::DescribeHostResources(Common::QueryHostResources()));
+                Common::Log::Stop();
+            } else if (type == QtCriticalMsg || type == QtWarningMsg) {
+                LOG_WARNING(Frontend, "Qt: {}", text);
+            }
+            if (qt_default_handler != nullptr) {
+                qt_default_handler(type, context, message);
+            }
+        });
 
     Network::Init();
 
@@ -235,14 +253,14 @@ void Init(QWidget* root) {
     const auto build_id = std::string(Common::g_build_id);
 
     const auto yuzu_build =
-        fmt::format("Eglantine Development Build | {}-{}", branch_name, description);
+        fmt::format("Dalia | {} | {}-{}", Common::g_build_id, branch_name, description);
     const auto override_build =
         fmt::format(fmt::runtime(std::string(Common::g_title_bar_format_idle)), build_id);
     const auto yuzu_build_version = override_build.empty() ? yuzu_build : override_build;
     const auto processor_count = std::thread::hardware_concurrency();
 
     // info logging
-    LOG_INFO(Frontend, "Eglantine Version: {}", yuzu_build_version);
+    LOG_INFO(Frontend, "Dalia Version: {}", yuzu_build_version);
     LogRuntimes();
 #ifdef ARCHITECTURE_x86_64
     const auto& caps = Common::g_cpu_caps;

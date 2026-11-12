@@ -72,6 +72,9 @@ public:
     template <typename T>
     [[nodiscard]] T Read(GPUVAddr addr) const;
 
+    [[nodiscard]] std::optional<u32> TryReadNativeSyncpointShim(GPUVAddr addr,
+                                                                u32& out_syncpoint_id) const;
+
     template <typename T>
     void Write(GPUVAddr addr, T data);
 

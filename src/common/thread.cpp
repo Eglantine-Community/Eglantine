@@ -504,6 +504,8 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
 }
 
 void SetCurrentThreadName(const char* name) {
+    // Every emulator thread names itself on start, the one hook MSVC's per-thread handler needs.
+    Common::Log::InstallTerminateHandler();
 #ifdef _MSC_VER
     // Sets the debugger-visible name of the current thread.
     if (auto pf = (decltype(&SetThreadDescription))(void*)GetProcAddress(GetModuleHandle(TEXT("KernelBase.dll")), "SetThreadDescription"); pf)
@@ -540,7 +542,14 @@ void SetCurrentThreadName(const char* name) {
 }
 
 void SetCurrentThreadToPerformanceCores() {
-#if defined(__ANDROID__)
+#if defined(_WIN32)
+    THREAD_POWER_THROTTLING_STATE throttling{
+        .Version = THREAD_POWER_THROTTLING_CURRENT_VERSION,
+        .ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+        .StateMask = 0,
+    };
+    SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &throttling, sizeof(throttling));
+#elif defined(__ANDROID__)
     if (ADPF::AddCurrentThread(ADPF::Session::Render)) {
         SetCurrentThreadCoreGroup(CoreGroup::Unrestricted);
         return;
@@ -550,7 +559,14 @@ void SetCurrentThreadToPerformanceCores() {
 }
 
 void SetCurrentThreadToEfficiencyCores() {
-#if defined(__ANDROID__)
+#if defined(_WIN32)
+    THREAD_POWER_THROTTLING_STATE throttling{
+        .Version = THREAD_POWER_THROTTLING_CURRENT_VERSION,
+        .ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+        .StateMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+    };
+    SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &throttling, sizeof(throttling));
+#elif defined(__ANDROID__)
     if (ADPF::AddCurrentThread(ADPF::Session::Background)) {
         SetCurrentThreadCoreGroup(CoreGroup::Unrestricted);
         return;
@@ -560,14 +576,24 @@ void SetCurrentThreadToEfficiencyCores() {
 }
 
 void SetCurrentThreadToBackgroundWork() {
-#if defined(__ANDROID__)
+#if defined(_WIN32)
+    SetCurrentThreadToEfficiencyCores();
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#elif defined(__ANDROID__)
     ADPF::AddCurrentThread(ADPF::Session::Background);
     SetCurrentThreadCoreGroup(CoreGroup::Unrestricted);
 #endif
 }
 
 void SetCurrentThreadToAllCores() {
-#if defined(__ANDROID__)
+#if defined(_WIN32)
+    THREAD_POWER_THROTTLING_STATE throttling{
+        .Version = THREAD_POWER_THROTTLING_CURRENT_VERSION,
+        .ControlMask = 0,
+        .StateMask = 0,
+    };
+    SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &throttling, sizeof(throttling));
+#elif defined(__ANDROID__)
     ADPF::RemoveCurrentThread();
     SetCurrentThreadCoreGroup(CoreGroup::Unrestricted);
 #endif

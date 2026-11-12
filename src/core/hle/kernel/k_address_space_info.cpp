@@ -9,6 +9,7 @@
 #include "common/assert.h"
 #include "common/literals.h"
 #include "core/hle/kernel/k_address_space_info.h"
+#include "core/hle/kernel/k_memory_layout.h"
 
 namespace Kernel {
 
@@ -35,8 +36,8 @@ constexpr std::array<KAddressSpaceInfo, 13> AddressSpaceInfos{{
    { .bit_width = 39, .address = 128_MiB     , .size = 512_GiB - 128_MiB, .type = KAddressSpaceInfo::Type::Map39Bit, },
 #endif
    { .bit_width = 39, .address = Size_Invalid, .size = 64_GiB           , .type = KAddressSpaceInfo::Type::MapSmall  },
-   // Switch 2 titles size their heap from up to 12 GiB of memory, which doesn't fit Switch 1's 8 GiB.
-   { .bit_width = 39, .address = Size_Invalid, .size = 16_GiB           , .type = KAddressSpaceInfo::Type::Heap,     },
+   // Switch 2 titles get their larger heap from GetAddressSpaceSize(..., is_switch2).
+   { .bit_width = 39, .address = Size_Invalid, .size = 8_GiB            , .type = KAddressSpaceInfo::Type::Heap,     },
    { .bit_width = 39, .address = Size_Invalid, .size = 64_GiB           , .type = KAddressSpaceInfo::Type::Alias,    },
    { .bit_width = 39, .address = Size_Invalid, .size = 2_GiB            , .type = KAddressSpaceInfo::Type::Stack,    },
 }};
@@ -57,7 +58,16 @@ std::size_t KAddressSpaceInfo::GetAddressSpaceStart(size_t width, KAddressSpaceI
     return GetAddressSpaceInfo(width, type).address;
 }
 
-std::size_t KAddressSpaceInfo::GetAddressSpaceSize(size_t width, KAddressSpaceInfo::Type type) {
+std::size_t KAddressSpaceInfo::GetAddressSpaceSize(size_t width, KAddressSpaceInfo::Type type,
+                                                   bool is_switch2) {
+    if (is_switch2 && width == 39 && type == Type::Heap) {
+        return MainMemorySizeMaxSwitch2;
+    }
+    // The Switch 2 SDK hands its whole alias region (minus the extra size) to its VAMM address
+    // allocator, and Xenoblade 2 reserves 60 GiB from it twice (nninitStartup and nnMain).
+    if (is_switch2 && width == 39 && type == Type::Alias) {
+        return 128_GiB;
+    }
     return GetAddressSpaceInfo(width, type).size;
 }
 

@@ -183,9 +183,17 @@ TEST_CASE("Ampere capture ends at the return of a helper called past the EXIT",
     REQUIRE(static_cast<bool>(LowerToMaxwell(code)));
 
     ProgramCaptureState jump;
-    CHECK(jump.Observe({{0x00007944, 0x10, 0x03c00000, 0}}, 0) == ProgramCaptureState::Result::Continue);
+    CHECK(jump.Observe({{0x00000944, 0x10, 0x03c00000, 0}}, 0) == ProgramCaptureState::Result::Continue);
     CHECK(jump.Observe(EXIT, 1) == ProgramCaptureState::Result::Continue);
     CHECK(jump.Observe(EXIT, 2) == ProgramCaptureState::Result::Complete);
+
+    ProgramCaptureState call_with_callee_exit;
+    CHECK(call_with_callee_exit.Observe({{0x00007944, 0x10, 0x03c00000, 0}}, 0) ==
+          ProgramCaptureState::Result::Continue);
+    CHECK(call_with_callee_exit.Observe(EXIT, 1) == ProgramCaptureState::Result::Continue);
+    CHECK(call_with_callee_exit.Observe(EXIT, 2) == ProgramCaptureState::Result::Continue);
+    CHECK(call_with_callee_exit.Observe({{0x00007950, 0xffffffc0, 0x03c3ffff, 0}}, 3) ==
+          ProgramCaptureState::Result::Complete);
 }
 
 TEST_CASE("Ampere uniform select and bit operations reach every uniform register",

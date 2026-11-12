@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <memory>
+#include <QIcon>
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
@@ -65,6 +66,8 @@ ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_,
     Settings::SetConfiguringGlobal(true);
 
     ui->setupUi(this);
+    setWindowTitle(QStringLiteral("Dalia Configuration"));
+    setWindowIcon(QIcon(QStringLiteral(":/icons/default/256x256/dalia.png")));
 
     ui->tabWidget->addTab(applets_tab.get(), tr("Applets"));
     ui->tabWidget->addTab(audio_tab.get(), tr("Audio"));
@@ -155,6 +158,8 @@ void ConfigureDialog::RetranslateUI() {
     const int old_index = ui->tabWidget->currentIndex();
 
     ui->retranslateUi(this);
+    setWindowTitle(QStringLiteral("Dalia Configuration"));
+    setWindowIcon(QIcon(QStringLiteral(":/icons/default/256x256/dalia.png")));
 
     PopulateSelectionList();
     ui->selectorList->setCurrentRow(old_row);

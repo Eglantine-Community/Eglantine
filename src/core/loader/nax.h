@@ -39,6 +39,7 @@ public:
     LoadResult Load(Kernel::KProcess& process, Core::System& system) override;
 
     ResultStatus ReadRomFS(FileSys::VirtualFile& dir) override;
+    ResultStatus ReadExeFS(FileSys::VirtualDir& dir) override;
     ResultStatus ReadProgramId(u64& out_program_id) override;
 
     ResultStatus ReadBanner(std::vector<u8>& buffer) override;

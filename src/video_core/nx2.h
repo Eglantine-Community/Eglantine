@@ -6,6 +6,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdlib>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -27,6 +30,9 @@ inline std::atomic<bool> g_nx2_ampere{false};
 // reads the command list. One bit per 4 KiB of the 36-bit device address space (2 MiB).
 inline constexpr u64 Nx2WrittenPageBits = 12;
 inline std::array<std::atomic<u64>, (u64{1} << (36 - Nx2WrittenPageBits)) / 64> g_nx2_gpu_written_pages{};
+/// Counts the times pages were marked GPU-written for the first time: it stops moving once a
+/// title has written all the memory it reuses (Nx2CheckCommandPagesFirst).
+inline std::atomic<u64> g_nx2_gpu_written_generation{};
 
 inline void Nx2MarkGpuWritten(u64 device_address, u64 size) {
     if (size == 0) {
@@ -34,16 +40,28 @@ inline void Nx2MarkGpuWritten(u64 device_address, u64 size) {
     }
     const u64 last = std::min<u64>((device_address + size - 1) >> Nx2WrittenPageBits,
                                    g_nx2_gpu_written_pages.size() * 64 - 1);
-    for (u64 page = device_address >> Nx2WrittenPageBits; page <= last;) {
-        const u64 first_bit = page % 64;
-        const u64 bits = std::min<u64>(64 - first_bit, last - page + 1);
-        const u64 mask = (bits == 64 ? ~u64{0} : (u64{1} << bits) - 1) << first_bit;
-        auto& word = g_nx2_gpu_written_pages[page / 64];
-        if ((word.load(std::memory_order_relaxed) & mask) != mask) {
-            word.fetch_or(mask, std::memory_order_relaxed);
+    const u64 first = device_address >> Nx2WrittenPageBits;
+    for (u64 index = first / 64; first <= last && index <= last / 64; ++index) {
+        const u64 low = index == first / 64 ? first % 64 : 0;
+        const u64 high = index == last / 64 ? last % 64 : 63;
+        const u64 bits = (~u64{0} >> (63 - high)) & (~u64{0} << low);
+        auto& word = g_nx2_gpu_written_pages[index];
+        if ((word.load(std::memory_order_relaxed) & bits) != bits) {
+            if ((word.fetch_or(bits, std::memory_order_relaxed) & bits) != bits) {
+                g_nx2_gpu_written_generation.fetch_add(1, std::memory_order_relaxed);
+            }
         }
-        page += bits;
     }
+}
+
+/// Whether DmaPusher may rely on GPU-written page bits once no new pages have been marked recently.
+/// EDEN_NX2_CMD_DRAIN=1 forces always waiting for queued writers.
+[[nodiscard]] inline bool Nx2CheckCommandPagesFirst() {
+    static const bool drain_first = [] {
+        const char* value = std::getenv("EDEN_NX2_CMD_DRAIN");
+        return value != nullptr && value[0] == '1';
+    }();
+    return !drain_first;
 }
 
 // GPU-written device pages the front has read command lists from (same layout as above). The
@@ -52,18 +70,107 @@ inline void Nx2MarkGpuWritten(u64 device_address, u64 size) {
 // the split and flushing the caches (BufferCache::Nx2ReadListCopy).
 inline std::array<std::atomic<u64>, (u64{1} << (36 - Nx2WrittenPageBits)) / 64> g_nx2_command_list_pages{};
 inline std::atomic<bool> g_nx2_has_command_list_pages{false};
+inline std::atomic<u64> g_nx2_cmd_list_epoch{1};
 
-inline void Nx2MarkCommandListPage(u64 device_address) {
+inline constexpr size_t Nx2ComputeProgramTableSize = 1024;
+inline constexpr size_t Nx2ComputeProgramTableMask = Nx2ComputeProgramTableSize - 1;
+inline constexpr u64 Nx2ComputeCleanThreshold = 16;
+
+struct Nx2ComputeProgramSlot {
+    std::atomic<u64> key{0};
+    std::atomic<u64> state{0};
+};
+inline std::array<Nx2ComputeProgramSlot, Nx2ComputeProgramTableSize> g_nx2_compute_programs{};
+
+[[nodiscard]] inline Nx2ComputeProgramSlot* FindOrInsertNx2ComputeProgramSlot(u64 code_addr) {
+    if (code_addr == 0) {
+        return nullptr;
+    }
+    const size_t base =
+        static_cast<size_t>(((code_addr >> 4) * 0x9e3779b97f4a7c15ULL) >> 54) &
+        Nx2ComputeProgramTableMask;
+    for (size_t i = 0; i < 16; ++i) {
+        auto& slot = g_nx2_compute_programs[(base + i) & Nx2ComputeProgramTableMask];
+        const u64 k = slot.key.load(std::memory_order_acquire);
+        if (k == code_addr) {
+            return &slot;
+        }
+        if (k == 0) {
+            u64 expected = 0;
+            if (slot.key.compare_exchange_strong(expected, code_addr, std::memory_order_acq_rel,
+                                                 std::memory_order_acquire) ||
+                expected == code_addr) {
+                return &slot;
+            }
+        }
+    }
+    return nullptr;
+}
+
+[[nodiscard]] inline bool Nx2ComputeProgramMayWriteCommandList(u64 code_addr) {
+    const auto* slot = FindOrInsertNx2ComputeProgramSlot(code_addr);
+    if (!slot) {
+        return true;
+    }
+    const u64 st = slot->state.load(std::memory_order_acquire);
+    if ((st & (u64{1} << 63)) != 0) {
+        return true;
+    }
+    const u64 cur_epoch =
+        g_nx2_cmd_list_epoch.load(std::memory_order_acquire) & ((u64{1} << 39) - 1);
+    const u64 slot_epoch = (st >> 24) & ((u64{1} << 39) - 1);
+    const u64 clean_count = st & 0xffffffULL;
+    return !(slot_epoch == cur_epoch && clean_count >= Nx2ComputeCleanThreshold);
+}
+
+inline void Nx2MarkComputeProgramCommandWriter(u64 code_addr) {
+    if (auto* slot = FindOrInsertNx2ComputeProgramSlot(code_addr)) {
+        slot->state.fetch_or(u64{1} << 63, std::memory_order_release);
+    }
+}
+
+inline void Nx2RecordComputeProgramCleanDispatch(u64 code_addr, u64 epoch_before, u64 epoch_after) {
+    if (epoch_before != epoch_after) {
+        return;
+    }
+    auto* slot = FindOrInsertNx2ComputeProgramSlot(code_addr);
+    if (!slot) {
+        return;
+    }
+    const u64 ep = epoch_after & ((u64{1} << 39) - 1);
+    u64 old = slot->state.load(std::memory_order_acquire);
+    for (;;) {
+        if ((old & (u64{1} << 63)) != 0) {
+            return;
+        }
+        const u64 old_ep = (old >> 24) & ((u64{1} << 39) - 1);
+        const u64 old_clean = old & 0xffffffULL;
+        if (old_ep == ep && old_clean >= Nx2ComputeCleanThreshold) {
+            return;
+        }
+        const u64 desired = (ep << 24) | (old_ep == ep ? (old_clean + 1) : u64{1});
+        if (slot->state.compare_exchange_weak(old, desired, std::memory_order_acq_rel,
+                                              std::memory_order_acquire)) {
+            return;
+        }
+    }
+}
+
+inline bool Nx2MarkCommandListPage(u64 device_address) {
     const u64 page = device_address >> Nx2WrittenPageBits;
     if (page >= g_nx2_command_list_pages.size() * 64) {
-        return;
+        return false;
     }
     auto& word = g_nx2_command_list_pages[page / 64];
     const u64 bit = u64{1} << (page % 64);
     if ((word.load(std::memory_order_relaxed) & bit) == 0) {
-        word.fetch_or(bit, std::memory_order_relaxed);
-        g_nx2_has_command_list_pages.store(true, std::memory_order_relaxed);
+        if ((word.fetch_or(bit, std::memory_order_relaxed) & bit) == 0) {
+            g_nx2_has_command_list_pages.store(true, std::memory_order_release);
+            g_nx2_cmd_list_epoch.fetch_add(1, std::memory_order_release);
+            return true;
+        }
     }
+    return false;
 }
 
 [[nodiscard]] inline bool Nx2IsCommandListPage(u64 device_address) {
@@ -82,7 +189,13 @@ inline void Nx2ClearGpuWrittenPages() {
     for (auto& word : g_nx2_command_list_pages) {
         word.store(0, std::memory_order_relaxed);
     }
+    for (auto& slot : g_nx2_compute_programs) {
+        slot.state.store(0, std::memory_order_relaxed);
+        slot.key.store(0, std::memory_order_relaxed);
+    }
     g_nx2_has_command_list_pages.store(false, std::memory_order_relaxed);
+    g_nx2_cmd_list_epoch.store(1, std::memory_order_relaxed);
+    g_nx2_gpu_written_generation.store(0, std::memory_order_relaxed);
 }
 
 [[nodiscard]] inline bool Nx2IsGpuWritten(u64 device_address) {
@@ -392,12 +505,45 @@ public:
         if (count.load(std::memory_order_acquire) == 0) {
             return;
         }
-        std::scoped_lock lk{mutex};
-        for (auto& w : waiters) {
-            if (w.address == device_address && !w.latched && Matches(w, value)) {
-                w.latched = true;
+        bool any_latched = false;
+        {
+            std::scoped_lock lk{mutex};
+            for (auto& w : waiters) {
+                if (w.address == device_address && !w.latched && Matches(w, value)) {
+                    w.latched = true;
+                    any_latched = true;
+                }
             }
         }
+        if (any_latched) {
+            NotifyWake();
+        }
+    }
+
+    [[nodiscard]] bool HasWaiters() const noexcept {
+        return count.load(std::memory_order_acquire) != 0;
+    }
+
+    [[nodiscard]] u64 WakeSeq() const noexcept {
+        return wake_seq.load(std::memory_order_acquire);
+    }
+
+    void NotifyWake() {
+        {
+            std::scoped_lock lk{wake_mutex};
+            wake_seq.fetch_add(1, std::memory_order_release);
+        }
+        wake_cv.notify_one();
+    }
+
+    void WaitWake(u64 seen_seq, std::chrono::microseconds timeout) {
+        if (wake_seq.load(std::memory_order_acquire) != seen_seq) {
+            return;
+        }
+        std::unique_lock lk{wake_mutex};
+        wake_cv.wait_for(lk, timeout, [this, seen_seq] {
+            return wake_seq.load(std::memory_order_acquire) != seen_seq;
+        });
     }
 
 private:
@@ -425,6 +571,9 @@ private:
     std::mutex mutex;
     std::vector<Waiter> waiters;
     std::atomic<size_t> count{};
+    std::mutex wake_mutex;
+    std::condition_variable wake_cv;
+    std::atomic<u64> wake_seq{0};
 };
 
 } // namespace Tegra

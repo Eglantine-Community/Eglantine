@@ -39,6 +39,11 @@
 #include "video_core/rasterizer_interface.h"
 #include "video_core/textures/decoders.h"
 
+extern "C" void Nx2DiagRecordSyncQuery(u8 src, u64 pos, u64 gpu, u64 dev, u64 size, u32 op,
+                                       u32 report, bool async_hw);
+
+std::atomic<u64> g_nx2_watch_qmd_page{0};
+
 namespace Tegra::Engines {
 
 KeplerCompute::KeplerCompute(MemoryManager& memory_manager_)
@@ -330,8 +335,10 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
         return true;
     case 0xae: case 0xaf: case 0xb0: {
         const GPUVAddr qmd_address = GPUVAddr{native_registers[0xad]} << 8;
-        VideoCommon::TraceNativeQuery(9, memory_manager.GetID(), qmd_address,
-            memory_manager.GpuToCpuAddress(qmd_address).value_or(0), method, argument, 0);
+        if (VideoCommon::TraceNativeQueryEnabled()) [[unlikely]] {
+            VideoCommon::TraceNativeQuery(9, memory_manager.GetID(), qmd_address,
+                memory_manager.GpuToCpuAddress(qmd_address).value_or(0), method, argument, 0);
+        }
         if (method == 0xae || (method == 0xaf && !(argument & 2)) ||
             (method == 0xb0 && ((argument & 15) == 0 || (argument & 15) == 1))) return true;
         static const bool qmd_diagnostics = std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS") != nullptr;
@@ -350,20 +357,22 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
             [&](u64 address, NativeQmdScheduler::Descriptor& descriptor) {
                 if (!memory_manager.IsFullyMappedRange(address, sizeof(descriptor))) return false;
                 memory_manager.ReadBlockUnsafe(address, descriptor.data(), sizeof(descriptor));
-                if (static u32 logged{}; (descriptor[53] & (1U << 23)) && logged < 8) {
-                    ++logged;
-                    LOG_INFO(HW_GPU, "Native QMD {:#x} releases: {:08x} | {:08x} | {:08x}", address,
-                             fmt::join(std::span{descriptor}.subspan(24, 4), ","),
-                             fmt::join(std::span{descriptor}.subspan(28, 4), ","),
-                             fmt::join(std::span{descriptor}.subspan(52, 4), ","));
-                }
-                for (u32 slot = 0; slot < 2; ++slot) {
-                    const u32 flags = descriptor[25 + slot * 4];
-                    if (!(flags & (1U << 23))) continue;
-                    const GPUVAddr destination = (GPUVAddr{flags & 0xff} << 32) | descriptor[24 + slot * 4];
-                    VideoCommon::TraceNativeQuery(7 + slot, memory_manager.GetID(), destination,
-                        memory_manager.GpuToCpuAddress(destination).value_or(0),
-                        descriptor[4], descriptor[26 + slot * 4], flags);
+                if (VideoCommon::TraceNativeQueryEnabled()) [[unlikely]] {
+                    if (static u32 logged{}; (descriptor[53] & (1U << 23)) && logged < 8) {
+                        ++logged;
+                        LOG_INFO(HW_GPU, "Native QMD {:#x} releases: {:08x} | {:08x} | {:08x}", address,
+                                 fmt::join(std::span{descriptor}.subspan(24, 4), ","),
+                                 fmt::join(std::span{descriptor}.subspan(28, 4), ","),
+                                 fmt::join(std::span{descriptor}.subspan(52, 4), ","));
+                    }
+                    for (u32 slot = 0; slot < 2; ++slot) {
+                        const u32 flags = descriptor[25 + slot * 4];
+                        if (!(flags & (1U << 23))) continue;
+                        const GPUVAddr destination = (GPUVAddr{flags & 0xff} << 32) | descriptor[24 + slot * 4];
+                        VideoCommon::TraceNativeQuery(7 + slot, memory_manager.GetID(), destination,
+                            memory_manager.GpuToCpuAddress(destination).value_or(0),
+                            descriptor[4], descriptor[26 + slot * 4], flags);
+                    }
                 }
                 return true;
             },
@@ -383,8 +392,10 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                         if (watch != 0 && (address & ~u64{0xf}) == watch) {
                             LOG_INFO(HW_GPU, "Semaphore watch: QMD release add {:#x} -> {:#x}", address, value);
                         }
-                        VideoCommon::TraceNativeQuery(1, memory_manager.GetID(), address,
-                            memory_manager.GpuToCpuAddress(address).value_or(0), 0, value, 1U << 26);
+                        if (VideoCommon::TraceNativeQueryEnabled()) [[unlikely]] {
+                            VideoCommon::TraceNativeQuery(1, memory_manager.GetID(), address,
+                                memory_manager.GpuToCpuAddress(address).value_or(0), 0, value, 1U << 26);
+                        }
                     });
                 } else if (flags & (1U << 19)) {
                     // NVN2 tracks QMD completion with a max release (bit 19) into a word other
@@ -728,8 +739,12 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
             const auto dest = surface(*replacement_output);
             if (source && dest) {
                 // Does the program decode sRGB itself? (Ocarina's movie network does.)
-                const bool decodes_srgb = [&] {
-                    const GPUVAddr program = regs.code_loc.Address();
+                static std::unordered_map<GPUVAddr, bool> srgb_cache;
+                const GPUVAddr program = regs.code_loc.Address();
+                bool decodes_srgb = false;
+                if (const auto it = srgb_cache.find(program); it != srgb_cache.end()) {
+                    decodes_srgb = it->second;
+                } else {
                     std::array<u32, 0x400> block{};
                     bool threshold = false, exponent = false;
                     for (u64 offset = 0; offset < 0x20000 && !(threshold && exponent);
@@ -743,8 +758,9 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
                             exponent |= opcode == 0x832 && block[word + 1] == 0x40cc40cc;
                         }
                     }
-                    return threshold && exponent;
-                }();
+                    decodes_srgb = threshold && exponent;
+                    srgb_cache.emplace(program, decodes_srgb);
+                }
                 const Fermi2D::Config config{
                     .operation = decodes_srgb ? Fermi2D::Operation::SrcCopySrgbToLinear
                                               : Fermi2D::Operation::SrcCopy,
@@ -760,10 +776,10 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
                     .src_y1 = static_cast<s32>(replacement_input->Height()),
                 };
                 const bool done = rasterizer->AccelerateSurfaceCopy(*source, *dest, config);
-                LOG_INFO(HW_GPU,
-                         "Native network pass {:#x} replaced by input copy {}->{} ({}): {}",
-                         regs.code_loc.Address(), replacement_input->Address(),
-                         replacement_output->Address(), decodes_srgb ? "sRGB" : "plain", done);
+                LOG_DEBUG(HW_GPU,
+                          "Native network pass {:#x} replaced by input copy {}->{} ({}): {}",
+                          regs.code_loc.Address(), replacement_input->Address(),
+                          replacement_output->Address(), decodes_srgb ? "sRGB" : "plain", done);
                 native_upscale_input.reset();
                 network_skip_remaining = 0;
                 return true;
@@ -775,9 +791,51 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
     }
 
     bool dispatched = true;
+    const GPUVAddr code_addr = regs.code_loc.Address();
+    const u64 pre_epoch = Tegra::g_nx2_cmd_list_epoch.load(std::memory_order_acquire);
+    const u64 pre_list_writes = rasterizer->Nx2ListWriteEvents();
     try {
         rasterizer->DispatchCompute();
         diag_note("ok");
+        const u64 post_list_writes = rasterizer->Nx2ListWriteEvents();
+        const u64 post_epoch = Tegra::g_nx2_cmd_list_epoch.load(std::memory_order_acquire);
+        if (post_list_writes != pre_list_writes) {
+            Tegra::Nx2MarkComputeProgramCommandWriter(code_addr);
+        } else {
+            Tegra::Nx2RecordComputeProgramCleanDispatch(code_addr, pre_epoch, post_epoch);
+        }
+        if (VideoCommon::Nx2Profile::Enabled()) {
+            static u64 b_disp{}, b_wr{}, b_ep{}, b_clean{};
+            static std::unordered_map<u64, u64> b_game_writers;
+            ++b_disp;
+            if (post_list_writes != pre_list_writes) {
+                ++b_wr;
+                static std::unordered_set<u64> b_wr_progs;
+                if (b_wr_progs.insert(code_addr).second && b_wr_progs.size() <= 32) {
+                    LOG_INFO(HW_GPU, "Nx2Compute Back writer #{}: disp={} code={:#x} list_writes=+{} epoch={}",
+                             b_wr_progs.size(), b_disp, code_addr, post_list_writes - pre_list_writes, post_epoch);
+                }
+                if (b_disp > 10000) {
+                    ++b_game_writers[code_addr];
+                }
+            } else if (pre_epoch != post_epoch) {
+                ++b_ep;
+            } else {
+                ++b_clean;
+            }
+            if (b_disp % 30000 == 0 && !b_game_writers.empty()) {
+                std::string summary;
+                for (const auto& [addr, cnt] : b_game_writers) {
+                    summary += fmt::format("{:#x}:{} ", addr, cnt);
+                }
+                LOG_INFO(HW_GPU, "Nx2Compute Back gameplay writers at disp={}: {}", b_disp,
+                         summary);
+            }
+            if (b_disp % 10000 == 0) {
+                LOG_INFO(HW_GPU, "Nx2Compute Back stats: disp={}, wr={}, ep_chg={}, clean={}",
+                         b_disp, b_wr, b_ep, b_clean);
+            }
+        }
     } catch (const Shader::Exception& error) {
         diag_note("failed", error.what());
         static std::unordered_set<std::string> logged;
@@ -1313,7 +1371,7 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
         LOG_INFO(HW_GPU, "Upscale fallback for program {:#x}: {}", program,
                  known->second ? "decodes sRGB like the program" : "plain copy");
     }
-    const Fermi2D::Config config{
+    Fermi2D::Config config{
         .operation = known->second ? Fermi2D::Operation::SrcCopySrgbToLinear
                                    : Fermi2D::Operation::SrcCopy,
         .filter = Fermi2D::Filter::Bilinear,
@@ -1327,10 +1385,33 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
         .src_x1 = static_cast<s32>(input->Width()),
         .src_y1 = static_cast<s32>(input->Height()),
     };
-    // Debug: does the input hold anything? Download it once and count non-zero words.
+    {
+        std::array<u32, 12> parameters{};
+        const size_t words = std::min<size_t>(parameters.size(), cbuf.size.Value() / sizeof(u32));
+        memory_manager.ReadBlock(cbuf_address, parameters.data(), words * sizeof(u32));
+        const auto regions = DecodeNativeUpscaleRegions(
+            std::span{parameters}.first(words),
+            {launch_description.block_dim_x.Value(), launch_description.block_dim_y.Value(),
+             launch_description.block_dim_z.Value()},
+            {launch_description.grid_dim_x.Value(), launch_description.grid_dim_y.Value(),
+             launch_description.grid_dim_z.Value()},
+            {input->Width(), input->Height()}, {output->Width(), output->Height()});
+        if (regions) {
+            config.src_x0 = static_cast<s32>(regions->source[0]);
+            config.src_y0 = static_cast<s32>(regions->source[1]);
+            config.src_x1 = static_cast<s32>(regions->source[2]);
+            config.src_y1 = static_cast<s32>(regions->source[3]);
+            config.dst_x0 = static_cast<s32>(regions->destination[0]);
+            config.dst_y0 = static_cast<s32>(regions->destination[1]);
+            config.dst_x1 = static_cast<s32>(regions->destination[2]);
+            config.dst_y1 = static_cast<s32>(regions->destination[3]);
+        }
+    }
+    // Debug: does the input hold anything? Download it once and count non-zero words (opt-in via
+    // EDEN_NX2_SAMPLE_AT=<n> so production runs do not stall downloading every target).
     static const u32 sample_at = [] {
         const char* value = std::getenv("EDEN_NX2_SAMPLE_AT");
-        return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 20U;
+        return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : ~0U;
     }();
     if (static u32 sampled{}; sampled++ == sample_at) {
         const auto sample = [&](const Texture::TICEntry& tic) {
@@ -1621,7 +1702,11 @@ void KeplerCompute::ProcessLaunch() {
     const GPUVAddr launch_desc_loc = regs.launch_desc_loc.Address();
     memory_manager.ReadBlockUnsafe(launch_desc_loc, &launch_description,
                                    LaunchParams::NUM_LAUNCH_PARAMETERS * sizeof(u32));
-    rasterizer->DispatchCompute();
+    try {
+        rasterizer->DispatchCompute();
+    } catch (const std::exception& error) {
+        LOG_ERROR(HW_GPU, "ProcessLaunch compute dispatch failed: {}", error.what());
+    }
 }
 
 Texture::TICEntry KeplerCompute::GetTICEntry(u32 tic_index) const {
@@ -1644,12 +1729,22 @@ Texture::TSCEntry KeplerCompute::GetTSCEntry(u32 tsc_index) const {
 // runs compute macros against its own copy of the native registers (which hold the last value
 // written to each, on the back too) and loads and binds the compute macro code itself.
 struct KeplerCompute::FrontState {
+    struct InlineQmdEntry {
+        DAddr dev_addr{};
+        u64 write_pos{};
+        std::array<u32, 64> qmd{};
+    };
+    static constexpr size_t InlineQmdSets = 64;
+    static constexpr size_t InlineQmdWays = 2;
+
     std::array<u32, 0x1000> registers{};
     std::optional<u32> executing_macro;
     std::vector<u32> parameters;
     bool compute_uploaded{};
     u32 bind_pointer{};
     MacroEngine* macro{}; ///< Without a native context: the one macro engine
+    std::array<std::array<InlineQmdEntry, InlineQmdWays>, InlineQmdSets> inline_qmds{};
+    size_t inline_qmd_rr{};
 };
 
 KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
@@ -1751,6 +1846,404 @@ void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit&
     }
     FrontApply(fs, method, argument);
     split.Method(this, method, argument, is_last_call, segment);
+    NoteFrontRelease(split, fs, method, argument);
+}
+
+void KeplerCompute::NoteFrontRelease(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
+                                     u32 argument) {
+    const bool sync_payload = !Settings::IsGPULevelHigh() &&
+                              !Settings::IsGPUFenceBehaviorBalanced() &&
+                              !Settings::IsGPUFenceBehaviorAccurate();
+    const auto note_address = [&](GPUVAddr addr, std::optional<u32> payload = std::nullopt,
+                                  u64 size_bytes = 4, u8 no_pl_reason = 8,
+                                  VideoCommon::GpuSplit::ReleaseOp op =
+                                      VideoCommon::GpuSplit::ReleaseOp::Write) {
+        if (addr == 0) {
+            return;
+        }
+        const auto dev = memory_manager.GpuToCpuAddress(addr);
+        if (!dev || *dev == 0) {
+            return;
+        }
+        std::optional<u32> add_idle_base;
+        if ((op == VideoCommon::GpuSplit::ReleaseOp::Add ||
+             op == VideoCommon::GpuSplit::ReleaseOp::Max) &&
+            sync_payload && !Tegra::Nx2IsGpuWritten(*dev) &&
+            memory_manager.IsFullyMappedRange(addr, sizeof(u32))) {
+            add_idle_base = memory_manager.Read<u32>(addr);
+        }
+        const u8 eff_reason = !sync_payload ? u8{6} : (payload.has_value() ? u8{0} : no_pl_reason);
+        split.NotePendingRelease(*dev, 5, sync_payload ? payload : std::nullopt, size_bytes,
+                                 eff_reason, op, add_idle_base);
+        split.NotePendingQuery(*dev, !sync_payload, size_bytes);
+        if (VideoCommon::Nx2Profile::Enabled()) {
+            ::Nx2DiagRecordSyncQuery(2, split.WritePosition(), addr, *dev, size_bytes,
+                                     static_cast<u32>(op), 0, !sync_payload);
+        }
+    };
+    const auto note_range = [&](GPUVAddr gpu_addr, size_t size) {
+        if (size == 0) {
+            return;
+        }
+        const GPUVAddr end = gpu_addr + size;
+        if ((gpu_addr & ~GPUVAddr{0xfff}) == ((end - 1) & ~GPUVAddr{0xfff})) [[likely]] {
+            if (const auto dev = memory_manager.GpuToCpuAddress(gpu_addr); dev && *dev != 0) {
+                if (const u64 wp = g_nx2_watch_qmd_page.load(std::memory_order_relaxed);
+                    wp != 0 && (*dev & ~u64{0xfff}) == wp) {
+                    static u32 w_log{};
+                    if (++w_log <= 12) {
+                        LOG_INFO(HW_GPU, "Nx2WatchQmd Compute note_range #{}: method={:#x} dev={:#x} size={} pos={}",
+                                 w_log, method, *dev, size, split.WritePosition());
+                    }
+                }
+                split.NoteWriterRange(*dev, size);
+            } else {
+                split.NoteWriter();
+            }
+            return;
+        }
+        if ((end - (gpu_addr & ~GPUVAddr{0xfff})) > 0x40000) {
+            split.NoteWriter();
+            return;
+        }
+        for (GPUVAddr page = gpu_addr & ~GPUVAddr{0xfff}; page < end; page += 0x1000) {
+            const GPUVAddr seg_start = (std::max)(page, gpu_addr);
+            const GPUVAddr seg_end = (std::min)(page + 0x1000, end);
+            if (const auto dev = memory_manager.GpuToCpuAddress(seg_start); dev && *dev != 0) {
+                if (const u64 wp = g_nx2_watch_qmd_page.load(std::memory_order_relaxed);
+                    wp != 0 && (*dev & ~u64{0xfff}) == wp) {
+                    static u32 w_log2{};
+                    if (++w_log2 <= 12) {
+                        LOG_INFO(HW_GPU, "Nx2WatchQmd Compute note_range_ml #{}: method={:#x} dev={:#x} size={} pos={}",
+                                 w_log2, method, *dev, seg_end - seg_start, split.WritePosition());
+                    }
+                }
+                split.NoteWriterRange(*dev, seg_end - seg_start);
+            } else {
+                split.NoteWriter();
+                return;
+            }
+        }
+    };
+    const auto record_inline_qmd = [&](DAddr dev_addr, u64 write_pos, const u32* qmd_words) {
+        if (dev_addr == 0 || write_pos == 0) {
+            return;
+        }
+        auto& set = fs.inline_qmds[(dev_addr >> 8) & (FrontState::InlineQmdSets - 1)];
+        FrontState::InlineQmdEntry* target = nullptr;
+        for (auto& entry : set) {
+            if (entry.dev_addr == dev_addr) {
+                target = &entry;
+                break;
+            }
+            if (entry.dev_addr == 0 && target == nullptr) {
+                target = &entry;
+            }
+        }
+        if (target == nullptr) {
+            target = &set[fs.inline_qmd_rr++ & (FrontState::InlineQmdWays - 1)];
+        }
+        target->dev_addr = dev_addr;
+        target->write_pos = write_pos;
+        std::memcpy(target->qmd.data(), qmd_words, sizeof(target->qmd));
+    };
+    const auto find_inline_qmd = [&](DAddr dev_addr, u64 wr_pos) -> const u32* {
+        if (dev_addr == 0 || wr_pos == 0) {
+            return nullptr;
+        }
+        const auto& set = fs.inline_qmds[(dev_addr >> 8) & (FrontState::InlineQmdSets - 1)];
+        for (const auto& entry : set) {
+            if (entry.dev_addr == dev_addr && entry.write_pos == wr_pos) {
+                return entry.qmd.data();
+            }
+        }
+        return nullptr;
+    };
+    u32 chain_why = 0; // bit0: step0 code, bit1: step>0 code, bit2: wr_range, bit3: unmapped/ovf
+    u64 chain_fail_wr = 0;
+    DAddr chain_fail_dev = 0;
+    GPUVAddr chain_fail_child = 0;
+    u8 chain_fail_kind = 0;
+    const auto note_qmd_chain = [&](const u32* initial_qmd, GPUVAddr initial_addr) -> bool {
+        bool may_write_cmd = false;
+        chain_why = 0;
+        chain_fail_wr = 0;
+        chain_fail_dev = 0;
+        chain_fail_child = 0;
+        chain_fail_kind = 0;
+        static constexpr size_t MaxChain = 32;
+        std::array<GPUVAddr, MaxChain> visited{};
+        size_t visited_count = 0;
+        if (initial_addr != 0) {
+            visited[visited_count++] = initial_addr;
+        }
+        std::array<u32, 64> scratch{};
+        const u32* cur = initial_qmd;
+        for (size_t step = 0;; ++step) {
+            const bool has_work =
+                cur[12] != 0 && (cur[13] & 0xffff) != 0 && (cur[14] & 0xffff) != 0;
+            const GPUVAddr code_addr = (GPUVAddr{cur[49] & 0x1ffff} << 32) | cur[48];
+            if (has_work && Tegra::Nx2ComputeProgramMayWriteCommandList(code_addr)) {
+                may_write_cmd = true;
+                chain_why |= (step == 0 ? 1U : 2U);
+            }
+            for (const u32 base : {24U, 28U, 52U}) {
+                const u32 flags = cur[base + 1];
+                if (flags & (1U << 23)) {
+                    const GPUVAddr dst = (GPUVAddr{flags & 0xff} << 32) | cur[base];
+                    const VideoCommon::GpuSplit::ReleaseOp rel_op =
+                        (flags & (1U << 26))
+                            ? VideoCommon::GpuSplit::ReleaseOp::Add
+                            : ((flags & (1U << 19)) ? VideoCommon::GpuSplit::ReleaseOp::Max
+                                                    : VideoCommon::GpuSplit::ReleaseOp::Write);
+                    const u8 no_pl_reason =
+                        (flags & (1U << 19)) ? u8{4} : ((flags & (1U << 26)) ? u8{5} : u8{0});
+                    note_address(dst, std::optional<u32>{cur[base + 2]}, 4ULL, no_pl_reason,
+                                 rel_op);
+                }
+            }
+            if ((cur[16] & 1) == 0) {
+                break;
+            }
+            const GPUVAddr child = GPUVAddr{cur[15]} << 8;
+            bool seen = false;
+            for (size_t i = 0; i < visited_count; ++i) {
+                if (visited[i] == child) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (seen) {
+                break;
+            }
+            if (visited_count >= MaxChain) {
+                if (VideoCommon::Nx2Profile::Enabled()) {
+                    static u32 overflow_logged{};
+                    if (overflow_logged++ < 4) {
+                        LOG_INFO(HW_GPU, "NoteFrontRelease QMD chain exceeded {} nodes (last child={:#x})",
+                                 MaxChain, child);
+                    }
+                }
+                split.NotePendingRelease(0, 4);
+                may_write_cmd = true;
+                chain_why |= 8U;
+                break;
+            }
+            visited[visited_count++] = child;
+            const auto child_dev = memory_manager.GpuToCpuAddress(child);
+            if (!child_dev || Tegra::Nx2IsGpuWritten(*child_dev) ||
+                !memory_manager.IsFullyMappedRange(child, 256)) {
+                if (VideoCommon::Nx2Profile::Enabled()) {
+                    static u32 unmapped_logged{};
+                    if (unmapped_logged++ < 4) {
+                        LOG_INFO(HW_GPU, "NoteFrontRelease child QMD skipped/wildcard child={:#x} dev={} gpu={}",
+                                 child, child_dev.has_value(),
+                                 child_dev && Tegra::Nx2IsGpuWritten(*child_dev));
+                    }
+                }
+                split.NotePendingRelease(0, 5);
+                may_write_cmd = true;
+                chain_why |= 8U;
+                break;
+            }
+            const u64 child_wr = split.WriterRangePosition(*child_dev, 256);
+            if (child_wr == 0) {
+                memory_manager.ReadBlockUnsafe(child, scratch.data(), sizeof(scratch));
+            } else if (const u32* inline_ptr = find_inline_qmd(*child_dev, child_wr)) {
+                std::memcpy(scratch.data(), inline_ptr, sizeof(scratch));
+            } else {
+                split.NotePendingRelease(0, 6);
+                may_write_cmd = true;
+                chain_why |= 4U;
+                chain_fail_wr = child_wr;
+                chain_fail_dev = *child_dev;
+                chain_fail_child = child;
+                chain_fail_kind = split.LastWriterDiagKind();
+                break;
+            }
+            cur = scratch.data();
+        }
+        return may_write_cmd;
+    };
+    if (method == KEPLER_COMPUTE_REG_INDEX(exec_upload) ||
+        method == KEPLER_COMPUTE_REG_INDEX(data_upload)) {
+        const bool is_linear = (fs.registers[KEPLER_COMPUTE_REG_INDEX(exec_upload)] & 1U) != 0;
+        const u32 line_count = fs.registers[KEPLER_COMPUTE_REG_INDEX(upload.line_count)];
+        const u32 line_len = fs.registers[KEPLER_COMPUTE_REG_INDEX(upload.line_length_in)];
+        if (is_linear && line_count == 1 && line_len > 0) {
+            const GPUVAddr dst =
+                (GPUVAddr{fs.registers[KEPLER_COMPUTE_REG_INDEX(upload.dest.address_high)]}
+                 << 32) |
+                GPUVAddr{fs.registers[KEPLER_COMPUTE_REG_INDEX(upload.dest.address_low)]};
+            note_range(dst, line_len);
+        } else {
+            split.NoteWriter();
+        }
+        return;
+    }
+    if (method == 0x6c3) {
+        const u32 op = argument & 3U;
+        if (op == 0U || op == 2U) {
+            const GPUVAddr address = (GPUVAddr{fs.registers[0x6c0] & 0x1ffffff} << 32) |
+                                     fs.registers[0x6c1];
+            const bool one_word = ((argument >> 28) & 1U) != 0U;
+            const bool is_reduction = ((argument >> 3) & 1U) != 0U;
+            const u64 size_bytes = (!is_reduction && !one_word) ? 16ULL : 4ULL;
+            const std::optional<u32> payload =
+                !is_reduction ? std::optional<u32>{fs.registers[0x6c2]} : std::nullopt;
+            note_address(address, payload, size_bytes, is_reduction ? u8{7} : u8{8});
+        }
+    } else if ((method == 0xaf && (argument & 2) != 0) ||
+               (method == 0xb0 && (argument & 15) != 0 && (argument & 15) != 1)) {
+        const bool is_pcas_inc = method == 0xb0 && (argument & 15) == 12;
+        if (!is_pcas_inc) {
+            split.NoteAllComputeWriter();
+        }
+        const GPUVAddr qmd_address = GPUVAddr{fs.registers[0xad]} << 8;
+        const auto qmd_dev = memory_manager.GpuToCpuAddress(qmd_address);
+        if (!qmd_dev || Tegra::Nx2IsGpuWritten(*qmd_dev) ||
+            !memory_manager.IsFullyMappedRange(qmd_address, 256)) {
+            if (!is_pcas_inc) {
+                split.NoteComputeWriter();
+            }
+            split.NotePendingRelease(0, 3);
+            if (VideoCommon::Nx2Profile::Enabled()) {
+                static u64 f_unreadable{};
+                if (++f_unreadable <= 8) {
+                    LOG_INFO(HW_GPU, "Nx2Compute Front QMD fallback #{}: addr={:#x} gpu_wr={}",
+                             f_unreadable, qmd_address, qmd_dev && Tegra::Nx2IsGpuWritten(*qmd_dev));
+                }
+            }
+            return;
+        }
+        std::array<u32, 64> qmd{};
+        const u64 wr_pos = split.WriterRangePosition(*qmd_dev, 256);
+        const u8 wr_kind = split.LastWriterDiagKind();
+        const u32* qmd_ptr = nullptr;
+        if (wr_pos == 0) {
+            memory_manager.ReadBlockUnsafe(qmd_address, qmd.data(), sizeof(qmd));
+            qmd_ptr = qmd.data();
+        } else if (const u32* inline_ptr = find_inline_qmd(*qmd_dev, wr_pos)) {
+            std::memcpy(qmd.data(), inline_ptr, sizeof(qmd));
+            qmd_ptr = qmd.data();
+        }
+        const bool wr_rng = qmd_ptr == nullptr;
+        const bool may_wr = !is_pcas_inc && (wr_rng || note_qmd_chain(qmd_ptr, qmd_address));
+        if (is_pcas_inc) {
+            if (qmd_ptr != nullptr) {
+                note_qmd_chain(qmd_ptr, qmd_address);
+            } else {
+                split.NotePendingRelease(0, 7);
+            }
+        }
+        if (may_wr) {
+            split.NoteComputeWriter();
+        }
+        if (VideoCommon::Nx2Profile::Enabled()) {
+            static u64 f_cnt{}, f_wr{}, f_clean{}, f_inc{}, f_rng{}, f_c0{}, f_c1{}, f_c2{}, f_c3{};
+            static u64 f_log{};
+            ++f_cnt;
+            if (is_pcas_inc) ++f_inc;
+            if (may_wr) {
+                ++f_wr;
+                if (wr_rng) ++f_rng;
+                if (chain_why & 1) ++f_c0;
+                if (chain_why & 2) ++f_c1;
+                if (chain_why & 4) ++f_c2;
+                if (chain_why & 8) ++f_c3;
+                if (f_cnt > 40000 && ++f_log <= 12) {
+                    if (g_nx2_watch_qmd_page.load(std::memory_order_relaxed) == 0) {
+                        g_nx2_watch_qmd_page.store(*qmd_dev & ~u64{0xfff}, std::memory_order_relaxed);
+                    }
+                    const auto& set =
+                        fs.inline_qmds[(*qmd_dev >> 8) & (FrontState::InlineQmdSets - 1)];
+                    u64 slot_pos = 0;
+                    for (const auto& entry : set) {
+                        if (entry.dev_addr == *qmd_dev) {
+                            slot_pos = entry.write_pos;
+                            break;
+                        }
+                    }
+                    const u64 child = (GPUVAddr{qmd[15]} << 8);
+                    const GPUVAddr code0 = (GPUVAddr{qmd[49] & 0x1ffff} << 32) | qmd[48];
+                    LOG_INFO(HW_GPU,
+                             "Nx2Compute Front qmd fail #{}: method={:#x} arg={:#x} gpu={:#x} "
+                             "dev={:#x} wr_pos={} (kind={}) inl_pos={} rng={} why={:#x} chain={} "
+                             "child={:#x} (cwr={} ckind={}) code={:#x} q4={:#x} q12={} q18={:#x} "
+                             "rel0=({:#x},{:#x},{:#x}) rel2=({:#x},{:#x},{:#x})",
+                             f_log, method, argument, qmd_address, *qmd_dev, wr_pos, wr_kind,
+                             slot_pos, wr_rng, chain_why, qmd[16] & 1, child, chain_fail_wr,
+                             chain_fail_kind, code0, qmd[4], qmd[12], qmd[18], qmd[24], qmd[25],
+                             qmd[26], qmd[52], qmd[53], qmd[54]);
+                }
+            } else {
+                ++f_clean;
+            }
+            if (f_cnt % 20000 == 0) {
+                LOG_INFO(HW_GPU,
+                         "Nx2Compute Front qmd stats: total={}, wr={}, clean={}, inc={}, "
+                         "why=(rng={}, s0={}, ch={}, cwr={}, cunm={})",
+                         f_cnt, f_wr, f_clean, f_inc, f_rng, f_c0, f_c1, f_c2, f_c3);
+            }
+        }
+    } else if (method == 0x107) {
+        const GPUVAddr inline_addr =
+            ((GPUVAddr{fs.registers[0xc6]} << 32) | fs.registers[0xc7]) << 8;
+        const auto inline_dev = memory_manager.GpuToCpuAddress(inline_addr);
+        if (inline_dev && *inline_dev != 0) {
+            split.NoteWriterRange(*inline_dev, 256);
+            record_inline_qmd(*inline_dev, split.WritePosition(), fs.registers.data() + 0xc8);
+        } else {
+            note_range(inline_addr, 256);
+        }
+        const u32 control = fs.registers[0xa7];
+        if ((control & (1U << 24)) || !(fs.registers[0xcc] & (1U << 12))) {
+            split.NoteAllComputeWriter();
+            const bool may_wr = note_qmd_chain(fs.registers.data() + 0xc8, inline_addr);
+            if (may_wr) {
+                split.NoteComputeWriter();
+            }
+            if (VideoCommon::Nx2Profile::Enabled()) {
+                static u64 fi_cnt{}, fi_wr{}, fi_clean{}, fi_s0{}, fi_s1{}, fi_wrng{}, fi_unm{};
+                static u64 fi_wrng_log{};
+                ++fi_cnt;
+                if (may_wr) {
+                    ++fi_wr;
+                    if (chain_why & 1) ++fi_s0;
+                    if (chain_why & 2) ++fi_s1;
+                    if (chain_why & 4) {
+                        ++fi_wrng;
+                        if (fi_cnt > 30000 && ++fi_wrng_log <= 8) {
+                            u64 cinl = 0;
+                            if (chain_fail_dev != 0) {
+                                for (const auto& entry :
+                                     fs.inline_qmds[(chain_fail_dev >> 8) &
+                                                    (FrontState::InlineQmdSets - 1)]) {
+                                    if (entry.dev_addr == chain_fail_dev) {
+                                        cinl = entry.write_pos;
+                                        break;
+                                    }
+                                }
+                            }
+                            LOG_INFO(HW_GPU,
+                                     "Nx2Compute Front inline wrng #{}: gpu={:#x} child={:#x} "
+                                     "cdev={:#x} cwr={} ckind={} cinl={}",
+                                     fi_wrng_log, inline_addr, chain_fail_child, chain_fail_dev,
+                                     chain_fail_wr, chain_fail_kind, cinl);
+                        }
+                    }
+                    if (chain_why & 8) ++fi_unm;
+                } else {
+                    ++fi_clean;
+                }
+                if (fi_cnt % 20000 == 0) {
+                    LOG_INFO(HW_GPU,
+                             "Nx2Compute Front inline stats: total={}, wr={}, clean={}, why=(s0={}, ch={}, wrng={}, unm={})",
+                             fi_cnt, fi_wr, fi_clean, fi_s0, fi_s1, fi_wrng, fi_unm);
+                }
+            }
+        }
+    }
 }
 
 void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split,
@@ -1769,6 +2262,16 @@ void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuS
         }
     }
     split.MultiMethod(this, method, base_start, amount, methods_pending, segment);
+    if (method == KEPLER_COMPUTE_REG_INDEX(exec_upload) ||
+        method == KEPLER_COMPUTE_REG_INDEX(data_upload)) {
+        if (amount > 0) {
+            NoteFrontRelease(split, fs, method, base_start[amount - 1]);
+        }
+    } else if (method == 0x6c3 || method == 0xaf || method == 0xb0 || method == 0x107) {
+        for (u32 i = 0; i < amount; ++i) {
+            NoteFrontRelease(split, fs, method, base_start[i]);
+        }
+    }
 }
 
 void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
@@ -1797,6 +2300,7 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
             }
             FrontApply(fs, address, value);
             split.MacroWrite(this, address, value);
+            NoteFrontRelease(split, fs, address, value);
             return true;
         });
     if (!result.success) {

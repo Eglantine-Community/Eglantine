@@ -47,6 +47,13 @@ class RasterizerInterface;
 
 namespace Tegra::Engines {
 
+namespace detail {
+inline const bool skip_same_value_writes = [] {
+    const char* value = std::getenv("EDEN_NX2_SKIP_SAME");
+    return value == nullptr || value[0] != '0';
+}();
+} // namespace detail
+
 /**
  * This Engine is known as GF100_3D. Documentation can be found in:
  * https://github.com/NVIDIA/open-gpu-doc/blob/master/classes/3d/clb197.h
@@ -3304,12 +3311,8 @@ private:
     void CallMacroMethod(Core::System& system, u32 method, std::span<const u32> parameters);
 
     /// Whether state register writes that keep the register's value are dropped (CallMethod).
-    static bool SkipSameValueWrites() {
-        static const bool skip = [] {
-            const char* value = std::getenv("EDEN_NX2_SKIP_SAME");
-            return value == nullptr || value[0] != '0';
-        }();
-        return skip;
+    static bool SkipSameValueWrites() noexcept {
+        return detail::skip_same_value_writes;
     }
 
     /// Handles writes to the macro uploading register.

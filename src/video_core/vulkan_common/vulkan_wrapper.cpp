@@ -783,11 +783,31 @@ Pipeline Device::CreateGraphicsPipeline(const VkGraphicsPipelineCreateInfo& ci, 
     return Pipeline(object, handle, *dld);
 }
 
+Pipeline Device::TryCreateGraphicsPipeline(const VkGraphicsPipelineCreateInfo& ci,
+                                           VkPipelineCache cache) const noexcept {
+    VkPipeline object = VK_NULL_HANDLE;
+    const VkResult result = dld->vkCreateGraphicsPipelines(handle, cache, 1, &ci, nullptr, &object);
+    if ((result == VK_SUCCESS || result == VK_INCOMPLETE) && object != VK_NULL_HANDLE) {
+        return Pipeline(object, handle, *dld);
+    }
+    return {};
+}
+
 Pipeline Device::CreateComputePipeline(const VkComputePipelineCreateInfo& ci,
                                        VkPipelineCache cache) const {
     VkPipeline object;
     Check(dld->vkCreateComputePipelines(handle, cache, 1, &ci, nullptr, &object));
     return Pipeline(object, handle, *dld);
+}
+
+Pipeline Device::TryCreateComputePipeline(const VkComputePipelineCreateInfo& ci,
+                                          VkPipelineCache cache) const noexcept {
+    VkPipeline object = VK_NULL_HANDLE;
+    const VkResult result = dld->vkCreateComputePipelines(handle, cache, 1, &ci, nullptr, &object);
+    if (result == VK_SUCCESS && object != VK_NULL_HANDLE) {
+        return Pipeline(object, handle, *dld);
+    }
+    return {};
 }
 
 Sampler Device::CreateSampler(const VkSamplerCreateInfo& ci) const {

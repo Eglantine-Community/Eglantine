@@ -39,4 +39,10 @@ cmd /c "`"$bat`" $arch && set" | ForEach-Object {
     }
 }
 
+$toolsBin = Join-Path $PSScriptRoot "bin"
+if (Test-Path $toolsBin) {
+    $currentPath = [Environment]::GetEnvironmentVariable("Path", "Process")
+    [Environment]::SetEnvironmentVariable("Path", "$toolsBin;$currentPath", "Process")
+}
+
 Write-Host "load-msvc-env.ps1: MSVC environment loaded for $arch ($vs)"

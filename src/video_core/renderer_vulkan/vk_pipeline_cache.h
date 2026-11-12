@@ -24,6 +24,7 @@
 #include "common/common_types.h"
 #include "common/thread_worker.h"
 #include "shader_recompiler/frontend/ir/basic_block.h"
+#include "shader_recompiler/frontend/ir/program.h"
 #include "shader_recompiler/frontend/ir/value.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/host_translate_info.h"
@@ -84,6 +85,10 @@ struct hash<Vulkan::ComputePipelineCacheKey> {
 
 } // namespace std
 
+namespace Core {
+class System;
+}
+
 namespace Vulkan {
 
 class ComputePipeline;
@@ -96,6 +101,18 @@ class Scheduler;
 using VideoCommon::ShaderInfo;
 
 struct ShaderPools {
+    void ReleaseComputeContents(Shader::IR::Program& program, std::vector<u32>& code,
+                                bool build_in_parallel) {
+        if (build_in_parallel) {
+            return;
+        }
+        // Disk-cache workers do not need translation storage during the synchronous driver call.
+        program = {};
+        code = std::vector<u32>{};
+        block.Free();
+        inst.Free();
+    }
+
     void ReleaseContents() {
         flow_block.ReleaseContents();
         block.ReleaseContents();
@@ -114,7 +131,8 @@ public:
                            GuestDescriptorQueue& guest_descriptor_queue,
                            DescriptorBufferRing& descriptor_buffer_ring,
                            RenderPassCache& render_pass_cache, BufferCache& buffer_cache,
-                           TextureCache& texture_cache, VideoCore::ShaderNotify& shader_notify_);
+                           TextureCache& texture_cache, VideoCore::ShaderNotify& shader_notify_,
+                           Core::System* system_ = nullptr);
     ~PipelineCache();
 
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline();
@@ -174,6 +192,7 @@ private:
     BufferCache& buffer_cache;
     TextureCache& texture_cache;
     VideoCore::ShaderNotify& shader_notify;
+    Core::System* system{};
     bool use_asynchronous_shaders{};
     bool use_vulkan_pipeline_cache{};
 
@@ -213,6 +232,7 @@ private:
 
     std::filesystem::path vulkan_pipeline_cache_filename;
     vk::PipelineCache vulkan_pipeline_cache;
+    GraphicsPipelineLibraryCache gpl_cache;
     size_t pipelines_since_flush{};
     std::chrono::steady_clock::time_point last_flush{};
     std::atomic<size_t> last_cache_size{};

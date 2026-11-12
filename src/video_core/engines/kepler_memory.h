@@ -26,6 +26,10 @@ namespace VideoCore {
 class RasterizerInterface;
 }
 
+namespace VideoCommon {
+class GpuSplit;
+}
+
 namespace Tegra::Engines {
 
 /**
@@ -50,6 +54,11 @@ public:
 
     /// Write multiple values to the register identified by method.
     void CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) override;
+
+    void FrontCallMethod(VideoCommon::GpuSplit& split, u32 method, u32 method_argument,
+                         bool is_last_call, const GPUVAddr* segment);
+    void FrontCallMultiMethod(VideoCommon::GpuSplit& split, u32 method, const u32* base_start,
+                              u32 amount, u32 methods_pending, const GPUVAddr* segment);
 
     struct Regs {
         static constexpr size_t NUM_REGS = 0x7F;
@@ -76,7 +85,14 @@ public:
 
 private:
     void ConsumeSinkImpl(Core::System& system) override;
+    void FrontNoteWrite(VideoCommon::GpuSplit& split, u32 write_off, u32 byte_count);
+
+    MemoryManager& memory_manager;
     Upload::State upload_state;
+    Regs front_regs{};
+    u32 front_write_offset{};
+    u32 front_copy_size{};
+    bool front_is_linear{};
 };
 
 #define ASSERT_REG_POSITION(field_name, position)                                                  \

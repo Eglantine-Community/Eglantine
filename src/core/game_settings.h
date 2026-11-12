@@ -44,7 +44,14 @@ enum class GPUVendor {
 };
 
 enum class TitleID : std::uint64_t {
-    NinjaGaidenRagebound = 0x0100781020710000ULL
+    NinjaGaidenRagebound = 0x0100781020710000ULL,
+    Orbitals = 0x040004F027560000ULL,
+    MarioTennisFever = 0x0400D4201C6EA000ULL,
+    HyruleWarriorsAgeOfImprisonment = 0x04003F40232DE000ULL,
+    DonkeyKongBananza = 0x040074A01BF12000ULL,
+    XenobladeChroniclesDENintendoSwitch2Edition = 0x0400FF500E34A001ULL,
+    SuperMarioBrosWonderNintendoSwitch2Edition = 0x040015100B514001ULL,
+    OcarinaOfTime = 0x0400486024DEC000ULL,
 };
 
 struct EnvironmentInfo {
@@ -56,5 +63,9 @@ struct EnvironmentInfo {
 EnvironmentInfo DetectEnvironment(const VideoCore::RendererBase& renderer);
 
 void LoadOverrides(std::uint64_t program_id, const VideoCore::RendererBase& renderer);
+
+/// Title defaults for settings read while the renderer is created, applied before that.
+/// Follows LoadOverrides: applied only where the user kept the global value.
+void LoadEarlyOverrides(std::uint64_t program_id);
 
 } // namespace Core::GameSettings

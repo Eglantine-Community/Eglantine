@@ -475,6 +475,21 @@ bool LeanGlobalMemory() {
     }();
     return enabled;
 }
+bool HasSideEffectWrites(const Info& info) noexcept {
+    if (info.stores_global_memory || info.uses_global_increment || info.uses_global_decrement ||
+        info.uses_atomic_f32_add || info.uses_atomic_f16x2_add || info.uses_atomic_f16x2_min ||
+        info.uses_atomic_f16x2_max || info.uses_atomic_f32x2_add || info.uses_atomic_f32x2_min ||
+        info.uses_atomic_f32x2_max || info.uses_atomic_s32_min || info.uses_atomic_s32_max ||
+        info.uses_int64_bit_atomics || info.uses_atomic_image_u32 ||
+        info.uses_typeless_image_writes) {
+        return true;
+    }
+    const auto has_written{[](const auto& descs) {
+        return std::ranges::any_of(descs, [](const auto& desc) { return desc.is_written; });
+    }};
+    return has_written(info.storage_buffers_descriptors) || has_written(info.image_descriptors) ||
+           has_written(info.image_buffer_descriptors);
+}
 } // Anonymous namespace
 
 void VectorTypes::Define(Sirit::Module& sirit_ctx, Id base_type, std::string_view name) {
@@ -506,6 +521,17 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     DefineInterfaces(program);
     DefineMesh(program);
     DefineLocalMemory(program);
+    if (stage == Stage::Fragment && profile.support_demote_to_helper_invocation &&
+        profile.has_broken_spirv_demote_reorder && program.info.uses_demote_to_helper_invocation) {
+        defer_demote_to_return =
+            !program.info.uses_is_helper_invocation && !HasSideEffectWrites(program.info);
+        demoted_flag =
+            Name(AddGlobalVariable(private_u32, spv::StorageClass::Private, u32_zero_value),
+                 "demoted_flag");
+        if (profile.supported_spirv >= 0x00010400) {
+            interfaces.push_back(demoted_flag);
+        }
+    }
     DefineSharedMemory(program);
     DefineSharedMemoryFunctions(program);
     DefineConstantBuffers(program.info, uniform_binding);

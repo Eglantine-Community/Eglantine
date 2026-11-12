@@ -76,6 +76,10 @@ ResultStatus AppLoader_NAX::ReadRomFS(FileSys::VirtualFile& dir) {
     return nca_loader->ReadRomFS(dir);
 }
 
+ResultStatus AppLoader_NAX::ReadExeFS(FileSys::VirtualDir& dir) {
+    return nca_loader->ReadExeFS(dir);
+}
+
 ResultStatus AppLoader_NAX::ReadProgramId(u64& out_program_id) {
     return nca_loader->ReadProgramId(out_program_id);
 }

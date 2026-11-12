@@ -6,6 +6,9 @@
 
 #include <chrono>
 #include <thread>
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
 
 #include "common/assert.h"
 #include "common/scope_exit.h"
@@ -18,6 +21,7 @@
 #include "video_core/gpu.h"
 #include "video_core/gpu_thread.h"
 #include "video_core/gpu_split.h"
+#include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/renderer_base.h"
@@ -60,25 +64,30 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
         auto last_progress = std::chrono::steady_clock::now();
         namespace Profile = VideoCommon::Nx2Profile;
         auto& split = VideoCommon::GpuSplit::Get();
+        auto& sem_waiters = Tegra::Nx2SemaphoreWaiters::Get();
         while (!stop_token.stop_requested()) {
             Profile::Report();
             split.MaybeStart(system);
             if (scheduler.HasPendingChannels()) {
-                // Suspended channels wait on semaphores the CPU releases: poll them meanwhile.
+                const u64 wake_seq = sem_waiters.WakeSeq();
+                // Suspended channels wait on semaphores: resume what became ready.
                 {
                     Profile::Scope scope{Profile::Zone::ResumePending};
                     scheduler.ResumePending(system.GPU());
                 }
                 if (!state.queue.TryPop(next)) {
-                    // The CPU usually releases the semaphore soon after: poll for half a
-                    // millisecond before sleeping, or every wait also waits out a host sleep
-                    // (title 1 waits ~25 times a second).
+                    // Wait for GPU semaphore writes, queued commands, or brief CPU polls without
+                    // spinning through SwitchToThread or oversleeping when notified.
                     Profile::Scope scope{Profile::Zone::PendingSleep};
                     if (std::chrono::steady_clock::now() - last_progress <
-                        std::chrono::microseconds{500}) {
+                        std::chrono::microseconds{40}) {
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+                        _mm_pause();
+#else
                         std::this_thread::yield();
-                    } else {
-                        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+#endif
+                    } else if (!stop_token.stop_requested()) {
+                        sem_waiters.WaitWake(wake_seq, std::chrono::microseconds{500});
                     }
                     continue;
                 }
@@ -193,6 +202,9 @@ u64 ThreadManager::PushCommand(CommandData&& command_data, bool block, bool is_a
     std::unique_lock lk(state.write_lock);
     const u64 fence{++state.last_fence};
     state.queue.EmplaceWait(std::move(command_data), fence, block);
+    if (system.GPU().HasSuspendedChannels()) {
+        Tegra::Nx2SemaphoreWaiters::Get().NotifyWake();
+    }
 
     if (block) {
         state.cv.wait(lk, thread.get_stop_token(), [this, fence] {
@@ -206,6 +218,7 @@ u64 ThreadManager::PushCommand(CommandData&& command_data, bool block, bool is_a
 void ThreadManager::NotifyShutdown() {
     if (thread.joinable()) {
         thread.request_stop();
+        Tegra::Nx2SemaphoreWaiters::Get().NotifyWake();
         thread.join();
     }
     VideoCommon::GpuSplit::Get().Stop();

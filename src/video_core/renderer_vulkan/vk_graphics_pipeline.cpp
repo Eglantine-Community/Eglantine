@@ -16,6 +16,7 @@
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 
 #include "common/bit_field.h"
+#include "common/cityhash.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
@@ -51,6 +52,28 @@ using Shader::Backend::SPIRV::RESCALING_LAYOUT_DOWN_FACTOR_OFFSET;
 using Shader::Backend::SPIRV::RESCALING_LAYOUT_WORDS_OFFSET;
 using Tegra::Texture::TexturePair;
 using VideoCore::Surface::PixelFormat;
+
+u64 ComputeStageLayoutDigest(const std::array<Shader::Info, 5>& infos) {
+    struct StageCounts {
+        u32 cbuf_mask{};
+        u32 storage_count{};
+        u32 tex_buf_count{};
+        u32 img_buf_count{};
+        u32 tex_count{};
+        u32 img_count{};
+    };
+    std::array<StageCounts, 5> table{};
+    for (size_t i = 0; i < table.size(); ++i) {
+        const auto& info = infos[i];
+        table[i].cbuf_mask = info.constant_buffer_mask;
+        table[i].storage_count = static_cast<u32>(info.storage_buffers_descriptors.size());
+        table[i].tex_buf_count = static_cast<u32>(info.texture_buffer_descriptors.size());
+        table[i].img_buf_count = static_cast<u32>(info.image_buffer_descriptors.size());
+        table[i].tex_count = static_cast<u32>(info.texture_descriptors.size());
+        table[i].img_count = static_cast<u32>(info.image_descriptors.size());
+    }
+    return Common::CityHash64(reinterpret_cast<const char*>(table.data()), sizeof(table));
+}
 using VideoCore::Surface::PixelFormatFromDepthFormat;
 using VideoCore::Surface::PixelFormatFromRenderTargetFormat;
 
@@ -271,11 +294,13 @@ GraphicsPipeline::GraphicsPipeline(
     Common::ThreadWorker* worker_thread,
     PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
     const GraphicsPipelineCacheKey& key_, std::array<vk::ShaderModule, NUM_STAGES> stages,
-    const std::array<const Shader::Info*, NUM_STAGES>& infos)
+    const std::array<const Shader::Info*, NUM_STAGES>& infos,
+    GraphicsPipelineLibraryCache* gpl_cache_)
     : key{key_}, device{device_}, texture_cache{texture_cache_}, buffer_cache{buffer_cache_},
       pipeline_cache(pipeline_cache_), scheduler{scheduler_},
       guest_descriptor_queue{guest_descriptor_queue_},
-      descriptor_buffer_ring{descriptor_buffer_ring_}, spv_modules{std::move(stages)} {
+      descriptor_buffer_ring{descriptor_buffer_ring_}, spv_modules{std::move(stages)},
+      gpl_cache{gpl_cache_} {
     if (shader_notify) {
         shader_notify->MarkShaderBuilding();
     }
@@ -296,33 +321,49 @@ GraphicsPipeline::GraphicsPipeline(
     }
     fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
 
-    DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos)};
-    uses_push_descriptor = builder.CanUsePushDescriptor();
-    uses_descriptor_buffer = builder.CanUseDescriptorBuffer() && descriptor_buffer_ring.IsValid();
-    descriptor_set_layout =
-        builder.CreateDescriptorSetLayout(uses_push_descriptor, uses_descriptor_buffer);
-    if (uses_descriptor_buffer) {
-        descriptor_buffer_layout = builder.MakeDescriptorBufferLayout(*descriptor_set_layout);
-        if (!descriptor_buffer_ring.CanAllocate(descriptor_buffer_layout.size)) {
-            LOG_WARNING(Render_Vulkan,
-                        "Graphics pipeline {:016X} needs {} descriptor bytes per draw, falling back "
-                        "to sets",
-                        key.Hash(), descriptor_buffer_layout.size);
-            uses_descriptor_buffer = false;
-            descriptor_buffer_layout = {};
-            descriptor_set_layout = builder.CreateDescriptorSetLayout(uses_push_descriptor);
+    auto make_layout_bundle = [&] {
+        auto bundle = std::make_shared<SharedPipelineLayoutBundle>();
+        DescriptorLayoutBuilder builder{MakeBuilder(device, stage_infos)};
+        bundle->uses_push_descriptor = builder.CanUsePushDescriptor();
+        bundle->uses_descriptor_buffer =
+            builder.CanUseDescriptorBuffer() && descriptor_buffer_ring.IsValid();
+        bundle->descriptor_set_layout = builder.CreateDescriptorSetLayout(
+            bundle->uses_push_descriptor, bundle->uses_descriptor_buffer);
+        if (bundle->uses_descriptor_buffer) {
+            bundle->descriptor_buffer_layout =
+                builder.MakeDescriptorBufferLayout(*bundle->descriptor_set_layout);
+            if (!descriptor_buffer_ring.CanAllocate(bundle->descriptor_buffer_layout.size)) {
+                LOG_WARNING(Render_Vulkan,
+                            "Graphics pipeline {:016X} needs {} descriptor bytes per draw, "
+                            "falling back to sets",
+                            key.Hash(), bundle->descriptor_buffer_layout.size);
+                bundle->uses_descriptor_buffer = false;
+                bundle->descriptor_buffer_layout = {};
+                bundle->descriptor_set_layout =
+                    builder.CreateDescriptorSetLayout(bundle->uses_push_descriptor);
+            }
         }
-    }
+        const VkDescriptorSetLayout set_layout{*bundle->descriptor_set_layout};
+        bundle->pipeline_layout = builder.CreatePipelineLayout(set_layout);
+        if (!bundle->uses_descriptor_buffer) {
+            bundle->descriptor_update_template = builder.CreateTemplate(
+                set_layout, *bundle->pipeline_layout, bundle->uses_push_descriptor);
+        }
+        return bundle;
+    };
 
-    const VkDescriptorSetLayout set_layout{*descriptor_set_layout};
-    pipeline_layout = builder.CreatePipelineLayout(set_layout);
-    if (!uses_descriptor_buffer) {
-        descriptor_update_template =
-            builder.CreateTemplate(set_layout, *pipeline_layout, uses_push_descriptor);
-        if (!uses_push_descriptor) {
-            descriptor_allocator =
-                descriptor_pool.Allocator(device, scheduler, set_layout, stage_infos);
-        }
+    if (gpl_cache) {
+        shared_layout = gpl_cache->GetOrCreateLayout(
+            key.unique_hashes, ComputeStageLayoutDigest(stage_infos), make_layout_bundle);
+    } else {
+        shared_layout = make_layout_bundle();
+    }
+    uses_push_descriptor = shared_layout->uses_push_descriptor;
+    uses_descriptor_buffer = shared_layout->uses_descriptor_buffer;
+    if (!uses_descriptor_buffer && !uses_push_descriptor) {
+        const VkDescriptorSetLayout set_layout{*shared_layout->descriptor_set_layout};
+        descriptor_allocator =
+            descriptor_pool.Allocator(device, scheduler, set_layout, stage_infos);
     }
 
     auto func{[this, shader_notify, &render_pass_cache, pipeline_statistics] {
@@ -330,7 +371,7 @@ GraphicsPipeline::GraphicsPipeline(
         Validate();
         try {
             MakePipeline(render_pass);
-        } catch (const vk::Exception& exception) {
+        } catch (const std::exception& exception) {
             LOG_CRITICAL(Render_Vulkan,
                          "Graphics pipeline build failed: {} (stages: tcs={} tes={} geom={}, "
                          "patch control points {}, device max patch size {})",
@@ -691,7 +732,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
 
     VkDeviceSize descriptor_buffer_offset{};
     u32 descriptor_buffer_chunk{};
-    if (descriptor_set_layout && uses_descriptor_buffer) {
+    if (shared_layout->descriptor_set_layout && uses_descriptor_buffer) {
         const auto* const entries = static_cast<const DescriptorUpdateEntry*>(descriptor_data);
         const bool reuse_allocation =
             last_descriptor_buffer_generation == descriptor_buffer_ring.CurrentGeneration() &&
@@ -703,13 +744,14 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             descriptor_buffer_chunk = last_descriptor_buffer_chunk;
             descriptor_buffer_ring.TouchFrame(scheduler);
         } else {
-            const DescriptorBufferRing::Allocation alloc{
-                descriptor_buffer_ring.Allocate(scheduler, descriptor_buffer_layout.size)};
+            const DescriptorBufferRing::Allocation alloc{descriptor_buffer_ring.Allocate(
+                scheduler, shared_layout->descriptor_buffer_layout.size)};
             if (!alloc.host) {
                 LOG_DEBUG(Render_Vulkan, "Failed to reserve descriptor memory, skipping draw");
                 return false;
             }
-            WriteDescriptorBuffer(device, descriptor_buffer_layout, entries, alloc.host);
+            WriteDescriptorBuffer(device, shared_layout->descriptor_buffer_layout, entries,
+                                  alloc.host);
             descriptor_buffer_offset = alloc.offset;
             descriptor_buffer_chunk = alloc.chunk;
             last_descriptor_buffer_offset = alloc.offset;
@@ -732,7 +774,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     const bool update_rescaling{scheduler.UpdateRescaling(is_rescaling)};
     const bool bind_pipeline{scheduler.UpdateGraphicsPipeline(this)};
     const bool bind_descriptor_buffer{
-        descriptor_set_layout && uses_descriptor_buffer &&
+        shared_layout->descriptor_set_layout && uses_descriptor_buffer &&
         scheduler.UpdateDescriptorBufferChunk(descriptor_buffer_chunk)};
 
     // Log graphics pipeline binding
@@ -743,7 +785,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     }
 
     bool update_descriptors = true;
-    if (descriptor_set_layout && !uses_push_descriptor && !uses_descriptor_buffer) {
+    if (shared_layout->descriptor_set_layout && !uses_push_descriptor && !uses_descriptor_buffer) {
         const auto* const entries = static_cast<const DescriptorUpdateEntry*>(descriptor_data);
         update_descriptors =
             bind_pipeline || last_descriptor_payload.size() != num_descriptor_entries ||
@@ -770,37 +812,40 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             }
             cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline);
         }
-        cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
+        cmdbuf.PushConstants(*shared_layout->pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
                              RESCALING_LAYOUT_WORDS_OFFSET, sizeof(rescaling_data),
                              rescaling_data.data());
         if (update_rescaling) {
             const f32 config_down_factor{Settings::values.resolution_info.down_factor};
             const f32 scale_down_factor{is_rescaling ? config_down_factor : 1.0f};
-            cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
+            cmdbuf.PushConstants(*shared_layout->pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
                                  RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, sizeof(scale_down_factor),
                                  &scale_down_factor);
         }
         if (uses_render_area) {
-            cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
+            cmdbuf.PushConstants(*shared_layout->pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
                                  RENDERAREA_LAYOUT_OFFSET, sizeof(render_area_data),
                                  &render_area_data);
         }
-        if (!descriptor_set_layout) {
+        if (!shared_layout->descriptor_set_layout) {
             return;
         }
         if (uses_descriptor_buffer) {
             const u32 buffer_index{};
-            cmdbuf.SetDescriptorBufferOffsetsEXT(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout,
-                                                 0, buffer_index, descriptor_buffer_offset);
+            cmdbuf.SetDescriptorBufferOffsetsEXT(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                                 *shared_layout->pipeline_layout, 0, buffer_index,
+                                                 descriptor_buffer_offset);
         } else if (uses_push_descriptor) {
-            cmdbuf.PushDescriptorSetWithTemplateKHR(*descriptor_update_template, *pipeline_layout,
-                                                    0, descriptor_data);
+            cmdbuf.PushDescriptorSetWithTemplateKHR(*shared_layout->descriptor_update_template,
+                                                    *shared_layout->pipeline_layout, 0,
+                                                    descriptor_data);
         } else if (update_descriptors) {
             const VkDescriptorSet descriptor_set{descriptor_allocator.Commit()};
             const vk::Device& dev{device.GetLogical()};
-            dev.UpdateDescriptorSet(descriptor_set, *descriptor_update_template, descriptor_data);
-            cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout, 0,
-                                      descriptor_set, nullptr);
+            dev.UpdateDescriptorSet(descriptor_set, *shared_layout->descriptor_update_template,
+                                    descriptor_data);
+            cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                      *shared_layout->pipeline_layout, 0, descriptor_set, nullptr);
         }
     });
     return true;
@@ -1221,27 +1266,68 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
     }
 
-    pipeline = device.GetLogical().CreateGraphicsPipeline({
-        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = flags,
-        .stageCount = static_cast<u32>(shader_stages.size()),
-        .pStages = shader_stages.data(),
-        .pVertexInputState = is_mesh ? nullptr : &vertex_input_ci,
-        .pInputAssemblyState = is_mesh ? nullptr : &input_assembly_ci,
-        .pTessellationState = is_mesh ? nullptr : &tessellation_ci,
-        .pViewportState = &viewport_ci,
-        .pRasterizationState = &rasterization_ci,
-        .pMultisampleState = &multisample_ci,
-        .pDepthStencilState = &depth_stencil_ci,
-        .pColorBlendState = &color_blend_ci,
-        .pDynamicState = &dynamic_state_ci,
-        .layout = *pipeline_layout,
-        .renderPass = render_pass,
-        .subpass = 0,
-        .basePipelineHandle = nullptr,
-        .basePipelineIndex = 0,
-    }, *pipeline_cache);
+    if (!is_mesh && gpl_cache && gpl_cache->IsSupported()) {
+        const GraphicsPipelineLibraryInput gpl_input{
+            .unique_hashes = key.unique_hashes,
+            .layout_bundle = shared_layout,
+            .render_pass = render_pass,
+            .base_flags = flags,
+            .shader_stages = shader_stages,
+            .vertex_input_ci = &vertex_input_ci,
+            .input_divisor_ci = vertex_binding_divisors.empty() ? nullptr : &input_divisor_ci,
+            .input_assembly_ci = &input_assembly_ci,
+            .tessellation_ci = &tessellation_ci,
+            .viewport_ci = &viewport_ci,
+            .swizzle_ci = device.IsNvViewportSwizzleSupported() ? &swizzle_ci : nullptr,
+            .ndc_info = device.IsExtDepthClipControlSupported() ? &ndc_info : nullptr,
+            .rasterization_ci = &rasterization_ci,
+            .line_state_ci = (IsLine(input_assembly_topology) && device.IsExtLineRasterizationSupported())
+                                 ? &line_state
+                                 : nullptr,
+            .conservative_raster_ci =
+                device.IsExtConservativeRasterizationSupported() ? &conservative_raster : nullptr,
+            .provoking_vertex_ci =
+                device.IsExtProvokingVertexSupported() ? &provoking_vertex : nullptr,
+            .multisample_ci = &multisample_ci,
+            .depth_stencil_ci = &depth_stencil_ci,
+            .color_blend_ci = &color_blend_ci,
+            .dynamic_states = dynamic_states,
+        };
+        pipeline = gpl_cache->BuildLinkedPipeline(gpl_input);
+        if (!pipeline) {
+            static std::atomic<bool> logged_fallback{false};
+            if (!logged_fallback.exchange(true, std::memory_order_relaxed)) {
+                LOG_WARNING(Render_Vulkan,
+                            "Graphics pipeline library linking failed for {:016X}; falling back "
+                            "to monolithic creation",
+                            key.Hash());
+            }
+        }
+    }
+
+    if (!pipeline) {
+        pipeline = device.GetLogical().CreateGraphicsPipeline({
+            .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = flags,
+            .stageCount = static_cast<u32>(shader_stages.size()),
+            .pStages = shader_stages.data(),
+            .pVertexInputState = is_mesh ? nullptr : &vertex_input_ci,
+            .pInputAssemblyState = is_mesh ? nullptr : &input_assembly_ci,
+            .pTessellationState = is_mesh ? nullptr : &tessellation_ci,
+            .pViewportState = &viewport_ci,
+            .pRasterizationState = &rasterization_ci,
+            .pMultisampleState = &multisample_ci,
+            .pDepthStencilState = &depth_stencil_ci,
+            .pColorBlendState = &color_blend_ci,
+            .pDynamicState = &dynamic_state_ci,
+            .layout = *shared_layout->pipeline_layout,
+            .renderPass = render_pass,
+            .subpass = 0,
+            .basePipelineHandle = nullptr,
+            .basePipelineIndex = 0,
+        }, *pipeline_cache);
+    }
 
     // Log graphics pipeline creation
     if (GPU::Logging::IsActive()) {

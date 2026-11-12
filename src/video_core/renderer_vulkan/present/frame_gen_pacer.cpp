@@ -65,7 +65,6 @@ FrameGenPlan FrameGenPacer::Plan(size_t capacity) {
     last_frame = now;
 
     if (interval_seconds <= 0.0f) {
-        Stabilize(now);
         return {};
     }
 
@@ -84,7 +83,7 @@ FrameGenPlan FrameGenPacer::Plan(size_t capacity) {
     }
 
     if (interval_seconds > 1.0f / MINIMUM_BASE_RATE) {
-        Stabilize(now);
+        // Skip only this stalled frame instead of resetting cadence for 1 second.
         return {};
     }
 

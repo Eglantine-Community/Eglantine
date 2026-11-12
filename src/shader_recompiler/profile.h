@@ -105,6 +105,8 @@ struct Profile {
     bool has_broken_spirv_subgroup_mask_vector_extract_dynamic{};
     bool has_broken_spirv_subgroup_shuffle{};
     bool has_broken_spirv_fragment_shuffle{};
+    /// AMD drivers miscompile mid-shader OpDemoteToHelperInvocation and divergent early returns
+    bool has_broken_spirv_demote_reorder{};
     u32 max_subgroup_size{};
 
     u32 gl_max_compute_smem_size{};

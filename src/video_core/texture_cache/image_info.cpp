@@ -50,6 +50,7 @@ ImageInfo::ImageInfo(const TICEntry& config) noexcept {
     }
     rescaleable = false;
     is_sparse = config.is_sparse != 0;
+    maxwell_gobs = config.load_store_hint != 0;
     tile_width_spacing = config.tile_width_spacing;
     if (config.texture_type != TextureType::Texture2D &&
         config.texture_type != TextureType::Texture2DNoMipmap) {
@@ -286,7 +287,7 @@ static PixelFormat ByteSizeToFormat(u32 bytes_per_pixel) {
     case 16:
         return PixelFormat::R32G32B32A32_UINT;
     default:
-        UNIMPLEMENTED();
+        LOG_WARNING(HW_GPU, "Unsupported bytes per pixel {} in ByteSizeToFormat", bytes_per_pixel);
         return PixelFormat::Invalid;
     }
 }

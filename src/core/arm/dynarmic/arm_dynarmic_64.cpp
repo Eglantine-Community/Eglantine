@@ -9,6 +9,7 @@
 #if defined(_M_X64) || defined(__x86_64__)
 #include <immintrin.h>
 #endif
+#include "common/logging.h"
 #include "common/settings.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
@@ -387,12 +388,28 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
 
 HaltReason ArmDynarmic64::RunThread(Kernel::KThread* thread) {
     m_jit->ClearExclusiveState();
-    return TranslateHaltReason(m_jit->Run());
+    try {
+        return TranslateHaltReason(m_jit->Run());
+    } catch (const std::exception& e) {
+        LOG_CRITICAL(Core_ARM, "Dynarmic RunThread exception: {}", e.what());
+        return HaltReason::BreakLoop;
+    } catch (...) {
+        LOG_CRITICAL(Core_ARM, "Dynarmic RunThread unknown exception");
+        return HaltReason::BreakLoop;
+    }
 }
 
 HaltReason ArmDynarmic64::StepThread(Kernel::KThread* thread) {
     m_jit->ClearExclusiveState();
-    return TranslateHaltReason(m_jit->Step());
+    try {
+        return TranslateHaltReason(m_jit->Step());
+    } catch (const std::exception& e) {
+        LOG_CRITICAL(Core_ARM, "Dynarmic StepThread exception: {}", e.what());
+        return HaltReason::StepThread;
+    } catch (...) {
+        LOG_CRITICAL(Core_ARM, "Dynarmic StepThread unknown exception");
+        return HaltReason::StepThread;
+    }
 }
 
 u32 ArmDynarmic64::GetSvcNumber() const {

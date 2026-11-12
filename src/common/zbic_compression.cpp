@@ -10,6 +10,8 @@
 #define ZSTDLIB_HIDDEN static
 #define ZSTDERRORLIB_VISIBLE static
 #define ZSTDERRORLIB_HIDDEN static
+#define ZDICTLIB_VISIBLE static
+#define ZDICTLIB_HIDDEN static
 #undef ZSTD_MULTITHREAD
 
 #if defined(__ANDROID__)

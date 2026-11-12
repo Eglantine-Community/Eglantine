@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include "qt_common/config/uisettings.h"
 #include "qt_common/game_list/model.h"
 #include "yuzu/game/common.h"
@@ -24,11 +25,18 @@ GameCarousel::GameCarousel(QWidget* parent) : QListView{parent} {
     setEditTriggers(QAbstractItemView::NoEditTriggers);
     setContextMenuPolicy(Qt::CustomContextMenu);
 
-    setSpacing(10);
+    setSpacing(14);
     setWordWrap(true);
     setTextElideMode(Qt::ElideRight);
     setFlow(QListView::LeftToRight);
     setWrapping(false);
+
+    setStyleSheet(QStringLiteral(
+        "QListView { background-color: transparent; border: none; outline: none; }"
+        "QListView::item { background: transparent; border: none; outline: none; }"
+        "QListView::item:hover { background: transparent; border: none; }"
+        "QListView::item:selected { background: transparent; border: none; }"
+    ));
 }
 
 void GameCarousel::SetModel(GameListModel* model) {
@@ -55,31 +63,8 @@ void GameCarousel::ApplyFilter(const QString& edit_filter_text, GameListModel* m
 void GameCarousel::UpdateIconSize() {
     const u32 icon_size = UISettings::values.game_icon_size.GetValue();
 
-    int heightMargin = 0;
-    int widthMargin = 80;
-
-    // TODO(crueter): get rid of this nonsense
-    if (UISettings::values.show_game_name) {
-        switch (icon_size) {
-        case 128:
-            heightMargin = 65;
-            break;
-        case 0:
-            widthMargin = 120;
-            heightMargin = 120;
-            break;
-        case 64:
-            heightMargin = 77;
-            break;
-        case 32:
-        case 256:
-            heightMargin = 81;
-            break;
-        }
-    } else {
-        widthMargin = 24;
-        heightMargin = 24;
-    }
+    const int widthMargin = 24;
+    const int heightMargin = UISettings::values.show_game_name ? 56 : 24;
 
     const int min_item_width = icon_size + widthMargin;
     const int min_item_height = icon_size + heightMargin;

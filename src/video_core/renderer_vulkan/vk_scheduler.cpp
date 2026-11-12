@@ -395,12 +395,17 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
 
             // Perform the work, tracking whether the chunk was a submission
             // before executing.
-            const bool has_submit = work->HasSubmit();
-            work->ExecuteAll(current_cmdbuf, current_upload_cmdbuf);
+            try {
+                const bool has_submit = work->HasSubmit();
+                work->ExecuteAll(current_cmdbuf, current_upload_cmdbuf);
 
-            // If the chunk was a submission, reallocate the command buffer.
-            if (has_submit) {
-                AllocateWorkerCommandBuffer();
+                // If the chunk was a submission, reallocate the command buffer.
+                if (has_submit) {
+                    AllocateWorkerCommandBuffer();
+                }
+            } catch (const std::exception& e) {
+                LOG_CRITICAL(Render_Vulkan, "Exception in Vulkan worker execution: {}", e.what());
+                return;
             }
         }
 
@@ -489,7 +494,9 @@ void Scheduler::InvalidateState() {
 void Scheduler::EndPendingOperations() {
     // Pause, don't reset: a submission can land between a guest's counter reset and its report,
     // and resetting here would drop the samples counted so far (the report then reads too low).
-    query_cache->CounterClose(VideoCommon::QueryType::ZPassPixelCount64);
+    if (query_cache) {
+        query_cache->CounterClose(VideoCommon::QueryType::ZPassPixelCount64);
+    }
     EndRenderPass();
 }
 
@@ -500,7 +507,9 @@ void Scheduler::EndRenderPass()
             return;
         }
 
-        query_cache->CounterClose(VideoCommon::QueryType::StreamingByteCount);
+        if (query_cache) {
+            query_cache->CounterClose(VideoCommon::QueryType::StreamingByteCount);
+        }
 
         // Log render pass end
         if (GPU::Logging::IsActive() &&
@@ -508,8 +517,10 @@ void Scheduler::EndRenderPass()
             GPU::Logging::GPULogger::GetInstance().LogRenderPassEnd();
         }
 
-        query_cache->CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, false);
-        query_cache->NotifySegment(false);
+        if (query_cache) {
+            query_cache->CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, false);
+            query_cache->NotifySegment(false);
+        }
 
         Record([num_images = num_renderpass_images,
                        images = renderpass_images,

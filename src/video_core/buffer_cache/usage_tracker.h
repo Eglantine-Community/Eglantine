@@ -21,7 +21,7 @@ class UsageTracker {
     static constexpr size_t BUFFER_PAGE_SHIFT = 6 + BUFFER_BYTES_PER_BITSHIFT;
     static constexpr size_t BUFFER_PAGE_BYTES = 1 << BUFFER_PAGE_SHIFT;
 public:
-    explicit UsageTracker(size_t size) {
+    explicit UsageTracker(size_t size) : total_size{size} {
         const size_t num_pages = (size >> BUFFER_PAGE_SHIFT) + 1;
         pages.resize(num_pages, 0ULL);
     }
@@ -31,11 +31,15 @@ public:
             return;
         }
         tracked = false;
+        fully_tracked = false;
         std::ranges::fill(pages, 0ULL);
         recent.fill({~u64{0}, 0});
     }
 
     void Track(u64 offset, u64 size) noexcept {
+        if (fully_tracked) {
+            return;
+        }
         // Tracking is idempotent until Reset: skip ranges tracked just before. Draws bind the
         // same (often multi-megabyte) storage buffers again and again, and each Track wrote a
         // word per 4 KiB of the range.
@@ -46,6 +50,9 @@ public:
         }
         tracked = true;
         recent[recent_cursor++ % recent.size()] = {offset, size};
+        if (offset == 0 && size >= total_size) {
+            fully_tracked = true;
+        }
         const size_t page = offset >> BUFFER_PAGE_SHIFT;
         const size_t page_end = (offset + size) >> BUFFER_PAGE_SHIFT;
         if (page_end < page || page_end >= pages.size()) {
@@ -112,10 +119,15 @@ private:
 
 private:
     std::vector<u64> pages;
+    u64 total_size{};
     /// Ranges tracked last, (offset, size).
-    std::array<std::pair<u64, u64>, 4> recent{{{~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}}};
+    std::array<std::pair<u64, u64>, 16> recent{{{~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0},
+                                                {~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0},
+                                                {~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0},
+                                                {~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}}};
     size_t recent_cursor{};
     bool tracked{};
+    bool fully_tracked{};
 };
 
 } // namespace VideoCommon

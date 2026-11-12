@@ -15,6 +15,9 @@
 #include "common/settings_enums.h"
 #include "frontend_common/settings_generator.h"
 #include "render/performance_overlay.h"
+#include "yuzu/dalia/dalia_gameplay_overlay.h"
+#include "yuzu/dalia/dalia_library_page.h"
+#include "yuzu/dalia/dalia_main_container.h"
 #ifdef HAS_RESHADE
 #include "configuration/configure_post_processing.h"
 #include "video_core/post_processing/fx_preset.h"
@@ -173,6 +176,9 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "video_core/gpu.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
+#ifdef HAS_LSFG
+#include "video_core/frame_gen/lossless_dll.h"
+#endif
 
 #include <SDL3/SDL.h>
 
@@ -212,11 +218,20 @@ static inline void ApplyWindowsTitleBarDarkMode(HWND hwnd, bool enabled) {
     if (!hwnd)
         return;
     BOOL val = enabled ? TRUE : FALSE;
-    // 20 = Win11/21H2+
-    if (SUCCEEDED(DwmSetWindowAttribute(hwnd, 20, &val, sizeof(val))))
-        return;
-    // 19 = pre-21H2
-    DwmSetWindowAttribute(hwnd, 19, &val, sizeof(val));
+    // 20 = Win11/21H2+, 19 = pre-21H2
+    if (FAILED(DwmSetWindowAttribute(hwnd, 20, &val, sizeof(val)))) {
+        DwmSetWindowAttribute(hwnd, 19, &val, sizeof(val));
+    }
+
+    if (enabled) {
+        // Unify native Windows 11 title bar with DALIA graphite #13161D
+        COLORREF caption_color = RGB(19, 22, 29);
+        DwmSetWindowAttribute(hwnd, 35, &caption_color, sizeof(caption_color));
+        COLORREF text_color = RGB(255, 255, 255);
+        DwmSetWindowAttribute(hwnd, 36, &text_color, sizeof(text_color));
+        COLORREF border_color = RGB(36, 42, 53);
+        DwmSetWindowAttribute(hwnd, 34, &border_color, sizeof(border_color));
+    }
 }
 
 static inline void ApplyDarkToTopLevel(QWidget* w, bool on) {
@@ -410,6 +425,7 @@ MainWindow::MainWindow(bool has_broken_vulkan)
 
     setAcceptDrops(true);
     ui->setupUi(this);
+    ui->menubar->hide();
     statusBar()->hide();
 
     startup_icon_theme = QIcon::themeName();
@@ -439,6 +455,7 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     QtCommon::SetupHID();
     controller_dialog->refreshConfiguration();
 
+    setWindowIcon(QIcon(QStringLiteral(":/icons/default/256x256/dalia.png")));
     UpdateWindowTitle();
 
     show();
@@ -502,6 +519,9 @@ MainWindow::MainWindow(bool has_broken_vulkan)
         renderer_status_button->setChecked(false);
     } else {
         VkDeviceInfo::PopulateRecords(vk_device_records, this->window()->windowHandle());
+        if (dalia_main_container) {
+            dalia_main_container->RefreshVkRecords(vk_device_records);
+        }
     }
 
     // On macOS, SDL video would pump AppKit events alongside Qt and disrupt native menus.
@@ -942,7 +962,9 @@ void MainWindow::InitializeWidgets() {
 
     game_list = new GameList(QtCommon::vfs, QtCommon::provider.get(), *play_time_manager,
                              *QtCommon::system, this);
-    ui->horizontalLayout->addWidget(game_list);
+
+    dalia_main_container = new DaliaMainContainer(this, game_list, vk_device_records);
+    ui->horizontalLayout->addWidget(dalia_main_container);
 
     game_list_placeholder = new GameListPlaceholder(this);
     ui->horizontalLayout->addWidget(game_list_placeholder);
@@ -1128,6 +1150,56 @@ void MainWindow::InitializeWidgets() {
             });
     statusBar()->insertPermanentWidget(0, aa_status_button);
 
+    // Setup Frame Generation button
+    frame_gen_status_button = new QPushButton();
+    frame_gen_status_button->setObjectName(QStringLiteral("TogglableStatusBarButton"));
+    frame_gen_status_button->setFocusPolicy(Qt::NoFocus);
+    connect(frame_gen_status_button, &QPushButton::clicked, [this] {
+        const bool current = Settings::values.frame_gen.GetValue();
+        Settings::values.frame_gen.SetValue(!current);
+        UpdateFrameGenText();
+    });
+    UpdateFrameGenText();
+    frame_gen_status_button->setCheckable(true);
+    frame_gen_status_button->setChecked(Settings::values.frame_gen.GetValue());
+    frame_gen_status_button->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(frame_gen_status_button, &QPushButton::customContextMenuRequested,
+            [this](const QPoint& menu_location) {
+                QMenu context_menu;
+                auto* toggle_action = context_menu.addAction(tr("Enable Frame Generation"), [this] {
+                    const bool current = Settings::values.frame_gen.GetValue();
+                    Settings::values.frame_gen.SetValue(!current);
+                    UpdateFrameGenText();
+                });
+                toggle_action->setCheckable(true);
+                toggle_action->setChecked(Settings::values.frame_gen.GetValue());
+                context_menu.addSeparator();
+
+                auto* type_menu = context_menu.addMenu(tr("Type"));
+                for (const auto& [type, text] : ConfigurationShared::frame_gen_type_texts_map) {
+                    auto* action = type_menu->addAction(text, [this, type] {
+                        Settings::values.frame_gen_type.SetValue(type);
+                        UpdateFrameGenText();
+                    });
+                    action->setCheckable(true);
+                    action->setChecked(Settings::values.frame_gen_type.GetValue() == type);
+                }
+
+                auto* mult_menu = context_menu.addMenu(tr("Multiplier"));
+                for (u32 mult : {2u, 3u, 4u}) {
+                    auto* action = mult_menu->addAction(QStringLiteral("%1x").arg(mult), [this, mult] {
+                        Settings::values.frame_gen_multiplier.SetValue(mult);
+                        UpdateFrameGenText();
+                    });
+                    action->setCheckable(true);
+                    action->setChecked(Settings::values.frame_gen_multiplier.GetValue() == mult);
+                }
+
+                context_menu.exec(frame_gen_status_button->mapToGlobal(menu_location));
+                frame_gen_status_button->repaint();
+            });
+    statusBar()->insertPermanentWidget(0, frame_gen_status_button);
+
     // Setup Filter button
     filter_status_button = new QPushButton();
     filter_status_button->setObjectName(QStringLiteral("TogglableStatusBarButton"));
@@ -1229,17 +1301,37 @@ void MainWindow::InitializeWidgets() {
             });
     statusBar()->insertPermanentWidget(0, renderer_status_button);
 
-    // Setup Refresh Button
+    // Setup Refresh Button (hidden in DALIA because Tu Biblioteca includes its own refresh control)
     refresh_button = new QPushButton();
     refresh_button->setIcon(QIcon::fromTheme(QStringLiteral("view-refresh")));
     refresh_button->setObjectName(QStringLiteral("RefreshButton"));
     refresh_button->setFocusPolicy(Qt::NoFocus);
+    refresh_button->setVisible(false);
     connect(refresh_button, &QPushButton::clicked, this, &MainWindow::OnGameListRefresh);
 
     statusBar()->insertPermanentWidget(0, refresh_button);
 
     statusBar()->setVisible(true);
-    setStyleSheet(QStringLiteral("QStatusBar::item{border: none;}"));
+    statusBar()->setStyleSheet(QStringLiteral(
+        "QStatusBar {"
+        "  background-color: #13161D;"
+        "  border-top: 1px solid #242A35;"
+        "  color: #8E9297;"
+        "}"
+        "QStatusBar::item { border: none; }"
+        "QStatusBar QLabel { color: #8E9297; font-size: 11px; padding: 2px 6px; }"
+        "QStatusBar QPushButton {"
+        "  background-color: transparent;"
+        "  color: #8E9297;"
+        "  border: none;"
+        "  border-radius: 4px;"
+        "  padding: 2px 6px;"
+        "  font-size: 11px;"
+        "}"
+        "QStatusBar QPushButton:hover {"
+        "  background-color: #1B2029;"
+        "  color: #FFFFFF;"
+        "}"));
 }
 
 void MainWindow::InitializeDebugWidgets() {
@@ -1300,7 +1392,7 @@ void MainWindow::InitializeHotkeys() {
     hotkey_registry.LoadHotkeys();
 
     LinkActionShortcut(ui->action_Load_File, QStringLiteral("Load File"));
-    LinkActionShortcut(ui->action_Exit, QStringLiteral("Exit Eglantine"));
+    LinkActionShortcut(ui->action_Exit, QStringLiteral("Exit Dalia"));
     LinkActionShortcut(ui->action_Restart, QStringLiteral("Restart Emulation"));
     LinkActionShortcut(ui->action_Pause, QStringLiteral("Continue/Pause Emulation"));
     LinkActionShortcut(ui->action_Stop, QStringLiteral("Stop Emulation"));
@@ -1320,6 +1412,9 @@ void MainWindow::InitializeHotkeys() {
     LinkActionShortcut(ui->action_Leave_Room, QStringLiteral("Leave Room"));
     LinkActionShortcut(ui->action_Configure, QStringLiteral("Configure"));
     LinkActionShortcut(ui->action_Configure_Current_Game, QStringLiteral("Configure Current Game"));
+
+    auto* dalia_overlay_shortcut = new QShortcut(QKeySequence(Qt::Key_F10), this);
+    connect(dalia_overlay_shortcut, &QShortcut::activated, this, &MainWindow::OnToggleGameplayOverlay);
 
     static const QString main_window = QStringLiteral("Main Window");
     const auto connect_shortcut = [&]<typename Fn>(const QString& action_name, const Fn& function) {
@@ -1933,7 +2028,7 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     if (close_pending) {
         return;
     }
-    LOG_INFO(Frontend, "Eglantine starting...");
+    LOG_INFO(Frontend, "Dalia starting...");
 
     if (params.program_id == 0 ||
         params.program_id > static_cast<u64>(Service::AM::AppletProgramId::MaxProgramId)) {
@@ -1976,7 +2071,7 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
                    "Vulkan, 1x resolution, GPU Fast, asynchronous shaders, BC3, conservative VRAM, "
                    "reactive flushing off, FIFO Relaxed VSync, handheld mode, ScaleForce, and "
                    "FXAA.\n\n"
-                   "They apply to Mario Kart World until Eglantine is closed. Your saved settings "
+                   "They apply to Mario Kart World until Dalia is closed. Your saved settings "
                    "are not changed."),
                 QMessageBox::Yes | QMessageBox::No, QMessageBox::No) == QMessageBox::Yes;
         LOG_INFO(Config, "MKW recommended settings accepted: {}", use_recommended_mkw_settings);
@@ -1994,12 +2089,12 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
             QMessageBox::question(
                 this, tr("Recommended Ocarina of Time settings"),
                 tr("Use the recommended settings for Ocarina of Time?\n\n"
-                   "Vulkan, 1x resolution, GPU Fast, asynchronous shaders, BC3, conservative VRAM, "
-                   "reactive flushing on, FIFO Relaxed VSync, docked mode, ScaleForce, and "
-                   "FXAA.\n\n"
-                   "They apply to Ocarina of Time until Eglantine is closed. Your saved settings "
+                   "Vulkan, 1x resolution, GPU Low accuracy, async shaders, BC3 ASTC "
+                   "recompression, Conservative VRAM, reactive flushing off, Mailbox VSync, "
+                   "docked mode, ScaleForce, and FXAA.\n\n"
+                   "They apply to Ocarina of Time until Dalia is closed. Your saved settings "
                    "are not changed."),
-                QMessageBox::Yes | QMessageBox::No, QMessageBox::No) == QMessageBox::Yes;
+                QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes) == QMessageBox::Yes;
         LOG_INFO(Config, "OOT recommended settings accepted: {}", use_recommended_oot_settings);
     }
     if (Settings::ApplyOcarinaOfTimePreset(Settings::values, title_id,
@@ -2115,6 +2210,9 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     // Update the GUI
     UpdateStatusButtons();
     if (ui->action_Single_Window_Mode->isChecked()) {
+        if (dalia_main_container) {
+            dalia_main_container->hide();
+        }
         game_list->hide();
         game_list_placeholder->hide();
     }
@@ -2207,6 +2305,12 @@ bool MainWindow::OnShutdownBegin() {
         perf_overlay->hide();
         perf_overlay->deleteLater();
         perf_overlay = nullptr;
+    }
+
+    if (dalia_gameplay_overlay) {
+        dalia_gameplay_overlay->hide();
+        dalia_gameplay_overlay->deleteLater();
+        dalia_gameplay_overlay = nullptr;
     }
 
     QtCommon::system->SetShuttingDown(true);
@@ -2306,10 +2410,15 @@ void MainWindow::OnEmulationStopped() {
     render_window->hide();
     loading_screen->hide();
     loading_screen->Clear();
-    if (game_list->IsEmpty()) {
-        game_list_placeholder->show();
+    if (dalia_main_container) {
+        dalia_main_container->show();
+        ui->menubar->hide();
     } else {
-        game_list->show();
+        if (game_list->IsEmpty()) {
+            game_list_placeholder->show();
+        } else {
+            game_list->show();
+        }
     }
     game_list->SetFilterFocus();
     tas_label->clear();
@@ -3246,6 +3355,14 @@ void MainWindow::OnLoadComplete() {
     perf_overlay = new PerformanceOverlay(this);
     perf_overlay->setVisible(ui->action_Show_Performance_Overlay->isChecked());
 
+    dalia_gameplay_overlay = new DaliaGameplayOverlay(this);
+    std::string game_title_str;
+    QtCommon::system->GetAppLoader().ReadTitle(game_title_str);
+    const QString game_title = QString::fromStdString(game_title_str);
+    const u64 prog_id = QtCommon::system->GetApplicationProcessProgramID();
+    dalia_gameplay_overlay->SetGameTitle(game_title, prog_id);
+    dalia_gameplay_overlay->setVisible(ui->action_Show_Performance_Overlay->isChecked());
+
     connect(perf_overlay, &PerformanceOverlay::closed, perf_overlay,
             [this]() { ui->action_Show_Performance_Overlay->setChecked(false); });
 }
@@ -3435,7 +3552,9 @@ void MainWindow::HideFullscreen() {
         }
 
         statusBar()->setVisible(ui->action_Show_Status_Bar->isChecked());
-        ui->menubar->show();
+        if (emulation_running) {
+            ui->menubar->show();
+        }
     } else {
         if (UsingExclusiveFullscreen()) {
             render_window->showNormal();
@@ -3459,7 +3578,11 @@ void MainWindow::ToggleWindowMode() {
         if (emulation_running) {
             render_window->setVisible(true);
             render_window->setFocus();
-            game_list->hide();
+            if (dalia_main_container) {
+                dalia_main_container->hide();
+            } else {
+                game_list->hide();
+            }
         }
 
     } else {
@@ -3470,7 +3593,11 @@ void MainWindow::ToggleWindowMode() {
         if (emulation_running) {
             render_window->setVisible(true);
             render_window->RestoreGeometry();
-            game_list->show();
+            if (dalia_main_container) {
+                dalia_main_container->show();
+            } else {
+                game_list->show();
+            }
         }
     }
 }
@@ -3533,6 +3660,55 @@ void MainWindow::SetGameListMode(Settings::GameListMode mode) {
 
     CheckIconSize();
     game_list->ResetViewMode();
+    if (dalia_main_container && dalia_main_container->GetLibraryPage()) {
+        dalia_main_container->GetLibraryPage()->SyncViewModeButtons();
+    }
+}
+
+void MainWindow::ShowApplicationMenu(const QPoint& global_pos) {
+    QMenu menu(this);
+    menu.setStyleSheet(QStringLiteral(
+        "QMenu {"
+        "  background-color: #1B2029;"
+        "  color: #FFFFFF;"
+        "  border: 1px solid #282C37;"
+        "  border-radius: 8px;"
+        "  padding: 6px;"
+        "}"
+        "QMenu::item {"
+        "  padding: 8px 24px 8px 16px;"
+        "  border-radius: 6px;"
+        "}"
+        "QMenu::item:selected {"
+        "  background-color: #242A35;"
+        "  color: #48BDEB;"
+        "}"
+        "QMenu::separator {"
+        "  height: 1px;"
+        "  background-color: #242A35;"
+        "  margin: 4px 8px;"
+        "}"));
+
+    menu.addAction(ui->action_Load_File);
+    menu.addAction(ui->action_Load_Folder);
+    menu.addAction(ui->action_Install_File_NAND);
+    menu.addSeparator();
+    menu.addAction(ui->action_Root_Data_Folder);
+    menu.addAction(ui->action_Mod_Folder);
+    menu.addSeparator();
+
+    auto* toggle_menu_bar = menu.addAction(tr("Mostrar Barra de Menú Clásica"), [this] {
+        ui->menubar->setVisible(!ui->menubar->isVisible());
+    });
+    toggle_menu_bar->setCheckable(true);
+    toggle_menu_bar->setChecked(ui->menubar->isVisible());
+
+    menu.addAction(ui->action_Configure);
+    menu.addAction(ui->action_About);
+    menu.addSeparator();
+    menu.addAction(ui->action_Exit);
+
+    menu.exec(global_pos);
 }
 
 void MainWindow::SetGridView() {
@@ -4079,6 +4255,14 @@ void MainWindow::OnToggleStatusBar() {
 void MainWindow::OnTogglePerfOverlay() {
     if (perf_overlay)
         perf_overlay->setVisible(ui->action_Show_Performance_Overlay->isChecked());
+    if (dalia_gameplay_overlay)
+        dalia_gameplay_overlay->setVisible(ui->action_Show_Performance_Overlay->isChecked());
+}
+
+void MainWindow::OnToggleGameplayOverlay() {
+    if (dalia_gameplay_overlay) {
+        dalia_gameplay_overlay->ToggleVisibility();
+    }
 }
 
 #ifdef HAS_RESHADE
@@ -4594,23 +4778,14 @@ void MainWindow::OnApplicationChanged(u64 program_id) {
 
 void MainWindow::UpdateWindowTitle(std::string_view title_name, std::string_view title_version,
                                    std::string_view gpu_vendor) {
-    static const std::string build_id = std::string{Common::g_build_id};
-    static const std::string yuzu_title =
-        fmt::format("{} | {} | {}", std::string{Common::g_build_name},
-                    std::string{Common::g_build_version}, std::string{Common::g_compiler_id});
-
-    const auto override_title =
-        fmt::format(fmt::runtime(std::string(Common::g_title_bar_format_idle)), build_id);
-    const auto window_title = override_title.empty() ? yuzu_title : override_title;
-
     if (title_name.empty()) {
-        setWindowTitle(QString::fromStdString(window_title));
+        setWindowTitle(QStringLiteral("DALIA"));
     } else {
-        const auto run_title = [window_title, title_name, title_version, gpu_vendor]() {
+        const auto run_title = [title_name, title_version, gpu_vendor]() {
             if (title_version.empty()) {
-                return fmt::format("{} | {} | {}", window_title, title_name, gpu_vendor);
+                return fmt::format("DALIA | {} | {}", title_name, gpu_vendor);
             }
-            return fmt::format("{} | {} | {} | {}", window_title, title_name, title_version,
+            return fmt::format("DALIA | {} | {} | {}", title_name, title_version,
                                gpu_vendor);
         }();
         setWindowTitle(QString::fromStdString(run_title));
@@ -4674,6 +4849,13 @@ void MainWindow::UpdateStatusBar() {
     if (QtCommon::emu_thread == nullptr || !QtCommon::system->IsPoweredOn()) {
         status_bar_update_timer.stop();
         return;
+    }
+
+    // The timer fires every 500 ms: once a minute, so a crash report shows what ran out and how
+    // fast.
+    if (static u32 updates{}; ++updates % 120 == 0) {
+        LOG_INFO(Frontend, "Host resources: {}",
+                 Common::DescribeHostResources(Common::QueryHostResources()));
     }
 
     if (Settings::values.tas_enable)
@@ -4758,6 +4940,35 @@ void MainWindow::UpdateAAText() {
                                   : aa_text.toUpper());
 }
 
+void MainWindow::UpdateFrameGenText() {
+    if (!frame_gen_status_button) {
+        return;
+    }
+    const bool enabled = Settings::values.frame_gen.GetValue();
+    frame_gen_status_button->setChecked(enabled);
+    if (!enabled) {
+        frame_gen_status_button->setText(QStringLiteral("FG: OFF"));
+        frame_gen_status_button->setToolTip(QString());
+        return;
+    }
+    const auto type = Settings::values.frame_gen_type.GetValue();
+    const u32 mult = Settings::values.frame_gen_multiplier.GetValue();
+#ifdef HAS_LSFG
+    if (type == Settings::FrameGenType::Lsfg &&
+        VideoCore::FrameGen::GetInstalledLosslessStatus() !=
+            VideoCore::FrameGen::LosslessStatus::Ok) {
+        frame_gen_status_button->setText(QStringLiteral("FG: FSR3 (LSFG N/A) %1X").arg(mult));
+        frame_gen_status_button->setToolTip(
+            tr("Lossless.dll is not installed; using built-in FSR3 Frame Generation fallback."));
+        return;
+    }
+#endif
+    const auto it = ConfigurationShared::frame_gen_type_texts_map.find(type);
+    const QString type_str = it != ConfigurationShared::frame_gen_type_texts_map.end() ? it->second : QStringLiteral("FSR");
+    frame_gen_status_button->setText(QStringLiteral("FG: %1 %2X").arg(type_str).arg(mult));
+    frame_gen_status_button->setToolTip(QString());
+}
+
 #ifdef HAS_RESHADE
 void MainWindow::UpdatePostShaderText() {
     const bool enabled = Settings::values.post_shader_enabled.GetValue();
@@ -4798,6 +5009,7 @@ void MainWindow::UpdateStatusButtons() {
     UpdateDockedButton();
     UpdateFilterText();
     UpdateAAText();
+    UpdateFrameGenText();
     UpdateVolumeUI();
 }
 
@@ -4911,7 +5123,7 @@ void MainWindow::OnCheckGraphicsBackend() {
         UISettings::values.gui_force_x11.SetValue(true);
         GraphicsBackend::SetForceX11(true);
         QMessageBox::information(this, tr("Restart Required"),
-                                 tr("Restart Eglantine to apply the X11 backend."));
+                                 tr("Restart Dalia to apply the X11 backend."));
     }
 }
 #endif
@@ -5030,8 +5242,8 @@ bool MainWindow::ConfirmClose() {
         UISettings::values.confirm_before_stopping.GetValue() == ConfirmStop::Ask_Based_On_Game)
         return true;
 
-    const auto text = tr("Are you sure you want to close Eglantine?");
-    return question(this, tr("Eglantine"), text);
+    const auto text = tr("Are you sure you want to close Dalia?");
+    return question(this, tr("Dalia"), text);
 }
 
 void MainWindow::closeEvent(QCloseEvent* event) {
@@ -5137,7 +5349,7 @@ bool MainWindow::ConfirmChangeGame() {
 
     // Use custom question to link controller navigation
     return question(
-        this, tr("Eglantine"),
+        this, tr("Dalia"),
         tr("Are you sure you want to stop the emulation? Any unsaved progress will be lost."),
         QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes);
 }
@@ -5147,10 +5359,10 @@ bool MainWindow::ConfirmForceLockedExit() {
         return true;
 
     const auto text =
-        tr("The currently running application has requested Eglantine to not exit.\n\n"
+        tr("The currently running application has requested Dalia to not exit.\n\n"
            "Would you like to bypass this and exit anyway?");
 
-    return question(this, tr("Eglantine"), text);
+    return question(this, tr("Dalia"), text);
 }
 
 void MainWindow::RequestGameExit() {
@@ -5218,8 +5430,9 @@ void MainWindow::UpdateUITheme() {
     QFile f(theme_uri);
     if (f.open(QFile::ReadOnly | QFile::Text)) {
         QTextStream ts(&f);
-        qApp->setStyleSheet(ts.readAll());
-        setStyleSheet(ts.readAll());
+        const QString stylesheet = ts.readAll();
+        qApp->setStyleSheet(stylesheet);
+        setStyleSheet(stylesheet);
     } else {
         LOG_ERROR(Frontend, "Unable to set style \"{}\", stylesheet file not found",
                   UISettings::values.theme);

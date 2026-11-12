@@ -33,6 +33,7 @@ public:
                 if (IsValid(tmp.address)) {
                     std::scoped_lock lk(guard);
                     back_buffer.emplace_back(tmp);
+                    has_back.store(true, std::memory_order_release);
                     current.exchange(t, std::memory_order_relaxed);
                     return;
                 }
@@ -43,8 +44,50 @@ public:
                 return;
             }
             tmp.mask |= t.mask;
-        } while (!current.compare_exchange_weak(original, tmp, std::memory_order_release,
+        } while (!current.compare_exchange_weak(original, tmp, std::memory_order_acq_rel,
                                                 std::memory_order_relaxed));
+    }
+
+    /// Whether a CPU write was collected since the last Gather (without the lock).
+    [[nodiscard]] bool HasPending() const {
+        return has_back.load(std::memory_order_acquire) ||
+               current.load(std::memory_order_acquire).mask != 0;
+    }
+
+    /// Moves on with each Gather that took writes. A page the core reported to the GPU before
+    /// must be reported again on its next write: the write held back for it has been applied.
+    /// Read after Collect, it tells whether the write went into the list after that Gather.
+    [[nodiscard]] u64 Generation() const {
+        return generation.load(std::memory_order_acquire);
+    }
+
+    /// The page a core last reported to the GPU, and in which generation.
+    struct ReportedPage {
+        PAddr page{~PAddr{}};
+        u64 generation{};
+    };
+
+    /// Collects a CPU write to GPU-cached memory at `page`. `report` (the GPU's OnCPUWrite, which
+    /// holds the page back) runs for the first write to a page in each generation; when it returns
+    /// false the write is not collected.
+    template <typename Report>
+    void CollectWrite(PAddr address, size_t size, PAddr page, ReportedPage& last, Report&& report) {
+        const u64 seen = Generation();
+        if (last.page != page || last.generation != seen) {
+            if (!report()) {
+                return;
+            }
+            last = {page, seen};
+        }
+        Collect(address, size);
+        // A Gather took the list since the generation was read: the write may have gone with it
+        // (applied before the caller stores it) or into the next list (while the round releases
+        // the page). Report and collect it again for the next round.
+        if (const u64 now = Generation(); now != seen) {
+            report();
+            Collect(address, size);
+            last.generation = now;
+        }
     }
 
     /// Calls `callback` for each write collected and not yet gathered, without consuming them.
@@ -64,13 +107,22 @@ public:
     }
 
     void Gather(std::function<void(PAddr, size_t)>& callback) {
+        // Called for every GPU fence (thousands a second for Switch 2 titles), for each core,
+        // while the CPU rarely writes GPU-cached memory: nothing collected, no lock.
+        if (!has_back.load(std::memory_order_acquire) &&
+            current.load(std::memory_order_acquire).mask == 0) {
+            return;
+        }
         // FlushRegion also gathers off the GPU thread (host1x video decode reads); serialize
         // gatherers so one cannot swap or clear front_buffer while another iterates it.
         std::scoped_lock gather_lk(gather_guard);
         {
             std::scoped_lock lk(guard);
-            TransformAddress t = current.exchange(default_transform, std::memory_order_relaxed);
+            // Before the exchange: a Collect that lands in the next list sees the new generation.
+            generation.fetch_add(1, std::memory_order_relaxed);
+            TransformAddress t = current.exchange(default_transform, std::memory_order_acq_rel);
             front_buffer.swap(back_buffer);
+            has_back.store(false, std::memory_order_relaxed);
             if (IsValid(t.address)) {
                 front_buffer.emplace_back(t);
             }
@@ -137,6 +189,8 @@ private:
     }
 
     std::atomic<TransformAddress> current{};
+    std::atomic<u64> generation{};
+    std::atomic<bool> has_back{false};
     std::mutex guard;
     std::mutex gather_guard;
     std::vector<TransformAddress> back_buffer;

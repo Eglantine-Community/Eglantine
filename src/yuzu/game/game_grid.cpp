@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <QScroller>
 #include <QScrollerProperties>
 
@@ -26,11 +27,18 @@ GameGrid::GameGrid(QWidget* parent) : QListView{parent} {
     setEditTriggers(QAbstractItemView::NoEditTriggers);
     setContextMenuPolicy(Qt::CustomContextMenu);
 
-    setSpacing(10);
+    setSpacing(14);
     setWordWrap(true);
     setTextElideMode(Qt::ElideRight);
     setFlow(QListView::LeftToRight);
     setWrapping(true);
+
+    setStyleSheet(QStringLiteral(
+        "QListView { background-color: transparent; border: none; outline: none; }"
+        "QListView::item { background: transparent; border: none; outline: none; }"
+        "QListView::item:hover { background: transparent; border: none; }"
+        "QListView::item:selected { background: transparent; border: none; }"
+    ));
 }
 
 void GameGrid::SetModel(GameListModel* model) {
@@ -58,28 +66,14 @@ void GameGrid::UpdateIconSize() {
     const u32 icon_size = UISettings::values.game_icon_size.GetValue();
 
     int heightMargin = 0;
-    int widthMargin = 80;
+    int widthMargin = 28;
 
     if (UISettings::values.show_game_name) {
-        switch (icon_size) {
-        case 128:
-            heightMargin = 65;
-            break;
-        case 0:
-            widthMargin = 120;
-            heightMargin = 120;
-            break;
-        case 64:
-            heightMargin = 77;
-            break;
-        case 32:
-        case 256:
-            heightMargin = 81;
-            break;
-        }
+        widthMargin = std::max(28, static_cast<int>(icon_size / 4));
+        heightMargin = std::max(56, static_cast<int>(icon_size / 3));
     } else {
-        widthMargin = 24;
-        heightMargin = 24;
+        widthMargin = 16;
+        heightMargin = 16;
     }
 
     const int view_width = viewport()->width();

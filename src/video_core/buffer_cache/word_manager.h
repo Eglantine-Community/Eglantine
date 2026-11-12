@@ -13,6 +13,8 @@
 #include <utility>
 #include <vector>
 
+#include <boost/container/small_vector.hpp>
+
 #include "common/alignment.h"
 #include "common/common_funcs.h"
 #include "common/common_types.h"
@@ -48,6 +50,13 @@ struct WordManager {
         u64 const last_word = (~u64{0} << shift) >> shift;
         heap[num_words * size_t(Type::CPU) + num_words - 1] = last_word;
         heap[num_words * size_t(Type::Untracked) + num_words - 1] = last_word;
+        if constexpr (num_words <= 64) {
+            const u64 full_mask = num_words == 64 ? ~u64{0} : (u64{1} << num_words) - 1;
+            const u64 all_mask =
+                last_word == 0 ? (full_mask & ~(u64{1} << (num_words - 1))) : full_mask;
+            non_zero_words[size_t(Type::CPU)] = all_mask;
+            non_zero_words[size_t(Type::Untracked)] = all_mask;
+        }
     }
     explicit WordManager() = default;
 
@@ -119,23 +128,33 @@ struct WordManager {
         std::span<u64> state_words = Span(type);
         [[maybe_unused]] std::span<u64> untracked_words = Span(Type::Untracked);
         [[maybe_unused]] std::span<u64> cached_words = Span(Type::CachedCPU);
-        std::vector<std::pair<VAddr, u64>> ranges;
+        boost::container::small_vector<std::pair<VAddr, u64>, 32> ranges;
         IterateWords(dirty_addr - cpu_addr, size, [&](size_t index, u64 mask) {
             if (type == Type::CPU || type == Type::CachedCPU) {
                 CollectChangedRanges(!enable, index, untracked_words[index], mask, ranges);
             }
             if (enable) {
                 state_words[index] |= mask;
-                if (type == Type::CPU || type == Type::CachedCPU)
+                SyncWordMask(type, index, state_words[index]);
+                if (type == Type::CPU || type == Type::CachedCPU) {
                     untracked_words[index] |= mask;
-                if (type == Type::CPU)
+                    SyncWordMask(Type::Untracked, index, untracked_words[index]);
+                }
+                if (type == Type::CPU) {
                     cached_words[index] &= ~mask;
+                    SyncWordMask(Type::CachedCPU, index, cached_words[index]);
+                }
             } else {
-                if (type == Type::CPU)
+                if (type == Type::CPU) {
                     cached_words[index] &= ~(state_words[index] & mask);
+                    SyncWordMask(Type::CachedCPU, index, cached_words[index]);
+                }
                 state_words[index] &= ~mask;
-                if (type == Type::CPU || type == Type::CachedCPU)
+                SyncWordMask(type, index, state_words[index]);
+                if (type == Type::CPU || type == Type::CachedCPU) {
                     untracked_words[index] &= ~mask;
+                    SyncWordMask(Type::Untracked, index, untracked_words[index]);
+                }
             }
         });
         if (!ranges.empty()) {
@@ -153,6 +172,15 @@ struct WordManager {
     template <typename Func>
     void ForEachModifiedRange(Type type, bool clear, VAddr query_cpu_range, s64 size, Func&& func) {
         //static_assert(type != Type::Untracked);
+        if constexpr (num_words <= 64) {
+            const u64 active_words =
+                (clear && (type == Type::CPU || type == Type::CachedCPU))
+                    ? (non_zero_words[size_t(type)] | non_zero_words[size_t(Type::Untracked)])
+                    : non_zero_words[size_t(type)];
+            if (active_words == 0) {
+                return;
+            }
+        }
         std::span<u64> state_words = Span(type);
         std::span<u64> untracked_words = Span(Type::Untracked);
         std::span<u64> cached_words = Span(Type::CachedCPU);
@@ -164,7 +192,7 @@ struct WordManager {
             func(cpu_addr + pending_offset * BYTES_PER_PAGE,
                  (pending_pointer - pending_offset) * BYTES_PER_PAGE);
         };
-        std::vector<std::pair<VAddr, u64>> ranges;
+        boost::container::small_vector<std::pair<VAddr, u64>, 32> ranges;
         IterateWords(offset, size, [&](size_t index, u64 mask) {
             if (type == Type::GPU)
                 mask &= ~untracked_words[index];
@@ -179,10 +207,15 @@ struct WordManager {
                     CollectChangedRanges(true, index, untracked_words[index], mask, ranges);
                 }
                 state_words[index] &= ~mask;
-                if (type == Type::CPU || type == Type::CachedCPU)
+                SyncWordMask(type, index, state_words[index]);
+                if (type == Type::CPU || type == Type::CachedCPU) {
                     untracked_words[index] &= ~mask;
-                if (type == Type::CPU)
+                    SyncWordMask(Type::Untracked, index, untracked_words[index]);
+                }
+                if (type == Type::CPU) {
                     cached_words[index] &= ~word;
+                    SyncWordMask(Type::CachedCPU, index, cached_words[index]);
+                }
             }
             const size_t base_offset = index * PAGES_PER_WORD;
             IteratePages(word, [&](size_t pages_offset, size_t pages_size) {
@@ -213,6 +246,11 @@ struct WordManager {
     /// @param size   Size in bytes of the region to query for modifications
     [[nodiscard]] bool IsRegionModified(Type type, u64 offset, u64 size) const noexcept {
         //static_assert(type != Type::Untracked);
+        if constexpr (num_words <= 64) {
+            if (non_zero_words[size_t(type)] == 0) {
+                return false;
+            }
+        }
         const std::span<const u64> state_words = Span(type);
         const std::span<const u64> untracked_words = Span(Type::Untracked);
         bool result = false;
@@ -229,6 +267,11 @@ struct WordManager {
     /// @param size   Size in bytes of the region to query for modifications
     [[nodiscard]] std::pair<u64, u64> ModifiedRegion(Type type, u64 offset, u64 size) const noexcept {
         //static_assert(type != Type::Untracked);
+        if constexpr (num_words <= 64) {
+            if (non_zero_words[size_t(type)] == 0) {
+                return std::make_pair<u64, u64>(0, 0);
+            }
+        }
         const std::span<const u64> state_words = Span(type);
         const std::span<const u64> untracked_words = Span(Type::Untracked);
         u64 begin = (std::numeric_limits<u64>::max)(), end = 0;
@@ -249,10 +292,36 @@ struct WordManager {
     }
 
     void FlushCachedWrites() noexcept {
+        if constexpr (num_words <= 64) {
+            u64 dirty_mask = non_zero_words[size_t(Type::CachedCPU)];
+            if (dirty_mask == 0) {
+                return;
+            }
+            auto const cached_words = Span(Type::CachedCPU);
+            auto const untracked_words = Span(Type::Untracked);
+            auto const cpu_words = Span(Type::CPU);
+            boost::container::small_vector<std::pair<VAddr, u64>, 32> ranges;
+            while (dirty_mask != 0) {
+                const u64 word_index = std::countr_zero(dirty_mask);
+                dirty_mask &= dirty_mask - 1;
+                const u64 cached_bits = cached_words[word_index];
+                CollectChangedRanges(false, word_index, untracked_words[word_index], cached_bits, ranges);
+                untracked_words[word_index] |= cached_bits;
+                cpu_words[word_index] |= cached_bits;
+                cached_words[word_index] = 0;
+                SyncWordMask(Type::Untracked, word_index, untracked_words[word_index]);
+                SyncWordMask(Type::CPU, word_index, cpu_words[word_index]);
+            }
+            non_zero_words[size_t(Type::CachedCPU)] = 0;
+            if (!ranges.empty()) {
+                ApplyCollectedRanges(ranges, -1);
+            }
+            return;
+        }
         auto const cached_words = Span(Type::CachedCPU);
         auto const untracked_words = Span(Type::Untracked);
         auto const cpu_words = Span(Type::CPU);
-        std::vector<std::pair<VAddr, u64>> ranges;
+        boost::container::small_vector<std::pair<VAddr, u64>, 32> ranges;
         for (u64 word_index = 0; word_index < num_words; ++word_index) {
             const u64 cached_bits = cached_words[word_index];
             CollectChangedRanges(false, word_index, untracked_words[word_index], cached_bits, ranges);
@@ -271,7 +340,8 @@ struct WordManager {
     /// @param current_bits   Current state of the word
     /// @param new_bits       New state of the word
     /// @tparam add_to_tracker True when the tracker should start tracking the new pages
-    void CollectChangedRanges(bool add_to_tracker, u64 word_index, u64 current_bits, u64 new_bits, std::vector<std::pair<VAddr, u64>>& out_ranges) const {
+    void CollectChangedRanges(bool add_to_tracker, u64 word_index, u64 current_bits, u64 new_bits,
+                              boost::container::small_vector_base<std::pair<VAddr, u64>>& out_ranges) const {
         u64 changed_bits = (add_to_tracker ? current_bits : ~current_bits) & new_bits;
         VAddr addr = cpu_addr + word_index * BYTES_PER_WORD;
         IteratePages(changed_bits, [&](size_t offset, size_t size) {
@@ -279,13 +349,19 @@ struct WordManager {
         });
     }
 
-    void ApplyCollectedRanges(std::vector<std::pair<VAddr, u64>>& ranges, int delta) const {
+    void ApplyCollectedRanges(boost::container::small_vector_base<std::pair<VAddr, u64>>& ranges,
+                              int delta) const {
         if (ranges.empty())
             return;
+        if (ranges.size() == 1) {
+            tracker->UpdatePagesCachedCount(ranges[0].first, static_cast<size_t>(ranges[0].second),
+                                            delta);
+            ranges.clear();
+            return;
+        }
         std::sort(ranges.begin(), ranges.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
         // Coalesce adjacent/contiguous ranges
-        std::vector<std::pair<VAddr, size_t>> coalesced;
-        coalesced.reserve(ranges.size());
+        boost::container::small_vector<std::pair<VAddr, size_t>, 32> coalesced;
         VAddr cur_addr = ranges[0].first;
         size_t cur_size = static_cast<size_t>(ranges[0].second);
         for (size_t i = 1; i < ranges.size(); ++i) {
@@ -299,7 +375,7 @@ struct WordManager {
         }
         coalesced.emplace_back(cur_addr, cur_size);
         // Use batch API to reduce lock acquisitions and contention.
-        tracker->UpdatePagesCachedBatch(coalesced, delta);
+        tracker->UpdatePagesCachedBatch(std::span{coalesced.data(), coalesced.size()}, delta);
         ranges.clear();
     }
 
@@ -324,7 +400,16 @@ struct WordManager {
         return std::span<const u64>(heap.data() + num_words * size_t(type), num_words);
     }
 
+    void SyncWordMask(Type type, size_t index, u64 value) noexcept {
+        if constexpr (num_words <= 64) {
+            non_zero_words[size_t(type)] =
+                (non_zero_words[size_t(type)] & ~(u64{1} << index)) |
+                (u64{value != 0} << index);
+        }
+    }
+
     std::array<u64, size_t(Type::Max) * num_words> heap = {};
+    std::array<u64, size_t(Type::Max)> non_zero_words = {};
     DeviceTracker* tracker = nullptr;
     VAddr cpu_addr = 0;
 };

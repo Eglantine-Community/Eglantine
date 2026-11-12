@@ -128,7 +128,9 @@ GPUVAddr MemoryManager::PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr de
     u64 modified_size{};
     const auto flush_modified = [&] {
         if (modified_size != 0) {
-            rasterizer->ModifyGPUMemory(unique_identifier, modified_start, modified_size);
+            if (rasterizer) {
+                rasterizer->ModifyGPUMemory(unique_identifier, modified_start, modified_size);
+            }
             modified_size = 0;
         }
     };
@@ -164,7 +166,9 @@ GPUVAddr MemoryManager::BigPageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr
     u64 modified_size{};
     const auto flush_modified = [&] {
         if (modified_size != 0) {
-            rasterizer->ModifyGPUMemory(unique_identifier, modified_start, modified_size);
+            if (rasterizer) {
+                rasterizer->ModifyGPUMemory(unique_identifier, modified_start, modified_size);
+            }
             modified_size = 0;
         }
     };
@@ -236,8 +240,10 @@ void MemoryManager::Unmap(GPUVAddr gpu_addr, std::size_t size) {
     }
     GetSubmappedRangeImpl<false>(gpu_addr, size, page_stash);
 
-    for (const auto& [map_addr, map_size] : page_stash) {
-        rasterizer->UnmapMemory(map_addr, map_size);
+    if (rasterizer) {
+        for (const auto& [map_addr, map_size] : page_stash) {
+            rasterizer->UnmapMemory(map_addr, map_size);
+        }
     }
     page_stash.clear();
 
@@ -272,14 +278,23 @@ std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr addr, std::size_t s
     return std::nullopt;
 }
 
+std::optional<u32> MemoryManager::TryReadNativeSyncpointShim(GPUVAddr addr,
+                                                             u32& out_syncpoint_id) const {
+    const auto shim = native_syncpoint_shim.load(std::memory_order_acquire);
+    if (shim && addr >= shim && addr - shim < NumShimSyncpoints * sizeof(u32) &&
+        Common::IsAligned(addr - shim, sizeof(u32))) {
+        out_syncpoint_id = static_cast<u32>((addr - shim) / sizeof(u32));
+        return system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(out_syncpoint_id);
+    }
+    return std::nullopt;
+}
+
 template <typename T>
 T MemoryManager::Read(GPUVAddr addr) const {
     if constexpr (sizeof(T) == sizeof(u32)) {
-        const auto shim = native_syncpoint_shim.load(std::memory_order_acquire);
-        if (shim && addr >= shim && addr - shim < NumShimSyncpoints * sizeof(u32) &&
-            Common::IsAligned(addr - shim, sizeof(u32))) {
-            return static_cast<T>(system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(
-                static_cast<u32>((addr - shim) / sizeof(u32))));
+        u32 unused_id{};
+        if (const auto shim_val = TryReadNativeSyncpointShim(addr, unused_id)) {
+            return static_cast<T>(*shim_val);
         }
     }
 
@@ -596,7 +611,7 @@ size_t MemoryManager::MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const {
         u64 serial;
         size_t result;
     };
-    thread_local std::vector<Entry> cache(4096);
+    thread_local std::array<Entry, 4096> cache{};
     const u64 serial = map_serial.load(std::memory_order_acquire);
     Entry& entry = cache[((gpu_addr ^ size) * 0x9E3779B97F4A7C15ULL) >> 52];
     if (entry.owner == unique_identifier + 1 && entry.gpu_addr == gpu_addr && entry.size == size &&

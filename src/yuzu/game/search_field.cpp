@@ -84,7 +84,7 @@ void GameListSearchField::setFocus() {
 GameListSearchField::GameListSearchField(GameList* parent) : QWidget{parent} {
     auto* const key_release_eater = new KeyReleaseEater(parent, this);
     layout_filter = new QHBoxLayout;
-    layout_filter->setContentsMargins(8, 8, 8, 8);
+    layout_filter->setContentsMargins(12, 8, 12, 8);
     label_filter = new QLabel;
     edit_filter = new QLineEdit;
     edit_filter->clear();
@@ -93,21 +93,25 @@ GameListSearchField::GameListSearchField(GameList* parent) : QWidget{parent} {
     connect(edit_filter, &QLineEdit::textChanged, parent, &GameList::OnTextChanged);
     label_filter_result = new QLabel;
     button_filter_close = new QToolButton(this);
-    button_filter_close->setText(QStringLiteral("X"));
+    button_filter_close->setText(QStringLiteral("✕"));
     button_filter_close->setCursor(Qt::ArrowCursor);
-    button_filter_close->setStyleSheet(
-        QStringLiteral("QToolButton{ border: none; padding: 0px; color: "
-                       "#000000; font-weight: bold; background: #F0F0F0; }"
-                       "QToolButton:hover{ border: none; padding: 0px; color: "
-                       "#EEEEEE; font-weight: bold; background: #E81123}"));
     connect(button_filter_close, &QToolButton::clicked, parent, &GameList::OnFilterCloseClicked);
-    layout_filter->setSpacing(10);
+    layout_filter->setSpacing(12);
     layout_filter->addWidget(label_filter);
     layout_filter->addWidget(edit_filter);
     layout_filter->addWidget(label_filter_result);
     layout_filter->addWidget(button_filter_close);
     setLayout(layout_filter);
     RetranslateUI();
+
+    setStyleSheet(QStringLiteral(
+        "GameListSearchField { background-color: #242424; border-bottom: 1px solid #383838; }"
+        "QLineEdit { background-color: #1A1A1A; color: #FFFFFF; border: 1.5px solid #444444; border-radius: 13px; padding: 4px 12px; font-size: 13px; }"
+        "QLineEdit:focus { border: 1.5px solid #00D2FF; }"
+        "QLabel { color: #D0D0D0; font-weight: bold; font-size: 12px; }"
+        "QToolButton { border: none; border-radius: 9px; padding: 2px 7px; color: #BBBBBB; font-weight: bold; background: #383838; }"
+        "QToolButton:hover { color: #FFFFFF; background: #FF3C28; }"
+    ));
 }
 
 void GameListSearchField::changeEvent(QEvent* event) {

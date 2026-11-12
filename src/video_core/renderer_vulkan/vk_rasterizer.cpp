@@ -279,7 +279,7 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
       query_cache(gpu, *this, device_memory, query_cache_runtime),
       pipeline_cache(device_memory, device, scheduler, descriptor_pool, guest_descriptor_queue,
                      descriptor_buffer_ring, render_pass_cache, buffer_cache, texture_cache,
-                     gpu.ShaderNotify()),
+                     gpu.ShaderNotify(), &gpu_.System()),
       accelerate_dma(buffer_cache, texture_cache, scheduler),
       fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache, device, scheduler),
       frame_dump(device, memory_allocator, scheduler),
@@ -870,8 +870,11 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
         const DrawParams draw_params{MakeDrawParams(draw_state, num_instances, is_indexed)};
 
         if (mesh_draw) {
+            if (draw_params.num_vertices == 0) {
+                return;
+            }
             scheduler.Record([this, groups = draw_params.num_vertices](vk::CommandBuffer cmdbuf) {
-                if (scheduler.GraphicsPipelineMissing()) {
+                if (scheduler.GraphicsPipelineMissing() || groups == 0) {
                     return;
                 }
                 cmdbuf.DrawMeshTasksEXT(groups, 1, 1);
@@ -1426,9 +1429,13 @@ void Vulkan::RasterizerVulkan::DisableGraphicsUniformBuffer(size_t stage, u32 in
 void RasterizerVulkan::FlushAll() {}
 
 void RasterizerVulkan::SubmitNx2ListCopies() {
-    if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick()) && !scheduler.DeferFlush()) {
+    if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
         scheduler.Flush();
     }
+}
+
+u64 RasterizerVulkan::Nx2ListWriteEvents() const {
+    return buffer_cache.Nx2ListWriteEvents();
 }
 
 VideoCore::RasterizerInterface::GpuWrittenList RasterizerVulkan::ReadGpuWrittenCommandList(
@@ -1549,15 +1556,19 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
 
 bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
     DEBUG_ASSERT(addr != 0 || size != 0);
+    bool held;
     {
         std::scoped_lock lock{buffer_cache.mutex};
-        if (buffer_cache.OnCPUWrite(addr, size)) {
-            return true;
-        }
+        held = buffer_cache.OnCPUWrite(addr, size);
     }
     {
+        // Also for a held write: the images over it must not download their older bytes over
+        // it before it is applied.
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.WriteMemory(addr, size);
+    }
+    if (held) {
+        return true;
     }
     pipeline_cache.InvalidateRegion(addr, size);
     return false;
@@ -1587,6 +1598,16 @@ void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64
     for (const auto& [addr, size] : ranges) {
         OnCacheInvalidation(addr, size);
     }
+}
+
+void RasterizerVulkan::BeginCachedWrites() {
+    std::scoped_lock lock{buffer_cache.mutex};
+    buffer_cache.BeginCachedWrites();
+}
+
+void RasterizerVulkan::EndCachedWrites() {
+    std::scoped_lock lock{buffer_cache.mutex};
+    buffer_cache.EndCachedWrites();
 }
 
 bool RasterizerVulkan::TryCacheInvalidation(DAddr addr, u64 size) {
@@ -1845,17 +1866,22 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
                                                 std::span<const u8> memory) {
     auto cpu_addr = gpu_memory->GpuToCpuAddress(address);
     if (gpu_memory->UsesNativeTiling()) {
-        u32 first_word{};
-        if (memory.size() >= sizeof(first_word)) std::memcpy(&first_word, memory.data(), sizeof(first_word));
-        VideoCommon::TraceNativeQuery(11, gpu_memory->GetID(), address, cpu_addr.value_or(0),
-            0, first_word, static_cast<u32>(copy_size));
         static const GPUVAddr watch = [] {
             const char* value = std::getenv("EDEN_NX2_SEM_WATCH");
             return value ? GPUVAddr{std::strtoull(value, nullptr, 16)} : GPUVAddr{};
         }();
-        if (watch != 0 && address < watch + 16 && address + copy_size > watch) {
-            LOG_INFO(Render_Vulkan, "Semaphore watch: inline write {:#x} size {} first word {:#x}",
-                     address, copy_size, first_word);
+        if (VideoCommon::TraceNativeQueryEnabled() ||
+            (watch != 0 && address < watch + 16 && address + copy_size > watch)) [[unlikely]] {
+            u32 first_word{};
+            if (memory.size() >= sizeof(first_word)) {
+                std::memcpy(&first_word, memory.data(), sizeof(first_word));
+            }
+            VideoCommon::TraceNativeQuery(11, gpu_memory->GetID(), address, cpu_addr.value_or(0),
+                                          0, first_word, static_cast<u32>(copy_size));
+            if (watch != 0 && address < watch + 16 && address + copy_size > watch) {
+                LOG_INFO(Render_Vulkan, "Semaphore watch: inline write {:#x} size {} first word {:#x}",
+                         address, copy_size, first_word);
+            }
         }
     }
     if (!cpu_addr) [[unlikely]] {
@@ -2138,17 +2164,15 @@ void RasterizerVulkan::UpdateDynamicStates() {
     if (device.IsExtExtendedDynamicState3EnablesSupported()) {
         using namespace Tegra::Engines;
         // AMD Workaround: LogicOp incompatible with float render targets
-        if (device.GetDriverID() == VkDriverIdKHR::VK_DRIVER_ID_AMD_OPEN_SOURCE ||
-            device.GetDriverID() == VkDriverIdKHR::VK_DRIVER_ID_AMD_PROPRIETARY) {
+        if (regs.logic_op.enable &&
+            (device.GetDriverID() == VkDriverIdKHR::VK_DRIVER_ID_AMD_OPEN_SOURCE ||
+             device.GetDriverID() == VkDriverIdKHR::VK_DRIVER_ID_AMD_PROPRIETARY)) {
             const auto has_float = std::any_of(
                 regs.vertex_attrib_format.begin(), regs.vertex_attrib_format.end(),
                 [](const auto& attrib) {
                     return attrib.type == Maxwell3D::Regs::VertexAttribute::Type::Float;
-                }
-            );
-            if (regs.logic_op.enable) {
-                regs.logic_op.enable = static_cast<u32>(!has_float);
-            }
+                });
+            regs.logic_op.enable = static_cast<u32>(!has_float);
         }
         UpdateLogicOpEnable(regs);
         UpdateDepthClampEnable(regs);

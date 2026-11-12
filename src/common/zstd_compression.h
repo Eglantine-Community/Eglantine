@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <optional>
 #include <span>
 #include <vector>
@@ -68,5 +69,22 @@ namespace Common::Compression {
  *         frame also returns 0.
  */
 [[nodiscard]] std::size_t DecompressDataZSTD(std::span<const u8> compressed, std::span<u8> output);
+
+/**
+ * Returns the Zstandard dictionary ID encoded in a compressed frame header, or std::nullopt if invalid.
+ */
+[[nodiscard]] std::optional<u32> GetZstdDictId(std::span<const u8> compressed);
+
+/**
+ * Returns the Zstandard dictionary ID of a raw dictionary blob, or std::nullopt if not a Zstd dict.
+ */
+[[nodiscard]] std::optional<u32> GetZstdDictIdFromDict(std::span<const u8> dict);
+
+/**
+ * Streaming Zstandard decompression bounded by max_size, optionally using a Zstandard dictionary.
+ * Handles frames whose content size is omitted from the frame header.
+ */
+[[nodiscard]] std::optional<std::vector<u8>> TryDecompressDataZSTDStream(
+    std::span<const u8> compressed, std::size_t max_size, std::span<const u8> dict = {});
 
 } // namespace Common::Compression

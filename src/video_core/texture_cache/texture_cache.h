@@ -27,6 +27,7 @@
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/texture_cache/image_view_base.h"
+#include "video_core/texture_cache/memory_budget.h"
 #include "video_core/texture_cache/samples_helper.h"
 #include "video_core/texture_cache/texture_cache_base.h"
 #include "video_core/texture_cache/util.h"
@@ -261,11 +262,14 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
     // What the device budget allows (budget minus margins), before that cap.
     const u64 budget_critical = critical_memory;
     const u64 budget_expected = expected_memory;
-    critical_memory = (std::min)(critical_memory, MaxCriticalMemory);
-    expected_memory =
-        (std::min)(expected_memory, critical_memory - (std::min)(critical_memory, u64{768_MiB}));
-    minimum_memory =
-        (std::min)(minimum_memory, expected_memory - (std::min)(expected_memory, u64{1_GiB}));
+    const auto limits = VideoCommon::ClampTextureCacheThresholds(
+        {expected_memory, critical_memory, minimum_memory},
+        Settings::GetCurrentProgramID() == VideoCommon::WonderSwitch2ProgramId &&
+            native_driver_budget_available,
+        MaxCriticalMemory);
+    expected_memory = limits.expected;
+    critical_memory = limits.critical;
+    minimum_memory = limits.minimum;
     // EDEN_NX2_TC_EXPECTED_MIB / EDEN_NX2_TC_CRITICAL_MIB raise the collector's thresholds past
     // MaxCriticalMemory, but never past what the device budget allows: set outright, they kept
     // the cache above a shrinking budget (other programs' video memory, out-of-memory margins) and
@@ -301,8 +305,9 @@ void TextureCache<P>::TickFrame() {
         if (!native_thresholds_applied && gpu_memory != nullptr && gpu_memory->UsesNativeTiling()) {
             native_thresholds_applied = true;
             const u64 device_local = runtime.GetDeviceLocalMemory();
-            critical_memory = (std::max)(critical_memory, device_local - 256_MiB);
-            expected_memory = (std::max)(expected_memory, device_local - 1280_MiB);
+            const u64 initial_margin = (std::max)(1536_MiB, device_local / 8);
+            critical_memory = (std::max)(critical_memory, device_local > initial_margin ? device_local - initial_margin : device_local / 2);
+            expected_memory = (std::max)(expected_memory, critical_memory > 1024_MiB ? critical_memory - 1024_MiB : critical_memory / 2);
             ApplyThresholdOverrides();
             native_critical_memory = critical_memory;
             native_expected_memory = expected_memory;
@@ -337,9 +342,10 @@ void TextureCache<P>::TickFrame() {
             }
             if (native_thresholds_applied && budget_check_frames++ % 30 == 0) {
                 const u64 budget = runtime.GetDeviceMemoryBudget();
+                native_driver_budget_available = budget > 2_GiB;
                 if (budget > 2_GiB) {
                     const u64 old_critical = critical_memory;
-                    const u64 margin = (std::min)(budget / 8, 1_GiB);
+                    const u64 margin = (std::max)(1536_MiB, (std::min)(budget / 8, 3_GiB));
                     if constexpr (requires { runtime.GetDeviceMemorySlack(); }) {
                         // The usage counted here leaves out the unused part of the allocator's
                         // blocks, which the driver counts and a full heap cannot hand to a new
@@ -357,16 +363,21 @@ void TextureCache<P>::TickFrame() {
                     expected_memory = critical_memory - (std::min)(margin, critical_memory / 2);
                     // Log the first values and real changes (the budget moves by a few MiB all
                     // the time).
+                    const bool first = budget_check_frames == 1;
+                    ApplyThresholdOverrides(first);
                     const u64 change = critical_memory > old_critical
                                            ? critical_memory - old_critical
                                            : old_critical - critical_memory;
-                    const bool log = budget_check_frames == 1 || change >= 256_MiB;
-                    ApplyThresholdOverrides(log);
-                    if (log) {
+                    if (first || change >= 256_MiB) {
+                        LOG_INFO(HW_GPU,
+                                 "Texture cache target {} MiB, critical {} MiB",
+                                 expected_memory >> 20, critical_memory >> 20);
                         LOG_INFO(HW_GPU,
                                  "Memory margins: base {} MiB, out of memory {} MiB, block slack {} MiB",
                                  margin >> 20, pressure_margin >> 20, slack_margin >> 20);
                     }
+                } else {
+                    ApplyThresholdOverrides(false);
                 }
             }
         }
@@ -1510,11 +1521,14 @@ void TextureCache<P>::PopAsyncFlushes() {
             auto& download_buffer = download_map[download_info.async_buffer_id];
             if (download_info.is_swizzle) {
                 const ImageBase& image = download_info.GetImage(slot_images);
-                const auto copies = FullDownloadCopies(image.info);
                 download_buffer.offset -= Common::AlignUp(image.unswizzled_size_bytes, 64);
-                std::span<u8> download_span =
-                    download_buffer.mapped_span.subspan(download_buffer.offset);
-                SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, download_span, swizzle_data_buffer);
+                if (False(image.flags & ImageFlagBits::CpuModified)) {
+                    const auto copies = FullDownloadCopies(image.info);
+                    std::span<u8> download_span =
+                        download_buffer.mapped_span.subspan(download_buffer.offset);
+                    SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, download_span,
+                                 swizzle_data_buffer);
+                }
             } else {
                 const BufferDownload& buffer_info = slot_buffer_downloads[download_info.object_id];
                 std::span<u8> download_span =
@@ -1561,8 +1575,11 @@ void TextureCache<P>::PopAsyncFlushes() {
                 continue;
             }
             const ImageBase& image = download_info.GetImage(slot_images);
-            const auto copies = FullDownloadCopies(image.info);
-            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, download_span, swizzle_data_buffer);
+            if (False(image.flags & ImageFlagBits::CpuModified)) {
+                const auto copies = FullDownloadCopies(image.info);
+                SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, download_span,
+                             swizzle_data_buffer);
+            }
             download_map.offset += image.unswizzled_size_bytes;
             download_span = download_span.subspan(image.unswizzled_size_bytes);
         }
@@ -2508,7 +2525,7 @@ ImageId TextureCache<P>::InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
     }
     ASSERT_MSG(cpu_addr, "Tried to insert an image to an invalid gpu_addr={:#x}", gpu_addr);
     ImageInfo storage_info = info;
-    storage_info.native_tiling = gpu_memory->UsesNativeTiling();
+    storage_info.native_tiling = UsesNativeGobs(gpu_memory->UsesNativeTiling(), info);
     if (storage_info.native_tiling && info.type == ImageType::e3D) {
         // Switch 2 3D images (lighting/fog volumes) are rare: log each one's shape.
         LOG_DEBUG(HW_GPU, "3D image at {:#x}: {}x{}x{} levels {} format {} block {}x{}x{}",
@@ -2664,7 +2681,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     for (const ImageId overlap_id : join_ignore_textures) {
         Image& overlap = slot_images[overlap_id];
         if (True(overlap.flags & ImageFlagBits::GpuModified)) {
-            UNIMPLEMENTED();
+            new_image.flags |= ImageFlagBits::GpuModified;
         }
         if (True(overlap.flags & ImageFlagBits::Tracked)) {
             UntrackImage(overlap, overlap_id);

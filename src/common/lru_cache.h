@@ -6,9 +6,8 @@
 
 #pragma once
 
-#include <deque>
-#include <memory>
 #include <type_traits>
+#include <vector>
 
 #include "common/common_types.h"
 
@@ -18,16 +17,17 @@ template <class Traits>
 class LeastRecentlyUsedCache {
     using ObjectType = typename Traits::ObjectType;
     using TickType = typename Traits::TickType;
+    static constexpr u32 INVALID_INDEX = ~u32{0};
 
     struct Item {
         ObjectType obj;
+        u32 next{INVALID_INDEX};
+        u32 prev{INVALID_INDEX};
         TickType tick;
-        Item* next{};
-        Item* prev{};
     };
 
 public:
-    LeastRecentlyUsedCache() : first_item{}, last_item{} {}
+    LeastRecentlyUsedCache() = default;
     ~LeastRecentlyUsedCache() = default;
 
     size_t Insert(ObjectType obj, TickType tick) {
@@ -35,108 +35,112 @@ public:
         auto& item = item_pool[new_id];
         item.obj = obj;
         item.tick = tick;
-        Attach(item);
+        Attach(new_id);
         return new_id;
     }
 
     void Touch(size_t id, TickType tick) {
-        auto& item = item_pool[id];
+        const u32 idx = static_cast<u32>(id);
+        auto& item = item_pool[idx];
         if (item.tick >= tick) {
             return;
         }
         item.tick = tick;
-        if (&item == last_item) {
+        if (idx == last_item) {
             return;
         }
-        Detach(item);
-        Attach(item);
+        Detach(idx);
+        Attach(idx);
     }
 
     void Free(size_t id) {
-        auto& item = item_pool[id];
-        Detach(item);
-        item.prev = nullptr;
-        item.next = nullptr;
-        free_items.push_back(id);
+        const u32 idx = static_cast<u32>(id);
+        Detach(idx);
+        auto& item = item_pool[idx];
+        item.prev = INVALID_INDEX;
+        item.next = INVALID_INDEX;
+        free_items.push_back(idx);
     }
 
     template <typename Func>
     void ForEachItemBelow(TickType tick, Func&& func) {
         static constexpr bool RETURNS_BOOL =
             std::is_same_v<std::invoke_result_t<Func, ObjectType>, bool>;
-        Item* iterator = first_item;
-        while (iterator) {
-            if (static_cast<s64>(tick) - static_cast<s64>(iterator->tick) < 0) {
+        u32 iterator = first_item;
+        while (iterator != INVALID_INDEX) {
+            const auto& item = item_pool[iterator];
+            if (static_cast<s64>(tick) - static_cast<s64>(item.tick) < 0) {
                 return;
             }
-            Item* next = iterator->next;
+            const u32 next = item.next;
+            const ObjectType obj = item.obj;
             if constexpr (RETURNS_BOOL) {
-                if (func(iterator->obj)) {
+                if (func(obj)) {
                     return;
                 }
             } else {
-                func(iterator->obj);
+                func(obj);
             }
             iterator = next;
         }
     }
 
 private:
-    size_t Build() {
+    u32 Build() {
         if (free_items.empty()) {
-            const size_t item_id = item_pool.size();
-            auto& item = item_pool.emplace_back();
-            item.next = nullptr;
-            item.prev = nullptr;
+            const u32 item_id = static_cast<u32>(item_pool.size());
+            item_pool.emplace_back();
             return item_id;
         }
-        const size_t item_id = free_items.front();
-        free_items.pop_front();
+        const u32 item_id = free_items.back();
+        free_items.pop_back();
         auto& item = item_pool[item_id];
-        item.next = nullptr;
-        item.prev = nullptr;
+        item.next = INVALID_INDEX;
+        item.prev = INVALID_INDEX;
         return item_id;
     }
 
-    void Attach(Item& item) {
-        if (!first_item) {
-            first_item = &item;
+    void Attach(u32 idx) {
+        auto& item = item_pool[idx];
+        if (first_item == INVALID_INDEX) {
+            first_item = idx;
         }
-        if (!last_item) {
-            last_item = &item;
+        if (last_item == INVALID_INDEX) {
+            last_item = idx;
         } else {
             item.prev = last_item;
-            last_item->next = &item;
-            item.next = nullptr;
-            last_item = &item;
+            item_pool[last_item].next = idx;
+            item.next = INVALID_INDEX;
+            last_item = idx;
         }
     }
 
-    void Detach(Item& item) {
-        if (item.prev) {
-            item.prev->next = item.next;
+    void Detach(u32 idx) {
+        const auto& item = item_pool[idx];
+        if (item.prev != INVALID_INDEX) {
+            item_pool[item.prev].next = item.next;
         }
-        if (item.next) {
-            item.next->prev = item.prev;
+        if (item.next != INVALID_INDEX) {
+            item_pool[item.next].prev = item.prev;
         }
-        if (&item == first_item) {
+        if (idx == first_item) {
             first_item = item.next;
-            if (first_item) {
-                first_item->prev = nullptr;
+            if (first_item != INVALID_INDEX) {
+                item_pool[first_item].prev = INVALID_INDEX;
             }
         }
-        if (&item == last_item) {
+        if (idx == last_item) {
             last_item = item.prev;
-            if (last_item) {
-                last_item->next = nullptr;
+            if (last_item != INVALID_INDEX) {
+                item_pool[last_item].next = INVALID_INDEX;
             }
         }
     }
 
-    std::deque<Item> item_pool;
-    std::deque<size_t> free_items;
-    Item* first_item{};
-    Item* last_item{};
+    std::vector<Item> item_pool;
+    std::vector<u32> free_items;
+    u32 first_item{INVALID_INDEX};
+    u32 last_item{INVALID_INDEX};
 };
 
 } // namespace Common

@@ -79,8 +79,16 @@ public:
         uncommitted_operations.emplace_back(std::move(func));
     }
 
-    void SignalFence(std::function<void()>&& func) {
+    /// False only when shutdown cancelled the request before its callback was queued.
+    bool SignalFence(std::function<void()>&& func) {
         Nx2Profile::Scope profile_scope{Nx2Profile::Zone::Fence};
+        if constexpr (can_async_check) {
+            // No cache/queue locks are held here. The fencing thread must remain able to
+            // finish older readbacks while the producer waits for download memory.
+            if (!buffer_cache.WaitAsyncFlushBudget(gpu.GetShutdownToken())) {
+                return false;
+            }
+        }
         const bool delay_fence = Settings::IsGPUFenceBehaviorDefault() ? Settings::IsGPULevelHigh() : Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
         if constexpr (!can_async_check) {
             TryReleasePendingFences<false>();
@@ -90,7 +98,7 @@ public:
             Nx2Profile::Scope skipped_scope{Nx2Profile::Zone::FenceSkipped};
             func();
             rasterizer.InvalidateGPUCache();
-            return;
+            return true;
         }
         skipped_fences = 0;
         should_flush |= query_cache.HasUncommittedFlushes();
@@ -104,9 +112,13 @@ public:
             if (delay_fence) {
                 uncommitted_operations.emplace_back(std::move(func));
             }
-            pending_operations.emplace_back(std::move(uncommitted_operations));
-            uncommitted_operations.clear(); // moved-from: make it empty explicitly
-            uncommitted_operations.reserve(64);
+            if (!uncommitted_operations.empty()) {
+                pending_operations.emplace_back(std::move(uncommitted_operations));
+                uncommitted_operations.clear(); // moved-from: make it empty explicitly
+                uncommitted_operations.reserve(64);
+            } else {
+                pending_operations.emplace_back();
+            }
         }
         pending_flushes.push_back(committed_flushes);
         QueueFence(new_fence);
@@ -119,9 +131,10 @@ public:
         }
         if constexpr (can_async_check) {
             guard.unlock();
-            cv.notify_all();
+            cv.notify_one();
         }
         rasterizer.InvalidateGPUCache();
+        return true;
     }
 
     void SignalSyncPoint(u32 value) {
@@ -152,7 +165,9 @@ public:
                 wait_finished.store(true, std::memory_order_relaxed);
                 wait_cv.notify_all();
             });
-            SignalFence(std::move(func));
+            if (!SignalFence(std::move(func))) {
+                return;
+            }
             // With delayed fence operations the callback waits for this fence's tick, whose
             // submission may be deferred to the waiting thread itself (the GPU split's back).
             SubmitDeferred();

@@ -85,6 +85,50 @@ namespace {
         }
         return VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     }
+
+    template <typename CreateFn>
+    VkResult AllocateBufferWithFallback(const VmaAllocationCreateInfo& base_ci, u64 size,
+                                        std::atomic<u32>& pressure_events, CreateFn&& create_fn) {
+        VkResult result = create_fn(base_ci);
+        if (result == VK_SUCCESS) {
+            return VK_SUCCESS;
+        }
+        // Relax VMA budget first; Switch 2 buffer/staging spikes can exceed reported heap budget.
+        if ((base_ci.flags & VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT) != 0) {
+            pressure_events.fetch_add(1, std::memory_order_relaxed);
+            VmaAllocationCreateInfo relaxed = base_ci;
+            relaxed.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+            result = create_fn(relaxed);
+            if (result == VK_SUCCESS) {
+                return VK_SUCCESS;
+            }
+        }
+        // Fall back to host/GTT memory rather than throwing if VRAM or dedicated allocation is full.
+        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY) {
+            pressure_events.fetch_add(1, std::memory_order_relaxed);
+            VmaAllocationCreateInfo fallback = base_ci;
+            fallback.flags &= ~(VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT |
+                                VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT);
+            fallback.usage = VMA_MEMORY_USAGE_AUTO;
+            fallback.requiredFlags = 0;
+            fallback.preferredFlags = 0;
+            result = create_fn(fallback);
+            if (result != VK_SUCCESS && fallback.memoryTypeBits != 0) {
+                fallback.memoryTypeBits = 0;
+                result = create_fn(fallback);
+            }
+            if (result == VK_SUCCESS) {
+                static std::atomic<u32> logged{0};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                    LOG_WARNING(Render_Vulkan,
+                                "Buffer allocation ({} bytes) out of primary memory; placed in "
+                                "fallback host/GTT heap",
+                                size);
+                }
+            }
+        }
+        return result;
+    }
 } // namespace
 
 //MemoryCommit is now VMA-backed
@@ -251,23 +295,25 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
         result = vmaCreateImage(allocator, &ci, &relaxed, &handle, &allocation, &alloc_info);
     }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
-        // Still out of device memory: a real image in host memory (slow, but valid) beats one
-        // with nothing bound, which AMD's drivers do not survive being sampled.
-        VmaAllocationCreateInfo host = alloc_ci;
-        host.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
-        host.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
-        host.preferredFlags = 0;
-        result = vmaCreateImage(allocator, &ci, &host, &handle, &allocation, &alloc_info);
+        // Still out of device memory: try allocating from system/GTT memory rather than failing or unbacked
+        VmaAllocationCreateInfo fallback_ci = alloc_ci;
+        fallback_ci.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+        fallback_ci.flags &= ~VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+        fallback_ci.usage = VMA_MEMORY_USAGE_AUTO;
+        fallback_ci.preferredFlags = 0;
+        fallback_ci.requiredFlags = 0;
+        result = vmaCreateImage(allocator, &ci, &fallback_ci, &handle, &allocation, &alloc_info);
         static u32 host_logged{};
         if (result == VK_SUCCESS && host_logged++ < 16) {
             LOG_WARNING(Render_Vulkan,
                         "Image {}x{}x{} ({} levels, {} layers, format {}) is out of device memory; "
-                        "placed in host memory",
+                        "placed in fallback host/GTT memory",
                         ci.extent.width, ci.extent.height, ci.extent.depth, ci.mipLevels,
                         ci.arrayLayers, static_cast<u32>(ci.format));
         }
     }
-    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && ci.imageType != VK_IMAGE_TYPE_1D) {
+    const bool is_sparse_candidate = huge || (ci.flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT)) || ci.arrayLayers > 16;
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && is_sparse_candidate && ci.imageType != VK_IMAGE_TYPE_1D) {
         if (!huge) {
             pressure_events.fetch_add(1, std::memory_order_relaxed);
         }
@@ -424,7 +470,10 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
     VkMemoryPropertyFlags property_flags{};
 
     if (!CreateBufferInSeparatePool(ci, usage, alloc_ci, handle, allocation, alloc_info)) {
-        vk::Check(vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info));
+        vk::Check(AllocateBufferWithFallback(
+            alloc_ci, ci.size, pressure_events, [&](const VmaAllocationCreateInfo& try_ci) {
+                return vmaCreateBuffer(allocator, &ci, &try_ci, &handle, &allocation, &alloc_info);
+            }));
     }
     vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
 
@@ -481,8 +530,11 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
     VmaAllocation allocation{};
     VkMemoryPropertyFlags property_flags{};
 
-    vk::Check(vmaCreateBufferWithAlignment(allocator, &ci, &alloc_ci, min_alignment, &handle,
-                                           &allocation, &alloc_info));
+    vk::Check(AllocateBufferWithFallback(
+        alloc_ci, ci.size, pressure_events, [&](const VmaAllocationCreateInfo& try_ci) {
+            return vmaCreateBufferWithAlignment(allocator, &ci, &try_ci, min_alignment, &handle,
+                                                &allocation, &alloc_info);
+        }));
     vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
 
     u8 *data = reinterpret_cast<u8 *>(alloc_info.pMappedData);

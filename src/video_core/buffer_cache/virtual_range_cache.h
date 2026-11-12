@@ -27,8 +27,8 @@ using VirtualSegments = boost::container::small_vector<VirtualSegment, 8>;
 
 class VirtualRangeCache {
 public:
-    static constexpr size_t MAX_ENTRIES = 8192;
-    static constexpr size_t MAX_DEFERRED = 4096;
+    static constexpr size_t MAX_ENTRIES = 32768;
+    static constexpr size_t MAX_DEFERRED = 16384;
 
     const VirtualSegments* Query(Tegra::MemoryManager& memory, GPUVAddr gpu_addr, u32 size) {
         if (has_deferred.load(std::memory_order_acquire)) {
@@ -38,7 +38,7 @@ public:
             entries.clear();
         }
         const size_t as_id = memory.GetID();
-        const u64 key = MakeKey(as_id, gpu_addr);
+        const u64 key = MakeKey(as_id, gpu_addr, size);
         const auto it = entries.find(key);
         if (it != entries.end() && it->second.as_id == as_id &&
             it->second.gpu_addr == gpu_addr && it->second.size == size) {
@@ -121,8 +121,9 @@ private:
         u64 size;
     };
 
-    static u64 MakeKey(size_t as_id, GPUVAddr gpu_addr) {
-        return (static_cast<u64>(as_id) << 48) ^ gpu_addr;
+    static u64 MakeKey(size_t as_id, GPUVAddr gpu_addr, u32 size) {
+        return (static_cast<u64>(as_id) << 48) ^ gpu_addr ^
+               (static_cast<u64>(size) * 0x9e3779b97f4a7c15ULL);
     }
 
     void ApplyDeferred() {

@@ -8,6 +8,7 @@
 #include <string>
 
 #include <QApplication>
+#include <QIcon>
 
 #include "common/fs/fs_paths.h"
 #include "common/fs/path_util.h"
@@ -193,8 +194,8 @@ int main(int argc, char* argv[]) {
 #endif
 
     // Init settings params
-    QCoreApplication::setOrganizationName(QStringLiteral("eden"));
-    QCoreApplication::setApplicationName(QStringLiteral("Eglantine"));
+    QCoreApplication::setOrganizationName(QStringLiteral("dalia"));
+    QCoreApplication::setApplicationName(QStringLiteral("Dalia"));
 
     // Increases the maximum open file limit.
     // TODO: This should be common to all frontends.
@@ -265,6 +266,7 @@ int main(int argc, char* argv[]) {
 #endif
 
     QApplication app(argc, argv);
+    app.setWindowIcon(QIcon(QStringLiteral(":/icons/default/256x256/dalia.png")));
 
 #ifdef _WIN32
     OverrideWindowsFont();

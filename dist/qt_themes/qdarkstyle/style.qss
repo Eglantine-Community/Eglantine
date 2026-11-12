@@ -1130,6 +1130,11 @@ QToolBox::tab:selected {
     border-color: #3daee9;
 }
 
+QStatusBar {
+    background-color: #202020;
+    border-top: 1px solid #363636;
+}
+
 QStatusBar::item {
     border: 0;
 }
@@ -1220,89 +1225,73 @@ QPlainTextEdit:disabled {
 }
 
 
-QPushButton#TogglableStatusBarButton {
+QPushButton#TogglableStatusBarButton,
+QPushButton#RendererStatusBarButton,
+QPushButton#GPUStatusBarButton,
+QPushButton#DockingStatusBarButton,
+QPushButton#RefreshButton,
+QPushButton#FrameGenStatusBarButton {
     min-width: 0px;
-    color: #656565;
-    border: 1px solid transparent;
-    background-color: transparent;
-    padding: 0px 3px 0px 3px;
+    color: #C0C0C0;
+    border: 1px solid #3E4248;
+    background-color: #2D3035;
+    border-radius: 6px;
+    padding: 2px 7px;
+    margin: 1px 2px;
+    font-weight: bold;
     text-align: center;
+}
+
+QPushButton#TogglableStatusBarButton:hover,
+QPushButton#RendererStatusBarButton:hover,
+QPushButton#GPUStatusBarButton:hover,
+QPushButton#DockingStatusBarButton:hover,
+QPushButton#RefreshButton:hover,
+QPushButton#FrameGenStatusBarButton:hover {
+    border: 1px solid #00D2FF;
+    background-color: #383D45;
+    color: #FFFFFF;
 }
 
 QPushButton#TogglableStatusBarButton:checked {
-    color: #ffffff;
-}
-
-QPushButton#TogglableStatusBarButton:hover {
-    border: 1px solid #76797C;
-}
-
-QPushButton#RendererStatusBarButton {
-    min-width: 0px;
-    color: #656565;
-    border: 1px solid transparent;
-    background-color: transparent;
-    padding: 0px 3px 0px 3px;
-    text-align: center;
-}
-
-QPushButton#RendererStatusBarButton:hover {
-    border: 1px solid #76797C;
+    color: #35E87D;
 }
 
 QPushButton#RendererStatusBarButton:checked {
-    color: #e85c00;
+    color: #FF8040;
 }
 
 QPushButton#RendererStatusBarButton:!checked {
-    color: #00ccdd;
+    color: #00D2FF;
 }
 
 QPushButton#RefreshButton {
-    min-width: 0px;
-    color: #656565;
-    border: 1px solid transparent;
-    background-color: transparent;
-    padding: 0px 3px 0px 3px;
-    text-align: center;
+    padding: 2px 5px;
 }
 
 QPushButton#RefreshButton:hover {
-    border: 1px solid #76797C;
-}
-
-QPushButton#GPUStatusBarButton {
-    min-width: 0px;
-    color: #656565;
-    border: 1px solid transparent;
-    background-color: transparent;
-    padding: 0px 3px 0px 3px;
-    text-align: center;
-}
-
-QPushButton#GPUStatusBarButton:hover {
-    border: 1px solid #76797C;
+    border: 1px solid #00D2FF;
+    background-color: #383D45;
 }
 
 QPushButton#GPUStatusBarButton:checked {
-    color: #ff8040;
+    color: #FF4433;
 }
 
 QPushButton#GPUStatusBarButton:!checked {
-    color: #40dd40;
+    color: #00D2FF;
 }
 
-QPushButton#DockingStatusBarButton {
-    min-width: 0px;
-    color: #ffffff;
-    border: 1px solid transparent;
-    background-color: transparent;
-    padding: 0px 3px 0px 3px;
-    text-align: center;
+QPushButton#DockingStatusBarButton:checked {
+    color: #FF3C28; /* Joy-Con Neon Red for Docked */
 }
 
-QPushButton#DockingStatusBarButton:hover {
-    border: 1px solid #76797C;
+QPushButton#DockingStatusBarButton:!checked {
+    color: #0AB9E6; /* Joy-Con Neon Blue for Handheld */
+}
+
+QPushButton#FrameGenStatusBarButton {
+    color: #00E5FF; /* Glowing Switch Cyan for FSR Frame Gen */
 }
 
 QPushButton#buttonRefreshDevices {

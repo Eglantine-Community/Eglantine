@@ -103,6 +103,7 @@ public:
                      VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     GpuWrittenList ReadGpuWrittenCommandList(DAddr addr, std::span<u8> out) override;
     void NoteGpuWrittenCommandListSynced(DAddr page) override;
+    [[nodiscard]] u64 Nx2ListWriteEvents() const override;
     bool MustFlushRegion(DAddr addr, u64 size,
                          VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;
@@ -111,6 +112,11 @@ public:
     void InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) override;
     void OnCacheInvalidation(DAddr addr, u64 size) override;
     void OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) override;
+    void BeginCachedWrites() override;
+    void EndCachedWrites() override;
+    bool HasCachedWritesHeld() const override {
+        return buffer_cache.HasCachedWritesHeld();
+    }
     bool TryCacheInvalidation(DAddr addr, u64 size) override;
     bool OnCPUWrite(DAddr addr, u64 size) override;
     void InvalidateGPUCache() override;

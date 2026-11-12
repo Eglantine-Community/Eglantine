@@ -39,6 +39,7 @@
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/syncpoint_manager.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
 
@@ -117,13 +118,27 @@ struct GPU::Impl {
 
     /// Synchronizes CPU writes with Host GPU memory.
     void InvalidateGPUCache() {
-        std::vector<std::pair<DAddr, u64>> writes;
+        auto* const rasterizer = renderer->ReadRasterizer();
+        bool any_dirty = false;
+        for (const auto& manager : system.GetGPUDirtyMemoryManager()) {
+            if (manager.HasPending()) {
+                any_dirty = true;
+                break;
+            }
+        }
+        if (!any_dirty && !rasterizer->HasCachedWritesHeld()) {
+            return;
+        }
+        thread_local std::vector<std::pair<DAddr, u64>> writes;
+        writes.clear();
         std::function<void(PAddr, size_t)> callback_writes(
-            [&writes](PAddr address, size_t size) { writes.emplace_back(address, size); });
+            [](PAddr address, size_t size) { writes.emplace_back(address, size); });
+        rasterizer->BeginCachedWrites();
         system.GatherGPUDirtyMemory(callback_writes);
         if (!writes.empty()) {
-            renderer->ReadRasterizer()->OnCacheInvalidations(writes);
+            rasterizer->OnCacheInvalidations(writes);
         }
+        rasterizer->EndCachedWrites();
     }
 
     void ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback) {
@@ -154,7 +169,10 @@ struct GPU::Impl {
 
     void WaitForSyncOperation(const u64 fence) {
         std::unique_lock lck{sync_request_mutex};
-        sync_request_cv.wait(lck, [this, fence] { return CurrentSyncRequestFence() >= fence; });
+        sync_request_cv.wait(lck, [this, fence] {
+            return CurrentSyncRequestFence() >= fence ||
+                   shutting_down.load(std::memory_order::acquire);
+        });
     }
 
     void WaitForIdle() {
@@ -178,6 +196,10 @@ struct GPU::Impl {
     }
 
     [[nodiscard]] u64 GetTicks() const {
+        if (g_nx2_ampere.load(std::memory_order_relaxed)) {
+            return report_clock.Next(
+                static_cast<u64>(system.CoreTiming().GetGlobalTimeNs().count()));
+        }
         const u64 gpu_tick = system.CoreTiming().GetGPUTicks();
         return gpu_tick / GpuClockMultiplier(Settings::values.gpu_clock.GetValue());
     }
@@ -195,10 +217,17 @@ struct GPU::Impl {
     }
 
     void NotifyShutdown() {
+        shutdown_source.request_stop();
+        {
+            std::unique_lock lk{sync_mutex};
+            shutting_down.store(true, std::memory_order::release);
+            sync_cv.notify_all();
+        }
+        {
+            std::unique_lock req_lk{sync_request_mutex};
+            sync_request_cv.notify_all();
+        }
         gpu_thread.NotifyShutdown();
-        std::unique_lock lk{sync_mutex};
-        shutting_down.store(true, std::memory_order::relaxed);
-        sync_cv.notify_all();
     }
 
     /// Obtain the CPU Context
@@ -372,6 +401,8 @@ struct GPU::Impl {
 
     // Destruction of thread must be done before all (non trivial)
     // previous members has been destroyed
+    // Outlives gpu_thread so its workers can observe cancellation during shutdown/join.
+    std::stop_source shutdown_source;
     VideoCommon::GPUThread::ThreadManager gpu_thread;
 
     std::unique_ptr<VideoCore::RendererBase> renderer;
@@ -394,6 +425,7 @@ struct GPU::Impl {
 
     std::list<std::function<void()>> sync_requests;
     std::atomic<u64> current_sync_fence{};
+    mutable Nx2ReportClock report_clock;
     u64 last_sync_fence{};
 
     // Maps queued by MapInOrder and not run yet, by the GPU addresses they change.
@@ -502,6 +534,16 @@ const Host1x::Host1x& GPU::Host1x() const {
     return impl->system.Host1x();
 }
 
+/// Gets a mutable reference to the owning Core::System.
+Core::System& GPU::System() {
+    return impl->system;
+}
+
+/// Gets an immutable reference to the owning Core::System.
+const Core::System& GPU::System() const {
+    return impl->system;
+}
+
 Engines::Maxwell3D& GPU::Maxwell3D() {
     return impl->current_channel->payload->maxwell_3d;
 }
@@ -581,6 +623,10 @@ void GPU::Start() {
 
 void GPU::NotifyShutdown() {
     impl->NotifyShutdown();
+}
+
+std::stop_token GPU::GetShutdownToken() const noexcept {
+    return impl->shutdown_source.get_token();
 }
 
 void GPU::WaitForIdle() {

@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
+#include <mutex>
 #include <thread>
 
 #ifdef _MSC_VER
@@ -163,6 +165,38 @@ void GpuSplit::Stop() {
     ring.reset();
     write_position = 0;
     last_writer_position = 0;
+    last_compute_writer_position = 0;
+    last_all_compute_writer_position = 0;
+    last_unknown_writer_position = 0;
+    last_any_writer_position = 0;
+    writer_large_overflow_pos = 0;
+    last_wildcard_release_position = 0;
+    last_query_note_position = 0;
+    last_query_drain_position = 0;
+    last_sync_query_note_position = 0;
+    last_wildcard_syncpoint_position = 0;
+    syncpoint_positions.fill(0);
+    release_positions.fill({});
+    writer_large_ranges.fill({});
+    writer_pages.Clear();
+    writer_lines.Clear();
+    pending_query_pages.Clear();
+    pending_query_lines.Clear();
+    sync_query_pages.Clear();
+    sync_query_lines.Clear();
+    sync_payload_head = 0;
+    sync_payload_count = 0;
+    release_checks = 0;
+    wildcard_hits = 0;
+    exact_hits = 0;
+    wildcard_overflows = 0;
+    release_table_overflows = 0;
+    rel_payload_ok = 0;
+    rel_payload_diag.fill(0);
+    rel_no_pl_reasons.fill(0);
+    last_q_diag_kind = 0;
+    last_wr_diag_kind = 0;
+    wildcard_sources.fill(0);
     published_local = 0;
     consumed_cache = 0;
     publish_every = PublishEvery;
@@ -172,6 +206,74 @@ void GpuSplit::Stop() {
     published.store(0, std::memory_order_relaxed);
     consumed.store(0, std::memory_order_relaxed);
     back_waiting.store(false, std::memory_order_relaxed);
+}
+
+void GpuSplit::RecordPendingReleasePayloadResult(bool ok, u8 reason, u8 no_pl_reason) {
+    if (!Nx2Profile::Enabled()) {
+        return;
+    }
+    if (ok) {
+        ++rel_payload_ok;
+        if (reason == 5) {
+            ++rel_payload_diag[5];
+        }
+    } else if (reason < rel_payload_diag.size()) {
+        ++rel_payload_diag[reason];
+        if (reason == 1 && no_pl_reason < rel_no_pl_reasons.size()) {
+            ++rel_no_pl_reasons[no_pl_reason];
+        }
+    }
+    const u64 total = rel_payload_ok + rel_payload_diag[1] + rel_payload_diag[2] +
+                      rel_payload_diag[3] + rel_payload_diag[4];
+    if (total != 0 && (total % 25000) == 0) {
+        LOG_WARNING(HW_GPU,
+                    "GpuSplit rel_payload: total={}, ok={} (post_compute={}), rej=[no_pl={}, "
+                    "wr_range={}, unk_wr={}, wildcard={}], overflows=[rel={}, wr_large={}, "
+                    "pq_l={}, pq_p={}], no_pl_by=[3d_nosync={}, 3d_op={}, 3d_rpt={}, "
+                    "cmp_b19={}, cmp_b26={}, cmp_nosync={}, cmp_6c3={}, cmp_oth={}, "
+                    "pull_nosync={}, pull_null={}, subword={}]",
+                    total, rel_payload_ok, rel_payload_diag[5], rel_payload_diag[1],
+                    rel_payload_diag[2], rel_payload_diag[3], rel_payload_diag[4],
+                    release_table_overflows, writer_large_overflow_pos != 0 ? 1 : 0,
+                    pending_query_lines.overflow_pos != 0 ? 1 : 0,
+                    pending_query_pages.overflow_pos != 0 ? 1 : 0,
+                    rel_no_pl_reasons[1], rel_no_pl_reasons[2], rel_no_pl_reasons[3],
+                    rel_no_pl_reasons[4], rel_no_pl_reasons[5], rel_no_pl_reasons[6],
+                    rel_no_pl_reasons[7], rel_no_pl_reasons[8], rel_no_pl_reasons[9],
+                    rel_no_pl_reasons[10], rel_no_pl_reasons[11]);
+    }
+}
+
+void GpuSplit::RecordPendingReleaseEvent(bool is_wildcard, u8 source) {
+    if (!Nx2Profile::Enabled() || !is_wildcard) {
+        return;
+    }
+    if (source == 7) {
+        ++wildcard_overflows;
+    } else if (source < wildcard_sources.size()) {
+        ++wildcard_sources[source];
+    }
+}
+
+void GpuSplit::RecordPendingReleaseCheck(bool hit_wildcard, bool hit_exact) {
+    if (!Nx2Profile::Enabled()) {
+        return;
+    }
+    ++release_checks;
+    if (hit_wildcard) {
+        ++wildcard_hits;
+    } else if (hit_exact) {
+        ++exact_hits;
+    }
+    if (release_checks % 25000 == 0) {
+        LOG_INFO(HW_GPU,
+                 "GpuSplit pending_release: checks={}, wildcard_hits={}, exact_hits={}, "
+                 "overflows={}, q_pending={}, zero_src=[{}, {}, {}, {}, {}, {}, {}]",
+                 release_checks, wildcard_hits, exact_hits, wildcard_overflows,
+                 last_query_note_position > last_query_drain_position ? 1 : 0, wildcard_sources[0],
+                 wildcard_sources[1], wildcard_sources[2], wildcard_sources[3],
+                 wildcard_sources[4], wildcard_sources[5], wildcard_sources[6]);
+    }
 }
 
 u64* GpuSplit::ReserveSlow(size_t words) {
@@ -223,6 +325,7 @@ void GpuSplit::Publish() {
 void GpuSplit::Drain() {
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache == write_position && BackQuiet()) {
+        ClearPendingQueriesUpTo(write_position);
         return;
     }
     Publish();
@@ -230,11 +333,12 @@ void GpuSplit::Drain() {
     // Everything consumed is not enough: the back submits deferred work (Scheduler::DeferFlush)
     // from its idle hook afterwards, and the caller may use the scheduler once this returns.
     bool hook_asked = false;
-    for (u32 spins = 0;; ++spins) {
+    for (u32 spins = 0; spins < 32; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache == write_position) {
             if (BackQuiet()) {
                 publish_every = 8;
+                ClearPendingQueriesUpTo(write_position);
                 return;
             }
             if (!hook_asked) {
@@ -242,34 +346,96 @@ void GpuSplit::Drain() {
                 hook_asked = true;
             }
         }
-        if (spins < 16384) {
-            Pause();
-        } else {
-            std::this_thread::yield();
+        Pause();
+    }
+    SleepUntilConsumed(write_position, true);
+    publish_every = 8;
+    ClearPendingQueriesUpTo(write_position);
+}
+
+void GpuSplit::SleepUntilConsumed(u64 target, bool wait_quiet) {
+    // Sleeping instead of yield-spinning keeps cores free for the back thread and guest CPU.
+    // seq_cst pairs with StoreConsumed / NotifyFrontQuiet: either the back sees front_target,
+    // or this sees its store.
+    front_target.store(target, std::memory_order_seq_cst);
+    auto next_report = std::chrono::steady_clock::now() + std::chrono::seconds{5};
+    bool hook_asked = false;
+    std::unique_lock lock{front_mutex};
+    while ((consumed_cache = consumed.load(std::memory_order_seq_cst)) < target ||
+           (wait_quiet && !BackQuiet())) {
+        if (wait_quiet && consumed_cache >= target && !hook_asked) {
+            RequestIdleHook();
+            hook_asked = true;
+            if (BackQuiet()) {
+                break;
+            }
         }
+        if (front_cv.wait_for(lock, std::chrono::milliseconds{1}) != std::cv_status::timeout) {
+            continue;
+        }
+        // Still waiting on an asleep back thread: its wake-up was lost. Wake it again.
+        if (back_waiting.load(std::memory_order_seq_cst)) {
+            wake.fetch_add(1, std::memory_order_seq_cst);
+            wake.notify_all();
+        }
+        if (std::chrono::steady_clock::now() >= next_report) {
+            next_report += std::chrono::seconds{5};
+            LOG_WARNING(HW_GPU,
+                        "GPU split drain waiting on the back thread: {} of {} words consumed, "
+                        "back {} ({})",
+                        consumed_cache, target, back_waiting.load() ? "parked" : "running",
+                        g_back_busy.load() ? "inside a command" : "between batches");
+        }
+    }
+    front_target.store(~u64{0}, std::memory_order_relaxed);
+}
+
+void GpuSplit::StoreConsumed(u64 position) {
+    consumed.store(position, std::memory_order_seq_cst);
+    if (position >= front_target.load(std::memory_order_seq_cst)) {
+        // Taking the lock orders this after the front's last look at `consumed` or before it.
+        { std::scoped_lock lock{front_mutex}; }
+        front_cv.notify_one();
+    }
+    if (Tegra::Nx2SemaphoreWaiters::Get().HasWaiters()) {
+        Tegra::Nx2SemaphoreWaiters::Get().NotifyWake();
     }
 }
 
-bool GpuSplit::WaitForWriters() {
-    const u64 target = std::min(last_writer_position, write_position);
+void GpuSplit::NotifyFrontQuiet() {
+    if (front_target.load(std::memory_order_seq_cst) != ~u64{0}) {
+        { std::scoped_lock lock{front_mutex}; }
+        front_cv.notify_one();
+    }
+    if (Tegra::Nx2SemaphoreWaiters::Get().HasWaiters()) {
+        Tegra::Nx2SemaphoreWaiters::Get().NotifyWake();
+    }
+}
+
+bool GpuSplit::WaitForPosition(u64 target) {
+    target = std::min(target, write_position);
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache >= target) {
         return false;
     }
+    Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
     wait_target.store(target, std::memory_order_seq_cst);
     Publish();
-    for (u32 spins = 0;; ++spins) {
+    for (u32 spins = 0; spins < 32; ++spins) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache >= target) {
             wait_target.store(~u64{0}, std::memory_order_relaxed);
             return true;
         }
-        if (spins < 16384) {
-            Pause();
-        } else {
-            std::this_thread::yield();
-        }
+        Pause();
     }
+    SleepUntilConsumed(target);
+    wait_target.store(~u64{0}, std::memory_order_relaxed);
+    return true;
+}
+
+bool GpuSplit::WaitForWriters() {
+    return WaitForPosition(last_writer_position);
 }
 
 void GpuSplit::SwitchEngine(Tegra::Engines::EngineInterface* engine) {
@@ -381,7 +547,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         if (available == read_position) {
             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
             // The front usually sends more within microseconds: spin briefly before sleeping.
-            for (u32 spins = 0; spins < 8192 && available == read_position &&
+            for (u32 spins = 0; spins < 32 && available == read_position &&
                                 !hook_requested.load(std::memory_order_relaxed);
                  ++spins) {
                 Pause();
@@ -396,6 +562,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                         idle_hook(idle_argument);
                     }
                     back_quiet.store(true, std::memory_order_release);
+                    NotifyFrontQuiet();
                 }
                 available = published.load(std::memory_order_acquire);
             }
@@ -418,26 +585,38 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         // Before any entry runs, so a front that sees these entries consumed also sees this.
         back_quiet.store(false, std::memory_order_seq_cst);
         g_back_busy.store(true, std::memory_order_relaxed);
-        while (read_position != available) {
-            const size_t index = read_position & RingMask;
-            const size_t size = Execute(&ring[index]);
-            read_position += size != 0 ? size : RingWords - index;
-            if (hook_requested.load(std::memory_order_relaxed) &&
-                idle_hook != nullptr) [[unlikely]] {
-                hook_requested.store(false, std::memory_order_seq_cst);
-                idle_hook(idle_argument);
+        while (true) {
+            while (read_position != available) {
+                const size_t index = read_position & RingMask;
+                const size_t size = Execute(&ring[index]);
+                read_position += size != 0 ? size : RingWords - index;
+                if (hook_requested.load(std::memory_order_relaxed) &&
+                    idle_hook != nullptr) [[unlikely]] {
+                    hook_requested.store(false, std::memory_order_seq_cst);
+                    idle_hook(idle_argument);
+                }
+                // Hand ring space back now and then while working through a long batch, and at once
+                // when the front waits for this position (WaitForWriters).
+                if ((read_position - last_store >= 4096 ||
+                     read_position >= wait_target.load(std::memory_order_relaxed)) &&
+                    read_position != available) {
+                    StoreConsumed(read_position);
+                    last_store = read_position;
+                }
             }
-            // Hand ring space back now and then while working through a long batch, and at once
-            // when the front waits for this position (WaitForWriters).
-            if ((read_position - last_store >= 4096 ||
-                 read_position >= wait_target.load(std::memory_order_relaxed)) &&
-                read_position != available) {
-                consumed.store(read_position, std::memory_order_release);
+            const u64 more = published.load(std::memory_order_acquire);
+            if (more == read_position) {
+                break;
+            }
+            available = more;
+            if (read_position - last_store >= 4096 ||
+                read_position >= wait_target.load(std::memory_order_relaxed)) {
+                StoreConsumed(read_position);
                 last_store = read_position;
             }
         }
         g_back_busy.store(false, std::memory_order_release);
-        consumed.store(read_position, std::memory_order_release);
+        StoreConsumed(read_position);
     }
     back_running.store(false, std::memory_order_release);
 }

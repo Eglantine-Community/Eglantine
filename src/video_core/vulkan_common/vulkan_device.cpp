@@ -408,7 +408,7 @@ constexpr u32 STATIC_CACHE_VERSION = 1;
 
 std::filesystem::path StaticPipelineCacheFilename() {
     const auto shader_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir);
-    if (!Common::FS::CreateDir(shader_dir)) {
+    if (!Common::FS::CreateDirs(shader_dir)) {
         return {};
     }
     return shader_dir / "vulkan_static_pipelines.bin";
@@ -718,6 +718,14 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     if (!Settings::values.vertex_input_dynamic_state.GetValue()) {
         RemoveExtensionFeature(extensions.vertex_input_dynamic_state, features.vertex_input_dynamic_state, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
     }
+    if (!Settings::values.use_graphics_pipeline_library.GetValue()) {
+        RemoveExtensionFeature(extensions.graphics_pipeline_library,
+                               features.graphics_pipeline_library,
+                               VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+        if (extensions.pipeline_library) {
+            RemoveExtension(extensions.pipeline_library, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+        }
+    }
 
     // Descriptors feature list
     {
@@ -980,10 +988,15 @@ VkFormat Device::GetSupportedFormat(VkFormat wanted_format, VkFormatFeatureFlags
 }
 
 void Device::ReportLoss() const {
-    LOG_CRITICAL(Render_Vulkan, "Device loss occurred!");
+    LOG_CRITICAL(Render_Vulkan, "Device loss occurred! GPU: {} (Driver: {}, Version: {:#x})",
+                 properties.properties.deviceName, GetDriverName(),
+                 properties.properties.driverVersion);
+    LOG_CRITICAL(Render_Vulkan, "Physical Device Local Memory: {} MiB, Subgroup size: {}..{}",
+                 device_access_memory >> 20, properties.subgroup_properties.subgroupSize,
+                 properties.subgroup_size_control.maxSubgroupSize);
 
-    // Wait for the log to flush and for Nsight Aftermath to dump the results
-    std::this_thread::sleep_for(std::chrono::seconds{15});
+    // Wait briefly for logs to flush to disk
+    std::this_thread::sleep_for(std::chrono::seconds{2});
 }
 
 void Device::SaveShader(std::span<const u32> spirv) const {
@@ -1131,6 +1144,11 @@ bool Device::GetSuitability(bool requires_swapchain) {
     FOR_EACH_VK_FEATURE_EXT(FEATURE_EXTENSION);
     FOR_EACH_VK_EXTENSION(EXTENSION);
 
+    if (extensions.graphics_pipeline_library && !extensions.pipeline_library) {
+        RemoveExtension(extensions.graphics_pipeline_library,
+                        VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+    }
+
     extensions.depth_stencil_resolve =
         extensions.depth_stencil_resolve &&
         (instance_version >= VK_API_VERSION_1_2 || extensions.create_renderpass2);
@@ -1188,6 +1206,10 @@ bool Device::GetSuitability(bool requires_swapchain) {
 
     if (requires_swapchain) {
         CHECK_EXTENSION(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    } else {
+        RemoveExtension(extensions.swapchain, VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+        RemoveExtension(extensions.swapchain_mutable_format,
+                        VK_KHR_SWAPCHAIN_MUTABLE_FORMAT_EXTENSION_NAME);
     }
 
     if (instance_version < VK_API_VERSION_1_2) {
@@ -1333,6 +1355,11 @@ bool Device::GetSuitability(bool requires_swapchain) {
         properties.custom_border_color.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_PROPERTIES_EXT;
         SetNext(next, properties.custom_border_color);
+    }
+    if (extensions.graphics_pipeline_library) {
+        properties.graphics_pipeline_library.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT;
+        SetNext(next, properties.graphics_pipeline_library);
     }
 
     // Perform the property fetch.
@@ -1601,8 +1628,13 @@ void Device::RemoveUnsuitableExtensions() {
     RemoveExtensionFeatureIfUnsuitable(extensions.mesh_shader, features.mesh_shader,
                                        VK_EXT_MESH_SHADER_EXTENSION_NAME);
 
-    // VK_KHR_shader_quad_control
-    extensions.shader_quad_control = features.shader_quad_control.shaderQuadControl;
+    // VK_KHR_shader_quad_control (requires VK_KHR_shader_maximal_reconvergence)
+    extensions.shader_quad_control =
+        features.shader_quad_control.shaderQuadControl &&
+        supported_extensions.contains(VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME);
+    if (extensions.shader_quad_control) {
+        loaded_extensions.insert(VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME);
+    }
     RemoveExtensionFeatureIfUnsuitable(extensions.shader_quad_control, features.shader_quad_control,
                                        VK_KHR_SHADER_QUAD_CONTROL_EXTENSION_NAME);
 
@@ -1653,6 +1685,17 @@ void Device::RemoveUnsuitableExtensions() {
     extensions.synchronization2 = features.synchronization2.synchronization2;
     RemoveExtensionFeatureIfUnsuitable(extensions.synchronization2, features.synchronization2,
                                        VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
+
+    // VK_EXT_graphics_pipeline_library (+ VK_KHR_pipeline_library)
+    extensions.graphics_pipeline_library =
+        extensions.pipeline_library && features.graphics_pipeline_library.graphicsPipelineLibrary;
+    RemoveExtensionFeatureIfUnsuitable(extensions.graphics_pipeline_library,
+                                       features.graphics_pipeline_library,
+                                       VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+    if (!extensions.graphics_pipeline_library && extensions.pipeline_library) {
+        extensions.pipeline_library = false;
+        RemoveExtensionIfUnsuitable(false, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+    }
 }
 
 void Device::SetupFamilies(VkSurfaceKHR surface) {

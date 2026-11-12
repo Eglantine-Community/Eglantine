@@ -609,3 +609,28 @@ TEST_CASE("DeviceMemoryManager: UpdatePagesCachedBatch basic") {
     manager.UpdatePagesCachedBatch(ranges, 1);
     SUCCEED("UpdatePagesCachedBatch executed without error");
 }
+
+TEST_CASE("MemoryTracker: preflushable iteration clips unaligned writes across manager boundaries",
+          "[video_core][selective_download]") {
+    RasterizerInterface rasterizer;
+    MemoryTracker tracker(rasterizer);
+    constexpr VAddr boundary = 8 * 1024 * 1024;
+    constexpr u64 page = 4096;
+    tracker.MarkRegionAsPreflushable(boundary - page, 2 * page);
+    tracker.MarkRegionAsPreflushable(boundary + 3 * page, page);
+    const auto collect = [&](VAddr start, u64 size) {
+        std::vector<std::pair<VAddr, u64>> ranges;
+        tracker.ForEachPreflushableRange(start, size, [&](VAddr address, u64 length) {
+            ranges.emplace_back(address, length);
+        });
+        return ranges;
+    };
+    const std::vector<std::pair<VAddr, u64>> expected{{boundary - 13, 13}, {boundary, 17}};
+    CHECK(collect(boundary - 13, 30) == expected);
+    CHECK(collect(boundary - 13, 30) == expected);
+    CHECK(collect(boundary + page, 2 * page).empty());
+    CHECK(collect(boundary + 3 * page + 7, 19) ==
+          std::vector<std::pair<VAddr, u64>>{{boundary + 3 * page + 7, 19}});
+    tracker.UnmarkRegionAsPreflushable(boundary - page, 2 * page);
+    CHECK(collect(boundary - 13, 30).empty());
+}

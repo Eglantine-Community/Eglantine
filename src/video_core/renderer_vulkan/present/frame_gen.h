@@ -32,6 +32,8 @@ public:
     void GenerateInto(const Device& device, Frame* destination, size_t generation);
 
 private:
+    [[nodiscard]] bool UseFsr3() const noexcept;
+
     void Rebuild(const Device& device, VkExtent2D extent, VkFormat format, f32 flow_scale);
     void DumpDebugImages(u64 count);
 
@@ -54,6 +56,8 @@ private:
     bool generated{};
     bool unavailable{};
     bool dumped{};
+    bool logged_active{};
+    bool logged_lsfg_fallback{};
 };
 
 } // namespace Vulkan

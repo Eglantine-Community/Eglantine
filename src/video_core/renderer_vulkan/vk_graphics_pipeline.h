@@ -11,6 +11,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <type_traits>
@@ -24,6 +25,7 @@
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
+#include "video_core/renderer_vulkan/vk_graphics_pipeline_library.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -86,7 +88,8 @@ public:
         DescriptorBufferRing& descriptor_buffer_ring, Common::ThreadWorker* worker_thread,
         PipelineStatistics* pipeline_statistics, RenderPassCache& render_pass_cache,
         const GraphicsPipelineCacheKey& key, std::array<vk::ShaderModule, NUM_STAGES> stages,
-        const std::array<const Shader::Info*, NUM_STAGES>& infos);
+        const std::array<const Shader::Info*, NUM_STAGES>& infos,
+        GraphicsPipelineLibraryCache* gpl_cache = nullptr);
 
     bool HasDynamicVertexInput() const noexcept { return key.state.dynamic_vertex_input; }
     const std::array<u64, 6>& ShaderHashes() const noexcept {
@@ -213,13 +216,11 @@ private:
     u32 num_textures{};
     bool fragment_has_color0_output{};
 
-    vk::DescriptorSetLayout descriptor_set_layout;
+    std::shared_ptr<const SharedPipelineLayoutBundle> shared_layout;
     DescriptorAllocator descriptor_allocator;
-    vk::PipelineLayout pipeline_layout;
-    vk::DescriptorUpdateTemplate descriptor_update_template;
     vk::Pipeline pipeline;
+    GraphicsPipelineLibraryCache* gpl_cache{};
 
-    DescriptorBufferLayout descriptor_buffer_layout;
     std::vector<DescriptorUpdateEntry> last_descriptor_payload;
     VkDeviceSize last_descriptor_buffer_offset{};
     u32 last_descriptor_buffer_chunk{};

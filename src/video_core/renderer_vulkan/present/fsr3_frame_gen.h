@@ -33,19 +33,31 @@ public:
     ~Fsr3FrameGen();
 
     void Process(const Device& device, Scheduler& scheduler, VkImage current_frame,
-                 VkImageView current_view, u64 frame_count);
+                 [[maybe_unused]] VkImageView current_view, u64 frame_count);
 
-    void Generate(const Device& device, Scheduler& scheduler, VkImageView destination_storage_view,
-                  float blend_factor, float flow_scale);
+    void Generate(const Device& device, Scheduler& scheduler, VkImage destination_image,
+                  VkImageView destination_storage_view, float blend_factor, float flow_scale);
 
     [[nodiscard]] bool IsReady() const {
-        return m_initialized && m_has_history;
+        return m_initialized && m_has_history && m_flow_valid;
     }
 
 private:
+    static constexpr size_t kFrameSlotCount = 2;
+    static constexpr size_t kInterpCacheSlots = 16;
+
+    struct InterpDescriptorSlot {
+        u32 curr_index{};
+        VkImageView dest_view{VK_NULL_HANDLE};
+        bool populated{};
+    };
+
     void CreateResources(const Device& device);
     void CreateShaders(const Device& device);
     void CreatePipelines(const Device& device);
+    VkDescriptorSet GetOrCreateInterpDescriptorSet(const Device& device, Scheduler& scheduler,
+                                                   u32 curr_index,
+                                                   VkImageView destination_storage_view);
 
     MemoryAllocator& m_allocator;
     VkExtent2D m_extent;
@@ -68,17 +80,19 @@ private:
     vk::DescriptorSets m_flow_desc_sets;
     vk::DescriptorSets m_interp_desc_sets;
 
-    // History and motion vector images
-    vk::Image m_history_image;
-    vk::ImageView m_history_view;
+    // Ping-pong frame copies (previous vs current) and motion vector image
+    std::array<vk::Image, kFrameSlotCount> m_frame_images;
+    std::array<vk::ImageView, kFrameSlotCount> m_frame_views;
+    std::array<VkImageLayout, kFrameSlotCount> m_frame_layouts{
+        VK_IMAGE_LAYOUT_UNDEFINED,
+        VK_IMAGE_LAYOUT_UNDEFINED,
+    };
 
     vk::Image m_motion_image;
     vk::ImageView m_motion_view;
+    VkImageLayout m_motion_layout{VK_IMAGE_LAYOUT_UNDEFINED};
 
-    // Store the last current-frame view for descriptor caching
-    vk::Image m_current_image;
-    vk::ImageView m_current_view;
-
+    u32 m_curr_index{0};
     bool m_initialized{};
     bool m_has_history{};
 
@@ -86,9 +100,8 @@ private:
     u64 m_last_frame_count{};
     bool m_flow_valid{};
 
-    // Descriptor caching: only update when views change
-    VkImageView m_cached_flow_current_view{VK_NULL_HANDLE};
-    VkImageView m_cached_interp_dest_view{VK_NULL_HANDLE};
+    std::array<InterpDescriptorSlot, kInterpCacheSlots> m_interp_cache{};
+    size_t m_interp_next_slot{0};
 };
 
 } // namespace Vulkan

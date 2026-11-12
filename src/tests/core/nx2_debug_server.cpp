@@ -54,7 +54,7 @@ struct GuestPages {
         auto& table = process.GetPageTable().GetImpl();
         table.Resize(20, 12);
         backing = system.DeviceMemory().buffer.BackingBasePointer() + 0x10000;
-        std::memset(backing, 0, 0x4000);
+        system.DeviceMemory().buffer.ClearBackingRegion(0x10000, 0x4000, 0);
         MapPage(table, 4, backing + 0x1000, Common::PageType::Memory);
         MapPage(table, 5, backing, Common::PageType::Memory);
         MapPage(table, 7, backing + 0x2000, Common::PageType::RasterizerCachedMemory);
@@ -233,9 +233,9 @@ TEST_CASE("Debug memory reads guest pages and names the first unmapped byte",
     REQUIRE(std::memcmp(out.data() + 0x10, guest.backing, 0x10) == 0);
     REQUIRE_FALSE(Core::Nx2Debug::ReadGuestMemory(memory, 0x7000, out));
     REQUIRE(std::memcmp(out.data(), guest.backing + 0x2000, out.size()) == 0);
-    REQUIRE(Core::Nx2Debug::ReadGuestMemory(memory, 0x5ff0, out) == 0x6000);
-    REQUIRE(Core::Nx2Debug::ReadGuestMemory(memory, 0x6800, out) == 0x6800);
-    REQUIRE(Core::Nx2Debug::ReadGuestMemory(memory, 0x100000, out) == 0x100000);
+    REQUIRE(Core::Nx2Debug::ReadGuestMemory(memory, 0x5ff0, out) == 0x6000ULL);
+    REQUIRE(Core::Nx2Debug::ReadGuestMemory(memory, 0x6800, out) == 0x6800ULL);
+    REQUIRE(Core::Nx2Debug::ReadGuestMemory(memory, 0x100000, out) == 0x100000ULL);
     // The top 16 bits would alias page 4 through GetPointerSilent's mask.
     REQUIRE(Core::Nx2Debug::ReadGuestMemory(memory, (1ULL << 48) | 0x4000, out) ==
             ((1ULL << 48) | 0x4000));

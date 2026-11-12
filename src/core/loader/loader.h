@@ -356,6 +356,15 @@ public:
         return ResultStatus::ErrorNotImplemented;
     }
 
+    /**
+     * Get the ExeFS directory of the application
+     * @param out_dir Reference to store the ExeFS virtual directory
+     * @return ResultStatus result of function
+     */
+    virtual ResultStatus ReadExeFS(FileSys::VirtualDir& out_dir) {
+        return ResultStatus::ErrorNotImplemented;
+    }
+
 protected:
     FileSys::VirtualFile file;
     bool is_loaded = false;

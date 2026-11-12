@@ -198,6 +198,7 @@ RangeSet<AddressType>::RangeSet(RangeSet&& other) {
 template <typename AddressType>
 RangeSet<AddressType>& RangeSet<AddressType>::operator=(RangeSet&& other) {
     m_impl->m_ranges_set = std::move(other.m_impl->m_ranges_set);
+    return *this;
 }
 
 template <typename AddressType>

@@ -115,6 +115,15 @@ public:
         eden_path = GetExeDirectory() / PORTABLE_DIR;
         if (!Exists(eden_path) || !IsDir(eden_path)) {
             eden_path = GetAppDataRoamingDirectory() / EDEN_DIR;
+            if (!Exists(eden_path) || !IsDir(eden_path)) {
+                for (const auto* fallback : {"eglantaze", "eglantine_aze", EDEN_LEGACY_DIR, "eglantine", "eden", "yuzu", "suyu"}) {
+                    const auto legacy_dir = GetAppDataRoamingDirectory() / fallback;
+                    if (Exists(legacy_dir) && IsDir(legacy_dir)) {
+                        eden_path = legacy_dir;
+                        break;
+                    }
+                }
+            }
         }
         eden_path_cache = eden_path / CACHE_DIR;
         eden_path_config = eden_path / CONFIG_DIR;

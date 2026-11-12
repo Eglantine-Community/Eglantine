@@ -244,7 +244,9 @@ KPhysicalAddress KMemoryManager::AllocateAndOpenContinuous(size_t num_pages, siz
 
     // Open the first reference to the pages.
     chosen_manager->OpenFirst(allocated_block, num_pages);
-    this->MarkUsed(allocated_block, num_pages);
+    if (!m_system.DeviceMemory().buffer.HasLazyCommit()) {
+        this->MarkUsed(allocated_block, num_pages);
+    }
 
     return allocated_block;
 }
@@ -310,8 +312,10 @@ Result KMemoryManager::AllocatePageGroupImpl(KPageGroup* out, size_t num_pages, 
     // Only succeed if we allocated as many pages as we wanted.
     R_UNLESS(num_pages == 0, ResultOutOfMemory);
 
-    for (const auto& block : *out) {
-        this->MarkUsed(block.GetAddress(), block.GetNumPages());
+    if (!m_system.DeviceMemory().buffer.HasLazyCommit()) {
+        for (const auto& block : *out) {
+            this->MarkUsed(block.GetAddress(), block.GetNumPages());
+        }
     }
 
     // We succeeded!
@@ -466,8 +470,8 @@ size_t KMemoryManager::Impl::Initialize(KPhysicalAddress address, size_t size,
     // Setup region.
     m_pool = p;
     m_management_region = management;
-    m_page_reference_counts.resize(
-        Kernel::Board::Nintendo::Nx::KSystemControl::Init::GetIntendedMemorySize() / PageSize);
+    // Reference-count indices are offsets within this manager's region, not all of DRAM.
+    m_page_reference_counts.resize(size / PageSize);
     ASSERT(Common::IsAligned(GetInteger(m_management_region), PageSize));
 
     // Initialize the manager's KPageHeap.
@@ -478,6 +482,9 @@ size_t KMemoryManager::Impl::Initialize(KPhysicalAddress address, size_t size,
 
 void KMemoryManager::Impl::InitializeOptimizedMemory(KernelCore& kernel) {
     auto optimize_pa = KPageTable::GetHeapPhysicalAddress(kernel, m_management_region);
+    kernel.System().DeviceMemory().buffer.MarkUsed(
+        GetInteger(optimize_pa) - Core::DramMemoryMap::Base,
+        CalculateOptimizedProcessOverheadSize(m_heap.GetSize()));
     auto* optimize_map = kernel.System().DeviceMemory().GetPointer<u64>(optimize_pa);
 
     std::memset(optimize_map, 0, CalculateOptimizedProcessOverheadSize(m_heap.GetSize()));

@@ -110,6 +110,9 @@ void MasterSemaphore::Wait(u64 tick) {
     } catch (const vk::Exception& exception) {
         // The throw ends the process; say why first (a device loss reached nothing else here).
         LOG_CRITICAL(Render_Vulkan, "Waiting for GPU tick {} failed: {}", tick, exception.what());
+        if (exception.GetResult() == VK_ERROR_DEVICE_LOST) {
+            device.ReportLoss();
+        }
         throw;
     }
 
@@ -127,8 +130,7 @@ VkResult MasterSemaphore::SubmitQueue(vk::CommandBuffer& cmdbuf, vk::CommandBuff
     }
 }
 
-static constexpr VkPipelineStageFlags wait_stage_mask = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
-                                                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+static constexpr VkPipelineStageFlags wait_stage_mask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
 
 VkResult MasterSemaphore::SubmitQueueTimeline(vk::CommandBuffer& cmdbuf,
                                               vk::CommandBuffer& upload_cmdbuf,
@@ -182,7 +184,7 @@ VkResult MasterSemaphore::SubmitQueueTimeline(vk::CommandBuffer& cmdbuf,
             .pNext = nullptr,
             .semaphore = wait_semaphore,
             .value = 0,
-            .stageMask = static_cast<VkPipelineStageFlags2>(wait_stage_mask),
+            .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
             .deviceIndex = 0,
         };
 
@@ -274,7 +276,7 @@ VkResult MasterSemaphore::SubmitQueueFence(vk::CommandBuffer& cmdbuf,
             .pNext = nullptr,
             .semaphore = wait_semaphore,
             .value = 0,
-            .stageMask = static_cast<VkPipelineStageFlags2>(wait_stage_mask),
+            .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
             .deviceIndex = 0,
         };
 
@@ -351,15 +353,26 @@ void MasterSemaphore::WaitThread(std::stop_token token) {
             wait_queue.pop();
         }
 
-        fence.Wait();
-        fence.Reset();
+        try {
+            fence.Wait();
+            fence.Reset();
+        } catch (const vk::Exception& exception) {
+            LOG_CRITICAL(Render_Vulkan, "Waiting for GPU fence (tick {}) failed: {}", host_tick,
+                         exception.what());
+            if (exception.GetResult() == VK_ERROR_DEVICE_LOST) {
+                device.ReportLoss();
+            }
+            gpu_tick.store((std::numeric_limits<u64>::max)(), std::memory_order_release);
+            gpu_tick.notify_all();
+            return;
+        }
 
         {
             std::scoped_lock lock{free_mutex};
             free_queue.push_front(std::move(fence));
             gpu_tick.store(host_tick, std::memory_order_release);
         }
-        gpu_tick.notify_one();
+        gpu_tick.notify_all();
     }
 }
 

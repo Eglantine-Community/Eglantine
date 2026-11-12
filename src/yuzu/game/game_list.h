@@ -38,6 +38,10 @@ enum class AmLaunchType;
 enum class StartGameType;
 
 class GameCarousel;
+class SwitchTopBar;
+class SwitchTitleBar;
+class SwitchActionBar;
+class SwitchFooterBar;
 
 class QAbstractItemView;
 namespace Core {
@@ -132,7 +136,12 @@ private:
     void SetupScrollAnimation();
     bool eventFilter(QObject* obj, QEvent* event) override;
     void changeEvent(QEvent*) override;
+    void keyPressEvent(QKeyEvent* event) override;
 
+public slots:
+    void OpenGameDetails();
+
+private:
     void ValidateEntry(const QModelIndex& item);
 
     void ToggleFavorite(u64 program_id);
@@ -146,6 +155,7 @@ private:
     void RetranslateUI();
 
     friend class GameListSearchField;
+    friend class DaliaLibraryPage;
 
     std::shared_ptr<FileSys::VfsFilesystem> vfs;
     FileSys::ManualContentProvider* provider;
@@ -156,6 +166,10 @@ private:
     GameTree* tree_view = nullptr;
     GameGrid* grid_view = nullptr;
     GameCarousel* carousel_view = nullptr;
+    SwitchTopBar* switch_top_bar = nullptr;
+    SwitchTitleBar* switch_title_bar = nullptr;
+    SwitchActionBar* switch_action_bar = nullptr;
+    SwitchFooterBar* switch_footer_bar = nullptr;
     GameListModel* item_model = nullptr;
     Settings::GameListMode game_list_mode;
 

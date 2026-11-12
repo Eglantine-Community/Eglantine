@@ -555,18 +555,32 @@ void RasterizerOpenGL::InvalidateRegion(DAddr addr, u64 size, VideoCommon::Cache
 
 bool RasterizerOpenGL::OnCPUWrite(DAddr addr, u64 size) {
     DEBUG_ASSERT(addr != 0 || size != 0);
+    bool held;
     {
         std::scoped_lock lock{buffer_cache.mutex};
-        if (buffer_cache.OnCPUWrite(addr, size)) {
-            return true;
-        }
+        held = buffer_cache.OnCPUWrite(addr, size);
     }
     {
+        // Also for a held write: the images over it must not download their older bytes over
+        // it before it is applied.
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.WriteMemory(addr, size);
     }
+    if (held) {
+        return true;
+    }
     shader_cache.InvalidateRegion(addr, size);
     return false;
+}
+
+void RasterizerOpenGL::BeginCachedWrites() {
+    std::scoped_lock lock{buffer_cache.mutex};
+    buffer_cache.BeginCachedWrites();
+}
+
+void RasterizerOpenGL::EndCachedWrites() {
+    std::scoped_lock lock{buffer_cache.mutex};
+    buffer_cache.EndCachedWrites();
 }
 
 void RasterizerOpenGL::OnCacheInvalidation(DAddr addr, u64 size) {

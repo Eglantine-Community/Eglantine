@@ -1093,8 +1093,14 @@ public:
     [[nodiscard]] Pipeline CreateGraphicsPipeline(const VkGraphicsPipelineCreateInfo& ci,
                                                   VkPipelineCache cache = {}) const;
 
+    [[nodiscard]] Pipeline TryCreateGraphicsPipeline(const VkGraphicsPipelineCreateInfo& ci,
+                                                     VkPipelineCache cache = {}) const noexcept;
+
     [[nodiscard]] Pipeline CreateComputePipeline(const VkComputePipelineCreateInfo& ci,
                                                  VkPipelineCache cache = {}) const;
+
+    [[nodiscard]] Pipeline TryCreateComputePipeline(const VkComputePipelineCreateInfo& ci,
+                                                    VkPipelineCache cache = {}) const noexcept;
 
     [[nodiscard]] Sampler CreateSampler(const VkSamplerCreateInfo& ci) const;
 

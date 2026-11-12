@@ -135,27 +135,20 @@ VkBufferView Buffer::View(u32 offset, u32 size, VideoCore::Surface::PixelFormat 
         offset = 0;
         size = 0;
     }
-    const auto it{std::ranges::find_if(views, [offset, size, format](const BufferView& view) {
-        return offset == view.offset && size == view.size && format == view.format;
-    })};
-    if (it != views.end()) {
-        return *it->handle;
+    const ViewKey key{offset, size, format};
+    if (const auto it = views.find(key); it != views.end()) {
+        return *it->second;
     }
-    views.push_back({
+    const auto [it, inserted] = views.emplace(key, device->GetLogical().CreateBufferView({
+        .sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .buffer = *buffer,
+        .format = MaxwellToVK::SurfaceFormat(*device, FormatType::Buffer, false, format).format,
         .offset = offset,
-        .size = size,
-        .format = format,
-        .handle = device->GetLogical().CreateBufferView({
-            .sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO,
-            .pNext = nullptr,
-            .flags = 0,
-            .buffer = *buffer,
-            .format = MaxwellToVK::SurfaceFormat(*device, FormatType::Buffer, false, format).format,
-            .offset = offset,
-            .range = size,
-        }),
-    });
-    return *views.back().handle;
+        .range = size,
+    }));
+    return *it->second;
 }
 
 class QuadIndexBuffer {
@@ -414,6 +407,10 @@ VkFormat BufferCacheRuntime::TexelBufferFormat(VideoCore::Surface::PixelFormat f
 
 void BufferCacheRuntime::FreeDeferredStagingBuffer(StagingBufferRef& ref) {
     staging_pool.FreeDeferred(ref);
+}
+
+void BufferCacheRuntime::FreeCompletedDeferredStagingBuffer(StagingBufferRef& ref) {
+    staging_pool.FreeCompletedDeferred(ref);
 }
 
 u64 BufferCacheRuntime::GetDeviceLocalMemory() const {

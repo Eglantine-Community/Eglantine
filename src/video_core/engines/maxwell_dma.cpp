@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <bit>
 #include <cstdlib>
 #include "common/algorithm.h"
 #include "common/assert.h"
@@ -13,10 +15,13 @@
 #include "core/core.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_dma.h"
+#include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
 #include "video_core/renderer_base.h"
 #include "video_core/textures/decoders.h"
+
+extern std::atomic<u64> g_nx2_watch_qmd_page;
 
 namespace Tegra::Engines {
 
@@ -38,8 +43,150 @@ void MaxwellDMA::BindRasterizer(VideoCore::RasterizerInterface* rasterizer_) {
 void MaxwellDMA::ConsumeSinkImpl(Core::System& system) {
     for (auto [method, value] : method_sink) {
         regs.reg_array[method] = value;
+        front_regs.reg_array[method] = value;
     }
     method_sink.clear();
+}
+
+void MaxwellDMA::FrontNoteLaunchDma(VideoCommon::GpuSplit& split) {
+    const LaunchDMA& launch = front_regs.launch_dma;
+    const GPUVAddr dst = front_regs.offset_out;
+    const auto to_cpu = [this, dst, &launch](u64 gpu_addr) {
+        const auto dev = memory_manager.GpuToCpuAddress(gpu_addr);
+        if (dev && *dev != 0) {
+            if (const u64 wp = g_nx2_watch_qmd_page.load(std::memory_order_relaxed);
+                wp != 0 && (*dev & ~u64{0xfff}) == wp) {
+                static u32 w_dma{};
+                if (++w_dma <= 12) {
+                    LOG_INFO(HW_GPU,
+                             "Nx2WatchQmd MaxwellDMA #{}: ml={} rem={} sem={} dst={:#x} ll={} lc={} "
+                             "gpu={:#x} dev={:#x}",
+                             w_dma, launch.multi_line_enable.Value(), launch.remap_enable.Value(),
+                             static_cast<u32>(launch.semaphore_type.Value()), dst,
+                             front_regs.line_length_in, front_regs.line_count, gpu_addr, *dev);
+                }
+            }
+        }
+        return dev;
+    };
+    if (launch.multi_line_enable) {
+        const bool is_src_pitch = launch.src_memory_layout == LaunchDMA::MemoryLayout::PITCH;
+        const bool is_dst_pitch = launch.dst_memory_layout == LaunchDMA::MemoryLayout::PITCH;
+        if (is_dst_pitch) {
+            if (front_regs.line_count > 0 && front_regs.line_length_in > 0 && dst != 0) {
+                if (front_regs.pitch_out < 0) {
+                    split.NoteWriter();
+                } else {
+                    const u32 pitch = static_cast<u32>(front_regs.pitch_out);
+                    if (front_regs.line_count == 1 || pitch == front_regs.line_length_in) {
+                        split.NoteWriterGpuRange(
+                            dst, u64{front_regs.line_length_in} * front_regs.line_count, to_cpu);
+                    } else if (front_regs.line_count <= 32) {
+                        for (u32 line = 0; line < front_regs.line_count; ++line) {
+                            split.NoteWriterGpuRange(dst + u64{line} * pitch,
+                                                     front_regs.line_length_in, to_cpu);
+                        }
+                    } else {
+                        const u64 span = u64{front_regs.line_count - 1} * pitch +
+                                         front_regs.line_length_in;
+                        if (span <= 0x1000000ULL) {
+                            split.NoteWriterGpuRange(dst, span, to_cpu);
+                        } else {
+                            split.NoteWriter();
+                        }
+                    }
+                }
+            }
+        } else if (dst != 0) {
+            const bool is_remapping = launch.remap_enable != 0;
+            const u32 num_remap_components = front_regs.remap_const.num_dst_components_minus_one + 1;
+            const u32 remap_components_size = front_regs.remap_const.component_size_minus_one + 1;
+            const u32 base_bpp = !is_remapping ? 1U : num_remap_components * remap_components_size;
+            u32 dst_width = front_regs.dst_params.width;
+            u32 bpp_shift = 0U;
+            if (!is_remapping) {
+                if (!is_src_pitch) {
+                    bpp_shift = Common::FoldRight(
+                        4U,
+                        [](u32 x, u32 y) {
+                            return (std::min)(x, static_cast<u32>(std::countr_zero(y)));
+                        },
+                        front_regs.src_params.width, dst_width, front_regs.line_length_in,
+                        front_regs.src_params.origin.x, front_regs.dst_params.origin.x,
+                        static_cast<u32>(front_regs.offset_in), static_cast<u32>(dst));
+                } else {
+                    bpp_shift = Common::FoldRight(
+                        4U,
+                        [](u32 x, u32 y) {
+                            return (std::min)(x, static_cast<u32>(std::countr_zero(y)));
+                        },
+                        dst_width, front_regs.line_length_in, front_regs.dst_params.origin.x,
+                        static_cast<u32>(dst));
+                }
+                dst_width >>= bpp_shift;
+            }
+            const size_t dst_size =
+                CalculateSize(true, base_bpp << bpp_shift, dst_width, front_regs.dst_params.height,
+                              front_regs.dst_params.depth, front_regs.dst_params.block_size.height,
+                              front_regs.dst_params.block_size.depth);
+            split.NoteWriterGpuRange(dst, dst_size, to_cpu);
+        }
+    } else if (dst != 0 && front_regs.line_length_in > 0) {
+        const bool is_const_a_dst = front_regs.remap_const.dst_x == RemapConst::Swizzle::CONST_A;
+        if (launch.remap_enable != 0 && is_const_a_dst) {
+            const u32 component_size = front_regs.remap_const.component_size_minus_one + 1;
+            split.NoteWriterGpuRange(dst, u64{front_regs.line_length_in} * component_size, to_cpu);
+        } else {
+            const GPUVAddr aligned_dst = dst & ~GPUVAddr{0x1ff};
+            const u64 aligned_bytes =
+                ((dst - aligned_dst) + front_regs.line_length_in + 0x1ffULL) & ~0x1ffULL;
+            split.NoteWriterGpuRange(aligned_dst, aligned_bytes, to_cpu);
+        }
+    }
+    switch (launch.semaphore_type) {
+    case LaunchDMA::SemaphoreType::NONE:
+        break;
+    case LaunchDMA::SemaphoreType::RELEASE_ONE_WORD_SEMAPHORE:
+        if (front_regs.semaphore.address != 0) {
+            split.NoteWriterGpuRange(front_regs.semaphore.address, sizeof(u32), to_cpu);
+        }
+        break;
+    case LaunchDMA::SemaphoreType::RELEASE_FOUR_WORD_SEMAPHORE:
+        if (front_regs.semaphore.address != 0) {
+            split.NoteWriterGpuRange(front_regs.semaphore.address, 16, to_cpu);
+        }
+        break;
+    default:
+        split.NoteWriter();
+        break;
+    }
+}
+
+void MaxwellDMA::FrontCallMethod(VideoCommon::GpuSplit& split, u32 method, u32 method_argument,
+                                 bool is_last_call, const GPUVAddr* segment) {
+    if (method < NUM_REGS) {
+        front_regs.reg_array[method] = method_argument;
+    }
+    split.Method(this, method, method_argument, is_last_call, segment);
+    if (method == offsetof(Regs, launch_dma) / sizeof(u32)) {
+        FrontNoteLaunchDma(split);
+    }
+}
+
+void MaxwellDMA::FrontCallMultiMethod(VideoCommon::GpuSplit& split, u32 method,
+                                      const u32* base_start, u32 amount, u32 methods_pending,
+                                      const GPUVAddr* segment) {
+    split.MultiMethod(this, method, base_start, amount, methods_pending, segment);
+    if (method >= NUM_REGS) {
+        return;
+    }
+    const bool is_launch = (method == offsetof(Regs, launch_dma) / sizeof(u32));
+    for (u32 i = 0; i < amount; ++i) {
+        front_regs.reg_array[method] = base_start[i];
+        if (is_launch) {
+            FrontNoteLaunchDma(split);
+        }
+    }
 }
 
 void MaxwellDMA::CallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call) {
@@ -50,6 +197,9 @@ void MaxwellDMA::CallMethod(Core::System& system, u32 method, u32 method_argumen
     }
 
     regs.reg_array[method] = method_argument;
+    if (!VideoCommon::GpuSplit::Get().Active()) {
+        front_regs.reg_array[method] = method_argument;
+    }
 
     if (method == offsetof(Regs, launch_dma) / sizeof(u32)) {
         Launch();

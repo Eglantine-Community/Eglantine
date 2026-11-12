@@ -15,6 +15,8 @@
 #include <vector>
 #include <span>
 
+#include <boost/container/small_vector.hpp>
+
 #include "common/common_types.h"
 #include "common/range_mutex.h"
 #include "common/scratch_buffer.h"
@@ -134,6 +136,11 @@ public:
     /// Traps the next guest CPU read of these pages, to learn which GPU writes the CPU reads.
     void ArmReadTraps(DAddr addr, size_t size);
 
+    /// Returns the current page-mapping generation counter (bumped on Map and Unmap).
+    u64 MappingGeneration() const noexcept {
+        return translation_generation.load(std::memory_order_acquire);
+    }
+
 private:
     struct TranslationEntry {
         DAddr guest_page{};
@@ -145,9 +152,10 @@ private:
     /// cleared by Map on a service thread between the GPU thread's null check of an entry and
     /// its use, and the GPU thread copied from address 0 (title 1 crashed every few minutes).
     struct TranslationCache {
-        const void* owner{};
+        // Monotonic ID prevents address reuse while keeping the TLS cache trivially destructible.
+        u64 owner_id{};
         u64 generation{};
-        std::array<TranslationEntry, 4> slots{};
+        std::array<TranslationEntry, 16> slots{};
         u32 cursor{};
     };
     static inline thread_local TranslationCache t_cache{};
@@ -155,8 +163,8 @@ private:
     /// This thread's translations, emptied when Map or Unmap ran since they were made.
     TranslationCache& Translations() {
         const u64 current = translation_generation.load(std::memory_order_acquire);
-        if (t_cache.owner != this || t_cache.generation != current) {
-            t_cache = TranslationCache{.owner = this, .generation = current};
+        if (t_cache.owner_id != instance_id || t_cache.generation != current) {
+            t_cache = TranslationCache{.owner_id = instance_id, .generation = current};
         }
         return t_cache;
     }
@@ -237,6 +245,8 @@ private:
         tracked_entries.GetUnchecked(page_index).cpu_backing_address = address | (asid.id << asid_start_bit);
     }
 
+    static inline std::atomic<u64> next_instance_id{1};
+    const u64 instance_id{next_instance_id.fetch_add(1, std::memory_order_relaxed)};
     std::atomic<u64> translation_generation{1}; ///< Bumped by Map and Unmap
     using CounterType = u8;
     using CounterAtomicType = std::atomic_uint8_t;

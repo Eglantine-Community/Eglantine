@@ -109,3 +109,48 @@ TEST_CASE("Declining the MKW preset preserves global and per-game preferences", 
         CHECK(settings->resolution_setup.UsingGlobal() == !per_game);
     }
 }
+
+namespace {
+
+void CheckOotPreset(const Settings::Values& settings) {
+    CHECK(settings.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan);
+    CHECK(settings.resolution_setup.GetValue() == Settings::ResolutionSetup::Res1X);
+    CHECK(settings.gpu_accuracy.GetValue() == Settings::GpuAccuracy::Low);
+    CHECK(settings.use_asynchronous_shaders.GetValue());
+    CHECK(settings.astc_recompression.GetValue() == Settings::AstcRecompression::Bc3);
+    CHECK(settings.vram_usage_mode.GetValue() == Settings::VramUsageMode::Conservative);
+    CHECK_FALSE(settings.use_reactive_flushing.GetValue());
+    CHECK(settings.vsync_mode.GetValue() == Settings::VSyncMode::Mailbox);
+    CHECK(settings.use_docked_mode.GetValue() == Settings::ConsoleMode::Docked);
+    CHECK(settings.scaling_filter.GetValue() == Settings::ScalingFilter::ScaleForce);
+    CHECK(settings.anti_aliasing.GetValue() == Settings::AntiAliasing::Fxaa);
+}
+
+} // namespace
+
+TEST_CASE("Accepted OoT settings apply recommended preset for the session", "[game_presets]") {
+    auto settings = std::make_unique<Settings::Values>();
+    SetConflictingPreferences(*settings, false);
+    SetConflictingPreferences(*settings, true);
+
+    CHECK(Settings::ApplyOcarinaOfTimePreset(*settings, Settings::OcarinaOfTimeProgramId, true));
+    CheckOotPreset(*settings);
+    CheckPreferences(*settings, true);
+
+    CHECK_FALSE(settings->renderer_backend.UsingGlobal());
+    CHECK_FALSE(settings->resolution_setup.UsingGlobal());
+}
+
+TEST_CASE("OoT preset ignores unrelated games and declined prompts", "[game_presets]") {
+    auto settings = std::make_unique<Settings::Values>();
+    SetConflictingPreferences(*settings, false);
+
+    CHECK_FALSE(Settings::ApplyOcarinaOfTimePreset(*settings, 0, true));
+    CHECK_FALSE(Settings::ApplyOcarinaOfTimePreset(*settings,
+                                                    Settings::OcarinaOfTimeProgramId + 1, true));
+    CHECK_FALSE(Settings::ApplyOcarinaOfTimePreset(*settings, Settings::OcarinaOfTimeProgramId,
+                                                    false));
+    CheckPreferences(*settings);
+    CHECK(settings->renderer_backend.UsingGlobal());
+    CHECK(settings->resolution_setup.UsingGlobal());
+}

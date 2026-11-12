@@ -82,7 +82,8 @@ VK_DEFINE_HANDLE(VmaPool)
             pipeline_executable_properties)                                                        \
     FEATURE(KHR, ShaderQuadControl, SHADER_QUAD_CONTROL, shader_quad_control)                      \
     FEATURE(KHR, WorkgroupMemoryExplicitLayout, WORKGROUP_MEMORY_EXPLICIT_LAYOUT,                  \
-            workgroup_memory_explicit_layout)
+            workgroup_memory_explicit_layout)                                                      \
+    FEATURE(EXT, GraphicsPipelineLibrary, GRAPHICS_PIPELINE_LIBRARY, graphics_pipeline_library)
 
 
 // Define miscellaneous extensions which may be used by the implementation here.
@@ -120,7 +121,8 @@ VK_DEFINE_HANDLE(VmaPool)
     EXTENSION(NV, VIEWPORT_SWIZZLE, viewport_swizzle)                                              \
     EXTENSION(EXT, FILTER_CUBIC, filter_cubic)                                                     \
     EXTENSION(IMG, FILTER_CUBIC, filter_cubic_img)                                                 \
-    EXTENSION(QCOM, FILTER_CUBIC_WEIGHTS, filter_cubic_weights)
+    EXTENSION(QCOM, FILTER_CUBIC_WEIGHTS, filter_cubic_weights)                                    \
+    EXTENSION(KHR, PIPELINE_LIBRARY, pipeline_library)
 
 // Define extensions which must be supported.
 #define FOR_EACH_VK_MANDATORY_EXTENSION(EXTENSION_NAME)                                            \
@@ -134,6 +136,8 @@ VK_DEFINE_HANDLE(VmaPool)
     EXTENSION_NAME(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME)                                    \
     EXTENSION_NAME(VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME)                               \
     EXTENSION_NAME(VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME)                                       \
+    EXTENSION_NAME(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME)                                \
+    EXTENSION_NAME(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME)                                         \
     EXTENSION_NAME(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME)                                 \
     EXTENSION_NAME(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME)                                   \
     EXTENSION_NAME(VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME)                                 \
@@ -207,7 +211,8 @@ VK_DEFINE_HANDLE(VmaPool)
 // These features are not required but can be helpful for drivers that can use it.
 #define FOR_EACH_VK_OPTIONAL_FEATURE(FEATURE_NAME)                                                 \
     FEATURE_NAME(bit16_storage, uniformAndStorageBuffer16BitAccess)                                \
-    FEATURE_NAME(bit8_storage, uniformAndStorageBuffer8BitAccess)
+    FEATURE_NAME(bit8_storage, uniformAndStorageBuffer8BitAccess)                                  \
+    FEATURE_NAME(graphics_pipeline_library, graphicsPipelineLibrary)
 
 namespace Vulkan {
 
@@ -931,6 +936,25 @@ FN_MAX_LIMIT_LIST
         return extensions.vertex_input_dynamic_state;
     }
 
+    /// Returns true if the device supports VK_EXT_graphics_pipeline_library.
+    bool IsExtGraphicsPipelineLibrarySupported() const {
+        return extensions.graphics_pipeline_library && extensions.pipeline_library &&
+               features.graphics_pipeline_library.graphicsPipelineLibrary;
+    }
+
+    /// Returns true if the device supports fast linking of partial graphics pipeline libraries.
+    bool IsExtGraphicsPipelineLibraryFastLinkingSupported() const {
+        return IsExtGraphicsPipelineLibrarySupported() &&
+               properties.graphics_pipeline_library.graphicsPipelineLibraryFastLinking;
+    }
+
+    /// Returns true if independent interpolation decoration is supported in pipeline libraries.
+    bool IsExtGraphicsPipelineLibraryIndependentInterpolationSupported() const {
+        return IsExtGraphicsPipelineLibrarySupported() &&
+               properties.graphics_pipeline_library
+                   .graphicsPipelineLibraryIndependentInterpolationDecoration;
+    }
+
     /// Returns true if the device supports VK_EXT_shader_demote_to_helper_invocation
     bool IsExtShaderDemoteToHelperInvocationSupported() const {
         return extensions.shader_demote_to_helper_invocation;
@@ -1306,6 +1330,7 @@ private:
         VkPhysicalDeviceMaintenance5PropertiesKHR maintenance5{};
         VkPhysicalDeviceDepthStencilResolveProperties depth_stencil_resolve{};
         VkPhysicalDeviceCustomBorderColorPropertiesEXT custom_border_color{};
+        VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT graphics_pipeline_library{};
 
         VkPhysicalDeviceProperties properties{};
     };

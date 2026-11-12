@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <utility>
 #include <vector>
 
@@ -15,9 +16,11 @@
 #include "common/bit_util.h"
 #include "common/common_types.h"
 #include "common/literals.h"
+#include "common/logging.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/vulkan_common/vulkan_device.h"
+#include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace Vulkan {
@@ -84,6 +87,8 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
     : device{device_}, memory_allocator{memory_allocator_}, scheduler{scheduler_},
       stream_buffer_size{GetStreamBufferSize(device)}, region_size{stream_buffer_size /
                                                                    StagingBufferPool::NUM_SYNCS} {
+    const char* trace = std::getenv("EDEN_TRACE_STAGING");
+    trace_staging = trace && trace[0] == '1';
     VkBufferCreateInfo stream_ci = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .pNext = nullptr,
@@ -122,6 +127,15 @@ StagingBufferRef StagingBufferPool::Request(size_t size, MemoryUsage usage, bool
 }
 
 void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
+    ReleaseDeferred(ref, scheduler.CurrentTick());
+}
+
+void StagingBufferPool::FreeCompletedDeferred(StagingBufferRef& ref) {
+    // Unlike a just-recorded upload, a completed readback has no pending GPU use.
+    ReleaseDeferred(ref, 0);
+}
+
+void StagingBufferPool::ReleaseDeferred(StagingBufferRef& ref, u64 last_use_tick) {
     auto& entries = GetCache(ref.usage)[ref.log2_level].entries;
     const auto is_this_one = [&ref](const StagingBuffer& entry) {
         return entry.index == ref.index;
@@ -129,12 +143,13 @@ void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
     auto it = std::find_if(entries.begin(), entries.end(), is_this_one);
     ASSERT(it != entries.end());
     ASSERT(it->deferred);
-    it->tick = scheduler.CurrentTick();
+    it->tick = last_use_tick;
     it->deferred = false;
 }
 
 void StagingBufferPool::TickFrame() {
-    current_delete_level = (current_delete_level + 1) % NUM_LEVELS;
+    constexpr size_t LARGE_STAGING_LOG2 = 20;
+    current_delete_level = (current_delete_level + 1) % LARGE_STAGING_LOG2;
 
     ReleaseCache(MemoryUsage::DeviceLocal);
     ReleaseCache(MemoryUsage::Upload);
@@ -218,6 +233,7 @@ std::optional<StagingBufferRef> StagingBufferPool::TryGetReservedBuffer(size_t s
 
 StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage usage, bool deferred) {
     auto const log2_size = Common::Log2Ceil<u32>(u32(size));
+    TraceAllocation(size, size_t{1} << log2_size, usage, deferred);
     VkBufferCreateInfo buffer_ci = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .pNext = nullptr,
@@ -235,6 +251,19 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
     }
     if (device.IsBufferDeviceAddressSupported()) {
         buffer_ci.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    }
+    if (log2_size >= 20) {
+        // Reclaim finished large buffers from other size buckets before adding another >= 1 MiB
+        // allocation to Windows/WDDM commit.
+        for (const auto trim_usage :
+             {MemoryUsage::DeviceLocal, MemoryUsage::Upload, MemoryUsage::Download}) {
+            auto& trim_cache = GetCache(trim_usage);
+            for (size_t lvl = 20; lvl < NUM_LEVELS; ++lvl) {
+                if (!trim_cache[lvl].entries.empty()) {
+                    ReleaseLevel(trim_cache, lvl);
+                }
+            }
+        }
     }
     vk::Buffer buffer = memory_allocator.CreateBuffer(buffer_ci, usage);
     if (device.HasDebuggingToolAttached()) {
@@ -256,7 +285,65 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
         .tick = deferred ? (std::numeric_limits<u64>::max)() : scheduler.CurrentTick(),
         .deferred = deferred,
     });
+    if (trace_staging) {
+        trace_cached_bytes += size_t{1} << log2_size;
+    }
     return entry.Ref();
+}
+
+void StagingBufferPool::TraceAllocation(size_t requested, size_t rounded, MemoryUsage usage,
+                                        bool deferred) {
+    // Log before allocating, even when the allocation fails or no frame ever completes.
+    // Counters describe logical buffer sizes, not driver allocation/residency sizes.
+    if (!trace_staging || trace_reports >= 256) {
+        return;
+    }
+    const size_t projected = trace_cached_bytes + rounded;
+    const bool growth = projected > trace_high_water && projected - trace_high_water >= 128_MiB;
+    const bool large = rounded >= 64_MiB && trace_large_reports < 8;
+    if (trace_reports != 0 && !growth && !large) {
+        return;
+    }
+    ++trace_reports;
+    trace_large_reports += large;
+    trace_high_water = (std::max)(trace_high_water, projected);
+    const u64 gpu_tick = scheduler.GetMasterSemaphore().KnownGpuTick();
+    struct Totals {
+        size_t bytes{};
+        size_t deferred{};
+        size_t inflight{};
+        size_t count{};
+    };
+    const auto summarize = [gpu_tick](const StagingBuffersCache& cache) {
+        Totals total;
+        for (const auto& level : cache) {
+            for (const auto& entry : level.entries) {
+                const size_t bytes = size_t{1} << entry.log2_level;
+                total.bytes += bytes;
+                ++total.count;
+                if (entry.deferred) {
+                    total.deferred += bytes;
+                } else if (entry.tick > gpu_tick) {
+                    total.inflight += bytes;
+                }
+            }
+        }
+        return total;
+    };
+    const auto upload = summarize(upload_cache);
+    const auto download = summarize(download_cache);
+    const auto local = summarize(device_local_cache);
+    LOG_WARNING(Render_Vulkan,
+                "Staging allocation preflight #{}: requested={} rounded={} usage={} deferred={} "
+                "delete_level={} current_tick={} gpu_tick={} stream_bytes={} "
+                "upload(bytes/deferred/inflight/count)={}/{}/{}/{} "
+                "download={}/{}/{}/{} device_local={}/{}/{}/{}",
+                trace_reports, requested, rounded, static_cast<u32>(usage), deferred,
+                current_delete_level, scheduler.CurrentTick(), gpu_tick, stream_buffer_size,
+                upload.bytes, upload.deferred, upload.inflight, upload.count,
+                download.bytes, download.deferred, download.inflight, download.count,
+                local.bytes, local.deferred, local.inflight, local.count);
+    LogMemoryStatistics(device);
 }
 
 StagingBufferPool::StagingBuffersCache& StagingBufferPool::GetCache(MemoryUsage usage) {
@@ -274,30 +361,64 @@ StagingBufferPool::StagingBuffersCache& StagingBufferPool::GetCache(MemoryUsage 
 }
 
 void StagingBufferPool::ReleaseCache(MemoryUsage usage) {
-    ReleaseLevel(GetCache(usage), current_delete_level);
+    constexpr size_t LARGE_STAGING_LOG2 = 20; // >= 1 MiB
+    auto& cache = GetCache(usage);
+    if (current_delete_level < LARGE_STAGING_LOG2 && !cache[current_delete_level].entries.empty()) {
+        ReleaseLevel(cache, current_delete_level);
+    }
+    for (size_t lvl = LARGE_STAGING_LOG2; lvl < NUM_LEVELS; ++lvl) {
+        if (!cache[lvl].entries.empty()) {
+            ReleaseLevel(cache, lvl);
+        }
+    }
 }
 
 void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
+    constexpr size_t LARGE_STAGING_LOG2 = 20; // >= 1 MiB
+    constexpr size_t HUGE_STAGING_LOG2 = 24;  // >= 16 MiB
     constexpr size_t deletions_per_tick = 16;
     auto& staging = cache[log2];
     auto& entries = staging.entries;
     const size_t old_size = entries.size();
+    if (old_size == 0) {
+        return;
+    }
 
-    const auto is_deletable = [this](const StagingBuffer& entry) {
-        return scheduler.IsFree(entry.tick);
-    };
-    const size_t begin_offset = staging.delete_index;
-    const size_t end_offset = (std::min)(begin_offset + deletions_per_tick, old_size);
+    const bool is_large = log2 >= LARGE_STAGING_LOG2;
+    const size_t begin_offset = is_large ? 0 : staging.delete_index;
+    const size_t end_offset =
+        is_large ? old_size : (std::min)(begin_offset + deletions_per_tick, old_size);
+    bool kept_warm = log2 >= HUGE_STAGING_LOG2;
     const auto begin = entries.begin() + begin_offset;
     const auto end = entries.begin() + end_offset;
-    entries.erase(std::remove_if(begin, end, is_deletable), end);
+    entries.erase(std::remove_if(begin, end,
+                                 [this, is_large, &kept_warm](const StagingBuffer& entry) {
+                                     if (entry.deferred || !scheduler.IsFree(entry.tick)) {
+                                         return false;
+                                     }
+                                     // Keep at most one warm 1..8 MiB buffer to avoid per-frame
+                                     // reallocation churn; release >= 16 MiB buffers immediately.
+                                     if (is_large && !kept_warm) {
+                                         kept_warm = true;
+                                         return false;
+                                     }
+                                     if (trace_staging) {
+                                         trace_cached_bytes -= size_t{1} << entry.log2_level;
+                                     }
+                                     return true;
+                                 }),
+                  end);
 
     const size_t new_size = entries.size();
-    staging.delete_index += deletions_per_tick;
-    if (staging.delete_index >= new_size) {
+    if (is_large) {
         staging.delete_index = 0;
+    } else {
+        staging.delete_index += deletions_per_tick;
+        if (staging.delete_index >= new_size) {
+            staging.delete_index = 0;
+        }
     }
-    if (staging.iterate_index > new_size) {
+    if (staging.iterate_index >= new_size) {
         staging.iterate_index = 0;
     }
 }

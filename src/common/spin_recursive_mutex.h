@@ -7,6 +7,9 @@
 #include <cstdint>
 #include <thread>
 
+#if defined(_WIN32) && defined(_M_X64) && defined(_MSC_VER)
+#include <intrin.h>
+#endif
 #if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
 #endif
@@ -17,10 +20,23 @@ namespace Common {
 /// thousands of times a second by the GPU thread, the fencing thread and CPU write traps, and
 /// held for microseconds: std::recursive_mutex put a waiting thread to sleep at once, and its
 /// wake-up took longer than the critical section (title 1's GPU thread spent ~8% asleep there).
+#if defined(_WIN32) && defined(_M_X64) && defined(_MSC_VER)
+using MutexThreadId = std::uint32_t;
+[[nodiscard]] inline MutexThreadId CurrentMutexThreadId() noexcept {
+    // Win64 TEB+0x48 holds ClientId.UniqueThread (non-zero Win32 TID), avoiding MSVC _Thrd_id().
+    return __readgsdword(0x48);
+}
+#else
+using MutexThreadId = std::thread::id;
+[[nodiscard]] inline MutexThreadId CurrentMutexThreadId() noexcept {
+    return std::this_thread::get_id();
+}
+#endif
+
 class SpinRecursiveMutex {
 public:
     void lock() {
-        const std::thread::id self = std::this_thread::get_id();
+        const MutexThreadId self = CurrentMutexThreadId();
         if (owner.load(std::memory_order_relaxed) == self) {
             ++depth;
             return;
@@ -35,7 +51,7 @@ public:
     }
 
     bool try_lock() {
-        const std::thread::id self = std::this_thread::get_id();
+        const MutexThreadId self = CurrentMutexThreadId();
         if (owner.load(std::memory_order_relaxed) == self) {
             ++depth;
             return true;
@@ -54,7 +70,7 @@ public:
         if (--depth != 0) {
             return;
         }
-        owner.store(std::thread::id{}, std::memory_order_relaxed);
+        owner.store(MutexThreadId{}, std::memory_order_relaxed);
         if (state.exchange(0, std::memory_order_release) == 2) {
             state.notify_one();
         }
@@ -91,7 +107,7 @@ private:
     }
 
     std::atomic<std::uint32_t> state{0}; ///< 0 free, 1 held, 2 held with sleepers
-    std::atomic<std::thread::id> owner{};
+    std::atomic<MutexThreadId> owner{};
     std::uint32_t depth{}; ///< Recursion depth, touched only by the owner
 };
 

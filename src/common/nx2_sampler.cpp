@@ -119,29 +119,44 @@ std::vector<Target> FindThreads(const std::vector<std::string>& patterns) {
     return targets;
 }
 
+bool UnwindStep(CONTEXT* context, unsigned depth) {
+#ifdef _MSC_VER
+    __try {
+#endif
+        DWORD64 image_base{};
+        const PRUNTIME_FUNCTION function =
+            RtlLookupFunctionEntry(context->Rip, &image_base, nullptr);
+        if (function == nullptr) {
+            // A leaf function (no unwind data): its return address is on top of the stack. JIT
+            // code has none either; past the first frame, stop there.
+            if (depth != 1) {
+                return false;
+            }
+            context->Rip = *reinterpret_cast<const DWORD64*>(context->Rsp);
+            context->Rsp += 8;
+            return true;
+        }
+        PVOID handler_data{};
+        DWORD64 establisher_frame{};
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context->Rip, function, context,
+                         &handler_data, &establisher_frame, nullptr);
+        return true;
+#ifdef _MSC_VER
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+#endif
+}
+
 // Walks a suspended thread's stack from its context. Nothing here may allocate: the thread
 // could be paused holding the heap lock.
 unsigned Walk(CONTEXT context, std::array<DWORD64, MaxDepth>& frames) {
     unsigned depth = 0;
     while (depth < MaxDepth && context.Rip != 0) {
         frames[depth++] = context.Rip;
-        DWORD64 image_base{};
-        const PRUNTIME_FUNCTION function =
-            RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
-        if (function == nullptr) {
-            // A leaf function (no unwind data): its return address is on top of the stack. JIT
-            // code has none either; past the first frame, stop there.
-            if (depth != 1) {
-                break;
-            }
-            context.Rip = *reinterpret_cast<const DWORD64*>(context.Rsp);
-            context.Rsp += 8;
-            continue;
+        if (!UnwindStep(&context, depth)) {
+            break;
         }
-        PVOID handler_data{};
-        DWORD64 establisher_frame{};
-        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, function, &context,
-                         &handler_data, &establisher_frame, nullptr);
     }
     return depth;
 }

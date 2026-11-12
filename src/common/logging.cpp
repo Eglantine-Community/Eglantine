@@ -36,6 +36,7 @@
 #include "common/thread.h"
 
 #include "common/logging.h"
+#include "common/memory_detect.h"
 #include "common/settings.h"
 #include "common/string_util.h"
 #include "common/bounded_threadsafe_queue.h"
@@ -443,6 +444,30 @@ void Start() {
 void Stop() {
     if (logging_instance)
         logging_instance->ForEachBackend([](Backend& backend) { backend.Flush(); });
+}
+
+std::string DescribeException(std::exception_ptr exception) {
+    if (!exception) {
+        return "no active exception";
+    }
+    try {
+        std::rethrow_exception(exception);
+    } catch (const std::exception& e) {
+        return e.what();
+    } catch (...) {
+        return "non-standard exception";
+    }
+}
+
+void InstallTerminateHandler() {
+    std::set_terminate([] {
+        // Critical entries flush the file backend before the abort below.
+        LOG_CRITICAL(Common, "std::terminate: {}", DescribeException(std::current_exception()));
+        LOG_CRITICAL(Common, "Host resources: {}",
+                     Common::DescribeHostResources(Common::QueryHostResources()));
+        Stop();
+        std::abort();
+    });
 }
 
 void SetGlobalFilter(const Filter& filter) {

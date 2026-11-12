@@ -269,6 +269,12 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Enables GPU vendor-specific pipeline cache.\nThis option can improve shader loading "
               "time significantly in cases where the Vulkan driver does not store pipeline cache "
               "files internally."));
+    INSERT(Settings, use_graphics_pipeline_library, tr("Use Vulkan Graphics Pipeline Library"),
+           tr("Splits Vulkan graphics pipelines into reusable partial libraries "
+              "(VK_EXT_graphics_pipeline_library) to reduce shader compilation stutter."));
+    INSERT(Settings, precompile_shaders, tr("Precompile Game Shaders"),
+           tr("Scans and compiles game shaders from RomFS and ExeFS before launching to reduce "
+              "in-game shader compilation stutter."));
     INSERT(Settings, enable_compute_pipelines, tr("Enable Compute Pipelines (Intel Vulkan Only)"),
            tr("Required by some games.\nThis setting only exists for Intel "
               "proprietary drivers and may crash if enabled.\nCompute pipelines are always enabled "
@@ -501,7 +507,7 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
     translations->insert({Settings::EnumMetadata<Settings::FrameGenType>::Index(),
                           {
                               PAIR(FrameGenType, Lsfg, tr("Lossless Scaling (LSFG)")),
-                              PAIR(FrameGenType, Fsr3, tr("Optical Flow Interpolation (built-in)")),
+                              PAIR(FrameGenType, Fsr3, tr("AMD FSR Frame Generation (Optical Flow)")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::ScalingFilter>::Index(),
                           {
@@ -520,7 +526,7 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(ScalingFilter, Spline1, tr("Spline-1")),
                               PAIR(ScalingFilter, Sgsr, tr("Snapdragon Game Super Resolution")),
                               PAIR(ScalingFilter, SgsrEdge, tr("Snapdragon Game Super Resolution EdgeDir")),
-                              PAIR(ScalingFilter, Fsr3, tr("AMD FidelityFX Super Resolution 1, softer sharpening")),
+                              PAIR(ScalingFilter, Fsr3, tr("AMD FidelityFX Super Resolution 3 (FSR 3.1)")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::AntiAliasing>::Index(),
                           {

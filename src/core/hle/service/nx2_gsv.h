@@ -1755,9 +1755,12 @@ private:
         constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
         int frames_ahead = frames_ahead_setting;
         const u64 app_program_id = system.GetApplicationProcessProgramID();
-        if (frames_ahead == -1 && (app_program_id == DonkeyKongBananzaProgramId ||
-                                   app_program_id == OcarinaOfTimeProgramId)) {
-            frames_ahead = 0;
+        if (frames_ahead == -1) {
+            if (app_program_id == DonkeyKongBananzaProgramId) {
+                frames_ahead = 0;
+            } else if (app_program_id == OcarinaOfTimeProgramId) {
+                frames_ahead = Settings::values.use_asynchronous_gpu_emulation.GetValue() ? 1 : 0;
+            }
         }
         const auto entered = std::chrono::steady_clock::now();
         if (frames_ahead == 1 || (frames_ahead == -1 && !WaitForFrame(~w[22], w[24], true))) {
@@ -1939,7 +1942,7 @@ private:
             // Title 1's channels resume and suspend again while they wait on this thread, so any
             // suspension counts, not only an unbroken one.
             bool gpu_waited = false;
-            while (!wake->done && system.IsPoweredOn() &&
+            while (!wake->done && system.IsPoweredOn() && !system.IsShuttingDown() &&
                    std::chrono::steady_clock::now() < deadline) {
                 if (unless_gpu_waits) {
                     gpu_waited |= system.GPU().HasSuspendedChannels();

@@ -28,7 +28,13 @@ DECLARE_ENUM_FLAG_OPERATORS(MemoryPermission)
  */
 class HostMemory {
 public:
-    explicit HostMemory(size_t backing_size_, size_t virtual_size_);
+    enum class BackingMode {
+        Committed,
+        Deferred,
+    };
+
+    explicit HostMemory(size_t backing_size_, size_t virtual_size_,
+                        BackingMode backing_mode = BackingMode::Committed);
     ~HostMemory();
 
     /**
@@ -71,6 +77,9 @@ public:
     /// A new kernel on this memory: everything a previous one used may hold data.
     void ForgetContents();
 
+    /// Returns true when deferred backing commits on first access (no upfront Commit needed).
+    [[nodiscard]] bool HasLazyCommit() const noexcept;
+
     [[nodiscard]] u8* BackingBasePointer() noexcept {
         return backing_base;
     }
@@ -93,9 +102,16 @@ public:
         return address >= virtual_base && address < virtual_base + virtual_size;
     }
 
+    static constexpr size_t GranuleShift = 16; ///< 64 KiB of backing per state byte
+    static constexpr u8 GranuleUsed = 1 << 0;   ///< Handed out at least once
+    static constexpr u8 GranuleDirty = 1 << 1;  ///< May hold non-zero data
+
 private:
     size_t backing_size{};
     size_t virtual_size{};
+
+    std::unique_ptr<std::atomic<u8>[]> granules;
+    size_t num_granules{};
 
 #if !(defined(__OPENORBIS__) || defined(__managarm__))
     // Low level handler for the platform dependent memory routines
@@ -106,11 +122,6 @@ private:
     u8* virtual_base{};
     size_t virtual_base_offset{};
 
-    static constexpr size_t GranuleShift = 16; ///< 64 KiB of backing per state byte
-    static constexpr u8 GranuleUsed = 1 << 0;   ///< Handed out at least once
-    static constexpr u8 GranuleDirty = 1 << 1;  ///< May hold non-zero data
-    std::unique_ptr<std::atomic<u8>[]> granules;
-    size_t num_granules{};
     // Windows requires it for kernels whom lack proper support for some functions!
     bool fallback_buffer{false};
 };

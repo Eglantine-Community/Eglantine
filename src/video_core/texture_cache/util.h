@@ -87,6 +87,7 @@ struct UnswizzlePlan {
     size_t total_host_bytes{0};
     u32 bpp_log2{0};
     bool layout_valid{true};
+    bool maxwell_gobs{false};
 };
 
 /// Plans the unswizzle copies and runs for a 2D block-linear image overlapping `dirty_ranges`.
@@ -102,6 +103,12 @@ void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan&
 [[nodiscard]] boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(
     Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
     std::span<const u8> input, std::span<u8> output);
+
+/// Switch 2 block-linear surfaces swap GOB offset bits 5 and 6, unless their texture header asks
+/// for the Maxwell GOB layout (ImageInfo::maxwell_gobs).
+[[nodiscard]] constexpr bool UsesNativeGobs(bool native_memory, const ImageInfo& info) {
+    return native_memory && !info.maxwell_gobs;
+}
 
 /// For a single-layer 2D block-linear image of 1x1-texel blocks: the host sparse blocks
 /// (tile_width x tile_height texels) that the guest byte ranges (offset, size) touch, merged into

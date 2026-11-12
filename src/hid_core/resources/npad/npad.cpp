@@ -149,13 +149,26 @@ void NPad::ControllerUpdate(Kernel::KernelCore& kernel, Core::HID::ControllerTri
         ControllerUpdate(kernel, Core::HID::ControllerTriggerType::Battery, controller_idx);
         return;
     }
+    const auto applet_resource = applet_resource_holder.applet_resource;
+    if (applet_resource == nullptr) {
+        return;
+    }
+
+    // Only connection and battery changes are handled here. Motion and button updates arrive many
+    // times a second, a phone's gyro from the first frame: before the applet resource is set,
+    // which this callback (registered by the constructor) used to dereference.
+    if (type != Core::HID::ControllerTriggerType::Connected &&
+        type != Core::HID::ControllerTriggerType::Disconnected &&
+        type != Core::HID::ControllerTriggerType::Battery) {
+        return;
+    }
 
     for (std::size_t aruid_index = 0; aruid_index < AruidIndexMax; aruid_index++) {
         if (controller_idx >= controller_data[aruid_index].size()) {
             return;
         }
 
-        auto* data = applet_resource_holder.applet_resource->GetAruidDataByIndex(aruid_index);
+        auto* data = applet_resource->GetAruidDataByIndex(aruid_index);
 
         if (data == nullptr || !data->flag.is_assigned) {
             continue;
@@ -270,6 +283,13 @@ void NPad::InitNewlyAddedController(Kernel::KernelCore& kernel, u64 aruid, Core:
         shared_memory->fullkey_color.attribute = ColorAttribute::Ok;
         shared_memory->joycon_color.attribute = ColorAttribute::Ok;
         shared_memory->style_tag.joycon_dual.Assign(1);
+        {
+            // Joy-Con 2 bit only for games that ask for it; SetSupportedNpadStyleSet keeps it in sync.
+            Core::HID::NpadStyleSet supported{};
+            if (npad_resource.GetSupportedNpadStyleSet(supported, aruid).IsSuccess()) {
+                SyncJoycon2DualStyle(shared_memory->style_tag, supported);
+            }
+        }
         if (controller.is_dual_left_connected) {
             shared_memory->joycon_color.left = body_colors.left;
             shared_memory->battery_level_left = battery_level.left.battery_level;
@@ -579,16 +599,11 @@ void NPad::OnUpdate(Kernel::KernelCore& kernel, const Core::Timing::CoreTiming& 
                 npad->handheld_lifo.WriteNextEntry(pad_state);
                 break;
             case Core::HID::NpadStyleIndex::JoyconDual:
-                pad_state.connection_status.raw = 0;
-                pad_state.connection_status.is_connected.Assign(1);
-                if (controller.is_dual_left_connected) {
-                    pad_state.connection_status.is_left_connected.Assign(1);
-                    libnx_state.connection_status.is_left_connected.Assign(1);
-                }
-                if (controller.is_dual_right_connected) {
-                    pad_state.connection_status.is_right_connected.Assign(1);
-                    libnx_state.connection_status.is_right_connected.Assign(1);
-                }
+                // One raw store avoids bitfield-union sibling overwrite issues under optimizing compilers.
+                pad_state.connection_status.raw =
+                    1u | (controller.is_dual_left_connected ? 1u << 2 : 0u) |
+                    (controller.is_dual_right_connected ? 1u << 4 : 0u);
+                libnx_state.connection_status.raw = pad_state.connection_status.raw;
 
                 pad_state.sampling_number =
                     npad->joy_dual_lifo.ReadCurrentEntry().state.sampling_number + 1;
@@ -652,9 +667,20 @@ void NPad::OnUpdate(Kernel::KernelCore& kernel, const Core::Timing::CoreTiming& 
 
 Result NPad::SetSupportedNpadStyleSet(Kernel::KernelCore& kernel, u64 aruid, Core::HID::NpadStyleSet supported_style_set) {
     std::scoped_lock lock{mutex};
+    LOG_INFO(Service_HID, "SetSupportedNpadStyleSet {:#x}", static_cast<u32>(supported_style_set));
     hid_core.SetSupportedStyleTag({supported_style_set});
     const Result result = npad_resource.SetSupportedNpadStyleSet(aruid, supported_style_set);
     if (result.IsSuccess()) {
+        // Drag x Drive narrows its set to the Joy-Con 2 bit later without a reconnect, so connected
+        // dual pads gain or lose that bit here.
+        for (std::size_t i = 0; i < MaxSupportedNpadIdTypes; ++i) {
+            const auto npad_id = IndexToNpadIdType(i);
+            auto& controller = GetControllerFromNpadIdType(aruid, npad_id);
+            if (controller.is_connected && controller.shared_memory &&
+                SyncJoycon2DualStyle(controller.shared_memory->style_tag, supported_style_set)) {
+                npad_resource.SignalStyleSetUpdateEvent(kernel, aruid, npad_id);
+            }
+        }
         OnUpdate(kernel, {});
     }
     return result;

@@ -112,6 +112,10 @@ public:
     /// Switch 2: the front flushed this command list page with the split drained.
     virtual void NoteGpuWrittenCommandListSynced([[maybe_unused]] DAddr page) {}
 
+    [[nodiscard]] virtual u64 Nx2ListWriteEvents() const {
+        return 0;
+    }
+
     /// Check if the the specified memory area requires flushing to CPU Memory.
     virtual bool MustFlushRegion(DAddr addr, u64 size,
                                  VideoCommon::CacheType which = VideoCommon::CacheType::All) = 0;
@@ -138,6 +142,13 @@ public:
         for (const auto& [addr, size] : ranges) {
             OnCacheInvalidation(addr, size);
         }
+    }
+
+    /// Around each round of cache invalidations (one InvalidateGPUCache).
+    virtual void BeginCachedWrites() {}
+    virtual void EndCachedWrites() {}
+    [[nodiscard]] virtual bool HasCachedWritesHeld() const {
+        return true;
     }
 
     virtual bool TryCacheInvalidation(DAddr addr, u64 size) {

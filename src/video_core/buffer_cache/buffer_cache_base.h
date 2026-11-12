@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <condition_variable>
 #include <cstdlib>
 #include <functional>
 #include <memory>
@@ -16,6 +17,7 @@
 #include <numeric>
 #include <optional>
 #include <span>
+#include <stop_token>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -61,6 +63,13 @@ constexpr u32 NUM_GRAPHICS_UNIFORM_BUFFERS = 18;
 constexpr u32 NUM_COMPUTE_UNIFORM_BUFFERS = 8;
 // Native compute shaders bind up to 18 global memory ranges; the enable masks are 32 bits wide.
 constexpr u32 NUM_STORAGE_BUFFERS = 32;
+
+namespace detail {
+inline const char nx2_bank_reupload_mode = [] {
+    const char* v = std::getenv("EDEN_NX2_BANK_REUPLOAD");
+    return v != nullptr ? v[0] : '1';
+}();
+} // namespace detail
 // Compute programs can take pointer table entries beyond 32 bindings (Shader::Info::MAX_SSBOS).
 constexpr u32 NUM_COMPUTE_STORAGE_BUFFERS = 64;
 constexpr u32 NUM_TEXTURE_BUFFERS = 32;
@@ -246,9 +255,17 @@ public:
 
     void CachedWriteMemory(DAddr device_addr, u64 size);
 
+    /// Around each round of cache invalidations (GPU::InvalidateGPUCache): the writes held back
+    /// before it are the ones it applies.
+    void BeginCachedWrites();
+    void EndCachedWrites();
+    [[nodiscard]] bool HasCachedWritesHeld() const noexcept {
+        return has_held_cached_writes.load(std::memory_order_acquire);
+    }
+
     bool OnCPUWrite(DAddr device_addr, u64 size);
 
-    void DownloadMemory(DAddr device_addr, u64 size);
+    void DownloadMemory(DAddr device_addr, u64 size, bool skip_held = true);
 
     std::optional<VideoCore::RasterizerDownloadArea> GetFlushArea(DAddr device_addr, u64 size);
 
@@ -332,6 +349,9 @@ public:
     void CommitAsyncFlushes();
     void CommitAsyncFlushesHigh();
 
+    /// Called without cache locks; cancellation leaves outstanding downloads intact.
+    bool WaitAsyncFlushBudget(std::stop_token stop_token, size_t budget = 256 * 1024 * 1024);
+
     /// Pop asynchronous downloads
     void PopAsyncFlushes();
     void PopAsyncBuffers();
@@ -351,6 +371,9 @@ public:
     }
     /// True when it recorded copies, which the GPU completes at `tick` (the caller submits).
     bool Nx2CopyListPages(u64 tick);
+    [[nodiscard]] u64 Nx2ListWriteEvents() const noexcept {
+        return nx2_list_write_events;
+    }
     enum class Nx2ListRead { Unknown, Copied, Synced };
     /// Front thread: Synced when guest memory holds the page `device_addr` lies in (flushed and
     /// written by no GPU work since), else Copied with `out` filled from the copy of its last
@@ -445,7 +468,70 @@ public:
     Runtime& runtime;
     bool any_buffer_uploaded = false;
     /// Indirectly read banks of native programs already uploaded this frame.
-    std::unordered_set<DAddr> native_indirect_uniforms_this_frame;
+    struct FlatAddrSet {
+        struct InsertResult {
+            bool second;
+        };
+        void clear() noexcept {
+            has_zero = false;
+            if (count != 0) {
+                for (const u32 slot : dirty_slots) {
+                    table[slot] = 0;
+                }
+                dirty_slots.clear();
+                count = 0;
+            }
+        }
+        InsertResult insert(DAddr addr) {
+            if (addr == 0) {
+                const bool inserted = !has_zero;
+                has_zero = true;
+                return {inserted};
+            }
+            if (table.empty()) {
+                table.assign(4096, 0);
+            } else if ((count + 1) * 2 >= table.size()) {
+                Rehash(table.size() * 2);
+            }
+            const size_t mask = table.size() - 1;
+            size_t idx = static_cast<size_t>((addr * 0x9e3779b97f4a7c15ULL) >> 32) & mask;
+            for (;;) {
+                const DAddr cur = table[idx];
+                if (cur == addr) {
+                    return {false};
+                }
+                if (cur == 0) {
+                    table[idx] = addr;
+                    dirty_slots.push_back(static_cast<u32>(idx));
+                    ++count;
+                    return {true};
+                }
+                idx = (idx + 1) & mask;
+            }
+        }
+    private:
+        void Rehash(size_t new_size) {
+            std::vector<DAddr> next(new_size, 0);
+            const size_t mask = new_size - 1;
+            dirty_slots.clear();
+            for (const DAddr val : table) {
+                if (val == 0) {
+                    continue;
+                }
+                size_t idx = static_cast<size_t>((val * 0x9e3779b97f4a7c15ULL) >> 32) & mask;
+                while (next[idx] != 0) {
+                    idx = (idx + 1) & mask;
+                }
+                next[idx] = val;
+                dirty_slots.push_back(static_cast<u32>(idx));
+            }
+            table.swap(next);
+        }
+        std::vector<DAddr> table;
+        std::vector<u32> dirty_slots;
+        size_t count{};
+        bool has_zero{};
+    } native_indirect_uniforms_this_frame;
 
 private:
     template <typename Mask, typename Func>
@@ -482,7 +568,11 @@ private:
 
     void RunGarbageCollector(bool aggressive_gc);
 
+    void ReleaseCompletedAsyncBuffers();
+
     void BindHostIndexBuffer();
+
+    void MarkUploaded(Buffer& buffer, std::span<const BufferCopy> copies);
 
     void BindHostVertexBuffers();
 
@@ -560,7 +650,7 @@ private:
 
     void TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept;
 
-    bool SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size);
+    bool SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size, u64 force_upload_size = 0);
 
     void UploadMemory(Buffer& buffer, u64 total_size_bytes, u64 largest_copy,
                       std::span<BufferCopy> copies);
@@ -572,7 +662,7 @@ private:
 
     void DownloadBufferMemory(Buffer& buffer_id);
 
-    void DownloadBufferMemory(Buffer& buffer_id, DAddr device_addr, u64 size);
+    void DownloadBufferMemory(Buffer& buffer_id, DAddr device_addr, u64 size, bool skip_held = true);
 
     /// Downloads the GPU-written data of several buffers with one wait for the GPU.
     void DownloadBuffersMemory(std::span<const BufferId> buffer_ids);
@@ -610,9 +700,9 @@ private:
     /// CPU writes collected but not yet applied (SetPendingCpuWrites).
     [[nodiscard]] Common::RangeSet<DAddr> PendingCpuWriteRanges();
 
-    /// Writes downloaded bytes to guest memory, except over `cpu_written`.
+    /// Writes downloaded bytes to guest memory, except over `cpu_written` (and held pages when `skip_held`).
     void WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_written, DAddr device_addr,
-                               const u8* data, u64 size);
+                               const u8* data, u64 size, bool skip_held = true);
 
     void InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
                                     std::span<const u8> inlined_buffer);
@@ -738,11 +828,21 @@ private:
 
     // Async Buffers
     std::deque<std::optional<Async_Buffer>> async_buffers;
+    size_t pending_async_download_bytes{};
+    std::condition_variable_any async_download_progress;
     std::deque<boost::container::small_vector<BufferCopy, 4>> pending_downloads;
     /// For each entry of pending_downloads: the ranges it still writes to guest memory when its
     /// fence pops. A write to a range after a download was taken removes it from that download
     /// (and every other pending one): its bytes are older than the write.
     std::deque<Common::RangeSet<DAddr>> pending_download_ranges;
+    /// Pages of GPU-written memory the guest CPU wrote, whose writes the GPU thread has not
+    /// applied yet (OnCPUWrite holds them back). Guest memory holds the newest bytes there:
+    /// no download may write over them before the round of invalidations finishes.
+    Common::RangeSet<DAddr> cpu_held_ranges;
+    /// Pages of cpu_held_ranges held since the current round began: their writes may sit in
+    /// the cores' new write lists, so the round does not release them.
+    Common::RangeSet<DAddr> cpu_recent_held_ranges;
+    std::atomic<bool> has_held_cached_writes{false};
     PendingCpuWrites pending_cpu_writes;
     std::optional<Async_Buffer> current_buffer;
 
@@ -797,6 +897,7 @@ private:
     std::vector<std::pair<u64, Nx2Staging>> nx2_retired_list_copies;
     boost::container::small_vector<std::pair<BufferId, DAddr>, 8> nx2_list_copy_requests;
     bool nx2_collect_list_copies{};
+    u64 nx2_list_write_events{};
 };
 
 } // namespace VideoCommon

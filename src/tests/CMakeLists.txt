@@ -8,10 +8,13 @@ add_executable(tests
     common/bit_field.cpp
     common/cityhash.cpp
     common/container_hash.cpp
+    common/describe_exception.cpp
     common/event.cpp
     common/fibers.cpp
     common/game_presets.cpp
     common/host_memory.cpp
+    common/host_memory_commit.cpp
+    common/host_resources.cpp
     common/page_table.cpp
     common/param_package.cpp
     common/range_map.cpp
@@ -21,7 +24,11 @@ add_executable(tests
     common/undefined_fix.cpp
     common/unique_function.cpp
     common/zstd_compression.cpp
+    core/address_space.cpp
     core/core_timing.cpp
+    core/game_settings.cpp
+    core/gpu_dirty_memory_manager.cpp
+    core/hid_joycon2_style.cpp
     core/ldn.cpp
     core/internal_network/socket_proxy.cpp
     core/nup_writer.cpp
@@ -29,11 +36,18 @@ add_executable(tests
     core/nx2_movie_pacing.cpp
     core/priority_queue.cpp
     core/internal_network/network.cpp
+    video_core/buffer_cache_download.cpp
     video_core/frame_dump_schedule.cpp
+    video_core/fsr3_frame_gen.cpp
+    video_core/memory_budget.cpp
     video_core/memory_tracker.cpp
+    video_core/nx2_present.cpp
+    video_core/report_time.cpp
+    video_core/shader_object_pool.cpp
     video_core/spirv_storage_alignment.cpp
     video_core/pipeline_optimization.cpp
     video_core/spirv_atomic_retry.cpp
+    video_core/spirv_demote_multi_return.cpp
     video_core/spirv_fragment_shuffle.cpp
     video_core/ampere_depth_compare.cpp
     video_core/h264_packet.cpp
@@ -58,12 +72,16 @@ add_executable(tests
     video_core/ampere_vote.cpp
     video_core/shader_attributes.cpp
     video_core/indirect_reset.cpp
+    video_core/precompile_scanner.cpp
+    video_core/storage_buffer_descriptor.cpp
+    video_core/texture_row_upload.cpp
+    video_core/vk_gpl.cpp
     input_common/calibration_configuration_job.cpp
 )
 
 create_target_directory_groups(tests)
 
-target_link_libraries(tests PRIVATE common core input_common video_core)
+target_link_libraries(tests PRIVATE common core input_common video_core zstd::zstd)
 target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain Threads::Threads)
 
 add_test(NAME tests COMMAND tests)

@@ -84,6 +84,7 @@ private:
     void DiscardFrame(Frame* frame);
 
     void SetImageCount();
+    void SyncFramePoolLocked();
 
 private:
     const vk::Instance& instance;
@@ -106,6 +107,7 @@ private:
     bool blit_supported;
     bool storage_supported;
     bool use_present_thread;
+    std::size_t active_frame_count{};
     std::atomic<std::size_t> image_count{};
     std::atomic<std::size_t> swapchain_image_count{};
     std::atomic<VkFormat> swapchain_image_format{};

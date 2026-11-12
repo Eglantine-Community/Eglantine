@@ -141,9 +141,9 @@ PresentManager::PresentManager(const vk::Instance& instance_,
             VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
         .queueFamilyIndex = device.GetGraphicsFamily(),
     });
-    auto cmdbuffers = cmdpool.Allocate(image_count);
+    auto cmdbuffers = cmdpool.Allocate(MAX_FRAMES_IN_FLIGHT);
 
-    frames.resize(image_count);
+    frames.resize(MAX_FRAMES_IN_FLIGHT);
     for (u32 i = 0; i < frames.size(); i++) {
         Frame& frame = frames[i];
         frame.index = i;
@@ -159,7 +159,17 @@ PresentManager::PresentManager(const vk::Instance& instance_,
             .flags = VK_FENCE_CREATE_SIGNALED_BIT,
         });
         frame.storage_capable = storage_supported;
-        free_queue.push_back(&frame);
+    }
+
+    if (!storage_supported && Settings::values.frame_gen.GetValue()) {
+        LOG_WARNING(Render_Vulkan,
+                    "Frame Generation disabled: swapchain format {} lacks STORAGE_IMAGE support",
+                    static_cast<u32>(swapchain.GetImageFormat()));
+    }
+
+    {
+        std::scoped_lock lock{free_mutex};
+        SyncFramePoolLocked();
     }
 
     if (use_present_thread) {
@@ -169,10 +179,23 @@ PresentManager::PresentManager(const vk::Instance& instance_,
 
 PresentManager::~PresentManager() = default;
 
+void PresentManager::SyncFramePoolLocked() {
+#ifdef HAS_LSFG
+    SetImageCount();
+#endif
+    const size_t target = std::clamp<size_t>(image_count.load(std::memory_order_relaxed), 1,
+                                             frames.size());
+    while (active_frame_count < target) {
+        free_queue.push_back(&frames[active_frame_count]);
+        ++active_frame_count;
+    }
+}
+
 Frame* PresentManager::GetRenderFrame() {
 
     // Wait for free presentation frames
     std::unique_lock lock{free_mutex};
+    SyncFramePoolLocked();
     free_cv.wait(lock, [this] { return !free_queue.empty(); });
 
     // Take the frame from the queue
@@ -367,9 +390,9 @@ void PresentManager::SetImageCount() {
 #ifdef HAS_LSFG
     const size_t generations = Settings::FrameGenMaxGenerations();
     const size_t queued_composites = Settings::values.frame_gen_queue_target.GetValue() + 1;
-    image_count =
-        std::clamp<size_t>((generations + 1) * queued_composites, swapchain.GetImageCount(),
-                           MAX_FRAMES_IN_FLIGHT);
+    const size_t extra_reserve = generations > 0 ? 1 : 0;
+    image_count = std::clamp<size_t>((generations + 1) * queued_composites + extra_reserve,
+                                     swapchain.GetImageCount(), MAX_FRAMES_IN_FLIGHT);
 #else
     image_count = std::min<size_t>(swapchain.GetImageCount(), MAX_FRAMES_IN_FLIGHT);
 #endif

@@ -161,6 +161,7 @@ add_executable(yuzu
     game/game_tree.h game/game_tree.cpp
     game/game_card.h game/game_card.cpp
     game/search_field.h game/search_field.cpp
+    game/switch_home.h game/switch_home.cpp
 
     hotkeys.cpp
     hotkeys.h
@@ -242,9 +243,22 @@ add_executable(yuzu
     updater/update_dialog.h updater/update_dialog.cpp updater/update_dialog.ui
     game/common.h
     game/carousel.h game/carousel.cpp
+
+    dalia/dalia_game_details.h dalia/dalia_game_details.cpp
+    dalia/dalia_settings.h dalia/dalia_settings.cpp
+    dalia/dalia_diagnostics.h dalia/dalia_diagnostics.cpp
+    dalia/dalia_gameplay_overlay.h dalia/dalia_gameplay_overlay.cpp
+    dalia/dalia_theme.h
+    dalia/dalia_sidebar.h dalia/dalia_sidebar.cpp
+    dalia/dalia_home_page.h dalia/dalia_home_page.cpp
+    dalia/dalia_library_page.h dalia/dalia_library_page.cpp
+    dalia/dalia_controllers_page.h dalia/dalia_controllers_page.cpp
+    dalia/dalia_settings_page.h dalia/dalia_settings_page.cpp
+    dalia/dalia_system_page.h dalia/dalia_system_page.cpp
+    dalia/dalia_main_container.h dalia/dalia_main_container.cpp
 )
 
-set_target_properties(yuzu PROPERTIES OUTPUT_NAME "eglantine")
+set_target_properties(yuzu PROPERTIES OUTPUT_NAME "dalia")
 
 # Shipped next to the executable: the NX2 switches a GUI launch cannot set another way. Read at
 # startup (LoadNx2Switches in main.cpp); a user copy in %APPDATA%\eden overrides it.

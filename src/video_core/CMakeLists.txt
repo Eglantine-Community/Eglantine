@@ -19,6 +19,7 @@ add_library(video_core STATIC
     buffer_cache/buffer_cache.cpp
     buffer_cache/buffer_cache.h
     buffer_cache/memory_tracker_base.h
+    buffer_cache/storage_buffer_descriptor.h
     buffer_cache/usage_tracker.h
     buffer_cache/virtual_range_cache.h
     buffer_cache/word_manager.h
@@ -52,6 +53,7 @@ add_library(video_core STATIC
     engines/fermi_2d.h
     engines/kepler_compute.cpp
     engines/kepler_compute.h
+    engines/native_upscale.h
     engines/kepler_memory.cpp
     engines/kepler_memory.h
     engines/maxwell_3d.cpp
@@ -192,6 +194,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_frame_dump.h
     renderer_vulkan/vk_graphics_pipeline.cpp
     renderer_vulkan/vk_graphics_pipeline.h
+    renderer_vulkan/vk_graphics_pipeline_library.cpp
+    renderer_vulkan/vk_graphics_pipeline_library.h
     renderer_vulkan/vk_multi_range_buffer.cpp
     renderer_vulkan/vk_multi_range_buffer.h
     renderer_vulkan/vk_master_semaphore.cpp
@@ -244,6 +248,10 @@ add_library(video_core STATIC
     vulkan_common/vma.h
     vulkan_common/vulkan.h
 
+    precompile/shader_container_scanner.cpp
+    precompile/shader_container_scanner.h
+    precompile/shader_precompiler.cpp
+    precompile/shader_precompiler.h
     shader_cache.cpp
     shader_cache.h
     shader_environment.cpp
@@ -272,6 +280,7 @@ add_library(video_core STATIC
     texture_cache/image_view_base.h
     texture_cache/image_view_info.cpp
     texture_cache/image_view_info.h
+    texture_cache/memory_budget.h
     texture_cache/render_targets.h
     texture_cache/samples_helper.h
     texture_cache/texture_cache.cpp

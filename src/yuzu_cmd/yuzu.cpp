@@ -555,7 +555,8 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     state->system.GPU().Start();
     state->system.GetCpuManager().OnGpuReady();
 
-    if (Settings::values.use_disk_shader_cache.GetValue()) {
+    if (Settings::values.use_disk_shader_cache.GetValue() ||
+        Settings::values.precompile_shaders.GetValue()) {
         state->system.Renderer().ReadRasterizer()->LoadDiskResources(
             state->system.GetApplicationProcessProgramID(), std::stop_token{},
             [](VideoCore::LoadCallbackStage, size_t value, size_t total) {});
@@ -567,7 +568,8 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     // QLaunch launched applications (should) now reload shader cache.
     static std::mutex shader_cache_reload_mutex;
     state->system.RegisterApplicationChangedCallback([&state](u64 changed_program_id) {
-        if (!Settings::values.use_disk_shader_cache.GetValue()) {
+        if (!Settings::values.use_disk_shader_cache.GetValue() &&
+            !Settings::values.precompile_shaders.GetValue()) {
             return;
         }
 
@@ -735,6 +737,7 @@ extern "C" void SDL_AppQuit(void *appstate, SDL_AppResult result) {
     // --version): the kernel is uninitialised then, and Pause()/ShutdownMainProcess() would
     // dereference it.
     if (state->system.IsPoweredOn()) {
+        state->system.SetShuttingDown(true);
         void(state->system.Pause());
         state->system.ShutdownMainProcess();
     }

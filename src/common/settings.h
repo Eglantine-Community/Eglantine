@@ -601,6 +601,14 @@ struct Values {
         linkage, true, "use_vulkan_driver_pipeline_cache", Category::RendererAdvanced,
         Specialization::Default};
 
+    SwitchableSetting<bool> use_graphics_pipeline_library{
+        linkage, true, "use_graphics_pipeline_library", Category::RendererAdvanced,
+        Specialization::Default};
+
+    SwitchableSetting<bool> precompile_shaders{linkage, true, "precompile_shaders",
+                                               Category::RendererAdvanced,
+                                               Specialization::Default};
+
     SwitchableSetting<bool> enable_compute_pipelines{linkage, false, "enable_compute_pipelines",
                                                      Category::RendererAdvanced};
 
@@ -650,6 +658,8 @@ struct Values {
                                           Specialization::Default,
                                           true,
                                           true};
+
+    bool preemptive_cpu_reads{false};
 
     SwitchableSetting<bool> skip_cpu_inner_invalidation{linkage,
                                                         false,

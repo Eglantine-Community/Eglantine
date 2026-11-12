@@ -6,7 +6,7 @@
 #include <functional>
 #include <string_view>
 #include <type_traits>
-#include <unordered_map>
+#include <vector>
 
 namespace Tegra {
 
@@ -32,18 +32,23 @@ public:
         pending[0] = {address, argument & 15, ((argument >> 14) & 0x3ff) + 1};
         for (std::size_t i = 0; i < count; ++i) {
             const auto request = pending[i];
-            if (states.size() >= 4096 && !states.contains(request.address)) {
-                // Finished QMDs with nothing deferred are only history, drop them instead of stalling.
-                std::erase_if(states, [](const auto& entry) {
-                    return entry.second.completed && entry.second.deferred == 0;
-                });
-                if (states.size() >= 4096) return "QMD cache limit";
+            State* state_ptr = states.Find(request.address);
+            if (!state_ptr) {
+                if (states.LiveCount() >= MaxStates) {
+                    // Finished QMDs with nothing deferred are only history, drop them instead of stalling.
+                    states.SweepFinished();
+                    if (states.LiveCount() >= MaxStates) return "QMD cache limit";
+                }
+                state_ptr = states.Insert(request.address);
             }
-            auto& state = states[request.address];
+            auto& state = *state_ptr;
+            Descriptor local_qmd{};
+            bool just_loaded = false;
             if (request.action == 3 || request.action == 2) {
                 if (request.action == 3 || !state.loaded) {
-                    if (!read(request.address, state.descriptor)) return "unmapped QMD";
-                    const auto& qmd = state.descriptor;
+                    if (!read(request.address, local_qmd)) return "unmapped QMD";
+                    just_loaded = true;
+                    const auto& qmd = local_qmd;
                     if ((qmd[18] & 0xff) != 0x30 || (qmd[4] & 0x100)) return "unsupported QMD version or queue";
                     if constexpr (std::is_same_v<Dispatch, RejectShaderDispatch>) {
                         if (qmd[12] && (qmd[13] & 0xffff) && (qmd[14] & 0xffff))
@@ -74,9 +79,9 @@ public:
             if (!state.loaded || !state.scheduled || state.completed || state.dependencies > 0) continue;
             if (state.dependencies < 0) return "QMD dependency underflow";
             // The SDK patches release payloads while a scheduled QMD is
-            // waiting for its remaining dependencies. Fetch them at execution.
-            if (!read(request.address, state.descriptor)) return "unmapped QMD";
-            const auto qmd = state.descriptor;
+            // waiting for its remaining dependencies. Fetch them at execution unless just read.
+            if (!just_loaded && !read(request.address, local_qmd)) return "unmapped QMD";
+            const auto& qmd = local_qmd;
             if ((qmd[18] & 0xff) != 0x30 || (qmd[4] & 0x100)) return "unsupported QMD version or queue";
             // Validate the release slots before making any visible.
             for (const Word base : ReleaseSlots) {
@@ -123,17 +128,94 @@ private:
     // word 52 for queue syncs (e.g. a compute queue releasing a semaphore another queue waits on).
     static constexpr std::array<Word, 3> ReleaseSlots{24, 28, 52};
 
+    static constexpr std::size_t MaxStates = 4096;
+    static constexpr std::size_t TableSize = 8192;
+    static constexpr std::size_t TableMask = TableSize - 1;
+
     struct State {
-        Descriptor descriptor{};
         std::int32_t dependencies{};
         std::int32_t deferred{};
         bool loaded{};
         bool scheduled{};
         bool completed{};
     };
+    struct StateTable {
+        struct Bucket {
+            Address address{};
+            State state{};
+            std::uint8_t occupied{}; // 0 = empty, 1 = live, 2 = tombstone
+        };
+        static std::size_t Hash(Address addr) noexcept {
+            return static_cast<std::size_t>(((addr ^ (addr >> 8)) * 0x9e3779b97f4a7c15ULL) >>
+                                            51) &
+                   TableMask;
+        }
+        std::size_t LiveCount() const noexcept {
+            return live_count;
+        }
+        State* Find(Address addr) noexcept {
+            std::size_t idx = Hash(addr);
+            for (std::size_t probes = 0; probes < TableSize; ++probes) {
+                auto& b = buckets[idx];
+                if (b.occupied == 0) {
+                    return nullptr;
+                }
+                if (b.occupied == 1 && b.address == addr) {
+                    return &b.state;
+                }
+                idx = (idx + 1) & TableMask;
+            }
+            return nullptr;
+        }
+        State* Insert(Address addr) noexcept {
+            std::size_t idx = Hash(addr);
+            for (std::size_t probes = 0; probes < TableSize; ++probes) {
+                auto& b = buckets[idx];
+                if (b.occupied != 1) {
+                    if (b.occupied == 2) {
+                        --tombstones;
+                    }
+                    b.address = addr;
+                    b.state = {};
+                    b.occupied = 1;
+                    ++live_count;
+                    return &b.state;
+                }
+                idx = (idx + 1) & TableMask;
+            }
+            return nullptr;
+        }
+        void SweepFinished() {
+            for (auto& b : buckets) {
+                if (b.occupied == 1 && b.state.completed && b.state.deferred == 0) {
+                    b.occupied = 2;
+                    --live_count;
+                    ++tombstones;
+                }
+            }
+            if (live_count + tombstones >= 6144) {
+                std::vector<std::pair<Address, State>> kept;
+                kept.reserve(live_count);
+                for (const auto& b : buckets) {
+                    if (b.occupied == 1) {
+                        kept.emplace_back(b.address, b.state);
+                    }
+                }
+                buckets.fill({});
+                live_count = 0;
+                tombstones = 0;
+                for (const auto& [addr, st] : kept) {
+                    *Insert(addr) = st;
+                }
+            }
+        }
+        std::array<Bucket, TableSize> buckets{};
+        std::size_t live_count{};
+        std::size_t tombstones{};
+    };
     // One table for every channel: a QMD's dependency counter is state of the QMD itself, and
     // title 1 schedules a QMD on one channel while another decrements it (a decrement that
     // arrived first was kept by the other channel's scheduler and the QMD never launched).
-    static inline std::unordered_map<Address, State> states;
+    static inline StateTable states;
 };
 } // namespace Tegra

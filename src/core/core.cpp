@@ -433,6 +433,9 @@ struct System::Impl {
         // Make the process created be the application
         kernel.SetApplicationProcess(process->GetHandle());
 
+        // Apply early per-title defaults before initializing the GPU and renderer.
+        GameSettings::LoadEarlyOverrides(params.program_id);
+
         // Set up the rest of the system.
         SystemResultStatus init_result{SetupForApplicationProcess(system, emu_window)};
         if (init_result != SystemResultStatus::Success) {

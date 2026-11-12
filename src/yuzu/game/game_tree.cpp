@@ -22,7 +22,14 @@ GameTree::GameTree(QWidget* parent) : QTreeView{parent} {
     setEditTriggers(QHeaderView::NoEditTriggers);
     setContextMenuPolicy(Qt::CustomContextMenu);
     setAttribute(Qt::WA_AcceptTouchEvents, true);
-    setStyleSheet(QStringLiteral("QTreeView{ border: none; }"));
+    setAlternatingRowColors(false);
+    setStyleSheet(QStringLiteral(
+        "QTreeView { background-color: #161922; border: 1px solid #242A35; border-radius: 10px; outline: none; color: #FFFFFF; selection-background-color: #242A35; selection-color: #48BDEB; }"
+        "QTreeView::item { height: 42px; border-radius: 6px; padding: 4px 8px; }"
+        "QTreeView::item:hover { background-color: #1B2029; }"
+        "QTreeView::item:selected { background-color: #242A35; color: #48BDEB; }"
+        "QHeaderView::section { background-color: #1B2029; color: #8E9297; border: none; border-bottom: 1px solid #242A35; padding: 8px 10px; font-weight: bold; font-size: 11px; }"
+    ));
 
     connect(this, &QTreeView::expanded, this, &GameTree::OnItemExpanded);
     connect(this, &QTreeView::collapsed, this, &GameTree::OnItemExpanded);

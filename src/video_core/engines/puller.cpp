@@ -26,6 +26,9 @@
 #include "video_core/nx2.h"
 #include "video_core/rasterizer_interface.h"
 
+extern "C" void Nx2DiagRecordSyncQuery(u8 src, u64 pos, u64 gpu, u64 dev, u64 size, u32 op,
+                                       u32 report, bool async_hw);
+
 namespace Tegra::Engines {
 
 namespace {
@@ -68,6 +71,174 @@ void ReleaseFences(DmaPusher& dma_pusher) {
         [rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
 }
 
+bool DelayedFences() {
+    return Settings::IsGPUFenceBehaviorDefault()
+               ? Settings::IsGPULevelHigh()
+               : Settings::IsGPUFenceBehaviorBalanced() ||
+                     Settings::IsGPUFenceBehaviorAccurate();
+}
+
+bool CanReadAcquireFast(DmaPusher& dma_pusher, GPUVAddr address, u64& last_gen, u32& settled,
+                        u32& out_word, bool wait_for_pending = false, bool* waited_rel = nullptr,
+                        bool allow_lower_bound = false, u32 acquire_min_value = 0) {
+    if (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed) ||
+        !Tegra::Nx2CheckCommandPagesFirst() || !VideoCommon::GpuSplit::Get().Active()) {
+        return false;
+    }
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (u32 syncpoint_id{};
+        auto shim_val = dma_pusher.memory_manager.TryReadNativeSyncpointShim(address, syncpoint_id)) {
+        if (const u64 pending_sp = split.PendingSyncpointPosition(syncpoint_id); pending_sp > 0) {
+            if (!wait_for_pending) {
+                return false;
+            }
+            const bool sp_waited = split.WaitForPosition(pending_sp);
+            if (waited_rel != nullptr) {
+                *waited_rel = true;
+            }
+            if (sp_waited && VideoCommon::Nx2Profile::Enabled()) {
+                static u64 sp_waits{};
+                if (++sp_waits <= 8 || sp_waits % 1000 == 0) {
+                    LOG_INFO(HW_GPU, "CanReadAcquireFast sp_wait #{}: id={} gpu={:#x} pos={}",
+                             sp_waits, syncpoint_id, address, pending_sp);
+                }
+            }
+            shim_val = dma_pusher.memory_manager.TryReadNativeSyncpointShim(address, syncpoint_id);
+        }
+        out_word = *shim_val;
+        return true;
+    }
+    const u64 gen = Tegra::g_nx2_gpu_written_generation.load(std::memory_order_relaxed);
+    if (gen == last_gen) {
+        if (settled < 64) {
+            ++settled;
+        }
+    } else {
+        last_gen = gen;
+        settled = 0;
+    }
+    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
+    if (!device || Tegra::Nx2IsGpuWritten(*device)) {
+        return false;
+    }
+    static u64 rel_waits{}, norel_waits{}, r_nopl{}, r_lbfail{}, r_gt{}, nr_wr{}, nr_sq{},
+        nr_unk{};
+    if (const auto rel = split.PendingRelease(*device)) {
+        if (!Tegra::Nx2IsGpuWritten(*device) && rel->payload &&
+            (!rel->payload_is_lower_bound ||
+             (allow_lower_bound && *rel->payload >= acquire_min_value))) {
+            out_word = *rel->payload;
+            return true;
+        }
+        if (split.HasPendingQueryRange(*device, sizeof(u32))) {
+            return false;
+        }
+        const u64 wr_pos = split.WriterRangePosition(*device, sizeof(u32));
+        const u64 sq_pos = split.PendingSyncQueryPosition(*device, sizeof(u32));
+        const u64 unk_pos = split.LastUnknownWriterPosition();
+        const u64 target = (std::max)({rel->position, wr_pos, sq_pos, unk_pos});
+        if (!wait_for_pending) {
+            return false;
+        }
+        const bool waited = split.WaitForPosition(target);
+        if (waited_rel != nullptr) {
+            *waited_rel = true;
+        }
+        if (waited && VideoCommon::Nx2Profile::Enabled()) {
+            ++rel_waits;
+            if (!rel->payload) {
+                ++r_nopl;
+            } else if (rel->payload_is_lower_bound) {
+                ++r_lbfail;
+            }
+            if (target > rel->position) {
+                ++r_gt;
+            }
+            if (rel_waits <= 16 || (rel_waits + norel_waits) % 1000 == 0) {
+                const u32 post_w = dma_pusher.memory_manager.Read<u32>(address);
+                LOG_INFO(HW_GPU,
+                         "CanReadAcquireFast rel_wait #{}: gpu={:#x} dev={:#x} "
+                         "has_pl={} pl={:#x} lb={} min={:#x} post_w={:#x} r_pos={} wr={} sq={} unk={} "
+                         "tgt={} [tot_rel={} nopl={} lbf={} gt={} | tot_nr={} wr={} sq={} unk={}]",
+                         rel_waits, address, *device, rel->payload.has_value(),
+                         rel->payload.value_or(0), rel->payload_is_lower_bound, acquire_min_value,
+                         post_w, rel->position, wr_pos, sq_pos, unk_pos, target, rel_waits, r_nopl,
+                         r_lbfail, r_gt, norel_waits, nr_wr, nr_sq, nr_unk);
+            }
+        }
+        if (Tegra::Nx2IsGpuWritten(*device)) {
+            return false;
+        }
+    } else {
+        if (split.HasPendingQueryRange(*device, sizeof(u32))) {
+            return false;
+        }
+        const u64 wr_pos = split.WriterRangePosition(*device, sizeof(u32));
+        const u64 sq_pos = split.PendingSyncQueryPosition(*device, sizeof(u32));
+        const u64 unk_pos = split.LastUnknownWriterPosition();
+        const u64 target = (std::max)({wr_pos, sq_pos, unk_pos});
+        if (target > 0) {
+            if (!wait_for_pending) {
+                return false;
+            }
+            const bool waited = split.WaitForPosition(target);
+            if (waited_rel != nullptr) {
+                *waited_rel = true;
+            }
+            if (waited && VideoCommon::Nx2Profile::Enabled()) {
+                ++norel_waits;
+                if (wr_pos >= sq_pos && wr_pos >= unk_pos) {
+                    ++nr_wr;
+                } else if (sq_pos >= unk_pos) {
+                    ++nr_sq;
+                } else {
+                    ++nr_unk;
+                }
+                if (norel_waits <= 8 || (rel_waits + norel_waits) % 1000 == 0) {
+                    const u32 post_w = dma_pusher.memory_manager.Read<u32>(address);
+                    LOG_INFO(HW_GPU,
+                             "CanReadAcquireFast norel_wait #{}: gpu={:#x} dev={:#x} allow_lb={} "
+                             "min={:#x} post_w={:#x} wr={} sq={} unk={} tgt={} "
+                             "[tot_rel={} nopl={} lbf={} gt={} | tot_nr={} wr={} sq={} unk={}]",
+                             norel_waits, address, *device, allow_lower_bound, acquire_min_value,
+                             post_w, wr_pos, sq_pos, unk_pos, target, rel_waits, r_nopl, r_lbfail,
+                             r_gt, norel_waits, nr_wr, nr_sq, nr_unk);
+                }
+            }
+            if (Tegra::Nx2IsGpuWritten(*device)) {
+                return false;
+            }
+        } else if (settled < 64) {
+            return false;
+        }
+    }
+    out_word = dma_pusher.memory_manager.Read<u32>(address);
+    if (device && *device != 0 && split.HasPendingSyncPayloads()) {
+        split.ApplyPendingSyncPayloads(*device, &out_word, sizeof(out_word),
+                                       split.ConsumedPosition());
+    }
+    return true;
+}
+
+void NotePendingAddressRelease(DmaPusher& dma_pusher, GPUVAddr address,
+                               std::optional<u32> payload = std::nullopt, u64 size_bytes = 4) {
+    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
+    auto& split = VideoCommon::GpuSplit::Get();
+    const bool sync_payload = !Settings::IsGPULevelHigh() &&
+                              !Settings::IsGPUFenceBehaviorBalanced() &&
+                              !Settings::IsGPUFenceBehaviorAccurate();
+    const u8 no_pl_reason = !sync_payload ? 9 : (!payload.has_value() ? 10 : 0);
+    split.NotePendingRelease(device.value_or(0), 6, sync_payload ? payload : std::nullopt,
+                             size_bytes, no_pl_reason);
+    if (device && *device != 0) {
+        split.NotePendingQuery(*device, !sync_payload, size_bytes);
+        if (VideoCommon::Nx2Profile::Enabled()) {
+            ::Nx2DiagRecordSyncQuery(3, split.WritePosition(), address, *device, size_bytes, 0, 0,
+                                     !sync_payload);
+        }
+    }
+}
+
 } // Anonymous namespace
 
 bool Puller::PendingAcquire::Matches(u32 current) const {
@@ -86,6 +257,83 @@ bool Puller::PendingAcquire::Matches(u32 current) const {
 bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     if (!pending_acquire) {
         return true;
+    }
+    if (u32 fast_word{};
+        CanReadAcquireFast(dma_pusher, pending_acquire->address, fast_acquire_gen,
+                           fast_acquire_settled, fast_word, false, nullptr,
+                           pending_acquire->operation ==
+                               static_cast<u32>(GpuSemaphoreOperation::AcquireGequal),
+                           pending_acquire->value)) {
+        if (pending_acquire->Matches(fast_word)) {
+            return true;
+        }
+        const bool delayed = DelayedFences();
+        const auto now = std::chrono::steady_clock::now();
+        if ((!delayed || now - pending_acquire->last_fences < std::chrono::milliseconds{1}) &&
+            (pending_acquire->reported ||
+             now - pending_acquire->since <= std::chrono::seconds{2})) {
+            return false;
+        }
+    } else if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
+               Tegra::Nx2CheckCommandPagesFirst() && VideoCommon::GpuSplit::Get().Active()) {
+        auto& split = VideoCommon::GpuSplit::Get();
+        const auto now = std::chrono::steady_clock::now();
+        u32 syncpoint_id{};
+        if (auto shim_val = dma_pusher.memory_manager.TryReadNativeSyncpointShim(
+                pending_acquire->address, syncpoint_id)) {
+            if (const u64 pending_sp = split.PendingSyncpointPosition(syncpoint_id);
+                pending_sp > split.ConsumedPosition()) {
+                if (pending_acquire->reported ||
+                    now - pending_acquire->since <= std::chrono::seconds{2}) {
+                    return false;
+                }
+                split.WaitForPosition(pending_sp);
+                shim_val = dma_pusher.memory_manager.TryReadNativeSyncpointShim(
+                    pending_acquire->address, syncpoint_id);
+            }
+            return pending_acquire->Matches(*shim_val);
+        }
+        if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(pending_acquire->address);
+            device && !Tegra::Nx2IsGpuWritten(*device) &&
+            !split.HasPendingQueryRange(*device, sizeof(u32))) {
+            const auto rel = split.PendingRelease(*device);
+            const u64 target =
+                (std::max)({rel ? rel->position : 0ULL,
+                            split.WriterRangePosition(*device, sizeof(u32)),
+                            split.PendingSyncQueryPosition(*device, sizeof(u32)),
+                            split.LastUnknownWriterPosition()});
+            u64 min_pos = split.ConsumedPosition();
+            if (target > min_pos) {
+                if (pending_acquire->reported ||
+                    now - pending_acquire->since <= std::chrono::seconds{2}) {
+                    return false;
+                }
+                split.WaitForPosition(target);
+                min_pos = split.ConsumedPosition();
+            }
+            if (!Tegra::Nx2IsGpuWritten(*device) &&
+                !split.HasPendingQueryRange(*device, sizeof(u32))) {
+                u32 current = dma_pusher.memory_manager.Read<u32>(pending_acquire->address);
+                if (*device != 0 && split.HasPendingSyncPayloads()) {
+                    split.ApplyPendingSyncPayloads(*device, &current, sizeof(current), min_pos);
+                }
+                if (pending_acquire->Matches(current)) {
+                    return true;
+                }
+                const bool delayed = DelayedFences();
+                if ((!delayed ||
+                     now - pending_acquire->last_fences < std::chrono::milliseconds{1}) &&
+                    (pending_acquire->reported ||
+                     now - pending_acquire->since <= std::chrono::seconds{2})) {
+                    return false;
+                }
+            }
+        }
+        const bool delayed = DelayedFences();
+        if (!split.BackQuiet() && now - pending_acquire->last_fences < std::chrono::milliseconds{1} &&
+            (pending_acquire->reported || now - pending_acquire->since <= std::chrono::seconds{2})) {
+            return false;
+        }
     }
     // The release may still be queued for the split GPU thread's back half (and the caches
     // ReadSemaphoreWord asks are its state).
@@ -118,6 +366,8 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
             pending_acquire->Matches(ReadSemaphoreWord(dma_pusher, pending_acquire->address))) {
             return true;
         }
+    } else if (!delayed) {
+        pending_acquire->last_fences = std::chrono::steady_clock::now();
     }
     if (!pending_acquire->reported &&
         std::chrono::steady_clock::now() - pending_acquire->since > std::chrono::seconds{2}) {
@@ -213,11 +463,12 @@ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
         // WaitFence(regs.fence_action.syncpoint_id, regs.fence_value);
         OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
         break;
-    case Puller::FenceOperation::Increment:
-        OnBack([rasterizer = dma_pusher.rasterizer, id = static_cast<u32>(regs.fence_action.syncpoint_id.Value())] {
-            rasterizer->SignalSyncPoint(id);
-        });
+    case Puller::FenceOperation::Increment: {
+        const u32 id = static_cast<u32>(regs.fence_action.syncpoint_id.Value());
+        OnBack([rasterizer = dma_pusher.rasterizer, id] { rasterizer->SignalSyncPoint(id); });
+        VideoCommon::GpuSplit::Get().NotePendingSyncpoint(id);
         break;
+    }
     default:
         UNIMPLEMENTED_MSG("Unimplemented operation {}", regs.fence_action.op.Value());
         break;
@@ -252,12 +503,65 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         if (mirror != 0) {
             LOG_DEBUG(HW_GPU, "Switch 2 semaphore {:#x}={:#x} mirrored to {:#x}", sequence_address, payload, mirror);
         }
-        OnBack([rasterizer = dma_pusher.rasterizer, sequence_address, mirror, properties, payload] {
-            rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload, properties, payload, 0);
+        const bool sync_payload = !Settings::IsGPULevelHigh() &&
+                                  !Settings::IsGPUFenceBehaviorBalanced() &&
+                                  !Settings::IsGPUFenceBehaviorAccurate();
+        auto& split = VideoCommon::GpuSplit::Get();
+        if (split.Active() && sync_payload &&
+            properties != VideoCommon::QueryPropertiesFlags::IsAFence) {
+            const u64 ts = dma_pusher.system.GPU().GetTicks();
+            const std::array<u64, 2> raw{static_cast<u64>(payload), ts};
+            const auto dev_seq = dma_pusher.memory_manager.GpuToCpuAddress(sequence_address);
+            const auto dev_mir =
+                mirror != 0 ? dma_pusher.memory_manager.GpuToCpuAddress(mirror) : std::nullopt;
+            OnBack([&mem = dma_pusher.memory_manager, sequence_address, mirror, raw, payload,
+                    dev_seq, dev_mir] {
+                if (dev_seq) {
+                    mem.WriteBlockUnsafe(sequence_address, raw.data(), sizeof(raw));
+                    Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*dev_seq, payload);
+                }
+                if (mirror != 0 && dev_mir) {
+                    mem.WriteBlockUnsafe(mirror, raw.data(), sizeof(raw));
+                    Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*dev_mir, payload);
+                }
+            });
+            auto note_sync_bytes = [&](GPUVAddr gpu_addr, std::optional<DAddr> dev_addr) {
+                split.NotePendingRelease(dev_addr.value_or(0), 6, payload, sizeof(raw), 0);
+                if (!dev_addr || *dev_addr == 0) {
+                    return;
+                }
+                if (((gpu_addr & 0xfffULL) + sizeof(raw)) <= 0x1000ULL) [[likely]] {
+                    split.NotePendingSyncPayload(*dev_addr, static_cast<u32>(sizeof(raw)),
+                                                 raw.data());
+                } else {
+                    split.NotePendingSyncPayload(*dev_addr, 8, &raw[0]);
+                    if (const auto dev_hi = dma_pusher.memory_manager.GpuToCpuAddress(gpu_addr + 8);
+                        dev_hi && *dev_hi != 0) {
+                        split.NotePendingSyncPayload(*dev_hi, 8, &raw[1]);
+                    }
+                }
+            };
+            note_sync_bytes(sequence_address, dev_seq);
             if (mirror != 0) {
-                rasterizer->Query(mirror, VideoCommon::QueryType::Payload, properties, payload, 0);
+                note_sync_bytes(mirror, dev_mir);
             }
-        });
+        } else {
+            OnBack([rasterizer = dma_pusher.rasterizer, sequence_address, mirror, properties,
+                    payload] {
+                rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload, properties,
+                                  payload, 0);
+                if (mirror != 0) {
+                    rasterizer->Query(mirror, VideoCommon::QueryType::Payload, properties, payload,
+                                      0);
+                }
+            });
+            const u64 release_size =
+                properties == VideoCommon::QueryPropertiesFlags::IsAFence ? 4ULL : 16ULL;
+            NotePendingAddressRelease(dma_pusher, sequence_address, payload, release_size);
+            if (mirror != 0) {
+                NotePendingAddressRelease(dma_pusher, mirror, payload, release_size);
+            }
+        }
     } else if (g_nx2_ampere) {
         // Switch 2 waits on semaphores the CPU (or another channel) releases, e.g. once it has
         // written the commands this channel runs next: suspend the channel until the value is
@@ -276,9 +580,61 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             return;
         }
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
-        DrainBack();
-        if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
-            return;
+        bool waited_rel = false;
+        bool fast_read_ok = false;
+        if (u32 fast_word{}; CanReadAcquireFast(
+                dma_pusher, acquire.address, fast_acquire_gen, fast_acquire_settled, fast_word,
+                true, &waited_rel, op == GpuSemaphoreOperation::AcquireGequal, acquire.value)) {
+            fast_read_ok = true;
+            if (acquire.Matches(fast_word)) {
+                if (VideoCommon::Nx2Profile::Enabled()) {
+                    static u64 fast_hit{}, rel_hit{};
+                    if (waited_rel) {
+                        if (++rel_hit % 5000 == 0) {
+                            LOG_INFO(HW_GPU, "Puller rel wait hit: count={}", rel_hit);
+                        }
+                    } else if (++fast_hit % 5000 == 0) {
+                        LOG_INFO(HW_GPU, "Puller fast hit: count={}", fast_hit);
+                    }
+                }
+                return;
+            }
+            if (VideoCommon::Nx2Profile::Enabled()) {
+                static u64 fast_mismatch{}, rel_mismatch{};
+                if (waited_rel) {
+                    if (++rel_mismatch % 1000 == 1) {
+                        LOG_INFO(HW_GPU, "Puller rel wait mismatch: count={}", rel_mismatch);
+                    }
+                } else if (++fast_mismatch % 1000 == 1) {
+                    LOG_INFO(HW_GPU, "Puller fast mismatch: count={}", fast_mismatch);
+                }
+            }
+        } else if (VideoCommon::Nx2Profile::Enabled() && Tegra::Nx2CheckCommandPagesFirst() &&
+                   VideoCommon::GpuSplit::Get().Active()) {
+            static u64 miss_settled{}, miss_unmapped{}, miss_gpu{}, miss_rel{};
+            if (const auto dev = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address);
+                !dev) {
+                ++miss_unmapped;
+            } else if (Tegra::Nx2IsGpuWritten(*dev)) {
+                ++miss_gpu;
+            } else if (fast_acquire_settled < 64) {
+                ++miss_settled;
+            } else {
+                ++miss_rel;
+            }
+            const u64 tot = miss_settled + miss_unmapped + miss_gpu + miss_rel;
+            if (tot % 5000 == 0) {
+                LOG_INFO(HW_GPU,
+                         "Puller fast miss stats: total={}, settled={}, unmapped={}, gpu_written={}, pending_release={}",
+                         tot, miss_settled, miss_unmapped, miss_gpu, miss_rel);
+            }
+        }
+        const bool delayed = DelayedFences();
+        if (!fast_read_ok) {
+            DrainBack();
+            if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
+                return;
+            }
         }
         // Registered before the fences run, so a release among them that meets the value counts
         // even if a later one overwrites it.
@@ -286,8 +642,11 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address)) {
             waiters.Add(this, *device, acquire.value, acquire.operation);
         }
-        ReleaseFences(dma_pusher);
-        if (!waiters.Latched(this) && !acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
+        if (!fast_read_ok || delayed) {
+            ReleaseFences(dma_pusher);
+        }
+        if (!waiters.Latched(this) &&
+            !acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
             pending_acquire = acquire;
             dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
             VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireWaits, 1);
@@ -333,6 +692,7 @@ void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
         rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload,
                           VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
     });
+    NotePendingAddressRelease(dma_pusher, sequence_address, payload);
 }
 
 void Puller::ProcessSemaphoreAcquire(DmaPusher& dma_pusher) {
@@ -362,18 +722,22 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
             rasterizer->Query(address, VideoCommon::QueryType::Payload,
                               VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
         });
+        NotePendingAddressRelease(dma_pusher, address, payload);
         return;
     }
+    const auto matches_execute = [operation, payload](u32 word) {
+        return operation == 0   ? word == payload
+               : operation == 2 ? word >= payload
+               : operation == 3 ? static_cast<s32>(word - payload) >= 0
+               : operation == 4 ? (word & payload) != 0
+               : operation == 5 ? (word & payload) == 0
+                                : true;
+    };
     // Acquires: check once after flushing pending fences; never block the GPU thread on them.
     DrainBack();
     ReleaseFences(dma_pusher);
     const u32 word = dma_pusher.memory_manager.Read<u32>(address);
-    const bool ready = operation == 0   ? word == payload
-                       : operation == 2 ? word >= payload
-                       : operation == 3 ? static_cast<s32>(word - payload) >= 0
-                       : operation == 4 ? (word & payload) != 0
-                       : operation == 5 ? (word & payload) == 0
-                                        : true;
+    const bool ready = matches_execute(word);
     if (!ready) {
         static std::atomic<u32> reported{};
         if (reported.fetch_add(1) < 8) {

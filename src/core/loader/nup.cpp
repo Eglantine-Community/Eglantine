@@ -234,10 +234,17 @@ ResultStatus AppLoader_NUP::ReadRomFS(FileSys::VirtualFile& out_file) {
         return ResultStatus::ErrorNoRomFS;
     }
     out_file = FileSys::CreateRomFS(merged);
-    if (out_file == nullptr) {
-        return ResultStatus::ErrorNoRomFS;
-    }
-    return ResultStatus::Success;
+    return out_file != nullptr ? ResultStatus::Success : ResultStatus::ErrorNoRomFS;
+}
+
+ResultStatus AppLoader_NUP::ReadExeFS(FileSys::VirtualDir& out_dir) {
+    const auto base_index = nup->FindBasePackage();
+    const auto base_exefs = base_index ? nup->GetExeFSDir(*base_index) : FileSys::VirtualDir{};
+    const auto update_index = nup->FindBestUpdatePackage();
+    const auto update_exefs =
+        update_index ? nup->GetExeFSDir(*update_index) : FileSys::VirtualDir{};
+    out_dir = FileSys::NupContainer::MergeShadowDirs(base_exefs, update_exefs);
+    return out_dir != nullptr ? ResultStatus::Success : ResultStatus::ErrorNoExeFS;
 }
 
 bool AppLoader_NUP::IsRomFSUpdatable() const {

@@ -310,6 +310,8 @@ public:
     u32 render_are_member_index{};
 
     Id local_memory{};
+    Id demoted_flag{};
+    bool defer_demote_to_return{};
 
     bool uses_explicit_workgroup_layout{};
     Id shared_memory_u8{};

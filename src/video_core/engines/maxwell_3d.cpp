@@ -22,12 +22,61 @@
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/textures/texture.h"
 #ifdef ARCHITECTURE_x86_64
 #include "video_core/macro_turing_jit.h"
 #endif
+
+extern std::atomic<u64> g_nx2_watch_qmd_page;
+
+extern "C" {
+struct Nx2DiagSyncQueryEntry {
+    u64 pos{};
+    u64 gpu{};
+    u64 dev{};
+    u64 size{};
+    u32 op{};
+    u32 report{};
+    u8 src{};
+    bool async_hw{};
+};
+static std::array<Nx2DiagSyncQueryEntry, 128> g_diag_sq_ring{};
+static std::atomic<u64> g_diag_sq_idx{0};
+
+void Nx2DiagRecordSyncQuery(u8 src, u64 pos, u64 gpu, u64 dev, u64 size, u32 op, u32 report,
+                            bool async_hw) {
+    const u64 idx = g_diag_sq_idx.fetch_add(1, std::memory_order_relaxed);
+    g_diag_sq_ring[idx & 127] = {pos, gpu, dev, size, op, report, src, async_hw};
+}
+
+void Nx2DiagDumpSyncQueriesBefore(u64 target, u64 read_dev, u64 read_bytes) {
+    const u64 end_idx = g_diag_sq_idx.load(std::memory_order_relaxed);
+    const u64 count = (std::min<u64>)(end_idx, 128);
+    u32 dumped = 0;
+    for (u64 k = 0; k < count && dumped < 10; ++k) {
+        const auto& e = g_diag_sq_ring[(end_idx - 1 - k) & 127];
+        if (e.pos == 0 || e.pos > target) {
+            continue;
+        }
+        if (target - e.pos > 160 && dumped > 0) {
+            break;
+        }
+        const bool same_page = read_dev != 0 && ((e.dev ^ read_dev) & ~u64{0xfff}) == 0;
+        const bool same_line = read_dev != 0 && ((e.dev ^ read_dev) & ~u64{0x3f}) == 0;
+        if (e.pos == target || same_page || same_line || (target - e.pos <= 80)) {
+            LOG_INFO(HW_GPU,
+                     "  sync_q_hist: src={} pos={} gpu={:#x} dev={:#x} sz={} op={} rpt={} async={} "
+                     "same_pg={} same_cl={} (read_dev={:#x},len={})",
+                     e.src, e.pos, e.gpu, e.dev, e.size, e.op, e.report, e.async_hw, same_page,
+                     same_line, read_dev, read_bytes);
+            ++dumped;
+        }
+    }
+}
+}
 
 namespace Tegra::Engines {
 
@@ -511,6 +560,36 @@ void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument
         }
         return;
     }
+    if (VideoCommon::Nx2Profile::Enabled()) {
+        static u64 exec_calls = 0;
+        static u64 exec_same = 0;
+        static std::array<u64, 0x1000> same_by_method{};
+        ++exec_calls;
+        if (method < regs.reg_array.size() && regs.reg_array[method] == argument) {
+            ++exec_same;
+            ++same_by_method[method];
+        }
+        if (exec_calls % 2000000 == 0) {
+            std::array<std::pair<u64, u32>, 8> top{};
+            for (u32 m = 0; m < 0x1000; ++m) {
+                const u64 c = same_by_method[m];
+                if (c <= top.back().first) {
+                    continue;
+                }
+                top.back() = {c, m};
+                for (size_t i = top.size() - 1; i > 0 && top[i].first > top[i - 1].first; --i) {
+                    std::swap(top[i], top[i - 1]);
+                }
+            }
+            std::string s;
+            for (const auto& [c, m] : top) {
+                if (c > 0) {
+                    s += fmt::format("{:#x}:{} ", m, c);
+                }
+            }
+            LOG_INFO(HW_GPU, "Maxwell3D exec_same: {}/{} top=[{}]", exec_same, exec_calls, s);
+        }
+    }
     ProcessDirtyRegisters(method, argument);
     ProcessMethodCall(method, argument, method_argument, is_last_call);
 }
@@ -583,6 +662,32 @@ void Maxwell3D::CallMultiMethod(Core::System& system, u32 method, const u32* bas
         }
         [[fallthrough]];
     default:
+        if (!execution_mask[method] && SkipSameValueWrites()) {
+            const auto control = shadow_state.shadow_ram_control;
+            if (control == Regs::ShadowRamControl::Replay) {
+                if (amount != 0) {
+                    const u32 value = shadow_state.reg_array[method];
+                    if (regs.reg_array[method] != value) {
+                        ProcessDirtyRegisters(method, value);
+                    }
+                }
+                break;
+            }
+            if (control == Regs::ShadowRamControl::Passthrough ||
+                control == Regs::ShadowRamControl::Track ||
+                control == Regs::ShadowRamControl::TrackWithFilter) {
+                if (control != Regs::ShadowRamControl::Passthrough && amount != 0) {
+                    shadow_state.reg_array[method] = base_start[amount - 1];
+                }
+                for (u32 i = 0; i < amount; i++) {
+                    const u32 argument = base_start[i];
+                    if (regs.reg_array[method] != argument) {
+                        ProcessDirtyRegisters(method, argument);
+                    }
+                }
+                break;
+            }
+        }
         for (u32 i = 0; i < amount; i++) {
             CallMethod(system, method, base_start[i], methods_pending - i <= 1);
         }
@@ -851,6 +956,8 @@ struct Maxwell3D::FrontState {
     /// then can it have a deferred instanced draw to issue at the end of a macro.
     bool draw_pending{true};
     bool skip_same{}; ///< SkipSameValueWrites() && FrontSkipSame(), read once
+    u64 dma_read_gen{};
+    u32 dma_read_quiet{};
 };
 
 namespace {
@@ -941,6 +1048,132 @@ void Maxwell3D::ReleaseFront() {
     LOG_INFO(HW_GPU, "GPU thread split stopped: 3D macros back on the engine");
 }
 
+namespace {
+
+void NoteWriterGpuRange(VideoCommon::GpuSplit& split, MemoryManager& memory_manager,
+                        GPUVAddr gpu_addr, size_t size) {
+    if (size == 0) {
+        return;
+    }
+    const GPUVAddr end = gpu_addr + size;
+    if ((gpu_addr & ~GPUVAddr{0xfff}) == ((end - 1) & ~GPUVAddr{0xfff})) [[likely]] {
+        if (const auto dev = memory_manager.GpuToCpuAddress(gpu_addr); dev && *dev != 0) {
+            if (const u64 wp = ::g_nx2_watch_qmd_page.load(std::memory_order_relaxed);
+                wp != 0 && (*dev & ~u64{0xfff}) == wp) {
+                static u32 w_3d{};
+                if (++w_3d <= 12) {
+                    LOG_INFO(HW_GPU, "Nx2WatchQmd 3D #{}: gpu={:#x} dev={:#x} size={}",
+                             w_3d, gpu_addr, *dev, size);
+                }
+            }
+            split.NoteWriterRange(*dev, size);
+        } else {
+            split.NoteWriter();
+        }
+        return;
+    }
+    if ((end - (gpu_addr & ~GPUVAddr{0xfff})) > 0x40000) {
+        split.NoteWriter();
+        return;
+    }
+    for (GPUVAddr page = gpu_addr & ~GPUVAddr{0xfff}; page < end; page += 0x1000) {
+        const GPUVAddr seg_start = (std::max)(page, gpu_addr);
+        const GPUVAddr seg_end = (std::min)(page + 0x1000, end);
+        if (const auto dev = memory_manager.GpuToCpuAddress(seg_start); dev && *dev != 0) {
+            split.NoteWriterRange(*dev, seg_end - seg_start);
+        } else {
+            split.NoteWriter();
+            return;
+        }
+    }
+}
+
+void NoteFrontWriteEffects(VideoCommon::GpuSplit& split, MemoryManager& memory_manager,
+                           std::span<const u32> regs, u32 method, u32 argument,
+                           u32 write_bytes = sizeof(u32)) {
+    constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+    const bool is_query = method == MAXWELL3D_REG_INDEX(report_semaphore.query);
+    if (method >= cb_data && method < cb_data + 16) {
+        const GPUVAddr cb_base =
+            (GPUVAddr{regs[MAXWELL3D_REG_INDEX(const_buffer.address_high)]} << 32) |
+            GPUVAddr{regs[MAXWELL3D_REG_INDEX(const_buffer.address_low)]};
+        const u32 off_after = regs[MAXWELL3D_REG_INDEX(const_buffer.offset)];
+        const u32 off_before = off_after >= write_bytes ? off_after - write_bytes : 0;
+        NoteWriterGpuRange(split, memory_manager, cb_base + off_before, off_after - off_before);
+    } else if (method == MAXWELL3D_REG_INDEX(launch_dma) ||
+               method == MAXWELL3D_REG_INDEX(inline_data)) {
+        const bool is_linear = (regs[MAXWELL3D_REG_INDEX(launch_dma)] & 1U) != 0;
+        const u32 line_count = regs[MAXWELL3D_REG_INDEX(upload.line_count)];
+        const u32 line_len = regs[MAXWELL3D_REG_INDEX(upload.line_length_in)];
+        if (is_linear && line_count == 1 && line_len > 0) {
+            const GPUVAddr dst =
+                (GPUVAddr{regs[MAXWELL3D_REG_INDEX(upload.dest.address_high)]} << 32) |
+                GPUVAddr{regs[MAXWELL3D_REG_INDEX(upload.dest.address_low)]};
+            NoteWriterGpuRange(split, memory_manager, dst, line_len);
+        } else {
+            split.NoteWriter();
+        }
+    } else if (method == MAXWELL3D_REG_INDEX(sync_info)) {
+        split.NotePendingSyncpoint(argument & 0xffffU);
+    } else if (method == MAXWELL3D_REG_INDEX(clear_report_value)) {
+        const GPUVAddr address =
+            (GPUVAddr{regs[MAXWELL3D_REG_INDEX(report_semaphore.address_high)]} << 32) |
+            GPUVAddr{regs[MAXWELL3D_REG_INDEX(report_semaphore.address_low)]};
+        if (address != 0) {
+            NoteWriterGpuRange(split, memory_manager, address, 16);
+        }
+    } else if (is_query) {
+        const u32 op = argument & 3U;
+        if (op != 0U && op != 2U) {
+            return;
+        }
+        const GPUVAddr address =
+            (GPUVAddr{regs[MAXWELL3D_REG_INDEX(report_semaphore.address_high)]} << 32) |
+            GPUVAddr{regs[MAXWELL3D_REG_INDEX(report_semaphore.address_low)]};
+        if (address == 0) {
+            return;
+        }
+        const auto dev = memory_manager.GpuToCpuAddress(address);
+        if (!dev || *dev == 0) {
+            if (VideoCommon::Nx2Profile::Enabled()) {
+                static u32 unmapped_logged{};
+                if (unmapped_logged++ < 4) {
+                    LOG_INFO(HW_GPU, "Maxwell3D report_semaphore unmapped addr={:#x}", address);
+                }
+            }
+            return;
+        }
+        const u32 report = (argument >> 23) & 0x1fU;
+        const bool short_query = (argument & (1U << 28)) != 0;
+        const u64 query_size = (op == 2U || !short_query) ? 16ULL : 4ULL;
+        const bool sync_payload = !Settings::IsGPULevelHigh() &&
+                                  !Settings::IsGPUFenceBehaviorBalanced() &&
+                                  !Settings::IsGPUFenceBehaviorAccurate();
+        const std::optional<u32> payload =
+            (op == 0U && report == 0U && sync_payload)
+                ? std::optional<u32>{regs[MAXWELL3D_REG_INDEX(report_semaphore.payload)]}
+                : std::nullopt;
+        const u8 no_pl_reason = payload.has_value() ? 0 : (!sync_payload ? 1 : (op != 0U ? 2 : 3));
+        split.NotePendingRelease(*dev, 1, payload, query_size, no_pl_reason);
+        const bool async_hw = (report != 0U) || !sync_payload;
+        if (async_hw && VideoCommon::Nx2Profile::Enabled()) {
+            static u32 async_q_logged{};
+            if (async_q_logged++ < 6) {
+                LOG_INFO(HW_GPU,
+                         "NotePendingQuery async_hw #{}: gpu={:#x} dev={:#x} size={} op={} report={}",
+                         async_q_logged, address, *dev, query_size, op, report);
+            }
+        }
+        split.NotePendingQuery(*dev, async_hw, query_size);
+        if (VideoCommon::Nx2Profile::Enabled()) {
+            Nx2DiagRecordSyncQuery(1, split.WritePosition(), address, *dev, query_size, op, report,
+                                   async_hw);
+        }
+    }
+}
+
+} // Anonymous namespace
+
 void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
                            u32 argument, bool is_last_call, bool from_macro) {
     namespace Profile = VideoCommon::Nx2Profile;
@@ -1008,11 +1241,14 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
             break;
         }
     }
-    if (from_macro) {
+    if (from_macro && execution_mask[method]) {
         split.MacroWrite(this, method, argument);
+    } else if (from_macro) {
+        split.Method(this, method, argument, true, nullptr);
     } else {
         split.Method(this, method, argument, is_last_call, nullptr);
     }
+    NoteFrontWriteEffects(split, memory_manager, fs.regs, method, value);
 }
 
 void Maxwell3D::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
@@ -1076,6 +1312,27 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         }
         fs.draw_pending = true;
     } else {
+        if (amount != 0 && !execution_mask[method] && fs.skip_same) {
+            if (fs.control == Regs::ShadowRamControl::Replay) {
+                if (fs.regs[method] == fs.shadow[method]) {
+                    return;
+                }
+            } else if (fs.control == Regs::ShadowRamControl::Passthrough || tracked()) {
+                const u32 cur = fs.regs[method];
+                bool all_same = !tracked() || cur == fs.shadow[method];
+                if (all_same) {
+                    for (u32 i = 0; i < amount; ++i) {
+                        if (base_start[i] != cur) {
+                            all_same = false;
+                            break;
+                        }
+                    }
+                }
+                if (all_same) {
+                    return;
+                }
+            }
+        }
         // CallMethod for each word, macro uploads among them (load_mme.instruction). A word may
         // change the shadow RAM mode for the next (a run of SET_SHADOW_RAM_CONTROL writes).
         for (u32 i = 0; i < amount; ++i) {
@@ -1126,6 +1383,16 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         }
     }
     split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr);
+    if (amount != 0) {
+        if (method == MAXWELL3D_REG_INDEX(report_semaphore.query)) {
+            for (u32 i = 0; i < amount; ++i) {
+                NoteFrontWriteEffects(split, memory_manager, fs.regs, method, base_start[i]);
+            }
+        } else {
+            NoteFrontWriteEffects(split, memory_manager, fs.regs, method, base_start[amount - 1],
+                                  amount * sizeof(u32));
+        }
+    }
 }
 
 void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
@@ -1180,28 +1447,263 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
 
 void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
                              u32 count) {
-    // The words may be written by methods still queued for the back (indirect draw arguments
-    // from a culling dispatch), and the caches that may hold newer ones belong to it.
-    split.Drain();
     const GPUVAddr source = (GPUVAddr{fs.regs[0x154] & 0x1ffffff} << 32) | fs.regs[0x155];
     const u32 ram = fs.regs[0x156];
     const u32 words = std::min<u32>(count, 0x1000);
+    if (words == 0) {
+        return;
+    }
     const size_t read_bytes = size_t{words} * sizeof(u32);
     if (VideoCommon::Nx2Profile::Enabled()) {
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
     }
-    if (memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
+    bool gpu_written = false;
+    bool pending_query = false;
+    u64 wildcard_target = 0;
+    u64 range_target = 0;
+    u64 sync_query_target = 0;
+    u64 writer_target = 0;
+    u8 best_q_kind = 0;
+    u8 best_wr_kind = 0;
+    GPUVAddr first_q_src = 0;
+    u64 first_q_dev = 0;
+    u64 first_q_len = 0;
+    u64 first_sq_dev = 0;
+    const auto scan_pages = [&](bool include_wildcard) {
+        gpu_written = false;
+        pending_query = false;
+        wildcard_target = include_wildcard ? split.LastWriterPosition() : 0;
+        range_target = 0;
+        sync_query_target = 0;
+        best_q_kind = 0;
+        best_wr_kind = 0;
+        first_sq_dev = 0;
+        if ((source & ~GPUVAddr{0xfff}) == ((source + read_bytes - 1) & ~GPUVAddr{0xfff}))
+            [[likely]] {
+            if (const auto device = memory_manager.GpuToCpuAddress(source); device) {
+                if (VideoCommon::Nx2Profile::Enabled()) {
+                    VideoCommon::Nx2Profile::DmaReadPages().insert(*device >> 12);
+                }
+                if (Tegra::Nx2IsGpuWritten(*device)) {
+                    gpu_written = true;
+                }
+                if (split.HasPendingQueryRange(*device, read_bytes)) {
+                    pending_query = true;
+                    best_q_kind = split.LastQueryDiagKind();
+                    first_q_src = source;
+                    first_q_dev = *device;
+                    first_q_len = read_bytes;
+                }
+                const u64 sq_pos = split.PendingSyncQueryPosition(*device, read_bytes);
+                if (sq_pos > sync_query_target) {
+                    sync_query_target = sq_pos;
+                    first_sq_dev = *device;
+                }
+                const u64 wr_pos = split.WriterRangePosition(*device, read_bytes);
+                if (wr_pos > range_target) {
+                    range_target = wr_pos;
+                    best_wr_kind = split.LastWriterDiagKind();
+                }
+            }
+            writer_target = (std::max)({wildcard_target, range_target, sync_query_target});
+            return;
+        }
+        for (GPUVAddr page = source & ~GPUVAddr{0xfff}; page < source + read_bytes;
+             page += 0x1000) {
+            if (const auto device = memory_manager.GpuToCpuAddress(page); device) {
+                if (VideoCommon::Nx2Profile::Enabled()) {
+                    VideoCommon::Nx2Profile::DmaReadPages().insert(*device >> 12);
+                }
+                if (Tegra::Nx2IsGpuWritten(*device)) {
+                    gpu_written = true;
+                }
+                const GPUVAddr seg_start = (std::max)(page, source);
+                const GPUVAddr seg_end = (std::min)(page + 0x1000, source + read_bytes);
+                const u64 seg_dev = *device + (seg_start - page);
+                if (split.HasPendingQueryRange(seg_dev, seg_end - seg_start)) {
+                    pending_query = true;
+                    best_q_kind = split.LastQueryDiagKind();
+                    first_q_src = seg_start;
+                    first_q_dev = seg_dev;
+                    first_q_len = seg_end - seg_start;
+                }
+                const u64 sq_pos = split.PendingSyncQueryPosition(seg_dev, seg_end - seg_start);
+                if (sq_pos > sync_query_target) {
+                    sync_query_target = sq_pos;
+                    first_sq_dev = seg_dev;
+                }
+                const u64 wr_pos = split.WriterRangePosition(seg_dev, seg_end - seg_start);
+                if (wr_pos > range_target) {
+                    range_target = wr_pos;
+                    best_wr_kind = split.LastWriterDiagKind();
+                }
+            }
+        }
+        writer_target = (std::max)({wildcard_target, range_target, sync_query_target});
+    };
+    const bool check_pages = Tegra::Nx2CheckCommandPagesFirst();
+    if (check_pages) {
+        const u64 gen = Tegra::g_nx2_gpu_written_generation.load(std::memory_order_relaxed);
+        if (gen == fs.dma_read_gen) {
+            if (fs.dma_read_quiet < 64) {
+                ++fs.dma_read_quiet;
+            }
+        } else {
+            fs.dma_read_gen = gen;
+            fs.dma_read_quiet = 0;
+        }
+        scan_pages(fs.dma_read_quiet < 64);
+    } else {
+        gpu_written = true;
+        wildcard_target = split.LastWriterPosition();
+        writer_target = wildcard_target;
+    }
+    bool waited_writers = false;
+    bool need_drain = !check_pages || gpu_written || pending_query;
+    const u64 waited_wildcard_target = wildcard_target;
+    const u64 waited_range_target = range_target;
+    const u64 waited_sync_query_target = sync_query_target;
+    const u8 waited_wr_kind = best_wr_kind;
+    static u64 diag_sync_q_seen = 0;
+    const bool log_sync_q_diag = VideoCommon::Nx2Profile::Enabled() && !need_drain &&
+                                 writer_target > 0 && diag_sync_q_seen < 8 &&
+                                 waited_sync_query_target > waited_wildcard_target &&
+                                 waited_sync_query_target >= waited_range_target;
+    std::array<u32, 6> pre_words{};
+    std::optional<u32> pre_rel_payload;
+    u64 pre_rel_pos = 0;
+    u32 pre_rel_off = 0;
+    const u64 pre_sq_dev = first_sq_dev;
+    if (log_sync_q_diag) {
+        const u32 sample_words = (std::min<u32>)(6, words);
+        memory_manager.ReadWordsUnsafe(source, pre_words.data(), sample_words);
+        if (pre_sq_dev != 0) {
+            for (u32 off = 0; off < sample_words * 4; off += 4) {
+                if (const auto rel = split.PendingRelease(pre_sq_dev + off)) {
+                    pre_rel_payload = rel->payload;
+                    pre_rel_pos = rel->position;
+                    pre_rel_off = off;
+                    break;
+                }
+            }
+        }
+    }
+    if (!need_drain && writer_target > 0) {
+        waited_writers = split.WaitForPosition(writer_target);
+        if (waited_writers && check_pages) {
+            scan_pages(false);
+            need_drain = gpu_written || pending_query;
+        }
+    }
+    if (need_drain) {
+        const u64 snap = split.WritePosition();
+        split.Drain();
+        split.ClearPendingQueriesUpTo(snap);
+    }
+    bool flushed = false;
+    if (gpu_written &&
+        memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
+        flushed = true;
         split.Run([memory = &memory_manager, source, read_bytes] {
             memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
         });
     }
-    for (u32 i = 0; i < words; ++i) {
-        const u32 word = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
-        if (method == 0x158) {
-            fs.parameters.push_back(word);
-        } else if (ram + i < native_data_ram.size()) {
-            native_data_ram[ram + i] = word;
+    if (VideoCommon::Nx2Profile::Enabled()) {
+        static u64 total_reads{}, gpu_written_reads{}, flushed_reads{}, query_drains{},
+            sync_query_waits{}, writer_waits{}, wildcard_waits{}, range_waits{};
+        static std::array<u64, 5> q_by{};
+        static std::array<u64, 8> wr_by{};
+        ++total_reads;
+        if (gpu_written) {
+            ++gpu_written_reads;
         }
+        if (flushed) {
+            ++flushed_reads;
+        }
+        if (pending_query) {
+            ++query_drains;
+            if (best_q_kind < q_by.size()) {
+                ++q_by[best_q_kind];
+            }
+            if (query_drains <= 8) {
+                LOG_INFO(HW_GPU, "FrontDmaRead query drain #{}: gpu={:#x} dev={:#x} len={} kind={}",
+                         query_drains, first_q_src, first_q_dev, first_q_len, best_q_kind);
+            }
+        }
+        if (waited_sync_query_target > waited_wildcard_target &&
+            waited_sync_query_target >= waited_range_target) {
+            ++sync_query_waits;
+            if (log_sync_q_diag) {
+                ++diag_sync_q_seen;
+                std::array<u32, 6> post_words{};
+                const u32 sample_words = (std::min<u32>)(6, words);
+                memory_manager.ReadWordsUnsafe(source, post_words.data(), sample_words);
+                LOG_INFO(HW_GPU,
+                         "FrontDmaRead sync_q wait #{}: gpu={:#x} dev={:#x} len={} target={} "
+                         "rel=(off={},pos={},has={},val={:#x}) pre=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}] "
+                         "post=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
+                         sync_query_waits, source, pre_sq_dev, read_bytes,
+                         waited_sync_query_target, pre_rel_off, pre_rel_pos,
+                         pre_rel_payload.has_value(), pre_rel_payload.value_or(0),
+                         pre_words[0], pre_words[1], pre_words[2], pre_words[3], pre_words[4],
+                         pre_words[5], post_words[0], post_words[1], post_words[2], post_words[3],
+                         post_words[4], post_words[5]);
+                Nx2DiagDumpSyncQueriesBefore(waited_sync_query_target, pre_sq_dev, read_bytes);
+            }
+        }
+        if (waited_writers) {
+            ++writer_waits;
+            if (waited_wildcard_target > waited_range_target &&
+                waited_wildcard_target > waited_sync_query_target) {
+                ++wildcard_waits;
+            } else if (waited_range_target > waited_sync_query_target) {
+                ++range_waits;
+                if (waited_wr_kind < wr_by.size()) {
+                    ++wr_by[waited_wr_kind];
+                }
+                if (range_waits <= 8) {
+                    LOG_INFO(HW_GPU,
+                             "FrontDmaRead writer wait #{}: gpu={:#x} len={} kind={} target={}",
+                             range_waits, source, read_bytes, waited_wr_kind, waited_range_target);
+                }
+            }
+        }
+        if (total_reads % 25000 == 0) {
+            LOG_INFO(HW_GPU,
+                     "FrontDmaRead stats: total={}, gpu_written={}, flushed={}, query_drains={} "
+                     "(ex={}, sp={}, ovf={}, lg={}), sync_q_waits={}, writer_waits={} "
+                     "(wildcard={}, range={}, r_by=[ex={}, sp={}, ovf={}, lgr={}, lgovf={}, big={}, wc={}])",
+                     total_reads, gpu_written_reads, flushed_reads, query_drains, q_by[1], q_by[2],
+                     q_by[3], q_by[4], sync_query_waits, writer_waits, wildcard_waits, range_waits,
+                     wr_by[1], wr_by[2], wr_by[3], wr_by[4], wr_by[5], wr_by[6], wr_by[7]);
+        }
+    }
+    auto apply_sync_payload_overlay = [&](u32* dst_words, u32 word_count) {
+        if (!split.HasPendingSyncPayloads() || word_count == 0) {
+            return;
+        }
+        const u64 min_pos = split.ConsumedPosition();
+        u8* const dst_bytes = reinterpret_cast<u8*>(dst_words);
+        const GPUVAddr end_gpu = source + size_t{word_count} * sizeof(u32);
+        for (GPUVAddr seg = source; seg < end_gpu;) {
+            const GPUVAddr seg_end = (std::min)(end_gpu, (seg & ~GPUVAddr{0xfff}) + 0x1000);
+            if (const auto seg_dev = memory_manager.GpuToCpuAddress(seg);
+                seg_dev && *seg_dev != 0) {
+                split.ApplyPendingSyncPayloads(*seg_dev, dst_bytes + (seg - source), seg_end - seg,
+                                               min_pos);
+            }
+            seg = seg_end;
+        }
+    };
+    if (method == 0x158) {
+        const size_t base = fs.parameters.size();
+        fs.parameters.resize(base + words);
+        memory_manager.ReadWordsUnsafe(source, fs.parameters.data() + base, words);
+        apply_sync_payload_overlay(fs.parameters.data() + base, words);
+    } else if (ram < native_data_ram.size()) {
+        const u32 copy_words = std::min<u32>(words, static_cast<u32>(native_data_ram.size() - ram));
+        memory_manager.ReadWordsUnsafe(source, native_data_ram.data() + ram, copy_words);
+        apply_sync_payload_overlay(native_data_ram.data() + ram, copy_words);
     }
 }
 

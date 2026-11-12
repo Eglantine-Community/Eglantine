@@ -223,6 +223,17 @@ void Traverse(EmitContext& ctx, IR::Program& program) {
             break;
         }
         case IR::AbstractSyntaxNode::Type::Return:
+            if (Sirit::ValidId(ctx.demoted_flag)) {
+                const Id demoted{ctx.OpLoad(ctx.U32[1], ctx.demoted_flag)};
+                const Id is_demoted{ctx.OpINotEqual(ctx.U1, demoted, ctx.u32_zero_value)};
+                const Id kill_label{ctx.OpLabel()};
+                const Id return_label{ctx.OpLabel()};
+                ctx.OpSelectionMerge(return_label, spv::SelectionControlMask::MaskNone);
+                ctx.OpBranchConditional(is_demoted, kill_label, return_label);
+                ctx.AddLabel(kill_label);
+                ctx.OpKill();
+                ctx.AddLabel(return_label);
+            }
             ctx.OpReturn();
             break;
         case IR::AbstractSyntaxNode::Type::Unreachable:
@@ -467,7 +478,8 @@ void SetupCapabilities(const Profile& profile, const Info& info, EmitContext& ct
     if (info.uses_sparse_residency) {
         ctx.AddCapability(spv::Capability::SparseResidency);
     }
-    if (info.uses_demote_to_helper_invocation && profile.support_demote_to_helper_invocation) {
+    if (info.uses_demote_to_helper_invocation && profile.support_demote_to_helper_invocation &&
+        !ctx.defer_demote_to_return) {
         if (profile.supported_spirv < 0x00010600) {
             ctx.AddExtension("SPV_EXT_demote_to_helper_invocation");
         }

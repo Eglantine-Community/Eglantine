@@ -32,11 +32,13 @@
 #include "qt_common/game_list/model.h"
 #include "qt_common/qt_common.h"
 #include "qt_common/util/game.h"
+#include "yuzu/dalia/dalia_game_details.h"
 #include "yuzu/game/carousel.h"
 #include "yuzu/game/game_grid.h"
 #include "yuzu/game/game_list.h"
 #include "yuzu/game/game_tree.h"
 #include "yuzu/game/search_field.h"
+#include "yuzu/game/switch_home.h"
 #include "yuzu/main_window.h"
 #include "yuzu/util/controller_navigation.h"
 
@@ -56,8 +58,35 @@ GameList::GameList(FileSys::VirtualFilesystem vfs_, FileSys::ManualContentProvid
 
     SetupViews();
 
+    switch_top_bar = new SwitchTopBar(this);
+    switch_title_bar = new SwitchTitleBar(this);
+    switch_action_bar = new SwitchActionBar(main_window, this, this);
+    switch_footer_bar = new SwitchFooterBar(main_window, this, this);
     search_field = new GameListSearchField(this);
-    layout->addWidget(search_field);
+
+    // Keep legacy Switch 1 overlay bars and duplicate search field permanently hidden in DALIA
+    switch_top_bar->setVisible(false);
+    switch_title_bar->setVisible(false);
+    switch_action_bar->setVisible(false);
+    switch_footer_bar->setVisible(false);
+    search_field->setVisible(false);
+
+    connect(switch_footer_bar, &SwitchFooterBar::StartRequested, this, [this] {
+        const QModelIndex cur = carousel_view->currentIndex();
+        if (cur.isValid()) {
+            ValidateEntry(cur);
+        }
+    });
+
+    connect(switch_footer_bar, &SwitchFooterBar::OptionsRequested, this, &GameList::OpenGameDetails);
+
+    connect(carousel_view->selectionModel(), &QItemSelectionModel::currentChanged, this,
+            [this](const QModelIndex& current, const QModelIndex&) {
+                if (current.isValid()) {
+                    QString title = current.data(Qt::DisplayRole).toString().split(QLatin1Char('\n')).first();
+                    switch_title_bar->SetTitle(title);
+                }
+            });
 
     controller_navigation = new ControllerNavigation(system.HIDCore(), this);
 
@@ -127,13 +156,14 @@ void GameList::ClearFilter() {
 }
 
 void GameList::SetFilterFocus() {
-    if (item_model->rowCount() > 0) {
-        search_field->setFocus();
+    if (m_currentView && item_model->rowCount() > 0) {
+        m_currentView->setFocus();
     }
 }
 
 void GameList::SetFilterVisible(bool visibility) {
-    search_field->setVisible(visibility);
+    Q_UNUSED(visibility);
+    search_field->setVisible(false);
 }
 
 bool GameList::IsEmpty() const {
@@ -222,7 +252,15 @@ void GameList::ResetViewMode() {
     // MainWindow switches the view right after starting the first populate; keep it disabled
     // until that finishes, as OnPopulate does for every other populate.
     m_currentView->setEnabled(!m_populating);
-    layout->insertWidget(0, m_currentView);
+
+    switch_top_bar->setVisible(false);
+    switch_title_bar->setVisible(false);
+    switch_action_bar->setVisible(false);
+    switch_footer_bar->setVisible(false);
+    search_field->setVisible(false);
+
+    layout->addWidget(m_currentView);
+    setStyleSheet(QStringLiteral("GameList { background-color: transparent; }"));
 
     auto view = m_currentView->viewport();
     view->installEventFilter(this);
@@ -254,6 +292,8 @@ void GameList::OnTextChanged(const QString& new_text) {
 
     if (m_isTreeMode) {
         tree_view->ApplyFilter(edit_filter_text, item_model);
+    } else if (game_list_mode == Settings::GameListMode::CarouselView) {
+        carousel_view->ApplyFilter(edit_filter_text, item_model);
     } else {
         grid_view->ApplyFilter(edit_filter_text, item_model);
     }
@@ -265,6 +305,15 @@ void GameList::OnFilterCloseClicked() {
 
 void GameList::OnPopulatingCompleted(const QStringList& watch_list) {
     emit ShowList(!item_model->IsEmpty());
+
+    if (game_list_mode == Settings::GameListMode::CarouselView && item_model->rowCount() > 0) {
+        if (!carousel_view->currentIndex().isValid()) {
+            const QModelIndex first = item_model->index(0, 0);
+            carousel_view->setCurrentIndex(first);
+            QString title = first.data(Qt::DisplayRole).toString().split(QLatin1Char('\n')).first();
+            switch_title_bar->SetTitle(title);
+        }
+    }
 
     // favorites row
     if (m_isTreeMode) {
@@ -797,23 +846,59 @@ bool GameList::eventFilter(QObject* obj, QEvent* event) {
     return QWidget::eventFilter(obj, event);
 }
 
+void GameList::keyPressEvent(QKeyEvent* event) {
+    if (event->key() == Qt::Key_Minus || event->key() == Qt::Key_Plus || event->key() == Qt::Key_X) {
+        OpenGameDetails();
+        event->accept();
+        return;
+    }
+    QWidget::keyPressEvent(event);
+}
+
+void GameList::OpenGameDetails() {
+    if (!m_currentView) return;
+    const QModelIndex cur = m_currentView->currentIndex();
+    if (!cur.isValid()) return;
+    const auto selected = cur.sibling(cur.row(), 0);
+    if (selected.data(GameListItem::TypeRole).value<GameListItemType>() != GameListItemType::Game) {
+        return;
+    }
+    const QString title = selected.data(GameListItemPath::TitleRole).toString();
+    const u64 program_id = selected.data(GameListItemPath::ProgramIdRole).toULongLong();
+    const QString file_path = selected.data(GameListItemPath::FullPathRole).toString();
+    const QPixmap icon = selected.data(Qt::DecorationRole).value<QPixmap>();
+    const QString version = cur.sibling(cur.row(), 2).data(Qt::DisplayRole).toString();
+    const QString file_size = cur.sibling(cur.row(), 4).data(Qt::DisplayRole).toString();
+    const QString play_time = selected.data(Qt::ToolTipRole).toString();
+
+    auto* dialog = new DaliaGameDetailsDialog(main_window, title, program_id, file_path, icon,
+                                             QStringLiteral("Nintendo / Verified"), version, play_time, file_size);
+    connect(dialog, &DaliaGameDetailsDialog::LaunchRequested, this, [this](const QString& path) {
+        emit GameChosen(path);
+    });
+    dialog->exec();
+}
+
 GameListPlaceholder::GameListPlaceholder(MainWindow* parent) : QWidget{parent} {
     layout = new QVBoxLayout;
     image = new QLabel;
     text = new QLabel;
     layout->setAlignment(Qt::AlignCenter);
-    image->setPixmap(QIcon::fromTheme(QStringLiteral("plus_folder")).pixmap(200));
+    image->setPixmap(QIcon::fromTheme(QStringLiteral("plus_folder")).pixmap(180));
 
     RetranslateUI();
     QFont font = text->font();
-    font.setPointSize(20);
+    font.setPointSize(16);
+    font.setBold(true);
     text->setFont(font);
+    text->setStyleSheet(QStringLiteral("color: #CCCCCC; margin-top: 14px;"));
     text->setAlignment(Qt::AlignHCenter);
     image->setAlignment(Qt::AlignHCenter);
 
     layout->addWidget(image);
     layout->addWidget(text);
     setLayout(layout);
+    setStyleSheet(QStringLiteral("GameListPlaceholder { background-color: #2D2D2D; }"));
 }
 
 GameListPlaceholder::~GameListPlaceholder() = default;
