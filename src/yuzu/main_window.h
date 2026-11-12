@@ -11,9 +11,10 @@
 
 #include <filesystem>
 #include <QElapsedTimer>
-#include <QFutureWatcher>
 #include <QMainWindow>
+#include <QPointer>
 #include <QMessageBox>
+#include <QFutureWatcher>
 #include <QPushButton>
 #include <QTimer>
 #include <QTranslator>
@@ -27,6 +28,7 @@
 #include "qt_common/config/qt_config.h"
 #include "qt_common/qt_common.h"
 #include "qt_common/util/game.h"
+#include "yuzu/compatibility_report.h"
 #include "yuzu/hotkeys.h"
 #include "yuzu/user_data_migration.h"
 
@@ -40,7 +42,7 @@
 #ifdef ENABLE_UPDATE_CHECKER
 #include <QFuture>
 #include <QFutureWatcher>
-#include "common/net/net.h"
+#include "frontend_common/update_checker.h"
 #endif
 
 class QtConfig;
@@ -56,15 +58,12 @@ class MultiplayerState;
 class QPushButton;
 class QProgressDialog;
 class NupProgressDialog;
+class ShaderWarmDialog;
+class NxTools;
 class QSlider;
 class QHBoxLayout;
 class WaitTreeWidget;
 class PerformanceOverlay;
-class DaliaGameDetailsDialog;
-class DaliaGameplayOverlay;
-class DaliaSettingsDialog;
-class DaliaDiagnosticsDialog;
-class DaliaMainContainer;
 #ifdef HAS_RESHADE
 class ConfigurePostProcessing;
 #endif
@@ -79,6 +78,7 @@ class QtSoftwareKeyboardDialog;
 class QtNXWebEngineView;
 
 namespace VideoCore {
+enum class FrameGenState : u8;
 class ShaderNotify;
 }
 namespace Core {
@@ -146,8 +146,6 @@ namespace VkDeviceInfo {
 class Record;
 }
 
-class SwitchActionBar;
-
 class VolumeButton : public QPushButton {
     Q_OBJECT
 public:
@@ -173,19 +171,6 @@ private:
 class MainWindow : public QMainWindow {
     Q_OBJECT
 
-    friend class SwitchActionBar;
-    friend class DaliaGameDetailsDialog;
-    friend class DaliaGameplayOverlay;
-    friend class DaliaSettingsDialog;
-    friend class DaliaDiagnosticsDialog;
-    friend class DaliaMainContainer;
-    friend class DaliaSidebar;
-    friend class DaliaHomePage;
-    friend class DaliaLibraryPage;
-    friend class DaliaControllersPage;
-    friend class DaliaSettingsPage;
-    friend class DaliaSystemPage;
-
     /// Max number of recently loaded items to keep track of
     static const int max_recent_files_item = 10;
 
@@ -199,7 +184,16 @@ public:
     void AcceptDropEvent(QDropEvent* event);
 
     std::filesystem::path GetShortcutPath(QtCommon::Game::ShortcutTarget target);
-    void ShowApplicationMenu(const QPoint& global_pos);
+
+    /// Frames per second frame generation added since the last status bar update.
+    [[nodiscard]] double FrameGenFps() const {
+        return frame_gen_fps;
+    }
+
+    /// What NVIDIA DLSS ran as since the last status bar update, empty when it didn't run
+    [[nodiscard]] const QString& DlssStatusText() const {
+        return dlss_status_text;
+    }
 
 signals:
 
@@ -306,6 +300,8 @@ private:
     void LoadAmiibo(const QString& filename);
 
     bool SelectAndSetCurrentUser(const Core::Frontend::ProfileSelectParameters& parameters);
+    bool ConfirmLowRamBoot(const QString& filename,
+                           const Service::AM::FrontendAppletParameters& params);
 
     /**
      * Stores the filename in the recently loaded files list.
@@ -379,6 +375,9 @@ private slots:
     void OnGameListDumpRomFS(u64 program_id, const std::string& game_path, DumpRomFSTarget target);
     void OnGameListVerifyIntegrity(const std::string& game_path);
     void OnGameListConvertToNup(const std::string& game_path);
+    void OnGameListPrepareShaderWarm(u64 program_id, const std::string& game_path);
+    void OnGameListDeleteShaderWarm(u64 program_id);
+    void PrepareShaderPrecache(u64 title_id, const std::filesystem::path& game_path);
     void OnGameListExtractNup(const std::string& game_path);
     void OnGameListEditNupMetadata(const std::string& game_path);
     void OnGameListCopyTID(u64 program_id);
@@ -417,13 +416,15 @@ private slots:
     void OnInstallFirmware();
     void OnInstallFirmwareFromZIP();
     void OnInstallDecryptionKeys();
+    void OnWhatsNew();
     void OnAbout();
     void OnEdenDependencies();
+    void OnApplyRecommendedSettings();
+    void OnRestorePreviousSettings();
     void OnDataDialog();
     void OnToggleFilterBar();
     void OnToggleStatusBar();
     void OnTogglePerfOverlay();
-    void OnToggleGameplayOverlay();
 #ifdef HAS_RESHADE
     void OnPostProcessingShaders();
 #endif
@@ -467,8 +468,11 @@ private slots:
 #ifdef ENABLE_UPDATE_CHECKER
     void OnEmulatorUpdateAvailable();
 #endif
+    void KeepNextendoSessionAlive();
 
 private:
+    void OnGameListNxTool(const std::string& game_path, void (NxTools::*tool)(const std::string&));
+    void OnGameListEditNxMetadata(const std::string& game_path);
     void RemovePlayTimeData(u64 program_id);
     bool SelectRomFSDumpTarget(const FileSys::ContentProvider&, u64 program_id,
                                u64* selected_title_id, u8* selected_content_record_type);
@@ -480,12 +484,13 @@ private:
     void UpdateAPIText();
     void UpdateFilterText();
     void UpdateAAText();
-    void UpdateFrameGenText();
     void UpdatePostShaderText();
+    void UpdateFrameGenButton();
     void UpdateVolumeUI();
     void UpdateStatusBar();
     void UpdateGPUAccuracyButton();
     void UpdateStatusButtons();
+    void UpdateMenuIcons();
     void UpdateUISettings();
     void UpdateInputDrivers();
     void HideMouseCursor();
@@ -523,25 +528,21 @@ private:
     std::shared_ptr<InputCommon::InputSubsystem> input_subsystem;
 
 #ifdef ENABLE_UPDATE_CHECKER
-    QFuture<std::optional<Common::Net::Release>> update_future;
-    QFutureWatcher<std::optional<Common::Net::Release>> update_watcher;
+    QFuture<UpdateChecker::CheckResult> update_future;
+    QFutureWatcher<UpdateChecker::CheckResult> update_watcher;
 #endif
 
     MultiplayerState* multiplayer_state = nullptr;
-    bool use_recommended_mkw_settings = false;
-    bool asked_recommended_mkw_settings = false;
-    bool use_recommended_oot_settings = false;
-    bool asked_recommended_oot_settings = false;
 
     GRenderWindow* render_window = nullptr;
     GameList* game_list = nullptr;
-    DaliaMainContainer* dalia_main_container = nullptr;
     LoadingScreen* loading_screen = nullptr;
     QTimer shutdown_timer;
     QTimer emu_terminate_timer;
+    QTimer nextendo_session_timer;
+    QFutureWatcher<bool> nextendo_session_watcher;
     OverlayDialog* shutdown_dialog{};
     PerformanceOverlay* perf_overlay = nullptr;
-    DaliaGameplayOverlay* dalia_gameplay_overlay = nullptr;
 #ifdef HAS_RESHADE
     ConfigurePostProcessing* post_processing_dialog = nullptr;
 #endif
@@ -556,6 +557,7 @@ private:
     QLabel* res_scale_label = nullptr;
     QLabel* emu_speed_label = nullptr;
     QLabel* game_fps_label = nullptr;
+    QLabel* dlss_status_label = nullptr;
     QLabel* emu_frametime_label = nullptr;
     QLabel* tas_label = nullptr;
     QLabel* firmware_label = nullptr;
@@ -565,8 +567,15 @@ private:
     QPushButton* dock_status_button = nullptr;
     QPushButton* filter_status_button = nullptr;
     QPushButton* aa_status_button = nullptr;
-    QPushButton* frame_gen_status_button = nullptr;
     QPushButton* post_shader_status_button = nullptr;
+    QPushButton* frame_gen_status_button = nullptr;
+    VideoCore::FrameGenState frame_gen_state{};
+    u64 frame_gen_frames = 0;
+    u64 dlss_evaluations = 0;
+    QString dlss_status_text;
+    bool frame_gen_generating = false;
+    double frame_gen_fps = 0.0;
+    QElapsedTimer frame_gen_fps_timer;
     VolumeButton* volume_button = nullptr;
     QWidget* volume_popup = nullptr;
     QSlider* volume_slider = nullptr;
@@ -580,6 +589,7 @@ private:
 
     // Whether emulation is currently running in yuzu.
     bool emulation_running = false;
+    std::optional<CompatibilityReporting::Session> report_session;
     bool boot_in_progress = false;
     bool close_pending = false;
     // The path to the game currently running
@@ -617,6 +627,9 @@ private:
     QFutureWatcher<FileSys::Nup::PackResult> nup_watcher;
     std::shared_ptr<std::atomic_bool> nup_cancel;
     bool nup_running{};
+    QPointer<ShaderWarmDialog> shader_warm_dialog;
+    NxTools* nx_tools = nullptr;
+    bool nx_metadata_write_in_progress = false;
     std::string nup_source_path;
 
     // Last game booted, used for multi-process apps

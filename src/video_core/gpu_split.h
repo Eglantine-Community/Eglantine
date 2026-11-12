@@ -6,15 +6,14 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <bit>
-#include <condition_variable>
 #include <cstring>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <optional>
+#include <span>
 #include <thread>
 #include <type_traits>
+#include <unordered_map>
 
 #include "common/common_types.h"
 
@@ -22,11 +21,95 @@ namespace Core {
 class System;
 }
 
+namespace Tegra {
+class MemoryManager;
+}
+
 namespace Tegra::Engines {
 class EngineInterface;
 }
 
 namespace VideoCommon {
+
+/// Why the split's front waited for its back (EDEN_NX2_GPU_PROFILE counts each).
+enum class DrainSite : u32 {
+    Other,
+    FetchDrain,     ///< EDEN_NX2_FETCH_DRAIN: before every entry
+    Acquire,        ///< A semaphore acquire reads the value the back may release
+    SemaphoreFlush, ///< The acquired semaphore is in the buffer cache
+    FenceRelease,   ///< The puller's acquires release the pending fences
+    ListWriters,    ///< GPU-written command lists: the dispatches and copies sent before them
+    ListSync,       ///< Command lists on draw-written pages: the work before the last host sync
+    ListFlush,      ///< Command lists on GPU-written pages: drain and flush the pages
+    MacroDmaRead,   ///< The front's macros read memory (MME DMA) the caches may still write
+    MacroDmaWrites, ///< Those reads: the queued work that can write the words (WaitForWrites)
+    MacroDmaFlush,  ///< Those words are in the buffer cache
+    GpSyncFence,    ///< A GP entry's sync bit (sync_memory_operations)
+    Map,            ///< GPU memory maps before later command reads
+    FrontStart,     ///< The front takes an engine's macros over
+    FrontVerify,    ///< EDEN_NX2_FRONT_VERIFY
+    RingFull,       ///< The ring is full: the front waits for the back to make room
+    BackRegister,   ///< A register a macro the back ran may have written (Maxwell3D)
+    BackCode,       ///< The macro code changes under the macros the back has yet to run
+    Count,
+};
+
+/// How semaphore acquires and the polls of suspended ones were decided, counted with
+/// EDEN_NX2_GPU_PROFILE, EDEN_NX2_ACQUIRE_VERIFY, EDEN_NX2_ACQUIRE_STATS or
+/// EDEN_NX2_GUEST_THREAD_STATS and logged every 10 s (GpuSplit::ReportAcquire).
+struct AcquireStats {
+    std::atomic<u64> passed{};    ///< Acquires and polls met without a drain
+    std::atomic<u64> by_queued{}; ///< Of passed: met by a release the back had not run yet
+    std::atomic<u64> latched{};   ///< Polls resumed by a release the back ran (no drain)
+    std::atomic<u64> drained{};   ///< Acquires and polls that drained the split
+    std::atomic<u64> drain_operation{}; ///< Of drained: an equal or mask acquire
+    std::atomic<u64> drain_settings{};  ///< ...the split or the accuracy settings ask for it
+    std::atomic<u64> drain_word{};      ///< ...the word is unmapped or on a GPU-written page
+    std::atomic<u64> drain_queued{};    ///< ...a queued release to it is unknown or doesn't meet it
+    std::atomic<u64> queued_unknown{};  ///< Of drain_queued: its value is unknown (a reduction)
+    std::atomic<u64> queued_unknown_met{}; ///< ...and the word in memory already meets the acquire
+    std::atomic<u64> trigger_not_met{};    ///< Acquire methods not met without a drain (NotMet)
+    std::atomic<u64> trigger_not_met_twice{}; ///< ...still not met after it: fences drain again
+    std::atomic<u64> valve_drains{}; ///< Of drained: polls of an unmet acquire, once per 1 ms
+    std::atomic<u64> polls{};     ///< Polls that keep waiting without a drain
+    std::atomic<u64> acquire_polls{}; ///< Polls of suspended channels waiting on an acquire
+    std::atomic<u64> list_polls{};    ///< ...and on a command list copy the GPU writes
+    std::atomic<u64> front_polls{};   ///< GPU thread waits for them in hardware (gpu_thread.cpp)
+    std::atomic<u64> front_sleeps{};  ///< ...and in the OS
+    std::atomic<u64> front_woken{};   ///< Of those: ended by a wake (Nx2PendingWake)
+    std::atomic<u64> front_stored{};  ///< ...by a store to a word a channel waits on (WordStored)
+    std::atomic<u64> front_found_polling{}; ///< Channels found moving by a timed-out hardware wait
+    std::atomic<u64> front_found_late{};    ///< ...and by a timed-out OS wait, after the poll
+    std::atomic<u64> early_publishes{}; ///< Publishes to a back that waits for work (Commit)
+    std::atomic<u64> settles{};   ///< Idle hooks asked of a back that ran everything (SettleIdleBack)
+    std::atomic<u64> back_waits{};      ///< The back ran out of work
+    std::atomic<u64> back_sleeps{};     ///< Of those: it went to sleep
+    std::atomic<u64> back_spin_ns{};    ///< How long it spun for more work before that
+    std::atomic<u64> mismatches{}; ///< VERIFY: passed, yet the word after a drain doesn't meet it
+    std::atomic<u64> unlanded{};   ///< VERIFY: met by a queued release not in memory after a drain
+    std::atomic<u64> late{};       ///< VERIFY: a poll kept waiting, yet a drain meets it
+    /// The front's waits for its back (Drain, WaitFor, a full ring) and their time, by site
+    std::array<std::atomic<u64>, static_cast<size_t>(DrainSite::Count)> site_drains{};
+    std::array<std::atomic<u64>, static_cast<size_t>(DrainSite::Count)> site_drain_ns{};
+};
+inline AcquireStats g_acquire_stats;
+/// Whether g_acquire_stats counts, as of the split's last start.
+inline bool g_acquire_counting{};
+/// EDEN_NX2_ACQUIRE_VERIFY=1: acquires decided without a drain drain anyway and compare.
+inline bool g_acquire_verify{};
+
+inline void Count(std::atomic<u64>& counter, u64 amount = 1) {
+    if (g_acquire_counting) {
+        counter.fetch_add(amount, std::memory_order_relaxed);
+    }
+}
+
+inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> drain_site_names{
+    "other",           "fetch drain",   "acquire",    "semaphore flush", "fence release",
+    "list writers",    "list sync",     "list flush", "macro dma read",  "macro dma writes",
+    "macro dma flush", "gp sync fence", "map",        "front start",     "front verify",
+    "ring full",       "back register", "back code",
+};
 
 // Splits the GPU thread in two (NX2_GPU_THREAD_SPLIT.md). The GPU thread (the front) takes the
 // CPU's commands, parses command lists and runs the puller; engine method calls and everything
@@ -47,6 +130,10 @@ public:
     [[nodiscard]] bool Active() const {
         return active;
     }
+    /// How often the split started: state the front copied during an earlier start is stale.
+    [[nodiscard]] u32 Starts() const {
+        return starts;
+    }
     /// Whether the front runs the engines' macros (EDEN_NX2_SPLIT=2).
     [[nodiscard]] bool FrontMacros() const {
         return front_macros;
@@ -59,6 +146,10 @@ public:
     /// Marks the calling thread as the GPU thread (the front, or the only one without the split).
     static void MarkGpuThread() {
         on_gpu_thread = true;
+    }
+    /// Whether the calling thread is the GPU thread (see MarkGpuThread).
+    [[nodiscard]] static bool OnGpuThread() {
+        return on_gpu_thread;
     }
     /// Whether the calling thread owns the Vulkan scheduler: the back while it runs, else the
     /// GPU thread. Other threads (CPU cores, services) must not record or submit work.
@@ -74,12 +165,6 @@ public:
     [[nodiscard]] bool BackRunning() const {
         return back_running.load(std::memory_order_acquire);
     }
-    /// Whether the back is done with the Vulkan scheduler until it gets more work: set after its
-    /// idle hook ran, cleared before it executes entries.
-    [[nodiscard]] bool BackQuiet() const {
-        return back_quiet.load(std::memory_order_acquire) ||
-               !back_running.load(std::memory_order_acquire);
-    }
     /// Any thread: has the back call the idle hook soon, between entries or at once if it sleeps.
     void RequestIdleHook() {
         hook_requested.store(true, std::memory_order_seq_cst);
@@ -92,10 +177,17 @@ public:
     void MaybeStart(Core::System& system);
     void Stop();
 
+    /// What the sender of an entry tells about the guest memory the back writes running it, for
+    /// the front's reads of guest memory (WaitForWrites).
+    enum class Writes : u8 {
+        Anywhere, ///< Unknown: a read anywhere waits for the entry
+        Noted,    ///< Nothing, or what the sender notes right after sending it (NoteWrite)
+    };
+
     /// An engine method write, executed as DmaPusher would (method sink, ConsumeSink, call).
     /// `segment`: the engine's current_dma_segment for the call, when the engine reads it.
     void Method(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument, bool is_last,
-                const GPUVAddr* segment) {
+                const GPUVAddr* segment, Writes writes = Writes::Anywhere) {
         SelectEngine(engine);
         const size_t words = segment != nullptr ? 2 : 1;
         u64* const entry = Reserve(words);
@@ -106,42 +198,77 @@ public:
             entry[1] = *segment;
         }
         Commit(words);
+        if (writes == Writes::Anywhere) {
+            NoteAnyWrite();
+        }
     }
     void MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
-                     u32 amount, u32 methods_pending, const GPUVAddr* segment);
+                     u32 amount, u32 methods_pending, const GPUVAddr* segment,
+                     Writes writes = Writes::Anywhere);
     /// A write made by a macro: CallMethod without the method sink, as the engines' macros do.
-    void MacroWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument) {
+    void MacroWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument,
+                    Writes writes = Writes::Anywhere) {
         SelectEngine(engine);
         u64* const entry = Reserve(1);
         entry[0] = static_cast<u64>(Kind::Method) | IsLast | Direct | (u64{method & 0xffff} << 8) |
                    (u64{argument} << 32);
         Commit(1);
+        if (writes == Writes::Anywhere) {
+            NoteAnyWrite();
+        }
     }
 
+    /// Defer flag: the call doesn't end fast draw reuse (nx2_fast_draw.h).
+    static constexpr u64 FastDrawNeutral = 1 << 7;
+
     /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
+    /// `flags`: FastDrawNeutral when `func` can't change what a draw resolves to.
     template <typename Func>
-    void Defer(const Func& func) {
+    void Defer(const Func& func, u64 flags = 0, Writes writes = Writes::Anywhere) {
         static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
         constexpr size_t payload = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
         u64* const entry = Reserve(2 + payload);
-        entry[0] = static_cast<u64>(Kind::Call) | (u64{payload} << 8);
+        entry[0] = static_cast<u64>(Kind::Call) | flags | (u64{payload} << 8);
         entry[1] = reinterpret_cast<u64>(&CallThunk<Func>);
         std::memcpy(entry + 2, &func, sizeof(Func));
         Commit(2 + payload);
+        if (writes == Writes::Anywhere) {
+            NoteAnyWrite();
+        }
+    }
+    /// Defer, calling `func` with a copy of `words` (a std::span<const u32>).
+    template <typename Func>
+    void DeferWords(const Func& func, std::span<const u32> words,
+                    Writes writes = Writes::Anywhere) {
+        static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
+        constexpr size_t function_words = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
+        const size_t payload = function_words + 1 + (words.size() + 1) / 2;
+        u64* const entry = Reserve(2 + payload);
+        entry[0] = static_cast<u64>(Kind::Call) | (u64{payload} << 8);
+        entry[1] = reinterpret_cast<u64>(&CallWordsThunk<Func>);
+        std::memcpy(entry + 2, &func, sizeof(Func));
+        entry[2 + function_words] = words.size();
+        if (!words.empty()) {
+            entry[1 + payload] = 0; // Padding after an odd count
+            std::memcpy(entry + 3 + function_words, words.data(), words.size_bytes());
+        }
+        Commit(2 + payload);
+        if (writes == Writes::Anywhere) {
+            NoteAnyWrite();
+        }
     }
     void DeferFunction(std::function<void()>&& func);
-
     /// Runs `func` on the back and waits for it: for work on back-owned state, such as a buffer
     /// cache download that records into the Vulkan scheduler. A drained back still submits from
     /// its idle hook, so the front never touches that state itself.
     template <typename Func>
-    void Run(const Func& func) {
+    void Run(const Func& func, DrainSite site = DrainSite::Other) {
         if (on_back_thread || !active) {
             func();
             return;
         }
         Defer(func);
-        Drain();
+        Drain(site);
     }
 
     /// EDEN_NX2_SPLIT_CHECK=1 (debug): reports, with its stack, a thread other than the back
@@ -151,587 +278,79 @@ public:
 
     /// Makes what was sent visible to the back.
     void Publish();
+    /// The front has nothing to send while it polls suspended channels. A back that ran everything
+    /// runs its idle hook (the deferred submit) and sleeps now instead of spinning for more, as it
+    /// did when every poll drained (Drain asks for the hook), but without the wait.
+    void SettleIdleBack() {
+        if (hook_requested.load(std::memory_order_relaxed) || BackQuiet() ||
+            consumed.load(std::memory_order_acquire) != write_position) {
+            return;
+        }
+        Count(g_acquire_stats.settles);
+        RequestIdleHook();
+    }
+    /// Logs g_acquire_stats every 10 s (front, while they count).
+    void ReportAcquire();
     /// Waits until the back executed everything sent so far.
-    void Drain();
-
-    static constexpr size_t ReleaseSets = 8192;
-    static constexpr size_t ReleaseWays = 8;
-    static constexpr size_t ReleaseMask = ReleaseSets - 1;
-    static size_t ReleaseBucket(u64 aligned4_address) {
-        return static_cast<size_t>(((aligned4_address >> 2) * 0x9e3779b97f4a7c15ULL) >> 51) &
-               ReleaseMask;
+    void Drain(DrainSite site = DrainSite::Other);
+    /// The ring position after the entries sent so far, for WaitUntil.
+    [[nodiscard]] u64 Position() const {
+        return write_position;
+    }
+    /// Waits until the back executed the entries sent before `position`. Returns whether any of
+    /// them was still queued.
+    bool WaitUntil(u64 position, DrainSite site) {
+        return WaitFor((std::min)(position, write_position), site);
     }
 
-    u64& RefreshConsumedCache() {
-        consumed_cache = consumed.load(std::memory_order_acquire);
-        return consumed_cache;
-    }
-
-    /// Computes/copies can write GPU-written command lists.
+    /// Compute or copy work was just sent: what can write GPU-written command lists.
     void NoteWriter() {
         last_writer_position = write_position;
-        last_unknown_writer_position = write_position;
     }
-    void NoteComputeWriter() {
-        last_writer_position = write_position;
-        last_compute_writer_position = write_position;
-        last_all_compute_writer_position = write_position;
-    }
-    void NoteAllComputeWriter() {
-        last_all_compute_writer_position = write_position;
-    }
-    template <typename Translator>
-    void NoteWriterGpuRange(u64 gpu_addr, u64 size_bytes, Translator&& gpu_to_cpu) {
-        if (!active || gpu_addr == 0 || size_bytes == 0) {
-            return;
-        }
-        const u64 end = gpu_addr + size_bytes;
-        if (end < gpu_addr) {
-            NoteWriter();
-            return;
-        }
-        if ((gpu_addr & ~u64{0xfff}) == ((end - 1) & ~u64{0xfff})) [[likely]] {
-            if (const auto dev = gpu_to_cpu(gpu_addr); dev && *dev != 0) {
-                NoteWriterRange(*dev, size_bytes);
-            } else {
-                NoteWriter();
-            }
-            return;
-        }
-        if ((end - (gpu_addr & ~u64{0xfff})) > 0x400000) {
-            NoteWriter();
-            return;
-        }
-        u64 run_dev = 0;
-        u64 run_len = 0;
-        u32 run_count = 0;
-        for (u64 page = gpu_addr & ~u64{0xfff}; page < end; page += 0x1000) {
-            const u64 seg_start = (std::max)(page, gpu_addr);
-            const u64 seg_end = (std::min)(page + 0x1000, end);
-            const u64 seg_len = seg_end - seg_start;
-            const auto dev = gpu_to_cpu(seg_start);
-            if (!dev || *dev == 0) {
-                if (run_len > 0) {
-                    NoteWriterRange(run_dev, run_len);
-                }
-                NoteWriter();
-                return;
-            }
-            if (run_len == 0) {
-                run_dev = *dev;
-                run_len = seg_len;
-            } else if (*dev == run_dev + run_len) {
-                run_len += seg_len;
-            } else {
-                NoteWriterRange(run_dev, run_len);
-                if (++run_count >= 16) {
-                    NoteWriter();
-                    return;
-                }
-                run_dev = *dev;
-                run_len = seg_len;
-            }
-        }
-        if (run_len > 0) {
-            NoteWriterRange(run_dev, run_len);
-        }
-    }
-    void NoteWriterRange(u64 device_start, u64 size_bytes) {
-        if (!active || device_start == 0 || size_bytes == 0) {
-            return;
-        }
-        const u64 pos = write_position;
-        if (pos > last_any_writer_position) {
-            last_any_writer_position = pos;
-        }
-        if (size_bytes > 4096) {
-            const u64 end = device_start + size_bytes;
-            size_t victim = 0;
-            size_t stale = LargeWriteCount;
-            for (size_t i = 0; i < LargeWriteCount; ++i) {
-                auto& r = writer_large_ranges[i];
-                if (r.start == device_start && r.end == end) {
-                    if (pos > r.pos) {
-                        r.pos = pos;
-                    }
-                    return;
-                }
-                if (r.pos <= consumed_cache && stale == LargeWriteCount) {
-                    stale = i;
-                }
-                if (r.pos < writer_large_ranges[victim].pos) {
-                    victim = i;
-                }
-            }
-            if (stale != LargeWriteCount) {
-                writer_large_ranges[stale] = {device_start, end, pos};
-                return;
-            }
-            RefreshConsumedCache();
-            if (writer_large_ranges[victim].pos > consumed_cache &&
-                writer_large_ranges[victim].pos > writer_large_overflow_pos) {
-                writer_large_overflow_pos = writer_large_ranges[victim].pos;
-            }
-            writer_large_ranges[victim] = {device_start, end, pos};
-            return;
-        }
-        auto refresh = [this] { RefreshConsumedCache(); };
-        const u64 end = device_start + size_bytes;
-        const u64 page_lo = device_start >> 12;
-        const u64 page_hi = (end - 1) >> 12;
-        for (u64 page = page_lo; page <= page_hi; ++page) {
-            writer_pages.Record(page << 12, pos, consumed_cache, refresh);
-        }
-        const u64 line_lo = device_start & ~u64{0x3f};
-        const u64 line_hi = (end - 1) & ~u64{0x3f};
-        for (u64 line = line_lo;; line += 64) {
-            writer_lines.Record(line, pos, consumed_cache, refresh,
-                                ComputeLineWordMask(line, device_start, end));
-            if (line == line_hi) {
-                break;
-            }
-        }
-    }
-    [[nodiscard]] u64 LastWriterPosition() const {
-        return last_writer_position;
-    }
-    [[nodiscard]] u64 ActiveLastWriterPosition() const {
-        const u64 cur_consumed = consumed.load(std::memory_order_acquire);
-        return last_writer_position > cur_consumed
-                   ? (std::min)(last_writer_position, write_position)
-                   : 0;
-    }
-    [[nodiscard]] u64 ActiveLastComputeWriterPosition() const {
-        const u64 cur_consumed = consumed.load(std::memory_order_acquire);
-        return last_compute_writer_position > cur_consumed
-                   ? (std::min)(last_compute_writer_position, write_position)
-                   : 0;
-    }
-    [[nodiscard]] u64 ActiveLastAllComputeWriterPosition() const {
-        const u64 cur_consumed = consumed.load(std::memory_order_acquire);
-        return last_all_compute_writer_position > cur_consumed
-                   ? (std::min)(last_all_compute_writer_position, write_position)
-                   : 0;
-    }
-    [[nodiscard]] u64 LastUnknownWriterPosition() const {
-        const u64 cur_consumed = consumed.load(std::memory_order_acquire);
-        return last_unknown_writer_position > cur_consumed
-                   ? (std::min)(last_unknown_writer_position, write_position)
-                   : 0;
-    }
-    void NotePendingSyncpoint(u32 syncpoint_id) {
-        if (!active) {
-            return;
-        }
-        if (syncpoint_id < TrackedSyncpoints) {
-            syncpoint_positions[syncpoint_id] = write_position;
-        } else {
-            last_wildcard_syncpoint_position = write_position;
-        }
-    }
-    [[nodiscard]] u64 PendingSyncpointPosition(u32 syncpoint_id) const {
-        if (!active) {
-            return 0;
-        }
-        const u64 cur_consumed = consumed.load(std::memory_order_acquire);
-        const u64 pos =
-            syncpoint_id < TrackedSyncpoints
-                ? (std::max)(syncpoint_positions[syncpoint_id], last_wildcard_syncpoint_position)
-                : write_position;
-        return pos > cur_consumed ? (std::min)(pos, write_position) : 0;
-    }
-    [[nodiscard]] u64 WriterRangePosition(u64 device_start, u64 size_bytes) const {
-        const u64 cur_consumed = consumed.load(std::memory_order_acquire);
-        last_wr_diag_kind = 0;
-        u64 pos = 0;
-        if (writer_large_overflow_pos > cur_consumed) {
-            pos = writer_large_overflow_pos;
-            last_wr_diag_kind = 5;
-        }
-        if (device_start == 0 || size_bytes == 0) {
-            if (last_any_writer_position > cur_consumed && last_any_writer_position > pos) {
-                pos = last_any_writer_position;
-                last_wr_diag_kind = 7;
-            }
-            return pos;
-        }
-        const u64 query_end = device_start + size_bytes;
-        for (const auto& r : writer_large_ranges) {
-            if (r.pos > cur_consumed && r.pos > pos && device_start < r.end && r.start < query_end) {
-                pos = r.pos;
-                last_wr_diag_kind = 4;
-            }
-        }
-        u8 tbl_kind = 0;
-        const u64 range_pos = QueryRangePos(writer_pages, writer_lines, device_start, size_bytes,
-                                            cur_consumed, last_any_writer_position, &tbl_kind);
-        if (range_pos > pos) {
-            pos = range_pos;
-            last_wr_diag_kind = tbl_kind == 4 ? u8{6} : tbl_kind;
-        }
-        return pos;
-    }
-    [[nodiscard]] u8 LastQueryDiagKind() const {
-        return last_q_diag_kind;
-    }
-    [[nodiscard]] u8 LastWriterDiagKind() const {
-        return last_wr_diag_kind;
-    }
-    /// Waits until the back executed everything up to `target` (without flushing idle hooks).
-    bool WaitForPosition(u64 target);
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
     /// Returns whether any of it was still queued.
     bool WaitForWriters();
-
-    enum class ReleaseOp : u8 {
-        Write = 0,
-        Max = 1,
-        Add = 2,
+    /// A host-level wait was just sent (a syncpoint acquire, a host WFI, a GP entry with its sync
+    /// bit; semaphore acquires drain, or note it when a release still queued meets them): the
+    /// guest's GPU work before it is complete before the commands after it are fetched.
+    void NoteSync() {
+        last_sync_position = write_position;
+        synced_writer_position = last_writer_position;
+    }
+    /// Waits until the back executed the work sent before the last NoteSync. Returns whether any
+    /// of it was still queued.
+    bool WaitForSync();
+    /// A semaphore release was just sent: once the back ran it, the word at `device_address` holds
+    /// `payload`, or a value the front can't tell (`known` false: a reduction, a counter report).
+    void NoteSemaphoreWrite(u64 device_address, u32 payload, bool known);
+    struct QueuedSemaphoreWrite {
+        u32 payload;
+        bool known;
     };
-    enum class ReleaseValueKind : u8 {
-        Unknown = 0,
-        Exact = 1,
-        MinBound = 2,
-    };
+    /// The last write sent to the semaphore word at `device_address`, if the back may not have run
+    /// it yet.
+    [[nodiscard]] std::optional<QueuedSemaphoreWrite> QueuedSemaphoreWriteAt(
+        u64 device_address) const;
+    /// Waits until the back executed the compute and copy work sent before the last NoteSync:
+    /// the writers a command list fetched now is ordered after. Returns whether any of it was
+    /// still queued.
+    bool WaitForSyncedWriters();
 
-    struct ReleaseInfo {
-        u64 position{};
-        std::optional<u32> payload;
-        bool payload_is_lower_bound{};
-    };
-
-    /// Records a queued fence/query write targeting `device_address` (0 = unknown address).
-    /// When `payload` is provided (or chained from prior releases / idle RAM on `Max`/`Add`), the
-    /// release knows either the exact 32-bit value or a guaranteed minimum before `consumed` passes.
-    void NotePendingRelease(u64 device_address = 0, u8 source = 0,
-                            std::optional<u32> payload = std::nullopt, u64 size_bytes = 4,
-                            u8 no_pl_reason = 0, ReleaseOp op = ReleaseOp::Write,
-                            std::optional<u32> add_idle_base = std::nullopt) {
-        if (!active) {
-            return;
-        }
-        if (device_address == 0) {
-            last_wildcard_release_position = write_position;
-            RecordPendingReleaseEvent(true, source);
-            return;
-        }
-        const u64 words = size_bytes > 4 ? (std::min<u64>)((size_bytes + 3) / 4, 4ULL) : 1ULL;
-        const u64 base4 = device_address & ~u64{3};
-        struct ReleaseEval {
-            bool has_pl{};
-            u32 payload{};
-            ReleaseValueKind kind{};
-            u8 reason{};
-        };
-        const auto compute_state = [&](const ReleaseEntry* existing, u64 addr4,
-                                       std::optional<u32> word_payload, ReleaseOp word_op,
-                                       u8 word_reason) -> ReleaseEval {
-            if (word_op == ReleaseOp::Write) {
-                if (word_payload.has_value()) {
-                    return {true, *word_payload, ReleaseValueKind::Exact, u8{0}};
-                }
-                return {false, 0U, ReleaseValueKind::Unknown, word_reason};
-            }
-            if (!word_payload.has_value()) {
-                return {false, 0U, ReleaseValueKind::Unknown, word_reason};
-            }
-            const auto is_idle_for_base = [&]() -> bool {
-                if (!add_idle_base.has_value()) {
-                    return false;
-                }
-                if (existing != nullptr && existing->position > consumed_cache) {
-                    consumed_cache = consumed.load(std::memory_order_acquire);
-                    if (existing->position > consumed_cache) {
-                        return false;
-                    }
-                } else {
-                    consumed_cache = consumed.load(std::memory_order_acquire);
-                }
-                return last_wildcard_release_position <= consumed_cache &&
-                       last_unknown_writer_position <= consumed_cache &&
-                       WriterRangePosition(addr4, sizeof(u32)) <= consumed_cache &&
-                       PendingSyncQueryPosition(addr4, sizeof(u32)) <= consumed_cache &&
-                       !HasPendingQueryRange(addr4, sizeof(u32));
-            };
-            const bool has_active_existing = existing != nullptr && existing->position > consumed_cache;
-            const bool can_chain =
-                has_active_existing && existing->value_kind != ReleaseValueKind::Unknown &&
-                last_unknown_writer_position <= existing->position &&
-                WriterRangePosition(addr4, sizeof(u32)) <= existing->position;
-            if (word_op == ReleaseOp::Max) {
-                if (can_chain && existing->value_kind == ReleaseValueKind::Exact) {
-                    const u32 combined = (std::max)(existing->payload, *word_payload);
-                    return {true, combined, ReleaseValueKind::Exact, u8{0}};
-                }
-                if (is_idle_for_base()) {
-                    const u32 combined = (std::max)(*add_idle_base, *word_payload);
-                    return {true, combined, ReleaseValueKind::Exact, u8{0}};
-                }
-                if (can_chain) {
-                    const u32 combined = (std::max)(existing->payload, *word_payload);
-                    return {true, combined, existing->value_kind, u8{0}};
-                }
-                // `max(mem[addr], payload)` guarantees `mem[addr] >= payload` regardless of prior RAM.
-                return {true, *word_payload, ReleaseValueKind::MinBound, u8{0}};
-            }
-            // ReleaseOp::Add: chain exact queued state or derive exact base from idle RAM.
-            if (can_chain && existing->value_kind == ReleaseValueKind::Exact) {
-                return {true, existing->payload + *word_payload, ReleaseValueKind::Exact, u8{0}};
-            }
-            if (is_idle_for_base()) {
-                return {true, *add_idle_base + *word_payload, ReleaseValueKind::Exact, u8{0}};
-            }
-            return {false, 0U, ReleaseValueKind::Unknown, word_reason};
-        };
-        for (u64 i = 0; i < words; ++i) {
-            const u64 addr4 = base4 + i * 4;
-            const std::optional<u32> word_payload = (i == 0) ? payload : std::nullopt;
-            const ReleaseOp word_op = (i == 0) ? op : ReleaseOp::Write;
-            const u8 word_reason =
-                word_payload.has_value() ? u8{0} : (i > 0 ? u8{11} : no_pl_reason);
-            auto& set = release_positions[ReleaseBucket(addr4)];
-            ReleaseEntry* victim = &set[0];
-            ReleaseEntry* stale = nullptr;
-            bool updated = false;
-            for (ReleaseEntry& w : set) {
-                if (w.aligned_address == addr4) {
-                    if (write_position >= w.position) {
-                        const auto [has_pl, pl_val, val_kind, rsn] =
-                            compute_state(&w, addr4, word_payload, word_op, word_reason);
-                        w = {write_position, addr4, pl_val, has_pl, rsn, val_kind};
-                    }
-                    updated = true;
-                    break;
-                }
-                if (w.position <= consumed_cache && stale == nullptr) {
-                    stale = &w;
-                }
-                if (w.position < victim->position) {
-                    victim = &w;
-                }
-            }
-            if (updated) {
-                continue;
-            }
-            const auto [has_pl, pl_val, val_kind, rsn] =
-                compute_state(nullptr, addr4, word_payload, word_op, word_reason);
-            const ReleaseEntry entry{write_position, addr4, pl_val, has_pl, rsn, val_kind};
-            if (stale != nullptr) {
-                *stale = entry;
-                continue;
-            }
-            RefreshConsumedCache();
-            if (victim->position <= consumed_cache) {
-                *victim = entry;
-                continue;
-            }
-            if (victim->position > last_wildcard_release_position) {
-                last_wildcard_release_position = victim->position;
-            }
-            ++release_table_overflows;
-            *victim = entry;
-        }
+    /// The entry just sent (Writes::Noted) writes [address, address + size) of `memory`.
+    void NoteWrite(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size);
+    /// The entry just sent may write guest memory anywhere.
+    void NoteAnyWrite() {
+        last_any_write = write_position;
     }
-    /// Returns the ring position (and exact 32-bit payload, when known) of any unconsumed release
-    /// potentially targeting `device_address`.
-    [[nodiscard]] std::optional<ReleaseInfo> PendingRelease(u64 device_address) {
-        if (!active) {
-            return std::nullopt;
-        }
-        consumed_cache = consumed.load(std::memory_order_acquire);
-        const u64 wildcard_pos =
-            last_wildcard_release_position > consumed_cache ? last_wildcard_release_position : 0;
-        const u64 aligned4 = device_address & ~u64{3};
-        const ReleaseEntry* match = nullptr;
-        for (const ReleaseEntry& w : release_positions[ReleaseBucket(aligned4)]) {
-            if (w.aligned_address == aligned4 && w.position > consumed_cache &&
-                (match == nullptr || w.position > match->position)) {
-                match = &w;
-            }
-        }
-        const bool hit_wildcard = wildcard_pos > 0;
-        const bool hit_exact = !hit_wildcard && match != nullptr;
-        RecordPendingReleaseCheck(hit_wildcard, hit_exact);
-        if (match == nullptr && wildcard_pos == 0) {
-            return std::nullopt;
-        }
-        const u64 target_pos =
-            (std::max)(match != nullptr ? match->position : 0, wildcard_pos);
-        if (match == nullptr || wildcard_pos > match->position) {
-            if (hit_exact) {
-                RecordPendingReleasePayloadResult(false, 4);
-            }
-            return ReleaseInfo{(std::min)(target_pos, write_position), std::nullopt};
-        }
-        std::optional<u32> payload;
-        if (!match->has_payload) {
-            RecordPendingReleasePayloadResult(false, 1, match->no_pl_reason);
-        } else if (WriterRangePosition(aligned4, sizeof(u32)) > match->position) {
-            RecordPendingReleasePayloadResult(false, 2);
-        } else if (last_unknown_writer_position > match->position) {
-            RecordPendingReleasePayloadResult(false, 3);
-        } else {
-            payload = match->payload;
-            RecordPendingReleasePayloadResult(true, last_writer_position > match->position ? 5 : 0);
-        }
-        return ReleaseInfo{(std::min)(target_pos, write_position), payload,
-                           payload.has_value() &&
-                               match->value_kind == ReleaseValueKind::MinBound};
-    }
-    /// Returns the ring position of any unconsumed release targeting `device_address`.
-    [[nodiscard]] std::optional<u64> PendingReleasePosition(u64 device_address) {
-        if (const auto rel = PendingRelease(device_address)) {
-            return rel->position;
-        }
-        return std::nullopt;
-    }
-    /// True if an unconsumed release/query on the back may still write `device_address`.
-    [[nodiscard]] bool HasPendingRelease(u64 device_address) {
-        return PendingReleasePosition(device_address).has_value();
-    }
-
-    void RecordPendingReleaseEvent(bool is_wildcard, u8 source);
-    void RecordPendingReleaseCheck(bool hit_wildcard, bool hit_exact);
-    void RecordPendingReleasePayloadResult(bool ok, u8 reason, u8 no_pl_reason = 0);
-
-    [[nodiscard]] u64 WritePosition() const {
-        return write_position;
-    }
-    [[nodiscard]] u64 ConsumedPosition() const {
-        return consumed.load(std::memory_order_acquire);
-    }
-    [[nodiscard]] bool HasPendingSyncPayloads() const {
-        return sync_payload_count != 0;
-    }
-    void NotePendingSyncPayload(u64 device_address, u32 size_bytes, const void* bytes) {
-        if (bytes == nullptr || size_bytes == 0 || size_bytes > 16) {
-            NotePendingQuery(device_address, false, size_bytes == 0 ? 16 : size_bytes);
-            return;
-        }
-        const u64 cur_consumed = consumed.load(std::memory_order_acquire);
-        while (sync_payload_count > 0 && sync_payloads[sync_payload_head].pos <= cur_consumed) {
-            sync_payload_head = (sync_payload_head + 1) & SyncPayloadMask;
-            --sync_payload_count;
-        }
-        if (sync_payload_count == MaxSyncPayloads) {
-            NotePendingQuery(device_address, false, size_bytes);
-            return;
-        }
-        const size_t tail = (sync_payload_head + sync_payload_count) & SyncPayloadMask;
-        auto& entry = sync_payloads[tail];
-        entry.pos = write_position;
-        entry.dev_addr = device_address;
-        entry.size_bytes = size_bytes;
-        std::memcpy(entry.data.data(), bytes, size_bytes);
-        ++sync_payload_count;
-    }
-    void ApplyPendingSyncPayloads(u64 device_addr, void* dst, u64 size, u64 min_pos) const {
-        if (sync_payload_count == 0 || size == 0 || dst == nullptr) {
-            return;
-        }
-        auto* dst_bytes = static_cast<u8*>(dst);
-        const u64 read_end = device_addr + size;
-        for (size_t i = 0; i < sync_payload_count; ++i) {
-            const auto& entry = sync_payloads[(sync_payload_head + i) & SyncPayloadMask];
-            if (entry.pos <= min_pos) {
-                continue;
-            }
-            const u64 entry_end = entry.dev_addr + entry.size_bytes;
-            if (entry_end <= device_addr || entry.dev_addr >= read_end) {
-                continue;
-            }
-            const u64 ov_start = (std::max)(device_addr, entry.dev_addr);
-            const u64 ov_end = (std::min)(read_end, entry_end);
-            std::memcpy(dst_bytes + (ov_start - device_addr),
-                        entry.data.data() + (ov_start - entry.dev_addr),
-                        static_cast<size_t>(ov_end - ov_start));
-        }
-    }
-
-    /// Tracks GPU queries whose host-memory write occurs either synchronously on Back before
-    /// `consumed >= position` (`async_hw == false`) or via delayed HW/fence completion (`async_hw`).
-    void NotePendingQuery(u64 device_address, bool async_hw = true, u64 size_bytes = 16) {
-        if (!active || device_address == 0 || size_bytes == 0) {
-            return;
-        }
-        const u64 pos = write_position;
-        const u64 range_end = device_address + size_bytes;
-        const u64 end = range_end - 1;
-        const u64 page_lo = device_address >> 12;
-        const u64 page_hi = end >> 12;
-        const u64 line_lo = device_address & ~u64{0x3f};
-        const u64 line_hi = end & ~u64{0x3f};
-        if (!async_hw) {
-            if (pos > last_sync_query_note_position) {
-                last_sync_query_note_position = pos;
-            }
-            auto refresh = [this] { RefreshConsumedCache(); };
-            for (u64 page = page_lo; page <= page_hi; ++page) {
-                sync_query_pages.Record(page << 12, pos, consumed_cache, refresh);
-            }
-            if (size_bytes <= 256) {
-                const u64 sq_lo = device_address & ~decltype(sync_query_lines)::LineMask;
-                const u64 sq_hi = end & ~decltype(sync_query_lines)::LineMask;
-                for (u64 unit = sq_lo;; unit += decltype(sync_query_lines)::LineSize) {
-                    sync_query_lines.Record(unit, pos, consumed_cache, refresh);
-                    if (unit == sq_hi) {
-                        break;
-                    }
-                }
-            } else {
-                sync_query_lines.RecordOverflow(pos);
-            }
-            return;
-        }
-        if (pos > last_query_note_position) {
-            last_query_note_position = pos;
-        }
-        auto noop_refresh = [] {};
-        for (u64 page = page_lo; page <= page_hi; ++page) {
-            pending_query_pages.Record(page << 12, pos, last_query_drain_position, noop_refresh);
-        }
-        for (u64 line = line_lo;; line += 64) {
-            pending_query_lines.Record(line, pos, last_query_drain_position, noop_refresh,
-                                       ComputeLineWordMask(line, device_address, range_end));
-            if (line == line_hi) {
-                break;
-            }
-        }
-    }
-    /// Returns max unconsumed synchronous-query ring position overlapping `[device_start, size_bytes)`.
-    [[nodiscard]] u64 PendingSyncQueryPosition(u64 device_start, u64 size_bytes) const {
-        if (!active || device_start == 0 || size_bytes == 0) {
-            return 0;
-        }
-        const u64 cur_consumed = consumed.load(std::memory_order_acquire);
-        if (last_sync_query_note_position <= cur_consumed) {
-            return 0;
-        }
-        return QueryRangePos(sync_query_pages, sync_query_lines, device_start, size_bytes,
-                             cur_consumed, last_sync_query_note_position);
-    }
-    [[nodiscard]] bool HasPendingQueryRange(u64 device_start, u64 size_bytes) const {
-        if (!active || device_start == 0 || size_bytes == 0 ||
-            last_query_note_position <= last_query_drain_position) {
-            return false;
-        }
-        u8 kind = 0;
-        const bool pending =
-            QueryRangePos(pending_query_pages, pending_query_lines, device_start, size_bytes,
-                          last_query_drain_position, last_query_note_position, &kind) >
-            last_query_drain_position;
-        if (pending) {
-            last_q_diag_kind = kind;
-        }
-        return pending;
-    }
-    void ClearPendingQueriesUpTo(u64 pos) {
-        if (pos > last_query_drain_position) {
-            last_query_drain_position = pos;
-        }
-    }
+    /// Waits until the back executed every entry sent so far that can write guest memory in
+    /// [address, address + size) of `memory`, not the others. Returns whether one was queued.
+    /// Writes are placed by the device memory the GPU addresses map to when noted and read: GPU
+    /// maps drain the split first (GPU::MapInOrder), the unmaps it is sent count as anywhere.
+    bool WaitForWrites(const Tegra::MemoryManager& memory, GPUVAddr address, u64 size);
 
 private:
+    friend struct GpuSplitTestAccess;
+
     enum class Kind : u64 {
         Wrap,   ///< The rest of the ring is unused: continue at its start
         Engine, ///< The engine the next methods go to: word 1
@@ -747,10 +366,35 @@ private:
     static constexpr size_t RingMask = RingWords - 1;
     static constexpr u32 MaxMultiWords = 8192;
     static constexpr size_t PublishEvery = 256;
+    /// Words a back waiting for work gets without a publish_every (Commit).
+    static constexpr size_t PublishAfterWait = 8;
+
+    /// NoteWrite places writes by 256-byte granule of device memory, up to MaxNotedBytes long
+    /// (longer ones count as anywhere), in write_positions slots hashed by granule: granules that
+    /// share a slot share its position, so a read may wait for a write elsewhere, never miss one.
+    static constexpr u32 WriteGranuleBits = 8;
+    static constexpr u64 MaxNotedBytes = 0x4000;
+    static constexpr u32 WriteSlotBits = 10;
+
+    static size_t WriteSlot(u64 granule) {
+        return static_cast<size_t>((granule * 0x9E3779B97F4A7C15ULL) >> (64 - WriteSlotBits));
+    }
+    void NoteDeviceWrite(DAddr address, u64 size);
+    /// The position WaitForWrites waits for.
+    [[nodiscard]] u64 WritesTarget(const Tegra::MemoryManager& memory, GPUVAddr address,
+                                   u64 size) const;
+    [[nodiscard]] u64 DeviceWritesTarget(DAddr address, u64 size) const;
 
     template <typename Func>
     static void CallThunk(const u64* payload) {
         (*reinterpret_cast<const Func*>(payload))();
+    }
+    template <typename Func>
+    static void CallWordsThunk(const u64* payload) {
+        constexpr size_t function_words = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
+        (*reinterpret_cast<const Func*>(payload))(
+            std::span<const u32>{reinterpret_cast<const u32*>(payload + function_words + 1),
+                                 static_cast<size_t>(payload[function_words])});
     }
 
     /// Room for an entry of `words` at the write position (never across the ring's end).
@@ -765,332 +409,83 @@ private:
     u64* ReserveSlow(size_t words);
     void Commit(size_t words) {
         write_position += words;
-        if (write_position - published_local >= publish_every) {
+        const u64 unpublished = write_position - published_local;
+        if (unpublished >= publish_every) {
+            Publish();
+            return;
+        }
+        // The back waits for work at the last position published (back_idle_at): it gets these
+        // words after a few, not after publish_every. A drain used to restart it like that.
+        if (unpublished >= PublishAfterWait &&
+            back_idle_at.load(std::memory_order_relaxed) == published_local) {
+            Count(g_acquire_stats.early_publishes);
             Publish();
         }
     }
     void WaitForSpace(size_t words);
-    /// Front: blocks until the back stored `consumed` at or past target (and is quiet if wait_quiet).
-    void SleepUntilConsumed(u64 target, bool wait_quiet = false);
-    /// Back: hands ring space back and wakes a front sleeping for this position.
-    void StoreConsumed(u64 position);
-    /// Back: wakes a front waiting for BackQuiet() after consumed already reached target.
-    void NotifyFrontQuiet();
     void SelectEngine(Tegra::Engines::EngineInterface* engine) {
         if (engine != front_engine) [[unlikely]] {
             SwitchEngine(engine);
         }
     }
     void SwitchEngine(Tegra::Engines::EngineInterface* engine);
+    bool WaitFor(u64 target, DrainSite site);
+
+    /// One step of a front wait for the back to consume `target`.
+    void Backoff(u32 spins, u64 target);
+    /// After the back stored `consumed`: wakes a front sleeping in Backoff.
+    void NotifyFront() {
+        if (front_waiting.load(std::memory_order_seq_cst)) {
+            front_wake.fetch_add(1, std::memory_order_seq_cst);
+            front_wake.notify_one();
+        }
+    }
 
     void BackLoop(std::stop_token stop_token);
-    size_t Execute(const u64* entry);
+    /// Runs the entry at `entry` (of the `words` published before the ring's end), returns its size.
+    size_t Execute(const u64* entry, size_t words);
 
     Core::System* system{};
     bool active{};
+    u32 starts{};
     bool front_macros{};
     std::unique_ptr<u64[]> ring;
 
-    [[nodiscard]] static u16 ComputeLineWordMask(u64 line_addr, u64 range_start,
-                                                   u64 range_end) noexcept {
-        const u64 lo = (std::max)(line_addr, range_start) - line_addr;
-        const u64 hi = (std::min)(line_addr + 64, range_end) - line_addr;
-        const u32 w0 = static_cast<u32>(lo >> 2);
-        const u32 w1 = static_cast<u32>((hi - 1) >> 2);
-        const u32 bits = w1 - w0 + 1;
-        return static_cast<u16>(bits >= 16 ? 0xffffU : (((1U << bits) - 1U) << w0));
-    }
-
-    template <size_t Sets, size_t Ways, size_t Shift, bool WordMasked = false>
-    struct TaggedPosTable {
-        static constexpr bool UsesWordMask = WordMasked;
-        static constexpr size_t LineShift = Shift;
-        static constexpr u64 LineSize = u64{1} << Shift;
-        static constexpr u64 LineMask = LineSize - 1;
-        struct Way {
-            u64 key{};
-            u64 pos{};
-            u16 mask{0xffff};
-        };
-        static constexpr size_t SpillWays = 16;
-        std::array<std::array<Way, Ways>, Sets> sets{};
-        std::array<Way, SpillWays> spill{};
-        size_t spill_cursor{};
-        u64 spill_max_pos{};
-        u64 overflow_pos{};
-
-        void RecordOverflow(u64 pos) {
-            if (pos > overflow_pos) {
-                overflow_pos = pos;
-            }
-        }
-
-        static constexpr size_t Mask = Sets - 1;
-        static constexpr unsigned HashShift = 64 - static_cast<unsigned>(std::bit_width(Mask));
-
-        static size_t Bucket(u64 addr) {
-            return static_cast<size_t>(((addr >> Shift) * 0x9e3779b97f4a7c15ULL) >> HashShift) &
-                   Mask;
-        }
-
-        void Clear() {
-            sets.fill({});
-            spill.fill({});
-            spill_cursor = 0;
-            spill_max_pos = 0;
-            overflow_pos = 0;
-        }
-
-        template <typename RefreshFloor>
-        void Record(u64 addr, u64 pos, u64& stale_floor, RefreshFloor&& refresh_floor,
-                    u16 word_mask = 0xffff) {
-            const u64 key = addr >> Shift;
-            auto& set = sets[Bucket(addr)];
-            Way* victim = &set[0];
-            Way* stale = nullptr;
-            for (Way& w : set) {
-                if (w.key == key) {
-                    if constexpr (WordMasked) {
-                        if (w.pos <= stale_floor) {
-                            w.pos = pos;
-                            w.mask = word_mask;
-                        } else {
-                            if (pos > w.pos) {
-                                w.pos = pos;
-                            }
-                            w.mask |= word_mask;
-                        }
-                    } else if (pos > w.pos) {
-                        w.pos = pos;
-                    }
-                    return;
-                }
-                if (w.pos <= stale_floor && stale == nullptr) {
-                    stale = &w;
-                }
-                if (w.pos < victim->pos) {
-                    victim = &w;
-                }
-            }
-            if (stale != nullptr) {
-                *stale = {key, pos, word_mask};
-                return;
-            }
-            refresh_floor();
-            if (victim->pos <= stale_floor) {
-                *victim = {key, pos, word_mask};
-                return;
-            }
-            Way* spill_match = nullptr;
-            Way* spill_stale = nullptr;
-            for (Way& s : spill) {
-                if (s.key == victim->key) {
-                    spill_match = &s;
-                    break;
-                }
-                if (s.pos <= stale_floor && spill_stale == nullptr) {
-                    spill_stale = &s;
-                }
-            }
-            if (spill_match != nullptr) {
-                if constexpr (WordMasked) {
-                    if (spill_match->pos <= stale_floor) {
-                        spill_match->pos = victim->pos;
-                        spill_match->mask = victim->mask;
-                    } else {
-                        if (victim->pos > spill_match->pos) {
-                            spill_match->pos = victim->pos;
-                        }
-                        spill_match->mask |= victim->mask;
-                    }
-                } else if (victim->pos > spill_match->pos) {
-                    spill_match->pos = victim->pos;
-                }
-            } else if (spill_stale != nullptr) {
-                *spill_stale = *victim;
-            } else {
-                Way& evicted = spill[spill_cursor];
-                spill_cursor = (spill_cursor + 1) & (SpillWays - 1);
-                if (evicted.pos > overflow_pos) {
-                    overflow_pos = evicted.pos;
-                }
-                evicted = *victim;
-            }
-            if (victim->pos > spill_max_pos) {
-                spill_max_pos = victim->pos;
-            }
-            *victim = {key, pos, word_mask};
-        }
-
-        [[nodiscard]] u64 Query(u64 addr, u64 floor, u8* diag_kind = nullptr,
-                                u16 query_mask = 0xffff) const {
-            const u64 key = addr >> Shift;
-            u64 res = 0;
-            if (overflow_pos > floor) {
-                res = overflow_pos;
-                if (diag_kind != nullptr) {
-                    *diag_kind = 3;
-                }
-            }
-            if (spill_max_pos > floor) {
-                for (const Way& s : spill) {
-                    if (s.key == key && s.pos > floor &&
-                        (!WordMasked || (s.mask & query_mask) != 0) && s.pos > res) {
-                        res = s.pos;
-                        if (diag_kind != nullptr) {
-                            *diag_kind = 2;
-                        }
-                    }
-                }
-            }
-            for (const Way& w : sets[Bucket(addr)]) {
-                if (w.key == key && w.pos > floor &&
-                    (!WordMasked || (w.mask & query_mask) != 0) && w.pos > res) {
-                    res = w.pos;
-                    if (diag_kind != nullptr) {
-                        *diag_kind = 1;
-                    }
-                }
-            }
-            return res;
-        }
-    };
-
-    template <typename Pages, typename Lines>
-    [[nodiscard]] static u64 QueryRangePos(const Pages& pages, const Lines& lines,
-                                           u64 device_start, u64 size_bytes, u64 floor,
-                                           u64 overflow_all, u8* diag_kind = nullptr) {
-        if (size_bytes > 0x40000) {
-            if (overflow_all > floor) {
-                if (diag_kind != nullptr) {
-                    *diag_kind = 4;
-                }
-                return overflow_all;
-            }
-            return 0;
-        }
-        const u64 end = device_start + size_bytes;
-        u64 pos = 0;
-        constexpr u64 FastRangeLimit = Lines::LineShift < 6 ? 64ULL : 256ULL;
-        if (size_bytes <= FastRangeLimit) {
-            const u64 line_lo = device_start & ~Lines::LineMask;
-            const u64 line_hi = (end - 1) & ~Lines::LineMask;
-            for (u64 line = line_lo;; line += Lines::LineSize) {
-                u8 line_kind = 0;
-                const u16 qmask = Lines::UsesWordMask
-                                      ? ComputeLineWordMask(line, device_start, end)
-                                      : u16{0xffff};
-                const u64 q = lines.Query(line, floor, &line_kind, qmask);
-                if (q > pos) {
-                    pos = q;
-                    if (diag_kind != nullptr) {
-                        *diag_kind = line_kind;
-                    }
-                }
-                if (line == line_hi) {
-                    break;
-                }
-            }
-            return pos;
-        }
-        u64 page_start = device_start;
-        while (page_start < end) {
-            const u64 page = page_start >> 12;
-            const u64 next_page = (page + 1) << 12;
-            const u64 seg_end = (std::min)(end, next_page);
-            u8 page_kind = 0;
-            const u64 pq = pages.Query(page << 12, floor, &page_kind);
-            if (pq > pos) {
-                if (page_kind == 3 || (Lines::LineShift < 6 && (seg_end - page_start) > 256)) {
-                    // Page table overflowed globally (or range too wide for word-granular lines).
-                    pos = pq;
-                    if (diag_kind != nullptr) {
-                        *diag_kind = page_kind;
-                    }
-                } else {
-                    const u64 line_lo = page_start & ~Lines::LineMask;
-                    const u64 line_hi = (seg_end - 1) & ~Lines::LineMask;
-                    for (u64 line = line_lo;; line += Lines::LineSize) {
-                        u8 line_kind = 0;
-                        const u16 qmask = Lines::UsesWordMask
-                                              ? ComputeLineWordMask(line, device_start, end)
-                                              : u16{0xffff};
-                        const u64 q = lines.Query(line, floor, &line_kind, qmask);
-                        if (q > pos) {
-                            pos = q;
-                            if (diag_kind != nullptr) {
-                                *diag_kind = line_kind;
-                            }
-                        }
-                        if (line == line_hi) {
-                            break;
-                        }
-                    }
-                }
-            }
-            page_start = seg_end;
-        }
-        return pos;
-    }
-
-    struct ReleaseEntry {
-        u64 position{};
-        u64 aligned_address{};
-        u32 payload{};
-        bool has_payload{};
-        u8 no_pl_reason{};
-        ReleaseValueKind value_kind{};
-    };
-
-    struct LargeWriteRange {
-        u64 start{};
-        u64 end{};
-        u64 pos{};
-    };
-    static constexpr size_t LargeWriteCount = 64;
-    static constexpr size_t TrackedSyncpoints = 192;
-
-    // Front side.
-    u64 write_position{};
+    // Front side, in its own 128-byte block (x86 prefetchers pull 64-byte lines in pairs): the
+    // back writes back_engine on every engine switch, and next to these fields that made the
+    // front miss the cache on almost every ring write (found by SerkiGohan).
+    alignas(128) u64 write_position{};
     u64 last_writer_position{};
-    u64 last_compute_writer_position{};
-    u64 last_all_compute_writer_position{};
-    u64 last_unknown_writer_position{};
-    u64 last_any_writer_position{};
-    u64 writer_large_overflow_pos{};
-    u64 last_wildcard_release_position{};
-    u64 last_query_note_position{};
-    u64 last_query_drain_position{};
-    u64 last_sync_query_note_position{};
-    u64 last_wildcard_syncpoint_position{};
-    std::array<u64, TrackedSyncpoints> syncpoint_positions{};
-    std::array<std::array<ReleaseEntry, ReleaseWays>, ReleaseSets> release_positions{};
-    std::array<LargeWriteRange, LargeWriteCount> writer_large_ranges{};
-    TaggedPosTable<2048, 4, 12> writer_pages{};
-    TaggedPosTable<4096, 4, 6, true> writer_lines{};
-    TaggedPosTable<2048, 4, 12> pending_query_pages{};
-    TaggedPosTable<4096, 4, 6, true> pending_query_lines{};
-    TaggedPosTable<2048, 4, 12> sync_query_pages{};
-    TaggedPosTable<8192, 4, 2> sync_query_lines{};
-    u64 release_checks{};
-    u64 wildcard_hits{};
-    u64 exact_hits{};
-    u64 wildcard_overflows{};
-    u64 release_table_overflows{};
-    u64 rel_payload_ok{};
-    std::array<u64, 6> rel_payload_diag{};
-    std::array<u64, 16> rel_no_pl_reasons{};
-    mutable u8 last_q_diag_kind{};
-    mutable u8 last_wr_diag_kind{};
-    std::array<u64, 8> wildcard_sources{};
+    u64 last_sync_position{};
+    u64 synced_writer_position{};
+    struct SemaphoreWrite {
+        u64 position; ///< write_position once it was sent
+        u32 payload;
+        bool known;
+    };
+    /// The front's NoteSemaphoreWrite, by word address.
+    std::unordered_map<u64, SemaphoreWrite> semaphore_writes;
+    size_t semaphore_writes_limit = 1024; ///< Forget what the back ran past this many
+    /// After the last entry that may write guest memory anywhere (NoteAnyWrite), the last one
+    /// NoteWrite placed, and the last placed write in each slot's granules.
+    u64 last_any_write{};
+    u64 last_noted_write{};
+    std::array<u64, size_t{1} << WriteSlotBits> write_positions{};
     u64 published_local{};
     u64 consumed_cache{};
     /// Words between publishes: small right after a drain, while the back has nothing to do.
     size_t publish_every{PublishEvery};
     Tegra::Engines::EngineInterface* front_engine{};
 
-    // Back side.
-    Tegra::Engines::EngineInterface* back_engine{};
+    // Back side, in its own block.
+    alignas(128) Tegra::Engines::EngineInterface* back_engine{};
+
+    /// Whether the back is done with the Vulkan scheduler until it gets more work: set after its
+    /// idle hook ran, cleared before it executes entries.
+    [[nodiscard]] bool BackQuiet() const {
+        return back_quiet.load(std::memory_order_acquire) ||
+               !back_running.load(std::memory_order_acquire);
+    }
 
     static GpuSplit instance;
     static inline thread_local bool on_back_thread{};
@@ -1105,26 +500,17 @@ private:
     // always touched together by both threads, so they share a block.
     alignas(128) std::atomic<u64> published{};
     alignas(128) std::atomic<u64> consumed{};
-    /// A position the front waits for (WaitForWriters): the back stores `consumed` once past it.
+    /// A position the front waits for (WaitFor): the back stores `consumed` once past it.
     alignas(128) std::atomic<u64> wait_target{~u64{0}};
     alignas(128) std::atomic<bool> back_waiting{};
     std::atomic<u32> wake{};
-    struct SyncPayloadEntry {
-        u64 pos{};
-        u64 dev_addr{};
-        u32 size_bytes{};
-        std::array<u8, 16> data{};
-    };
-    static constexpr size_t MaxSyncPayloads = 128;
-    static constexpr size_t SyncPayloadMask = MaxSyncPayloads - 1;
-    std::array<SyncPayloadEntry, MaxSyncPayloads> sync_payloads{};
-    size_t sync_payload_head{};
-    size_t sync_payload_count{};
-
-    /// A position the front sleeps for (SleepUntilConsumed): the back wakes it once past it.
-    alignas(128) std::atomic<u64> front_target{~u64{0}};
-    std::mutex front_mutex;
-    std::condition_variable front_cv;
+    /// The front sleeps in Backoff (#161: instead of yielding).
+    alignas(128) std::atomic<bool> front_waiting{};
+    std::atomic<u32> front_wake{};
+    /// The back's position when it last ran out of work, stored before it waits: while
+    /// it equals published_local, the back waits for the words the front holds (Commit). Port of
+    /// the publish part of 62db242b34 (jpkto, PR #805).
+    alignas(128) std::atomic<u64> back_idle_at{~u64{0}};
     std::jthread back_thread;
 };
 

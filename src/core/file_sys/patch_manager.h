@@ -71,6 +71,7 @@ public:
     // Currently tracked NSO patches:
     // - IPS
     // - IPSwitch
+    // - Built-in patches, keyed by title and build id
     [[nodiscard]] std::vector<u8> PatchNSO(const std::vector<u8>& nso,
                                            const std::string& name) const;
 
@@ -104,6 +105,7 @@ public:
 
     // Version of GetControlMetadata that takes an arbitrary NCA
     [[nodiscard]] Metadata ParseControlNCA(const NCA& nca) const;
+    [[nodiscard]] static Metadata ParseControlRomFS(const VirtualFile& romfs);
 
     /// @brief Gets NACP metadata (accounting for any patches or updates)
     [[nodiscard]] static PatchManager::Metadata GetMetadataFromBaseOrUpdate(Core::System& system, u64 application_id) noexcept;

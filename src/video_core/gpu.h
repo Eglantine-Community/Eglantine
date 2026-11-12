@@ -8,7 +8,6 @@
 
 #include <functional>
 #include <memory>
-#include <stop_token>
 
 #include "common/bit_field.h"
 #include "common/common_types.h"
@@ -152,6 +151,8 @@ public:
     /// Calls `callback` for each CPU write into GPU-written memory that InvalidateGPUCache has not
     /// applied yet.
     void ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback);
+    /// Returns true when guest CPU writes to the range are collected but not yet applied.
+    [[nodiscard]] bool HasPendingCPUWrites(DAddr addr, u64 size);
     /// Signal the ending of command list.
     void OnCommandListEnd();
 
@@ -183,12 +184,6 @@ public:
 
     /// Gets a mutable reference to the Host1x interface
     [[nodiscard]] Host1x::Host1x& Host1x();
-
-    /// Gets a mutable reference to the owning Core::System
-    [[nodiscard]] Core::System& System();
-
-    /// Gets an immutable reference to the owning Core::System
-    [[nodiscard]] const Core::System& System() const;
 
     /// Gets an immutable reference to the Host1x interface.
     [[nodiscard]] const Host1x::Host1x& Host1x() const;
@@ -248,7 +243,6 @@ public:
 
     /// Performs any additional necessary steps to shutdown GPU emulation.
     void NotifyShutdown();
-    [[nodiscard]] std::stop_token GetShutdownToken() const noexcept;
 
     /// Obtain the CPU Context
     void ObtainContext();

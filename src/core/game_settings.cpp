@@ -119,61 +119,19 @@ EnvironmentInfo DetectEnvironment(const VideoCore::RendererBase& renderer) {
     return env;
 }
 
-template <typename T, bool ranged>
-static void OverrideIfGlobal(Settings::SwitchableSetting<T, ranged>& setting, T value) {
-    if (!setting.UsingGlobal()) {
-        return;
-    }
-    setting.SetGlobal(false);
-    setting.SetValue(value);
-}
-
-void LoadEarlyOverrides(std::uint64_t program_id) {
-    switch (static_cast<TitleID>(program_id)) {
-        case TitleID::SuperMarioBrosWonderNintendoSwitch2Edition:
-        case TitleID::Orbitals:
-            OverrideIfGlobal(Settings::values.gpu_accuracy, Settings::GpuAccuracy::Low);
-            OverrideIfGlobal(Settings::values.gpu_fence_behavior, Settings::GpuFenceBehavior::Balanced);
-            OverrideIfGlobal(Settings::values.use_reactive_flushing, false);
-            Settings::UpdateGPUAccuracy();
-            break;
-        case TitleID::MarioTennisFever:
-        case TitleID::OcarinaOfTime:
-            OverrideIfGlobal(Settings::values.async_presentation, true);
-            break;
-        default:
-            break;
-    }
-}
-
 void LoadOverrides(std::uint64_t program_id, const VideoCore::RendererBase& renderer) {
     const auto env = DetectEnvironment(renderer);
-    LoadEarlyOverrides(program_id);
-    Settings::values.preemptive_cpu_reads = false;
 
+    Settings::values.force_reactive_flushing = false;
     switch (static_cast<TitleID>(program_id)) {
         case TitleID::NinjaGaidenRagebound:
             Settings::values.use_squashed_iterated_blend = true;
             break;
-        case TitleID::MarioTennisFever:
-            OverrideIfGlobal(Settings::values.gpu_accuracy, Settings::GpuAccuracy::Low);
-            OverrideIfGlobal(Settings::values.gpu_fence_behavior, Settings::GpuFenceBehavior::Balanced);
-            OverrideIfGlobal(Settings::values.use_reactive_flushing, false);
-            break;
-        case TitleID::HyruleWarriorsAgeOfImprisonment:
-            OverrideIfGlobal(Settings::values.cpu_clock, Settings::CpuClock::Normal);
-            OverrideIfGlobal(Settings::values.gpu_accuracy, Settings::GpuAccuracy::Low);
-            OverrideIfGlobal(Settings::values.gpu_fence_behavior, Settings::GpuFenceBehavior::Balanced);
-            Settings::values.preemptive_cpu_reads = true;
-            break;
-        case TitleID::DonkeyKongBananza:
-            Settings::values.preemptive_cpu_reads = true;
-            OverrideIfGlobal(Settings::values.gpu_accuracy, Settings::GpuAccuracy::Low);
-            OverrideIfGlobal(Settings::values.use_reactive_flushing, false);
-            OverrideIfGlobal(Settings::values.gpu_clock, Settings::GpuClock::Boost);
-            break;
-        case TitleID::XenobladeChroniclesDENintendoSwitch2Edition:
-            Settings::values.preemptive_cpu_reads = true;
+        case TitleID::DuskbloodsNetworkTest:
+            // The game reads values its GPU passes wrote (the tone pass's exposure among them)
+            // back on the CPU. Without reactive flushing it reads stale ones and the whole picture
+            // brightens and darkens every few frames.
+            Settings::values.force_reactive_flushing = true;
             break;
         default:
             break;

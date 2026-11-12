@@ -20,6 +20,10 @@
 #include "video_core/texture_cache/types.h"
 #include "video_core/textures/texture.h"
 
+namespace Tegra::Texture {
+class UnswizzleWorker;
+}
+
 namespace VideoCommon {
 
 using Tegra::Texture::TICEntry;
@@ -102,7 +106,8 @@ void ExecuteUnswizzlePlan(Tegra::MemoryManager& gpu_memory, const UnswizzlePlan&
 
 [[nodiscard]] boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(
     Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
-    std::span<const u8> input, std::span<u8> output);
+    std::span<const u8> input, std::span<u8> output,
+    Tegra::Texture::UnswizzleWorker* worker = nullptr);
 
 /// Switch 2 block-linear surfaces swap GOB offset bits 5 and 6, unless their texture header asks
 /// for the Maxwell GOB layout (ImageInfo::maxwell_gobs).
@@ -141,6 +146,17 @@ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8
 [[nodiscard]] Extent3D MipSize(Extent3D size, u32 level);
 
 [[nodiscard]] Extent3D MipBlockSize(const ImageInfo& info, u32 level);
+
+/// Sets `written[level * layers + layer]` for each level and layer of `dst` that `copies` from
+/// `src` write whole, unscaled and from the origin. Sets none when the images differ in 2D format,
+/// the format is compressed, or either image is rescaled or lacks part of its host memory (sparse,
+/// unbacked, trimmed levels).
+void MarkSubresourcesWrittenWhole(const ImageBase& dst, const ImageBase& src,
+                                  std::span<const ImageCopy> copies, std::span<u8> written);
+
+/// Whether `copies` from `src` write every texel of `dst` (MarkSubresourcesWrittenWhole).
+[[nodiscard]] bool CopiesWriteWholeImage(const ImageBase& dst, const ImageBase& src,
+                                         std::span<const ImageCopy> copies);
 
 [[nodiscard]] boost::container::small_vector<SwizzleParameters, 16> FullUploadSwizzles(
     const ImageInfo& info);

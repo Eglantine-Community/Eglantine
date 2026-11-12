@@ -9,6 +9,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -37,11 +38,17 @@ public:
         static_assert(std::is_trivially_copyable_v<T>);
         const VAddr masked_address = address & RESERVATION_GRANULE_MASK;
 
-        Lock();
-        exclusive_addresses[processor_id] = masked_address;
+#ifdef ARCHITECTURE_arm64
+        std::atomic_ref<VAddr>{reservations[processor_id].address}.store(masked_address, std::memory_order_release);
         const T value = op();
-        std::memcpy(exclusive_values[processor_id].data(), &value, sizeof(T));
+        std::memcpy(reservations[processor_id].value.data(), &value, sizeof(T));
+#else
+        Lock();
+        reservations[processor_id].address = masked_address;
+        const T value = op();
+        std::memcpy(reservations[processor_id].value.data(), &value, sizeof(T));
         Unlock();
+#endif
         return value;
     }
 
@@ -57,10 +64,12 @@ public:
         }
 
         T saved_value;
-        std::memcpy(&saved_value, exclusive_values[processor_id].data(), sizeof(T));
+        std::memcpy(&saved_value, reservations[processor_id].value.data(), sizeof(T));
         const bool result = op(saved_value);
 
+#ifndef ARCHITECTURE_arm64
         Unlock();
+#endif
         return result;
     }
 
@@ -83,8 +92,14 @@ private:
     static constexpr VAddr RESERVATION_GRANULE_MASK = 0xFFFF'FFFF'FFFF'FFFFull;
     static constexpr VAddr INVALID_EXCLUSIVE_ADDRESS = 0xDEAD'DEAD'DEAD'DEADull;
     static constexpr size_t MAX_NUM_CPU_CORES = 6; // Sync with src/core/hardware_properties
-    boost::container::static_vector<VAddr, MAX_NUM_CPU_CORES> exclusive_addresses;
-    boost::container::static_vector<Vector, MAX_NUM_CPU_CORES> exclusive_values;
+    /// A processor's reservation. Every exclusive load and store on that processor writes it, so
+    /// each has its own cache line: packed together, all six shared one or two lines, which
+    /// guest atomics on any two cores bounced between them.
+    struct alignas(64) Reservation {
+        VAddr address = INVALID_EXCLUSIVE_ADDRESS;
+        Vector value{};
+    };
+    boost::container::static_vector<Reservation, MAX_NUM_CPU_CORES> reservations;
     SpinLock lock;
 };
 

@@ -48,6 +48,8 @@ These options control dependencies.
   - Only available on Linux
 - `ENABLE_DEBUG_TOOLS` (OFF) Enables debugging and development tools, see [tools](../tools/README.md).
 - `ENABLE_WERROR` (ON) Enables warnings as errors (-Werror).
+- `LICHII_FUZZERS` (OFF) Builds the libFuzzer harnesses for the game-file parsers and instruments the whole build with ASan and UBSan, see [Fuzzing](./Fuzzing.md).
+  - Clang only
 
 ### Flavors
 
@@ -59,6 +61,8 @@ These options control executables and build flavors.
   - Not supported on Linux
   - Automatically set if `YUZU_USE_BUNDLED_QT` is on for non-Linux
 - `ENABLE_UPDATE_CHECKER` (OFF) Enable update checking functionality
+  - `LICHII_BUILD_TAG` (empty) Published `build-N` tag. Builds without it never check for updates.
+  - `LICHII_BUILD_PLATFORM` (empty) Release asset platform and variant, such as `linux-x86_64-pgo`. CI sets this from its build matrix.
 - `YUZU_DISABLE_LLVM` (OFF) Do not attempt to link to the LLVM demangler
   - Really only useful for CI or distribution builds
 
@@ -84,7 +88,7 @@ The following options are desktop only.
 Also desktop-only, but apply strictly to Qt
 
 - `ENABLE_QT` (ON) Enable the Qt frontend (recommended)
-- `ENABLE_QT_TRANSLATION` (OFF) Enable translations for the Qt frontend
+- `ENABLE_QT_TRANSLATION` (OFF) Enable translations for the Qt frontend. Release builds turn it on; it needs Qt Linguist Tools (`lrelease`)
 - `YUZU_USE_BUNDLED_QT` (ON for MSVC) Download bundled Qt binaries
   - Not recommended on Linux. For Windows and macOS, the provided build is statically linked.
 - `YUZU_QT_MIRROR` (string) What mirror to use for downloading the bundled Qt libraries

@@ -14,11 +14,17 @@ endif()
 
 find_package(Qt6 REQUIRED COMPONENTS Widgets)
 
+if(YUZU_TESTS)
+    add_subdirectory(../tests/qt_compatibility ${CMAKE_BINARY_DIR}/qt_compatibility_tests)
+endif()
+
 add_executable(yuzu
     Info.plist
     about_dialog.cpp
     about_dialog.h
     aboutdialog.ui
+    compatibility_report.cpp
+    compatibility_report.h
     applets/qt_amiibo_settings.cpp
     applets/qt_amiibo_settings.h
     applets/qt_amiibo_settings.ui
@@ -74,6 +80,8 @@ add_executable(yuzu
     configuration/configure_general.ui
     configuration/configure_graphics.cpp
     configuration/configure_graphics.h
+    configuration/amd_fsr4_panel.cpp
+    configuration/amd_fsr4_panel.h
     configuration/nvidia_dlss_panel.cpp
     configuration/nvidia_dlss_panel.h
     configuration/configure_graphics.ui
@@ -106,6 +114,8 @@ add_executable(yuzu
     configuration/configure_mouse_panning.cpp
     configuration/configure_mouse_panning.h
     configuration/configure_mouse_panning.ui
+    configuration/configure_microphone.cpp
+    configuration/configure_microphone.h
     configuration/configure_motion_touch.cpp
     configuration/configure_motion_touch.h
     configuration/configure_motion_touch.ui
@@ -161,7 +171,6 @@ add_executable(yuzu
     game/game_tree.h game/game_tree.cpp
     game/game_card.h game/game_card.cpp
     game/search_field.h game/search_field.cpp
-    game/switch_home.h game/switch_home.cpp
 
     hotkeys.cpp
     hotkeys.h
@@ -172,6 +181,7 @@ add_executable(yuzu
     loading_screen.ui
 
     main.cpp
+    nx2_switches.h
 
     multiplayer/chat_room.cpp
     multiplayer/chat_room.h
@@ -225,6 +235,9 @@ add_executable(yuzu
     yuzu.rc
     migration_dialog.h migration_dialog.cpp
     nup_dialogs.h nup_dialogs.cpp
+    shader_warm_dialog.h shader_warm_dialog.cpp
+    recommended_settings_dialog.h recommended_settings_dialog.cpp
+    whats_new_dialog.h whats_new_dialog.cpp
     migration_worker.h migration_worker.cpp
     libqt_common.h libqt_common.cpp
 
@@ -239,29 +252,16 @@ add_executable(yuzu
     configuration/system/profile_avatar_dialog.h configuration/system/profile_avatar_dialog.cpp
     configuration/addon/mod_select_dialog.h configuration/addon/mod_select_dialog.cpp configuration/addon/mod_select_dialog.ui
 
-    render/performance_overlay.h render/performance_overlay.cpp render/performance_overlay.ui
+    render/performance_overlay.h render/performance_overlay.cpp
     updater/update_dialog.h updater/update_dialog.cpp updater/update_dialog.ui
     game/common.h
     game/carousel.h game/carousel.cpp
-
-    dalia/dalia_game_details.h dalia/dalia_game_details.cpp
-    dalia/dalia_settings.h dalia/dalia_settings.cpp
-    dalia/dalia_diagnostics.h dalia/dalia_diagnostics.cpp
-    dalia/dalia_gameplay_overlay.h dalia/dalia_gameplay_overlay.cpp
-    dalia/dalia_theme.h
-    dalia/dalia_sidebar.h dalia/dalia_sidebar.cpp
-    dalia/dalia_home_page.h dalia/dalia_home_page.cpp
-    dalia/dalia_library_page.h dalia/dalia_library_page.cpp
-    dalia/dalia_controllers_page.h dalia/dalia_controllers_page.cpp
-    dalia/dalia_settings_page.h dalia/dalia_settings_page.cpp
-    dalia/dalia_system_page.h dalia/dalia_system_page.cpp
-    dalia/dalia_main_container.h dalia/dalia_main_container.cpp
 )
 
-set_target_properties(yuzu PROPERTIES OUTPUT_NAME "dalia")
+set_target_properties(yuzu PROPERTIES OUTPUT_NAME "lichii")
 
 # Shipped next to the executable: the NX2 switches a GUI launch cannot set another way. Read at
-# startup (LoadNx2Switches in main.cpp); a user copy in %APPDATA%\eden overrides it.
+# startup (LoadNx2Switches in main.cpp); a user copy in %APPDATA%\lichii overrides it.
 add_custom_command(TARGET yuzu POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${PROJECT_SOURCE_DIR}/dist/nx2_switches.txt" "$<TARGET_FILE_DIR:yuzu>/nx2_switches.txt"
@@ -386,20 +386,15 @@ target_sources(yuzu
 if (APPLE)
     target_sources(yuzu PRIVATE util/macos_sleep.cpp util/macos_sleep.h)
 
-    # Xcode will automatically generate the Assets.car and icns file for us.
+    # Use the supplied Lichii artwork for all macOS generators.
     set(_dist "${CMAKE_SOURCE_DIR}/dist")
+    set(_icons "${_dist}/lichii.icns")
     if (CMAKE_GENERATOR MATCHES "Xcode")
-        set(_icons "${_dist}/eglantine.icon")
-
-        set_target_properties(eden PROPERTIES
-            XCODE_ATTRIBUTE_ASSETCATALOG_COMPILER_APPICON_NAME eglantine
-            MACOSX_BUNDLE_ICON_FILE eglantine
+        set_target_properties(yuzu PROPERTIES
+            MACOSX_BUNDLE_ICON_FILE lichii.icns
             # Also force xcode to manage signing for us.
             XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED ON
             XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED ON)
-    # Otherwise, we'll use our own.
-    else()
-        set(_icons "${_dist}/eglantine.icns" "${_dist}/Assets.car")
     endif()
 
     set_source_files_properties(${_icons} PROPERTIES
@@ -431,9 +426,12 @@ endif()
 
 target_link_libraries(yuzu PRIVATE nlohmann_json::nlohmann_json)
 target_link_libraries(yuzu PRIVATE common core input_common frontend_common network video_core qt_common)
-target_link_libraries(yuzu PRIVATE Boost::headers Qt6::Widgets Qt6::Charts Qt6::Concurrent)
+target_link_libraries(yuzu PRIVATE Boost::headers Qt6::Widgets Qt6::Concurrent Qt6::Network)
 # Unpacks NVIDIA's files from the Streamline release (nvidia_dlss_panel.cpp).
 target_link_libraries(yuzu PRIVATE ZLIB::ZLIB)
+if (WIN32)
+    target_link_libraries(yuzu PRIVATE QuaZip::QuaZip)
+endif()
 target_link_libraries(yuzu PRIVATE ${PLATFORM_LIBRARIES} Threads::Threads)
 if (ENABLE_OPENGL)
     target_link_libraries(yuzu PRIVATE glad)
@@ -471,6 +469,8 @@ if (WIN32 AND NOT YUZU_USE_BUNDLED_QT)
         find_program(WINDEPLOYQT_EXECUTABLE NAMES windeployqt6 windeployqt
                      HINTS "${QT_HOST_PATH}/bin" "${QT_TARGET_PATH}/bin")
     endif()
+    file(GENERATE OUTPUT "$<TARGET_FILE_DIR:yuzu>/qt.conf"
+         CONTENT "[Paths]\nPrefix=.\nPlugins=plugins\n")
     if (WINDEPLOYQT_EXECUTABLE)
         set(YUZU_EXE_DIR "$<TARGET_FILE_DIR:yuzu>")
         add_custom_command(TARGET yuzu POST_BUILD COMMAND ${WINDEPLOYQT_EXECUTABLE} "$<TARGET_FILE:yuzu>" --dir "${YUZU_EXE_DIR}" --libdir "${YUZU_EXE_DIR}" --plugindir "${YUZU_EXE_DIR}/plugins" --no-compiler-runtime --no-opengl-sw --no-system-d3d-compiler --no-translations --verbose 0)
@@ -499,4 +499,10 @@ endif()
 # Remember that the linker is incredibly stupid.
 target_link_libraries(yuzu PRIVATE OpenSSL::SSL OpenSSL::Crypto SDL3::SDL3)
 
+# NX archive conversion and editing (nx_tools.cpp) runs nxformat in the process, linked statically.
+if (TARGET nxformat::static_nozstd)
+    target_sources(yuzu PRIVATE nx_tools.h nx_tools.cpp)
+    target_link_libraries(yuzu PRIVATE nxformat::static_nozstd)
+    target_compile_definitions(yuzu PRIVATE LICHII_NX_TOOLS)
+endif()
 create_target_directory_groups(yuzu)

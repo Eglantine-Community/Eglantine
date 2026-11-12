@@ -29,6 +29,7 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
+#include "video_core/pipeline_cache_files.h"
 #include "video_core/renderer_opengl/gl_rasterizer.h"
 #include "video_core/renderer_opengl/gl_shader_cache.h"
 #include "video_core/renderer_opengl/gl_shader_util.h"
@@ -54,7 +55,7 @@ using VideoCommon::LoadPipelines;
 using VideoCommon::SerializePipeline;
 using Context = ShaderContext::Context;
 
-constexpr u32 CACHE_VERSION = 27;
+constexpr u32 CACHE_VERSION = VideoCommon::OpenGLPipelineCacheVersion;
 
 template <typename Container>
 auto MakeSpan(Container& container) {
@@ -285,11 +286,11 @@ void ShaderCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
     }
     const auto shader_dir{Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir)};
     const auto base_dir{shader_dir / fmt::format("{:016x}", title_id)};
-    if (!Common::FS::CreateDirs(base_dir)) {
+    if (!Common::FS::CreateDir(shader_dir) || !Common::FS::CreateDir(base_dir)) {
         LOG_ERROR(Common_Filesystem, "Failed to create shader cache directories");
         return;
     }
-    shader_cache_filename = base_dir / "opengl.bin";
+    shader_cache_filename = VideoCommon::VersionedPipelineCachePath(base_dir, "opengl", CACHE_VERSION);
 
     if (!workers && !strict_context_required) {
         workers = CreateWorkers();
@@ -316,6 +317,7 @@ void ShaderCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
     const auto load_compute{[&](std::ifstream& file, FileEnvironment env) {
         ComputePipelineKey key;
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
+        VideoCommon::CheckComputeRecord(env, key.shared_memory_size, key.workgroup_size);
         queue_work([this, key, env_ = std::move(env), &state, &callback](Context* ctx) mutable {
             ctx->pools.ReleaseContents();
             auto pipeline{CreateComputePipeline(ctx->pools, key, env_, true)};
@@ -333,8 +335,10 @@ void ShaderCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
     const auto load_graphics{[&](std::ifstream& file, std::vector<FileEnvironment> envs) {
         GraphicsPipelineKey key;
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
+        VideoCommon::CheckGraphicsRecord(key.unique_hashes, envs.size());
         queue_work([this, key, envs_ = std::move(envs), &state, &callback](Context* ctx) mutable {
-            boost::container::static_vector<Shader::Environment*, 5> env_ptrs;
+            boost::container::static_vector<Shader::Environment*, Maxwell::MaxShaderProgram>
+                env_ptrs;
             for (auto& env : envs_) {
                 env_ptrs.push_back(&env);
             }
@@ -465,7 +469,8 @@ std::unique_ptr<GraphicsPipeline> ShaderCache::CreateGraphicsPipeline() {
             env_ptrs.push_back(&environments.envs[index]);
         }
     }
-    SerializePipeline(graphics_key, env_ptrs, shader_cache_filename, CACHE_VERSION);
+    SerializePipeline(graphics_key, env_ptrs, shader_cache_filename, CACHE_VERSION,
+                      host_info.EnvironmentReadProperties());
     return pipeline;
 }
 
@@ -516,7 +521,7 @@ std::unique_ptr<GraphicsPipeline> ShaderCache::CreateGraphicsPipeline(
             auto& program_va{programs[0]};
             auto program_vb{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
             total_storage_buffers += Shader::NumDescriptors(program_vb.info.storage_buffers_descriptors);
-            programs[index] = MergeDualVertexPrograms(program_va, program_vb, env);
+            programs[index] = MergeDualVertexPrograms(program_va, program_vb, env, host_info);
         }
 
         if (programs[index].info.requires_layer_emulation) {
@@ -588,7 +593,7 @@ std::unique_ptr<ComputePipeline> ShaderCache::CreateComputePipeline(
         return pipeline;
     }
     SerializePipeline(key, std::array<const GenericEnvironment*, 1>{&env}, shader_cache_filename,
-                      CACHE_VERSION);
+                      CACHE_VERSION, host_info.EnvironmentReadProperties());
     return pipeline;
 }
 

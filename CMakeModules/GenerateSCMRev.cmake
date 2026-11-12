@@ -14,19 +14,16 @@ endfunction()
 
 get_timestamp(BUILD_DATE)
 
-set(DALIA_VERSION_MAJOR 1)
-set(DALIA_VERSION_MINOR 0)
-set(DALIA_VERSION_PATCH 0)
-set(DALIA_VERSION "${DALIA_VERSION_MAJOR}.${DALIA_VERSION_MINOR}.${DALIA_VERSION_PATCH}")
-
-string(SUBSTRING "${GIT_COMMIT}" 0 8 GIT_REV_SHORT)
-
-if (DEFINED GIT_RELEASE)
-    set(BUILD_VERSION "v${DALIA_VERSION}")
+if (LICHII_BUILD_TAG MATCHES "^build-[0-9]+$")
+    set(BUILD_VERSION "${LICHII_BUILD_TAG}")
+    set(IS_DEV_BUILD false)
+elseif (DEFINED GIT_RELEASE)
+    set(BUILD_VERSION "${GIT_TAG}")
     set(GIT_REFSPEC "${GIT_RELEASE}")
     set(IS_DEV_BUILD false)
 else()
-    set(BUILD_VERSION "v${DALIA_VERSION}-${GIT_REFSPEC}-${GIT_REV_SHORT}")
+    string(SUBSTRING ${GIT_COMMIT} 0 10 BUILD_VERSION)
+    set(BUILD_VERSION "${BUILD_VERSION}-${GIT_REFSPEC}")
     set(IS_DEV_BUILD true)
 endif()
 
@@ -40,26 +37,19 @@ set(GIT_DESC ${BUILD_VERSION})
 
 # Generate cpp with Git revision from template
 
-# TODO(crueter): Stable releases feed.
-set(BUILD_AUTO_UPDATE_STABLE_REPO "eden-emu/eden")
-set(BUILD_AUTO_UPDATE_STABLE_API "git.eden-emu.dev")
-set(BUILD_AUTO_UPDATE_STABLE_API_PATH "/api/v1/repos/")
-
-set(BUILD_AUTO_UPDATE_API_PATH "/latest/release.json")
+set(BUILD_AUTO_UPDATE_STABLE_REPO "zortos293/Lichii")
+set(BUILD_AUTO_UPDATE_STABLE_API "api.github.com")
+set(BUILD_AUTO_UPDATE_API_PATH "/repos/zortos293/Lichii/releases?per_page=100")
+set(BUILD_AUTO_UPDATE_WEBSITE "https://github.com")
+set(BUILD_AUTO_UPDATE_REPO "zortos293/Lichii")
 if (NIGHTLY_BUILD)
-    set(BUILD_AUTO_UPDATE_WEBSITE "https://git.eden-emu.dev")
-    set(BUILD_AUTO_UPDATE_API "nightly.eden-emu.dev")
-    set(BUILD_AUTO_UPDATE_REPO "eden-ci/nightly")
-    set(REPO_NAME "Dalia Nightly")
+    set(REPO_NAME "Lichii Nightly")
 else()
-    set(BUILD_AUTO_UPDATE_WEBSITE "https://git.eden-emu.dev")
-    set(BUILD_AUTO_UPDATE_API "stable.eden-emu.dev")
-    set(BUILD_AUTO_UPDATE_REPO "eden-emu/eden")
-    set(REPO_NAME "Dalia")
+    set(REPO_NAME "Lichii")
 endif()
 
-set(BUILD_ID "dalia-${BUILD_VERSION}")
-set(BUILD_FULLNAME "${REPO_NAME} ${BUILD_VERSION}")
+set(BUILD_ID ${GIT_REFSPEC})
+set(BUILD_FULLNAME "${REPO_NAME} ${BUILD_VERSION} ")
 set(CXX_COMPILER "${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
 
 configure_file(scm_rev.cpp.in scm_rev.cpp @ONLY)

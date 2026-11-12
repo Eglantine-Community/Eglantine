@@ -11,13 +11,13 @@
 #include <functional>
 #include <mutex>
 #include <span>
-#include <vector>
 
 #include <boost/container/small_vector.hpp>
 
 #include "common/common_types.h"
 #include "common/thread_worker.h"
 #include "shader_recompiler/shader_info.h"
+#include "video_core/renderer_vulkan/pipeline_build.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
@@ -33,19 +33,25 @@ class ShaderNotify;
 namespace Vulkan {
 
 class Device;
+class PipelineBinaries;
 class PipelineStatistics;
 class Scheduler;
 
 class ComputePipeline {
 public:
+    /// `binary_key` is the pipeline's key for shader cache v2's driver layer, `binaries` (or null)
     explicit ComputePipeline(const Device& device, Scheduler& scheduler, vk::PipelineCache& pipeline_cache,
+                             PipelineBinaries* binaries, u64 binary_key,
                              DescriptorPool& descriptor_pool,
                              GuestDescriptorQueue& guest_descriptor_queue,
                              DescriptorBufferRing& descriptor_buffer_ring,
-                             Common::ThreadWorker* thread_worker,
+                             const PipelineBuildQueue& build_queue,
                              PipelineStatistics* pipeline_statistics,
                              VideoCore::ShaderNotify* shader_notify, const Shader::Info& info,
-                             vk::ShaderModule spv_module, u64 shader_hash);
+                             vk::ShaderModule spv_module, u64 shader_hash,
+                             std::function<vk::ShaderModule()> emit = {});
+
+    ~ComputePipeline();
 
     ComputePipeline& operator=(ComputePipeline&&) noexcept = delete;
     ComputePipeline(ComputePipeline&&) noexcept = delete;
@@ -53,9 +59,19 @@ public:
     ComputePipeline& operator=(const ComputePipeline&) = delete;
     ComputePipeline(const ComputePipeline&) = delete;
 
+    using BindCommand = std::function<void(vk::CommandBuffer)>;
+
     [[nodiscard]] bool Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                                  Tegra::MemoryManager& gpu_memory, Scheduler& scheduler,
-                                 BufferCache& buffer_cache, TextureCache& texture_cache);
+                                 BufferCache& buffer_cache, TextureCache& texture_cache,
+                                 TextureCacheRuntime& texture_runtime,
+                                 std::optional<ByteAddressedShadow>& shadow,
+                                 BindCommand* deferred_bind = nullptr);
+
+    static constexpr u64 Ocarina1440pShader = 0x6bd913e1f34e83ebULL;
+    /// The same output pass at 1:1, run at 1920x1080 in handheld with the Max Resolution add-on.
+    static constexpr u64 OcarinaFullSizeShader = 0xc033c3ddc9f0897bULL;
+    [[nodiscard]] bool CanReplaceOcarinaUpscale() const;
 
     bool IsBound() const noexcept {
         return static_cast<bool>(pipeline);
@@ -65,13 +81,7 @@ public:
         return shader_hash;
     }
 
-    /// Native constant buffer pointer slots taken as storage buffers, and the ones left out
-    /// because they held null when this pipeline was built (rebuilt once one is filled).
-    std::vector<u64> pointer_slots;
-    std::vector<u64> null_pointer_slots;
-    u32 pointer_rebuilds{};
-
-    /// Storage images written by the last configured dispatch, kept while a frame dump runs.
+    /// Storage images written by the last configured dispatch
     [[nodiscard]] std::span<const VideoCommon::ImageViewId> WrittenImages() const noexcept {
         return written_images;
     }
@@ -87,12 +97,27 @@ public:
         return sampled_images;
     }
 
+    /// Advances the frame window of EDEN_NX2_UPSCALER_TRACE
+    static void TickUpscalerTrace();
+
+    /// Whether no build of this pipeline is left queued on a worker thread, which holds it
+    [[nodiscard]] bool IsBuildTaskDone() const noexcept {
+        return !jobs || job.Ready();
+    }
+
+    /// Builds it on this thread, for a pipeline made with PipelineBuildQueue::owner_builds
+    void Build() {
+        RunBuild();
+    }
+
 private:
     /// Builds the pipeline once, on whichever thread gets here first.
     void RunBuild();
 
     const Device& device;
     vk::PipelineCache& pipeline_cache;
+    PipelineBinaries* const binaries;
+    const u64 binary_key;
     GuestDescriptorQueue& guest_descriptor_queue;
     DescriptorBufferRing& descriptor_buffer_ring;
     Shader::Info info;
@@ -118,6 +143,9 @@ private:
     std::condition_variable build_condvar;
     std::mutex build_mutex;
     std::atomic_bool is_built{false};
+    /// Shader cache v2: the job that builds it (PipelineBuildQueue::jobs)
+    VideoCommon::ShaderJobScheduler* jobs{};
+    VideoCommon::ShaderJobHandle job;
 };
 
 } // namespace Vulkan

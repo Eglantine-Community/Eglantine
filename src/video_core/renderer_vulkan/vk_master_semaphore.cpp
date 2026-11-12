@@ -8,6 +8,8 @@
 
 #include <ranges>
 #include "common/settings.h"
+#include "video_core/nx2.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -74,6 +76,9 @@ void MasterSemaphore::Refresh() {
         }
     } while (!gpu_tick.compare_exchange_weak(this_tick, counter, std::memory_order_release,
                                              std::memory_order_relaxed));
+    if (counter > this_tick) {
+        Tegra::Nx2PendingWake::Get().OnGpuTick(counter);
+    }
 }
 
 void MasterSemaphore::Wait(u64 tick) {
@@ -83,6 +88,7 @@ void MasterSemaphore::Wait(u64 tick) {
             return;
         }
 
+        const VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::GpuWait};
         u64 last_tick = gpu_tick.load(std::memory_order_relaxed);
         while (gpu_tick.load(std::memory_order_acquire) < tick) {
             gpu_tick.wait(last_tick, std::memory_order_acquire);
@@ -104,15 +110,13 @@ void MasterSemaphore::Wait(u64 tick) {
     }
 
     // If none of the above is hit, fallback to a regular wait
+    const VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::GpuWait};
     try {
         while (!semaphore.Wait(tick)) {
         }
     } catch (const vk::Exception& exception) {
         // The throw ends the process; say why first (a device loss reached nothing else here).
         LOG_CRITICAL(Render_Vulkan, "Waiting for GPU tick {} failed: {}", tick, exception.what());
-        if (exception.GetResult() == VK_ERROR_DEVICE_LOST) {
-            device.ReportLoss();
-        }
         throw;
     }
 
@@ -122,6 +126,7 @@ void MasterSemaphore::Wait(u64 tick) {
 VkResult MasterSemaphore::SubmitQueue(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,
                                       VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                                       u64 host_tick) {
+    const VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::QueueSubmit};
     if (semaphore) {
         return SubmitQueueTimeline(cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore,
                                    host_tick);
@@ -130,7 +135,8 @@ VkResult MasterSemaphore::SubmitQueue(vk::CommandBuffer& cmdbuf, vk::CommandBuff
     }
 }
 
-static constexpr VkPipelineStageFlags wait_stage_mask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+static constexpr VkPipelineStageFlags wait_stage_mask = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                                                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
 
 VkResult MasterSemaphore::SubmitQueueTimeline(vk::CommandBuffer& cmdbuf,
                                               vk::CommandBuffer& upload_cmdbuf,
@@ -184,7 +190,7 @@ VkResult MasterSemaphore::SubmitQueueTimeline(vk::CommandBuffer& cmdbuf,
             .pNext = nullptr,
             .semaphore = wait_semaphore,
             .value = 0,
-            .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            .stageMask = static_cast<VkPipelineStageFlags2>(wait_stage_mask),
             .deviceIndex = 0,
         };
 
@@ -276,7 +282,7 @@ VkResult MasterSemaphore::SubmitQueueFence(vk::CommandBuffer& cmdbuf,
             .pNext = nullptr,
             .semaphore = wait_semaphore,
             .value = 0,
-            .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+            .stageMask = static_cast<VkPipelineStageFlags2>(wait_stage_mask),
             .deviceIndex = 0,
         };
 
@@ -353,26 +359,16 @@ void MasterSemaphore::WaitThread(std::stop_token token) {
             wait_queue.pop();
         }
 
-        try {
-            fence.Wait();
-            fence.Reset();
-        } catch (const vk::Exception& exception) {
-            LOG_CRITICAL(Render_Vulkan, "Waiting for GPU fence (tick {}) failed: {}", host_tick,
-                         exception.what());
-            if (exception.GetResult() == VK_ERROR_DEVICE_LOST) {
-                device.ReportLoss();
-            }
-            gpu_tick.store((std::numeric_limits<u64>::max)(), std::memory_order_release);
-            gpu_tick.notify_all();
-            return;
-        }
+        fence.Wait();
+        fence.Reset();
 
         {
             std::scoped_lock lock{free_mutex};
             free_queue.push_front(std::move(fence));
             gpu_tick.store(host_tick, std::memory_order_release);
         }
-        gpu_tick.notify_all();
+        gpu_tick.notify_one();
+        Tegra::Nx2PendingWake::Get().OnGpuTick(host_tick);
     }
 }
 

@@ -9,6 +9,7 @@
 #include <optional>
 #include <utility>
 
+#include "common/hex_util.h"
 #include "common/logging.h"
 #include <ranges>
 #include "core/crypto/aes_util.h"
@@ -38,13 +39,20 @@ NCA::NCA(VirtualFile file_, const NCA* base_nca, bool allow_missing_base)
 
     reader = std::make_shared<NcaReader>();
     if (Result rc = reader->Initialize(file, GetCryptoConfiguration(), GetNcaCompressionConfiguration()); R_FAILED(rc)) {
-        status = Loader::ResultStatus::ErrorBadNCAHeader;
+        // Without the header key every encrypted header reads as garbage, so a bad header
+        // usually means the keys were never installed.
+        status = keys.HasKey(Core::Crypto::S256KeyType::Header)
+                     ? Loader::ResultStatus::ErrorBadNCAHeader
+                     : Loader::ResultStatus::ErrorMissingHeaderKey;
         return;
     }
 
+    // A decrypted NCA needs no keys.
+    const bool decrypted = reader->GetMagic() == NcaHeader::MagicDecrypted;
+
     // Ensure we have the proper key area keys to continue.
     const u8 master_key_id = MasterKeyIdForKeyGeneration(reader->GetKeyGeneration());
-    if (!keys.HasKey(Core::Crypto::S128KeyType::KeyArea, master_key_id, reader->GetKeyIndex())) {
+    if (!decrypted && !keys.HasKey(Core::Crypto::S128KeyType::KeyArea, master_key_id, reader->GetKeyIndex())) {
         LOG_ERROR(Loader, "Cannot decrypt {}: keys for gen 0x{:02X}+ required.", file->GetName(), reader->GetKeyGeneration());
         status = Loader::ResultStatus::ErrorMissingKeyAreaKey;
         return;
@@ -52,7 +60,7 @@ NCA::NCA(VirtualFile file_, const NCA* base_nca, bool allow_missing_base)
 
     RightsId rights_id{};
     reader->GetRightsId(rights_id.data(), rights_id.size());
-    if (rights_id != RightsId{}) {
+    if (!decrypted && rights_id != RightsId{}) {
         // External decryption key required; provide it here.
         u128 rights_id_u128;
         std::memcpy(rights_id_u128.data(), rights_id.data(), sizeof(rights_id));
@@ -60,11 +68,15 @@ NCA::NCA(VirtualFile file_, const NCA* base_nca, bool allow_missing_base)
         auto titlekey =
             keys.GetKey(Core::Crypto::S128KeyType::Titlekey, rights_id_u128[1], rights_id_u128[0]);
         if (titlekey == Core::Crypto::Key128{}) {
+            LOG_ERROR(Loader, "Cannot decrypt {}: no title key for rights id {}", file->GetName(),
+                      Common::HexToString(rights_id));
             status = Loader::ResultStatus::ErrorMissingTitlekey;
             return;
         }
 
         if (!keys.HasKey(Core::Crypto::S128KeyType::Titlekek, master_key_id)) {
+            LOG_ERROR(Loader, "Cannot decrypt {}: titlekek_{:02x} is missing from prod.keys",
+                      file->GetName(), master_key_id);
             status = Loader::ResultStatus::ErrorMissingTitlekek;
             return;
         }
@@ -106,7 +118,10 @@ NCA::NCA(VirtualFile file_, const NCA* base_nca, bool allow_missing_base)
             }
         }
 
-        if (header_reader.GetEncryptionType() == NcaFsHeader::EncryptionType::AesCtrEx) {
+        // Decrypted updates keep their patch tables with encryption type None.
+        const auto& patch_info = header_reader.GetPatchInfo();
+        if (header_reader.GetEncryptionType() == NcaFsHeader::EncryptionType::AesCtrEx ||
+            (decrypted && patch_info.HasIndirectTable() && patch_info.HasAesCtrExTable())) {
             is_update = true;
         }
     }

@@ -80,7 +80,7 @@ void WritePortablePixmap(const std::filesystem::path& path, const std::string& m
 void WriteGrayscalePgm(const std::filesystem::path& path, VkExtent2D extent,
                        std::span<const u8> pixels) {
     const size_t expected = static_cast<size_t>(extent.width) * extent.height;
-    WritePortablePixmap(path, "P5", extent, pixels.subspan(0, std::min(expected, pixels.size())));
+    WritePortablePixmap(path, "P5", extent, pixels.subspan(0, (std::min)(expected, pixels.size())));
 }
 
 void WriteRaw(const std::filesystem::path& path, std::span<const u8> pixels) {
@@ -202,42 +202,37 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
         shaders.emplace(device);
     }
 
-    if (!Settings::values.frame_gen.GetValue()) {
+    if (unavailable || !Settings::values.frame_gen.GetValue()) {
         if (chain || fsr3_chain) {
             scheduler.Finish();
             chain.reset();
             fsr3_chain.reset();
         }
         warm_streak = 0;
-        logged_active = false;
         return;
     }
 
-    const bool want_fsr3 =
-        Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::Fsr3;
-    const bool use_fsr3 = UseFsr3();
-    if (!want_fsr3 && use_fsr3 && !logged_lsfg_fallback) {
-        logged_lsfg_fallback = true;
-        LOG_WARNING(Render_Vulkan,
-                    "LSFG FrameGen selected, but Lossless.dll shaders are unavailable; falling "
-                    "back to FSR3");
-    } else if (!use_fsr3) {
-        logged_lsfg_fallback = false;
+    if (!shaders->IsValid() && Settings::values.frame_gen_type.GetValue() != Settings::FrameGenType::Fsr3) {
+        unavailable = true;
+        state.store(shaders->IsDeviceSupported() ? VideoCore::FrameGenState::MissingLosslessDll
+                                                 : VideoCore::FrameGenState::UnsupportedGpu,
+                    std::memory_order_relaxed);
+        return;
     }
-    unavailable = false;
 
     if (!frame->storage_view) {
+        state.store(VideoCore::FrameGenState::UnsupportedSurface, std::memory_order_relaxed);
         warm_streak = 0;
         return;
     }
+    state.store(VideoCore::FrameGenState::Running, std::memory_order_relaxed);
 
-    peak_guest_extent.width = std::max(peak_guest_extent.width, guest_extent.width);
-    peak_guest_extent.height = std::max(peak_guest_extent.height, guest_extent.height);
+    peak_guest_extent.width = (std::max)(peak_guest_extent.width, guest_extent.width);
+    peak_guest_extent.height = (std::max)(peak_guest_extent.height, guest_extent.height);
 
     const VkExtent2D extent{.width = frame->width, .height = frame->height};
     const f32 flow_scale = ConfiguredFlowScale(peak_guest_extent, extent);
-    const bool need_backend = use_fsr3 ? !fsr3_chain.has_value() : !chain.has_value();
-    if (need_backend || built_extent.width != extent.width || built_extent.height != extent.height ||
+    if ((!chain && !fsr3_chain) || built_extent.width != extent.width || built_extent.height != extent.height ||
         built_format != format || built_flow_scale != flow_scale) {
         Rebuild(device, extent, format, flow_scale);
     }
@@ -246,17 +241,12 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
     last_count = count;
     last_generations = plan.generations;
 
-    const bool warm = plan.warm && count + 1 >= (use_fsr3 ? u64{2} : LSFG_REQUIRED_FRAMES);
+    const bool warm = plan.warm && count + 1 >= LSFG_REQUIRED_FRAMES;
     warm_streak = warm ? warm_streak + 1 : 0;
-    const u32 min_streak = use_fsr3 ? 1U : LSFG_RECURRENCE_FRAMES;
-    generated = warm && warm_streak >= min_streak && plan.generations > 0;
-    if (generated && !logged_active) {
-        logged_active = true;
-        LOG_INFO(Render_Vulkan,
-                 "FrameGen active: backend={}, multiplier={}x, extent={}x{}, flow_scale={:.2f}",
-                 use_fsr3 ? "FSR3" : "LSFG", last_generations + 1, extent.width, extent.height,
-                 flow_scale);
-    }
+    generated = warm && warm_streak >= LSFG_RECURRENCE_FRAMES && plan.generations > 0;
+    generated_frames.fetch_add(GeneratedFrameCount(), std::memory_order_relaxed);
+
+    const bool use_fsr3 = Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::Fsr3;
 
     if (use_fsr3 && fsr3_chain) {
         scheduler.RequestOutsideRenderPassOperationContext();
@@ -281,6 +271,16 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
     }
 }
 
+void FrameGen::Pause() {
+    pacer.Reset();
+    plan = {};
+    frame_count = 0;
+    last_count = 0;
+    last_generations = 0;
+    warm_streak = 0;
+    generated = false;
+}
+
 size_t FrameGen::WantedGenerations(size_t capacity) {
     if (unavailable) {
         plan = {};
@@ -290,17 +290,12 @@ size_t FrameGen::WantedGenerations(size_t capacity) {
     return plan.generations;
 }
 
-bool FrameGen::UseFsr3() const noexcept {
-    return Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::Fsr3 ||
-           !shaders || !shaders->IsValid();
-}
-
 size_t FrameGen::GeneratedFrameCount() const {
     return generated ? last_generations : 0;
 }
 
 void FrameGen::GenerateInto(const Device& device, Frame* destination, size_t generation) {
-    const bool use_fsr3 = UseFsr3();
+    const bool use_fsr3 = Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::Fsr3;
 
     if (use_fsr3 && fsr3_chain) {
         const f32 blend = static_cast<f32>(generation + 1) / static_cast<f32>(last_generations + 1);
@@ -332,8 +327,7 @@ void FrameGen::Rebuild(const Device& device, VkExtent2D extent, VkFormat format,
 
     built_flow_scale = flow_scale;
 
-    const bool use_fsr3 = UseFsr3();
-    if (use_fsr3) {
+    if (Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::Fsr3) {
         fsr3_chain.emplace(device, memory_allocator, extent, format);
     } else {
         chain.emplace(device, memory_allocator, *shaders, extent, format, built_flow_scale);
@@ -343,11 +337,6 @@ void FrameGen::Rebuild(const Device& device, VkExtent2D extent, VkFormat format,
     frame_count = 0;
     warm_streak = 0;
     generated = false;
-    logged_active = false;
-    LOG_INFO(Render_Vulkan,
-             "FrameGen initialized: backend={}, extent={}x{}, format={}, flow_scale={:.2f}",
-             use_fsr3 ? "FSR3" : "LSFG", extent.width, extent.height, static_cast<u32>(format),
-             built_flow_scale);
 }
 
 void FrameGen::DumpDebugImages(u64 count) {

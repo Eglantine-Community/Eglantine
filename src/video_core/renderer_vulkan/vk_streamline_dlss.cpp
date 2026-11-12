@@ -4,10 +4,14 @@
 // NVIDIA DLSS (through NVIDIA Streamline) in place of a game's DLSS evaluation.
 
 #include <array>
+#include <atomic>
 #include <cstdlib>
-#include <string_view>
 
 #include "common/logging.h"
+#include "common/settings.h"
+#include "video_core/dlss_evaluation.h"
+#include "video_core/dlss_mode.h"
+#include "video_core/renderer_base.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_streamline_dlss.h"
 #include "video_core/vulkan_common/streamline.h"
@@ -24,42 +28,58 @@ constexpr VkImageUsageFlags OUTPUT_USAGE = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE
                                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                                            VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 
+std::atomic<u64> evaluations{};
+std::atomic<u32> last_evaluation{}; ///< Mode, requested mode and preset, a byte each
+
+// slEvaluateFeature returns eWarnOutOfVRAM after it has evaluated DLSS, when the VRAM budget is
+// used up (commonInterface.cpp, slEvaluateFeatureInternal). The output is written; it is a warning.
+bool Evaluated(sl::Result result) {
+    return result == sl::Result::eOk || result == sl::Result::eWarnOutOfVRAM;
+}
+
 int EnvInt(const char* name, int fallback) {
     const char* const value = std::getenv(name);
     return value ? std::atoi(value) : fallback;
 }
 
-// DLSS validates the render size against the mode's range: pick the mode for this ratio.
-sl::DLSSMode ModeFor(VkExtent2D render, VkExtent2D upscale) {
-    const f32 ratio = static_cast<f32>(render.width) / static_cast<f32>(upscale.width);
-    if (ratio >= 0.99f) {
+sl::DLSSMode ModeFor(Settings::NvidiaDlssQuality mode) {
+    using Quality = Settings::NvidiaDlssQuality;
+    switch (mode) {
+    case Quality::Native:
         return sl::DLSSMode::eDLAA;
-    }
-    if (ratio >= 0.65f) {
+    case Quality::Quality:
         return sl::DLSSMode::eMaxQuality;
-    }
-    if (ratio >= 0.57f) {
+    case Quality::Balanced:
         return sl::DLSSMode::eBalanced;
-    }
-    if (ratio >= 0.49f) {
+    case Quality::Performance:
         return sl::DLSSMode::eMaxPerformance;
+    case Quality::UltraPerformance:
+        return sl::DLSSMode::eUltraPerformance;
+    case Quality::Automatic:
+        return sl::DLSSMode::eOff;
     }
-    return sl::DLSSMode::eUltraPerformance;
+    return sl::DLSSMode::eOff;
 }
 
-// Preset K for every mode: NVIDIA's defaults for Performance/Ultra Performance (M, L) draw thin
-// horizontal lines in Fire Emblem at 2x resolution scale. EDEN_NX2_DLSS_PRESET=J|K|L|M picks
-// another model, EDEN_NX2_DLSS_PRESET=default leaves the choice to NVIDIA.
-sl::DLSSPreset Preset() {
-    const char* const value = std::getenv("EDEN_NX2_DLSS_PRESET");
-    if (value && value[0] >= 'J' && value[0] <= 'M') {
-        return static_cast<sl::DLSSPreset>(static_cast<u32>(sl::DLSSPreset::ePresetJ) +
-                                           static_cast<u32>(value[0] - 'J'));
-    }
-    if (value && std::string_view{value} == "default") {
+sl::DLSSPreset PresetFor(Settings::NvidiaDlssPreset preset) {
+    using Preset = Settings::NvidiaDlssPreset;
+    switch (preset) {
+    case Preset::NvidiaDefault:
         return sl::DLSSPreset::eDefault;
+    case Preset::E:
+        return sl::DLSSPreset::ePresetE;
+    case Preset::F:
+        return sl::DLSSPreset::ePresetF;
+    case Preset::J:
+        return sl::DLSSPreset::ePresetJ;
+    case Preset::K:
+        return sl::DLSSPreset::ePresetK;
+    case Preset::L:
+        return sl::DLSSPreset::ePresetL;
+    case Preset::M:
+        return sl::DLSSPreset::ePresetM;
     }
-    return sl::DLSSPreset::ePresetK;
+    return sl::DLSSPreset::ePresetM;
 }
 
 sl::float4x4 Identity() {
@@ -119,7 +139,13 @@ StreamlineDlssUpscaler::StreamlineDlssUpscaler(const Device& device_, Scheduler&
                   static_cast<int>(result));
         throw vk::Exception(VK_ERROR_FEATURE_NOT_PRESENT);
     }
-    point_sampler = device.GetLogical().CreateSampler(VkSamplerCreateInfo{
+    Streamline::GetApi().get_feature_function(sl::kFeatureDLSS, "slDLSSGetState", get_state);
+    Streamline::GetApi().get_feature_function(sl::kFeatureDLSS, "slDLSSGetOptimalSettings",
+                                              get_optimal_settings);
+    if (!get_optimal_settings) {
+        throw vk::Exception(VK_ERROR_FEATURE_NOT_PRESENT);
+    }
+    VkSamplerCreateInfo sampler_info{
         .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
@@ -138,7 +164,11 @@ StreamlineDlssUpscaler::StreamlineDlssUpscaler(const Device& device_, Scheduler&
         .maxLod = VK_LOD_CLAMP_NONE,
         .borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,
         .unnormalizedCoordinates = VK_FALSE,
-    });
+    };
+    point_sampler = device.GetLogical().CreateSampler(sampler_info);
+    sampler_info.magFilter = VK_FILTER_LINEAR;
+    sampler_info.minFilter = VK_FILTER_LINEAR;
+    linear_sampler = device.GetLogical().CreateSampler(sampler_info);
 }
 
 StreamlineDlssUpscaler::~StreamlineDlssUpscaler() {
@@ -216,46 +246,47 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
     if (failed) {
         return false;
     }
-    bool reset = in.reset;
-    bool options_changed = false;
-    if (!output_image || in.render_size.width != render_extent.width ||
-        in.render_size.height != render_extent.height ||
-        in.upscale_size.width != upscale_extent.width ||
-        in.upscale_size.height != upscale_extent.height) {
+    const bool extent_changed = !output_image || in.render_size.width != render_extent.width ||
+                                in.render_size.height != render_extent.height ||
+                                in.upscale_size.width != upscale_extent.width ||
+                                in.upscale_size.height != upscale_extent.height;
+    const auto settings = Settings::GetNvidiaDlssRuntimeSettings();
+    const bool options_changed = extent_changed || in.hdr != hdr_input ||
+                                 quality_mode != settings.quality ||
+                                 model_preset != settings.preset;
+    const bool reset = in.reset || options_changed;
+    if (options_changed && !extent_changed) {
+        scheduler.Finish();
+    }
+    if (extent_changed) {
         CreateOutput(in.upscale_size);
         render_extent = in.render_size;
         upscale_extent = in.upscale_size;
-        options_changed = true;
-        reset = true;
     }
+    hdr_input = in.hdr;
+    quality_mode = settings.quality;
+    model_preset = settings.preset;
 
-    // The game's own setup (Fortune's Weave: render-size motion vectors, reversed depth). Its
-    // colour is linear and goes above 1 with no exposure passed, so by default DLSS gets the HDR
-    // path with its own auto exposure. EDEN_NX2_DLSS_HDR=0 / EDEN_NX2_DLSS_AUTO_EXPOSURE=0 turn
-    // those off.
+    // Keep the existing HDR controls for linear input such as Fortune's Weave. Tonemapped
+    // input such as Ocarina's already has its exposure applied.
     sl::DLSSOptions options{};
-    options.mode = ModeFor(in.render_size, in.upscale_size);
     options.outputWidth = in.upscale_size.width;
     options.outputHeight = in.upscale_size.height;
-    options.colorBuffersHDR = EnvInt("EDEN_NX2_DLSS_HDR", 1) != 0 ? sl::eTrue : sl::eFalse;
+    options.colorBuffersHDR =
+        in.hdr && EnvInt("EDEN_NX2_DLSS_HDR", 1) != 0 ? sl::eTrue : sl::eFalse;
     options.useAutoExposure =
-        EnvInt("EDEN_NX2_DLSS_AUTO_EXPOSURE", 1) != 0 ? sl::eTrue : sl::eFalse;
-    const sl::DLSSPreset preset = Preset();
+        in.hdr && EnvInt("EDEN_NX2_DLSS_AUTO_EXPOSURE", 1) != 0 ? sl::eTrue : sl::eFalse;
+    const sl::DLSSPreset preset = PresetFor(settings.preset);
     options.dlaaPreset = preset;
     options.qualityPreset = preset;
     options.balancedPreset = preset;
     options.performancePreset = preset;
     options.ultraPerformancePreset = preset;
     options.ultraQualityPreset = preset;
-    if (options_changed) {
-        LOG_INFO(Render_Vulkan, "NVIDIA DLSS (Streamline): {}x{} -> {}x{}, mode {}, preset {}",
-                 in.render_size.width, in.render_size.height, in.upscale_size.width,
-                 in.upscale_size.height, static_cast<int>(options.mode),
-                 static_cast<int>(preset));
-    }
 
     scheduler.RequestOutsideRenderPassOperationContext();
-    scheduler.Record([this, in, reset, options, options_changed, index = frame_index++,
+    scheduler.Record([this, in, reset, options, options_changed, requested = settings.quality,
+                      preset_setting = settings.preset, index = frame_index++,
                       output_image_handle = *output_image,
                       output_view_handle = *output_view](vk::CommandBuffer cmdbuf) {
         const Streamline::Api& api = Streamline::GetApi();
@@ -294,28 +325,7 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
                 barrier(VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT));
         };
-        if (options_changed) {
-            const auto set = reinterpret_cast<PFun_slDLSSSetOptions*>(set_options);
-            if (const sl::Result result = set(viewport, options); result != sl::Result::eOk) {
-                if (!failed.exchange(true)) {
-                    LOG_ERROR(Render_Vulkan,
-                              "Streamline rejected the DLSS options (result {}); using FSR 3.1",
-                              static_cast<int>(result));
-                }
-                clear_output();
-                return;
-            }
-        }
         sl::FrameToken* frame{};
-        if (const sl::Result result = api.get_new_frame_token(frame, &index);
-            result != sl::Result::eOk || !frame) {
-            if (!failed.exchange(true)) {
-                LOG_ERROR(Render_Vulkan, "Streamline gave no frame token (result {}); using FSR 3.1",
-                          static_cast<int>(result));
-            }
-            clear_output();
-            return;
-        }
 
         constexpr VkAccessFlags WRITES =
             VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
@@ -330,8 +340,6 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
             Barrier(in.motion_vectors, WRITES, VK_ACCESS_SHADER_READ_BIT,
                     VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL),
         };
-        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, {}, {}, to_read);
 
         // DLSS super resolution only reads the jitter, motion and depth conventions; the camera
         // fields are for frame generation, which this doesn't use.
@@ -355,12 +363,11 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
         constants.cameraFar = 1000.0f;
         constants.cameraFOV = 1.0f;
         constants.cameraAspectRatio = rw / rh;
-        constants.depthInverted = sl::eTrue;
+        constants.depthInverted = in.depth_inverted ? sl::eTrue : sl::eFalse;
         constants.cameraMotionIncluded = sl::eTrue;
         constants.motionVectors3D = sl::eFalse;
         constants.reset = reset ? sl::eTrue : sl::eFalse;
         constants.motionVectorsJittered = sl::eFalse;
-        api.set_constants(constants, *frame, viewport);
 
         sl::Resource color = Resource(in.color.image, in.color.view, in.color.format,
                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, in.render_size,
@@ -387,21 +394,12 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                                    sl::ResourceLifecycle::eValidUntilEvaluate, &output_area};
         const sl::BaseStructure* inputs[] = {&viewport, &color_tag, &depth_tag, &motion_tag,
                                              &output_tag};
-        const sl::Result result =
-            api.evaluate_feature(sl::kFeatureDLSS, *frame, inputs, std::size(inputs),
-                                 reinterpret_cast<sl::CommandBuffer*>(*cmdbuf));
-        if (result != sl::Result::eOk && !failed.exchange(true)) {
-            LOG_ERROR(Render_Vulkan, "NVIDIA DLSS evaluation failed (Streamline result {}); "
-                                     "using FSR 3.1 from now on",
-                      static_cast<int>(result));
-        }
-
         const std::array to_general{
-            Barrier(in.color, VK_ACCESS_SHADER_READ_BIT, 0,
+            Barrier(in.color, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_READ_BIT | WRITES,
                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL),
-            Barrier(in.depth, VK_ACCESS_SHADER_READ_BIT, 0,
+            Barrier(in.depth, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_READ_BIT | WRITES,
                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL),
-            Barrier(in.motion_vectors, VK_ACCESS_SHADER_READ_BIT, 0,
+            Barrier(in.motion_vectors, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_READ_BIT | WRITES,
                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL),
         };
         const VkMemoryBarrier output_written{
@@ -410,16 +408,123 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
             .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
             .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
         };
-        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, output_written, {},
-                               to_general);
-        if (result != sl::Result::eOk) {
+        sl::Result api_result = sl::Result::eOk;
+        const auto result = VideoCommon::RecordDlssEvaluation(
+            [&] {
+                if (!options_changed) {
+                    return true;
+                }
+                namespace Mode = VideoCommon::DlssMode;
+                auto validated = options;
+                const auto selection = Mode::Select(
+                    requested, {in.render_size.width, in.render_size.height},
+                    {in.upscale_size.width, in.upscale_size.height},
+                    [&](Settings::NvidiaDlssQuality mode) -> std::optional<Mode::Range> {
+                        validated.mode = ModeFor(mode);
+                        sl::DLSSOptimalSettings optimal{};
+                        const auto query =
+                            reinterpret_cast<PFun_slDLSSGetOptimalSettings*>(get_optimal_settings);
+                        api_result = query(validated, optimal);
+                        if (api_result != sl::Result::eOk) {
+                            return std::nullopt;
+                        }
+                        return Mode::Range{{optimal.renderWidthMin, optimal.renderHeightMin},
+                                           {optimal.renderWidthMax, optimal.renderHeightMax}};
+                    });
+                if (selection.fallback) {
+                    const Mode::Range range = selection.requested_range.value_or(Mode::Range{});
+                    LOG_WARNING(
+                        Render_Vulkan,
+                        "NVIDIA DLSS requested {} but using {} for {}x{} -> {}x{}; "
+                        "requested range {}x{} to {}x{} (query {})",
+                        Settings::CanonicalizeEnum(requested),
+                        selection.mode ? Settings::CanonicalizeEnum(*selection.mode) : "FSR 3.1",
+                        in.render_size.width, in.render_size.height, in.upscale_size.width,
+                        in.upscale_size.height, range.min.width, range.min.height, range.max.width,
+                        range.max.height, selection.requested_range ? "supported" : "unavailable");
+                }
+                if (!selection.mode) {
+                    LOG_WARNING(Render_Vulkan, "No NVIDIA DLSS mode accepts {}x{} -> {}x{}",
+                                in.render_size.width, in.render_size.height, in.upscale_size.width,
+                                in.upscale_size.height);
+                    return false;
+                }
+                validated.mode = ModeFor(*selection.mode);
+                evaluated_mode = *selection.mode;
+                LOG_INFO(Render_Vulkan,
+                         "NVIDIA DLSS (Streamline): {}x{} -> {}x{}, mode {}, preset {}, {}",
+                         in.render_size.width, in.render_size.height, in.upscale_size.width,
+                         in.upscale_size.height, Settings::CanonicalizeEnum(*selection.mode),
+                         static_cast<int>(validated.dlaaPreset),
+                         validated.colorBuffersHDR == sl::eTrue ? "HDR" : "LDR");
+                const auto set = reinterpret_cast<PFun_slDLSSSetOptions*>(set_options);
+                api_result = set(viewport, validated);
+                return api_result == sl::Result::eOk;
+            },
+            [&] {
+                api_result = api.get_new_frame_token(frame, &index);
+                return api_result == sl::Result::eOk && frame;
+            },
+            [&] {
+                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, {}, {}, to_read);
+            },
+            [&] {
+                api_result = api.set_constants(constants, *frame, viewport);
+                return api_result == sl::Result::eOk;
+            },
+            [&] {
+                api_result = api.evaluate_feature(sl::kFeatureDLSS, *frame, inputs, std::size(inputs),
+                                                  reinterpret_cast<sl::CommandBuffer*>(*cmdbuf));
+                if (api_result == sl::Result::eWarnOutOfVRAM && !vram_warned.exchange(true)) {
+                    LOG_WARNING(Render_Vulkan, "NVIDIA DLSS: Streamline reports the VRAM budget is "
+                                               "used up; DLSS stays on");
+                }
+                return Evaluated(api_result);
+            },
+            [&] {
+                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                       VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, output_written, {},
+                                       to_general);
+            });
+        if (result != VideoCommon::DlssEvaluationResult::Succeeded && !failed.exchange(true)) {
+            LOG_ERROR(Render_Vulkan,
+                      "NVIDIA DLSS recording failed at stage {} (Streamline result {}); using FSR 3.1",
+                      static_cast<int>(result), static_cast<int>(api_result));
+        }
+        if (result != VideoCommon::DlssEvaluationResult::Succeeded) {
             clear_output();
+            return;
+        }
+        last_evaluation.store(static_cast<u32>(evaluated_mode) |
+                                  (static_cast<u32>(requested) << 8) |
+                                  (static_cast<u32>(preset_setting) << 16),
+                              std::memory_order_relaxed);
+        evaluations.fetch_add(1, std::memory_order_release);
+        // NGX doesn't report the model it picked, but its memory tells them apart: at 3840x2160
+        // output DLSS 310.9 allocates about 198 MB for presets E and F and 307 MB for J and K.
+        sl::DLSSState state{};
+        if (options_changed && get_state &&
+            reinterpret_cast<PFun_slDLSSGetState*>(get_state)(viewport, state) == sl::Result::eOk) {
+            LOG_INFO(Render_Vulkan, "NVIDIA DLSS (Streamline): preset {} allocated {:.1f} MB",
+                     static_cast<int>(options.dlaaPreset),
+                     static_cast<double>(state.estimatedVRAMUsageInBytes) / 1e6);
         }
     });
     // DLSS binds its own pipelines and descriptors on the command buffer.
     scheduler.InvalidateState();
     return true;
+}
+
+VideoCore::DlssStatus StreamlineDlssUpscaler::Status() {
+    const u64 count = evaluations.load(std::memory_order_acquire);
+    const u32 last = last_evaluation.load(std::memory_order_relaxed);
+    return {
+        .evaluations = count,
+        .mode = static_cast<Settings::NvidiaDlssQuality>(last & 0xff),
+        .requested = static_cast<Settings::NvidiaDlssQuality>((last >> 8) & 0xff),
+        .preset = static_cast<Settings::NvidiaDlssPreset>((last >> 16) & 0xff),
+    };
 }
 
 } // namespace Vulkan

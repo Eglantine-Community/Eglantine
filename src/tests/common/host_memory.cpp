@@ -4,7 +4,17 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cstring>
+
 #include <catch2/catch_test_macros.hpp>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <psapi.h>
+#else
+#include <unistd.h>
+#endif
 
 #include "common/host_memory.h"
 #include "common/literals.h"
@@ -16,6 +26,14 @@ static constexpr size_t VIRTUAL_SIZE = 1ULL << 39;
 static constexpr size_t BACKING_SIZE = 4_GiB;
 static constexpr auto PERMS = Common::MemoryPermission::ReadWrite;
 static constexpr auto HEAP = false;
+
+static bool MapsSingleGuestPages() {
+#ifdef _WIN32
+    return true;
+#else
+    return sysconf(_SC_PAGESIZE) == 0x1000;
+#endif
+}
 
 TEST_CASE("HostMemory: Initialize and deinitialize", "[common]") {
     {
@@ -29,6 +47,9 @@ TEST_CASE("HostMemory: Initialize and deinitialize", "[common]") {
 }
 
 TEST_CASE("HostMemory: Simple map", "[common]") {
+    if (!MapsSingleGuestPages()) {
+        SKIP("Host pages larger than 4 KiB only map whole host pages");
+    }
     HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
     REQUIRE(mem.BackingBasePointer() != nullptr);
     mem.Map(0x5000, 0x8000, 0x1000, PERMS, HEAP);
@@ -38,7 +59,24 @@ TEST_CASE("HostMemory: Simple map", "[common]") {
     REQUIRE(data[0] == 50);
 }
 
+TEST_CASE("HostMemory: Aligned contiguous map", "[common]") {
+    HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
+    REQUIRE(mem.BackingBasePointer() != nullptr);
+    mem.Map(0x40000, 0x80000, 0x10000, PERMS, HEAP);
+
+    volatile u8* const data = mem.VirtualBasePointer() + 0x40000;
+    data[0] = 1;
+    data[0x5fff] = 2;
+    data[0xffff] = 3;
+    REQUIRE(mem.BackingBasePointer()[0x80000] == 1);
+    REQUIRE(mem.BackingBasePointer()[0x85fff] == 2);
+    REQUIRE(mem.BackingBasePointer()[0x8ffff] == 3);
+}
+
 TEST_CASE("HostMemory: Simple mirror map", "[common]") {
+    if (!MapsSingleGuestPages()) {
+        SKIP("Host pages larger than 4 KiB only map whole host pages");
+    }
     HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
     REQUIRE(mem.BackingBasePointer() != nullptr);
     mem.Map(0x5000, 0x3000, 0x2000, PERMS, HEAP);
@@ -51,6 +89,9 @@ TEST_CASE("HostMemory: Simple mirror map", "[common]") {
 }
 
 TEST_CASE("HostMemory: Simple unmap", "[common]") {
+    if (!MapsSingleGuestPages()) {
+        SKIP("Host pages larger than 4 KiB only map whole host pages");
+    }
     HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
     REQUIRE(mem.BackingBasePointer() != nullptr);
     mem.Map(0x5000, 0x3000, 0x2000, PERMS, HEAP);
@@ -63,6 +104,9 @@ TEST_CASE("HostMemory: Simple unmap", "[common]") {
 }
 
 TEST_CASE("HostMemory: Simple unmap and remap", "[common]") {
+    if (!MapsSingleGuestPages()) {
+        SKIP("Host pages larger than 4 KiB only map whole host pages");
+    }
     HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
     REQUIRE(mem.BackingBasePointer() != nullptr);
     mem.Map(0x5000, 0x3000, 0x2000, PERMS, HEAP);
@@ -152,6 +196,9 @@ TEST_CASE("HostMemory: Unmap to right", "[common]") {
 }
 
 TEST_CASE("HostMemory: Partial right unmap check bindings", "[common]") {
+    if (!MapsSingleGuestPages()) {
+        SKIP("Host pages larger than 4 KiB only map whole host pages");
+    }
     HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
     REQUIRE(mem.BackingBasePointer() != nullptr);
     mem.Map(0x4000, 0x10000, 0x4000, PERMS, HEAP);
@@ -165,6 +212,9 @@ TEST_CASE("HostMemory: Partial right unmap check bindings", "[common]") {
 }
 
 TEST_CASE("HostMemory: Partial left unmap check bindings", "[common]") {
+    if (!MapsSingleGuestPages()) {
+        SKIP("Host pages larger than 4 KiB only map whole host pages");
+    }
     HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
     REQUIRE(mem.BackingBasePointer() != nullptr);
     mem.Map(0x4000, 0x10000, 0x4000, PERMS, HEAP);
@@ -195,6 +245,9 @@ TEST_CASE("HostMemory: Partial middle unmap check bindings", "[common]") {
 }
 
 TEST_CASE("HostMemory: Partial sparse middle unmap and check bindings", "[common]") {
+    if (!MapsSingleGuestPages()) {
+        SKIP("Host pages larger than 4 KiB only map whole host pages");
+    }
     HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
     REQUIRE(mem.BackingBasePointer() != nullptr);
     mem.Map(0x4000, 0x10000, 0x2000, PERMS, HEAP);
@@ -209,3 +262,49 @@ TEST_CASE("HostMemory: Partial sparse middle unmap and check bindings", "[common
     REQUIRE(ptr[0x0000] == 19);
     REQUIRE(ptr[0x3fff] == 12);
 }
+
+#ifdef _WIN32
+TEST_CASE("HostMemory: Trim zero pages keeps contents", "[common]") {
+    constexpr size_t Page = 0x1000;
+    HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
+    REQUIRE(mem.BackingBasePointer() != nullptr);
+    mem.Map(0x10000, 0x100000, 2 * Page, PERMS, HEAP);
+    // Two views next to each other: one run that VirtualUnlock can't take as a whole.
+    mem.Map(0x12000, 0x200000, Page, PERMS, HEAP);
+    mem.Map(0x13000, 0x300000, Page, PERMS, HEAP);
+    u8* const view = mem.VirtualBasePointer() + 0x10000;
+    u8* const backing = mem.BackingBasePointer();
+    std::memset(view, 0, Page);
+    std::memset(view + Page, 0x5a, Page);
+    std::memset(view + 2 * Page, 0, 2 * Page);
+    std::memset(backing + 0x400000, 0, Page);
+
+    const auto resident = [](const void* address) {
+        PSAPI_WORKING_SET_EX_INFORMATION info{};
+        info.VirtualAddress = const_cast<void*>(address);
+        REQUIRE(QueryWorkingSetEx(GetCurrentProcess(), &info, sizeof(info)));
+        return info.VirtualAttributes.Valid != 0;
+    };
+    REQUIRE(resident(view));
+    REQUIRE(!resident(backing + 0x100000 + Page));
+
+    const auto [looked_at, trimmed] = mem.TrimZeroPages();
+    REQUIRE(looked_at >= 5 * Page);
+    REQUIRE(trimmed >= 4 * Page);
+    REQUIRE(!resident(view));
+    REQUIRE(!resident(view + 2 * Page));
+    REQUIRE(!resident(view + 3 * Page));
+    REQUIRE(!resident(backing + 0x400000));
+    REQUIRE(resident(view + Page));
+    REQUIRE(!resident(backing + 0x100000 + Page));
+
+    const auto all = [](const u8* page, u8 value) {
+        return std::all_of(page, page + Page, [value](u8 byte) { return byte == value; });
+    };
+    REQUIRE(all(view, 0));
+    REQUIRE(all(view + Page, 0x5a));
+    REQUIRE(all(view + 2 * Page, 0));
+    REQUIRE(all(view + 3 * Page, 0));
+    REQUIRE(all(backing + 0x400000, 0));
+}
+#endif

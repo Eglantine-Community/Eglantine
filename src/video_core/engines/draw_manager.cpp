@@ -5,13 +5,38 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstring>
+#include <set>
+#include <tuple>
 
 #include "common/settings.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/rasterizer_interface.h"
+#include "video_core/render_trace.h"
 
 namespace Tegra::Engines {
+namespace {
+
+void TraceSuppressedDraw(const Maxwell3D& maxwell3d, bool indirect) {
+    if (!VideoCommon::RenderTrace::Enabled()) {
+        return;
+    }
+    const auto& regs = maxwell3d.regs;
+    const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
+    const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
+    static thread_local std::set<std::tuple<u64, u64, u64, bool, bool>> seen;
+    if (seen.size() < 256 &&
+        seen.emplace(vs, ps, regs.render_enable.Address(), Settings::IsDockedMode(), indirect).second) {
+        LOG_DEBUG(HW_GPU,
+                  "Render trace suppressed: docked={} indirect={} vs={:#x} ps={:#x} "
+                  "condition_address={:#x} mode={} override={}",
+                  Settings::IsDockedMode(), indirect, vs, ps, regs.render_enable.Address(),
+                  static_cast<u32>(regs.render_enable.mode),
+                  static_cast<u32>(regs.render_enable_override));
+    }
+}
+
+} // namespace
 
 void Maxwell3D::DrawManager::ProcessMethodCall(Maxwell3D& maxwell3d, u32 method, u32 argument) {
     switch (method) {
@@ -284,11 +309,7 @@ void Maxwell3D::DrawManager::DrawTexture(Maxwell3D& maxwell3d) {
     draw_texture_state.src_y1 = (f32(maxwell3d.regs.draw_texture.dy_dv) / 4294967296.f) * dst_height + draw_texture_state.src_y0;
     draw_texture_state.src_sampler = maxwell3d.regs.draw_texture.src_sampler;
     draw_texture_state.src_texture = maxwell3d.regs.draw_texture.src_texture;
-    try {
-        maxwell3d.rasterizer->DrawTexture();
-    } catch (const std::exception& e) {
-        LOG_ERROR(HW_GPU, "Exception during DrawTexture: {}", e.what());
-    }
+    maxwell3d.rasterizer->DrawTexture();
 }
 
 void Maxwell3D::DrawManager::UpdateTopology(Maxwell3D& maxwell3d) {
@@ -322,11 +343,9 @@ void Maxwell3D::DrawManager::ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed
     LOG_TRACE(HW_GPU, "called, topology={}, count={}", draw_state.topology, draw_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count);
     UpdateTopology(maxwell3d);
     if (maxwell3d.ShouldExecute()) {
-        try {
-            maxwell3d.rasterizer->Draw(draw_indexed, instance_count);
-        } catch (const std::exception& e) {
-            LOG_ERROR(HW_GPU, "Exception during Draw: {}", e.what());
-        }
+        maxwell3d.rasterizer->Draw(draw_indexed, instance_count);
+    } else {
+        TraceSuppressedDraw(maxwell3d, false);
     }
 }
 
@@ -335,11 +354,9 @@ void Maxwell3D::DrawManager::ProcessDrawIndirect(Maxwell3D& maxwell3d) {
     LOG_TRACE(HW_GPU, "called, topology={}, is_indexed={}, includes_count={}, buffer_size={}, max_draw_count={}", draw_state.topology, indirect_state.is_indexed, indirect_state.include_count, indirect_state.buffer_size, indirect_state.max_draw_counts);
     UpdateTopology(maxwell3d);
     if (maxwell3d.ShouldExecute()) {
-        try {
-            maxwell3d.rasterizer->DrawIndirect();
-        } catch (const std::exception& e) {
-            LOG_ERROR(HW_GPU, "Exception during DrawIndirect: {}", e.what());
-        }
+        maxwell3d.rasterizer->DrawIndirect();
+    } else {
+        TraceSuppressedDraw(maxwell3d, true);
     }
 }
 } // namespace Tegra::Engines

@@ -9,7 +9,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
-#include <mutex>
+#include <cstdlib>
 #include <optional>
 #include <span>
 #include <vector>
@@ -120,8 +120,6 @@ struct CommandList final {
     boost::container::small_vector<CommandHeader, 512> prefetch_command_list;
     /// EDEN_NX2_PB_CHECK: hash of each entry's words when it was submitted.
     std::vector<u64> submit_hashes;
-    /// Guest time (ns) at which the game submitted this list: the GPU time its reports show.
-    u64 submit_ns{};
     /// The entries' words when they were submitted (NX2), each entry's at submitted_offsets[i]:
     /// executed instead of the memory, which the game may already be refilling for a later frame.
     std::vector<CommandHeader> submitted_words;
@@ -134,38 +132,6 @@ struct CommandList final {
     /// release the acquire.
     u64 snapshot_suspensions = 0;
 };
-
-/// Submit time of the list the GPU is running (0: none yet), for GPU time reports.
-inline std::atomic<u64> g_nx2_list_submit_ns;
-
-/// The GPU time a report shows: when the game submitted the work, not when the host got to it.
-/// Never later than now, never behind an earlier report.
-constexpr u64 Nx2ReportTimeNs(u64 now, u64 submitted, u64 last) {
-    const u64 time = submitted != 0 && submitted < now ? submitted : now;
-    return time > last ? time : last;
-}
-
-/// The GPU times reports show, never behind an earlier one (reports come from several threads).
-class Nx2ReportClock {
-public:
-    u64 Next(u64 now) {
-        std::scoped_lock lock{mutex};
-        last = Nx2ReportTimeNs(now, g_nx2_list_submit_ns.load(std::memory_order_relaxed), last);
-        return last;
-    }
-
-private:
-    std::mutex mutex;
-    u64 last{};
-};
-
-/// The GPU starts on `list`: its reports show its submit time (lists from before it was known
-/// keep the previous one).
-inline void Nx2NoteRunningList(const CommandList& list) {
-    if (list.submit_ns != 0) {
-        g_nx2_list_submit_ns.store(list.submit_ns, std::memory_order_relaxed);
-    }
-}
 
 /// FNV-1a over pushbuffer words (EDEN_NX2_PB_CHECK).
 inline u64 HashPushbufferWords(std::span<const u32> words) {
@@ -206,12 +172,15 @@ public:
 
     void DispatchCalls();
 
-    /// Switch 2: true while the channel is suspended on a semaphore acquire.
+    /// Switch 2: true while the channel is suspended, on a semaphore acquire or on the GPU's copy
+    /// of a command list it reads next.
     [[nodiscard]] bool HasPendingAcquire() const {
-        return puller.HasPendingAcquire();
+        return puller.HasPendingAcquire() || pending_list_tick.has_value();
     }
-    [[nodiscard]] bool CanResumeAcquire() {
-        return puller.CanResumeAcquire(*this);
+    [[nodiscard]] bool CanResumeAcquire();
+    /// Suspended on the GPU's copy of a command list.
+    [[nodiscard]] bool WaitsForListCopy() const {
+        return pending_list_tick.has_value();
     }
 
     void BindSubchannel(Engines::EngineInterface* engine, u32 subchannel_id, Engines::EngineTypes engine_type) {
@@ -222,6 +191,11 @@ public:
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
 
 private:
+    friend struct DmaPusherTestAccess;
+
+    static bool IsMemoryWriter(const Engines::EngineInterface& engine, Engines::EngineTypes type,
+                               u32 method);
+
     static constexpr u32 non_puller_methods = 0x40;
     static constexpr u32 max_subchannels = 8;
     bool Step();
@@ -246,6 +220,9 @@ public:
     void RecordParsedEntry(const CommandListHeader& header, std::span<const CommandHeader> commands);
     /// Whether the entry lies on device pages the GPU has written (NX2).
     bool IsGpuWrittenCommands(GPUVAddr address, size_t size);
+    /// A copy engine method sent to the split's back: a launch that releases its semaphore tells
+    /// the front what it writes (GpuSplit::NoteSemaphoreWrite).
+    void NoteDmaSemaphore(u32 method, u32 argument);
     /// Copies the list's words from memory again, as of suspension count `now`.
     void RefreshSnapshot(CommandList& list, u64 now);
     /// Copies the list's deferred entries (CommandList::deferred_entries) from memory.
@@ -262,17 +239,13 @@ public:
     /// Reads a command list on pages the GPU wrote into command_headers, from the copies the
     /// buffer cache made after the work that wrote them or from guest memory for pages flushed
     /// since. False when not all are current (or the list isn't GPU-written): the caller drains,
-    /// flushes and reads guest memory.
-    bool ReadGpuWrittenCommands(GPUVAddr address, u32 count);
+    /// flushes and reads guest memory. With `pending`, a copy the GPU has not finished sets
+    /// `*pending` and pending_list_tick instead of waiting (the result is false then).
+    bool ReadGpuWrittenCommands(GPUVAddr address, u32 count, bool* pending = nullptr);
     /// Brings command list words the GPU wrote (still only in host buffers) to guest memory.
-    void FlushGpuWrittenCommands(GPUVAddr address, size_t size);
+    bool FlushGpuWrittenCommands(GPUVAddr address, size_t size);
 
 private:
-    static constexpr u32 CommandChecksBeforeBitsFirst = 2048;
-    u64 entry_wait_generation{~u64{0}};
-    u32 entry_checks_since_mark{};
-    /// Whether an entry not on GPU-written pages must still wait for the split's queued writers.
-    bool WaitForEntryWriters();
 
 public:
     Common::ScratchBuffer<CommandHeader> command_headers; ///< Buffer for list of commands fetched at once
@@ -310,6 +283,17 @@ public:
     void ResolveSplitMethod(GPUVAddr entry_address);
     static constexpr size_t MaxParkedMethods = 16;
 
+    // Read per channel, not at static initialization, which runs before the frontend loads
+    // nx2_switches.txt.
+    // EDEN_NX2_SEM_WATCH=<gpu address>: log every method whose argument is the low word of an
+    // address in the 16 bytes there (finds the engine and method that release a semaphore).
+    const u32 semaphore_watch = [] {
+        const char* value = std::getenv("EDEN_NX2_SEM_WATCH");
+        return value ? static_cast<u32>(std::strtoull(value, nullptr, 16)) : 0U;
+    }();
+    // EDEN_NX2_PB_CHECK also keeps the last parsed entries, for DumpCurrentEntry.
+    const bool record_parsed_entries = std::getenv("EDEN_NX2_PB_CHECK") != nullptr;
+
     // Debug aid: hashes of the words of the last entries as they were parsed.
     struct ParsedEntry {
         GPUVAddr address;
@@ -323,17 +307,27 @@ public:
 
     std::array<Engines::EngineInterface*, max_subchannels> subchannels{};
     std::array<Engines::EngineTypes, max_subchannels> subchannel_type;
+    /// The copy engine's semaphore address (high, low) and payload as sent (NoteDmaSemaphore).
+    std::array<u32, 3> dma_semaphore{};
 
     Engines::Puller puller;
     std::mutex sync_mutex;
     std::condition_variable sync_cv;
 
     VideoCore::RasterizerInterface* rasterizer = nullptr;
+    /// Host GPU tick of the command list copy this channel waits for (ReadGpuWrittenCommands).
+    std::optional<u64> pending_list_tick;
+    /// The entry parsed next was suspended on pending_list_tick, which is done now.
+    bool resumed_list_read{};
+    /// When the channel suspended on pending_list_tick (EDEN_NX2_LIST_MACRO_TRACE), else 0.
+    u64 list_trace_wait_start{};
 
-    const bool ib_enable : 1 = true; ///< IB mode enabled
-    bool dma_increment_once : 1 = false;
-    bool signal_sync : 1 = false;
-    bool synced : 1 = false;
+    // Not bitfields: the fence thread sets synced, and a bitfield write would rewrite the byte it
+    // shares with dma_increment_once and signal_sync (#479).
+    const bool ib_enable = true; ///< IB mode enabled
+    bool dma_increment_once = false;
+    bool signal_sync = false;
+    std::atomic<bool> synced{false};
 };
 
 } // namespace Tegra

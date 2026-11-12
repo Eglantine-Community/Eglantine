@@ -2,9 +2,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
-#include <algorithm>
-#include <array>
-
 #include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
 
 namespace Shader::Ampere {
@@ -49,11 +46,9 @@ public:
             const s64 target = s64{index} * 16 + 16 + relative;
             if (target < 0 || target % 16 || target >= MaximumInstructions * 16)
                 return Result::InvalidTarget;
-            // A predicated CALL.REL.NOINC is a loop-exit jump inside the program. Unpredicated it is
-            // the real call the lowering verifies, with its function behind the main EXIT.
-            const bool noinc_jump = opcode == 0x944 && (instruction.words[2] & 0x400000) != 0 &&
-                                    instruction.words[0] != 0x7944;
-            if (opcode == 0x944 && !noinc_jump) {
+            // CALL.REL.NOINC (bit 86) pushes no return address, but its callee still returns
+            // with RET.REL.NODEC through the link register set ahead of the call.
+            if (opcode == 0x944) {
                 last_call_target = std::max(last_call_target, static_cast<u32>(target / 16));
             } else {
                 last_forward_target = std::max(last_forward_target, static_cast<u32>(target / 16));
@@ -63,18 +58,11 @@ public:
             if (opcode == 0x947 && computed_branch && instruction.Bits(12, 4) == 7 &&
                 target == s64{index} * 16)
                 return Result::Complete;
-            // A closing self-branch past every branch target also ends programs whose end the
-            // EXIT/RET rules below can't see. Only taken when the capture then runs into an
-            // invalid branch (FallbackEnd); ending every capture there broke DKB level loading.
-            if (opcode == 0x947 && instruction.Bits(12, 4) == 7 && instruction.Bits(87, 4) == 7 &&
-                target == s64{index} * 16 && index >= last_forward_target &&
-                index >= last_call_target && fallback_end == 0)
-                fallback_end = index + 1;
         }
         if (opcode == 0x949 || opcode == 0x958) computed_branch = true;
         if (computed_branch) return Result::Continue;
         if (opcode == 0x94d && instruction.Bits(12, 4) == 7 && index >= last_forward_target) {
-            if (!last_call_target) return Result::Complete;
+            if (index >= last_call_target) return Result::Complete;
             main_exited = true;
         }
         if (opcode == 0x950 && instruction.Bits(12, 4) == 7 && main_exited &&
@@ -83,14 +71,8 @@ public:
         return Result::Continue;
     }
 
-    /// Instruction count up to the first closing self-branch, or 0 if none was seen.
-    u32 FallbackEnd() const {
-        return fallback_end;
-    }
-
 private:
     std::array<Instruction, 5> exit_setup{};
-    u32 fallback_end{};
     u32 last_call_target{};
     u32 last_forward_target{};
     bool main_exited{};

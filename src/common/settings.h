@@ -64,6 +64,11 @@ SETTING(std::string, false);
 SETTING(u16, false);
 SWITCHABLE(AnisotropyMode, true);
 SWITCHABLE(AntiAliasing, false);
+SWITCHABLE(OotAntiAliasing, false);
+SWITCHABLE(NvidiaDlssQuality, false);
+SWITCHABLE(NvidiaDlssPreset, false);
+SWITCHABLE(HdrMode, false);
+SWITCHABLE(HdrSwapchain, false);
 SWITCHABLE(AspectRatio, true);
 SWITCHABLE(AstcDecodeMode, true);
 SWITCHABLE(AstcRecompression, true);
@@ -201,6 +206,9 @@ struct Values {
     Setting<bool, false> dump_audio_commands{
                                              linkage, false, "dump_audio_commands", Category::Audio, Specialization::Default, false};
 
+    Setting<u16, true> microphone_volume{linkage, 100, 0, 200, "microphone_volume",
+                                        Category::Controls};
+
     // Core
     SwitchableSetting<bool> use_multi_core{linkage, true, "use_multi_core", Category::Core};
     SwitchableSetting<MemoryLayout, true> memory_layout_mode{linkage,
@@ -335,6 +343,18 @@ struct Values {
                                                                 linkage, true, "cpuopt_unsafe_ignore_global_monitor", Category::CpuUnsafe};
 
     // Renderer
+    // Off: the game always renders SDR. On: HDR whenever the surface offers an HDR format.
+    // Auto: HDR while the monitor showing the game runs in HDR, where the host can tell (Windows;
+    // elsewhere SDR). The game is told HDR only while the swapchain really presents HDR.
+    SwitchableSetting<HdrMode> hdr_mode{linkage, HdrMode::Off, "hdr_mode", Category::Renderer};
+    // HDR10: 10-bit PQ BT.2020 swapchain. scRGB: 16-bit float linear BT.709, for displays or
+    // drivers that band with 10-bit (reported on NVIDIA in fullscreen).
+    SwitchableSetting<HdrSwapchain> hdr_swapchain{linkage, HdrSwapchain::Hdr10, "hdr_swapchain",
+                                                  Category::Renderer};
+    SwitchableSetting<u16, true> hdr_reference_white{linkage, 0, 0, 1000, "hdr_reference_white",
+                                                  Category::Renderer, Specialization::Scalar};
+    SwitchableSetting<u16, true> hdr_peak_luminance{linkage, 0, 0, 10000, "hdr_peak_luminance",
+                                                 Category::Renderer, Specialization::Scalar};
     SwitchableSetting<RendererBackend, true> renderer_backend{linkage,
 #if defined(__sun__) || defined(__managarm__)
         RendererBackend::OpenGL_GLSL,
@@ -357,6 +377,18 @@ struct Values {
                                                   true,
                                                   true};
 
+    // Lichii: caps how often the game's own compositor presents, so the game itself is paced to
+    // this rate instead of only the display. 0 keeps the game's vblank and swap interval.
+    SwitchableSetting<u32, true> fps_limit{linkage,
+                                           0,
+                                           0,
+                                           480,
+                                           "fps_limit",
+                                           Category::Renderer,
+                                           Specialization::Countable,
+                                           true,
+                                           true};
+
     SwitchableSetting<ScalingFilter> scaling_filter{linkage,
                                                     ScalingFilter::ScaleForce,
                                                     "scaling_filter",
@@ -364,6 +396,10 @@ struct Values {
                                                     Specialization::Default,
                                                     true,
                                                     true};
+    // A Switch 2 game's own DLSS network (translated) in place of AMD FSR 3.1, where it runs and
+    // its output passes the checks.
+    SwitchableSetting<bool> game_dlss_network{linkage, false, "game_dlss_network",
+                                              Category::Renderer};
     SwitchableSetting<int, true> fsr_sharpening_slider{linkage,
 #ifdef __ANDROID__
                                                        0,
@@ -378,8 +414,36 @@ struct Values {
                                                            Specialization::Percentage,
                                                        true,
                                                        true};
+    // Switch 2 VSync event rate. Games start frames on it, so above 60 only games with a
+    // real-time step (e.g. the Ocarina "FPS Unlock" built-in) keep their speed.
+    SwitchableSetting<u16, true> frame_rate_limit{linkage,
+                                                  60,
+                                                  30,
+                                                  240,
+                                                  "nx2_frame_rate_limit",
+                                                  Category::Renderer,
+                                                  Specialization::Scalar,
+                                                  true,
+                                                  false};
     // NVIDIA DLSS (through NVIDIA Streamline) in place of a game's DLSS.
     SwitchableSetting<bool> nvidia_dlss{linkage, false, "nvidia_dlss", Category::Renderer};
+    SwitchableSetting<NvidiaDlssQuality> nvidia_dlss_quality{linkage,
+                                                             NvidiaDlssQuality::Automatic,
+                                                             "nvidia_dlss_quality",
+                                                             Category::Renderer,
+                                                             Specialization::Default,
+                                                             true,
+                                                             true};
+    SwitchableSetting<NvidiaDlssPreset> nvidia_dlss_preset{linkage,
+                                                           NvidiaDlssPreset::M,
+                                                           "nvidia_dlss_preset",
+                                                           Category::Renderer,
+                                                           Specialization::Default,
+                                                           true,
+                                                           true};
+    SwitchableSetting<bool> ocarina_fsr{linkage, false, "ocarina_fsr", Category::Renderer};
+    // AMD FSR 4 in place of FSR 3.1 where FSR replaces a game's upscaler (Windows, AMD's driver).
+    SwitchableSetting<bool> amd_fsr4{linkage, false, "amd_fsr4", Category::Renderer};
     SwitchableSetting<AspectRatio, true> aspect_ratio{linkage,
                                                       AspectRatio::R16_9,
                                                       "aspect_ratio",
@@ -395,6 +459,10 @@ struct Values {
                                                   Specialization::Default,
                                                   true,
                                                   true};
+    // The Legend of Zelda: Ocarina of Time's own anti-aliasing network and its sharpening output
+    // pass, or the tonemapped image as the game renders it (video_core/oot_network.h).
+    SwitchableSetting<OotAntiAliasing> oot_anti_aliasing{linkage, OotAntiAliasing::Game,
+                                                         "oot_anti_aliasing", Category::Renderer};
 
     SwitchableSetting<std::string> post_shader_chain{linkage,
                                                      std::string(),
@@ -544,6 +612,20 @@ struct Values {
                                                                  true,
                                                                  true};
 
+    // How much of a native (Switch 2) compute program's storage binding a dispatch marks
+    // GPU-written. Its pointer carries no size, so the binding is up to 8 MiB; marking all of it
+    // defers the CPU's later writes to those pages (Ocarina of Time's white leaves) and has fences
+    // copy them back. Auto: the extent the shader's stores provably reach (the whole binding when
+    // unknown). Full: the whole binding (the behaviour before the store extent).
+    SwitchableSetting<NativeComputeWriteMark, true> native_compute_write_mark{
+        linkage,
+        NativeComputeWriteMark::Auto,
+        "native_compute_write_mark",
+        Category::RendererAdvanced,
+        Specialization::Default,
+        true,
+        true};
+
     SwitchableSetting<VramUsageMode, true> vram_usage_mode{linkage,
                                                            VramUsageMode::Conservative,
                                                            "vram_usage_mode",
@@ -601,13 +683,41 @@ struct Values {
         linkage, true, "use_vulkan_driver_pipeline_cache", Category::RendererAdvanced,
         Specialization::Default};
 
-    SwitchableSetting<bool> use_graphics_pipeline_library{
-        linkage, true, "use_graphics_pipeline_library", Category::RendererAdvanced,
-        Specialization::Default};
+    SwitchableSetting<NativeAsyncDraws> native_async_draws{linkage,
+                                                           NativeAsyncDraws::Wait,
+                                                           "native_async_draws",
+                                                           Category::RendererAdvanced,
+                                                           Specialization::Default,
+                                                           true,
+                                                           true};
 
-    SwitchableSetting<bool> precompile_shaders{linkage, true, "precompile_shaders",
-                                               Category::RendererAdvanced,
-                                               Specialization::Default};
+    SwitchableSetting<u32, true> native_pipeline_wait_ms{linkage,
+                                                         8,
+                                                         1,
+                                                         100,
+                                                         "native_pipeline_wait_ms",
+                                                         Category::RendererAdvanced,
+                                                         Specialization::Countable,
+                                                         true,
+                                                         true};
+
+    // Precache shaders before the game starts: the compute programs in the game files and the
+    // cached graphics pipelines the boot leaves for later are built on the loading screen, so the
+    // driver's cache holds them before the game first uses them.
+    // Ask: the desktop app asks at launch while the game has no finished precache; where nothing
+    // asks, as Off.
+    SwitchableSetting<PrecacheShaders> precache_shaders{linkage,
+                                                        PrecacheShaders::Off,
+                                                        "precache_shaders",
+                                                        Category::RendererAdvanced,
+                                                        Specialization::Default,
+                                                        true,
+                                                        true};
+
+    // Build every cached graphics pipeline while the game loads, not only those recent sessions
+    // used, and keep them built, up to the pipelines kept in memory (a quarter of the RAM).
+    SwitchableSetting<bool> build_all_cached_shaders{linkage, false, "build_all_cached_shaders",
+                                                     Category::RendererAdvanced};
 
     SwitchableSetting<bool> enable_compute_pipelines{linkage, false, "enable_compute_pipelines",
                                                      Category::RendererAdvanced};
@@ -659,8 +769,6 @@ struct Values {
                                           true,
                                           true};
 
-    bool preemptive_cpu_reads{false};
-
     SwitchableSetting<bool> skip_cpu_inner_invalidation{linkage,
                                                         false,
                                                         "skip_cpu_inner_invalidation",
@@ -705,6 +813,9 @@ struct Values {
 
     SwitchableSetting<bool> gpu_unswizzle_enabled{linkage, false, "gpu_unswizzle_enabled",
                                                   Category::RendererHacks};
+
+    SwitchableSetting<bool> pin_gpu_threads{linkage, true, "pin_gpu_threads",
+                                            Category::RendererHacks};
 
     SwitchableSetting<ExtendedDynamicState> dyna_state{linkage,
 #if defined(__ANDROID__)
@@ -950,11 +1061,22 @@ struct Values {
     Setting<bool> log_flush_line{linkage, false, "flush_line", Category::Miscellaneous, Specialization::Default, true, true};
     Setting<bool> censor_username{linkage, true, "censor_username", Category::Miscellaneous};
     Setting<bool> first_launch{linkage, true, "first_launch", Category::Miscellaneous};
+    // The values the recommended settings (common/recommended_settings.h) replaced.
+    Setting<std::string> recommended_settings_backup{
+        linkage, {}, "recommended_settings_backup", Category::Miscellaneous};
 
     // Network
     Setting<std::string> network_interface{linkage, std::string(), "network_interface",
                                            Category::Network};
     SwitchableSetting<bool> airplane_mode{linkage, true, "airplane_mode", Category::Network};
+    Setting<bool> lan_play{linkage, false, "lan_play", Category::Network};
+    Setting<bool> nextendo_enabled{linkage, false, "nextendo_enabled", Category::Network};
+    Setting<std::string> nextendo_server_ip{linkage, "51.178.29.194", "nextendo_server_ip",
+                                           Category::Network};
+    Setting<std::string> nextendo_nat_ip{linkage, "164.132.111.120", "nextendo_nat_ip",
+                                        Category::Network};
+    Setting<std::string> nextendo_client_id{linkage, "nxc_eHeSgpYwMkFV", "nextendo_client_id",
+                                           Category::Network};
 
     // WebService
     Setting<std::string> web_api_url{linkage, "api.ynet-fun.xyz", "web_api_url",
@@ -969,10 +1091,21 @@ struct Values {
 
     // Per-game overrides
     bool use_squashed_iterated_blend;
+    /// A title that reads GPU-written memory on the CPU needs reactive flushing whatever the
+    /// setting says. Set per boot by the game overrides; the settings dialog never touches it.
+    bool force_reactive_flushing{};
 
 };
 
 extern Values values;
+
+struct NvidiaDlssRuntimeSettings {
+    NvidiaDlssQuality quality;
+    NvidiaDlssPreset preset;
+};
+
+void RefreshNvidiaDlssRuntimeSettings();
+NvidiaDlssRuntimeSettings GetNvidiaDlssRuntimeSettings();
 
 constexpr u32 MIN_FRAME_GEN_MULTIPLIER = 2;
 constexpr u32 MAX_FRAME_GEN_MULTIPLIER = 4;
@@ -1005,6 +1138,10 @@ u64 GetCurrentProgramID();
 // Whether the program being loaded is a Switch 2 one (set by the core before the GPU starts).
 void SetCurrentProgramIsSwitch2(bool is_switch2);
 bool CurrentProgramIsSwitch2();
+
+/// Whether GPU-written memory is flushed back when the CPU reads it: the setting, or a title
+/// that requires it.
+bool ReactiveFlushing();
 
 // The ASTC recompression in effect: astc_recompression, unless the renderer picked another one
 // for the running program (the configuration is left as is). The core clears it on load.

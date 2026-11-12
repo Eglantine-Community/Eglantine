@@ -7,11 +7,10 @@
 #pragma once
 
 #include <chrono>
-#include <exception>
-#include <filesystem>
-#include <string>
 #include <algorithm>
+#include <string>
 #include <type_traits>
+#include <vector>
 #include <fmt/ranges.h>
 #include "common/swap.h"
 
@@ -90,6 +89,15 @@ enum class Class : u8 {
 /// Logs a message to the global logger, using fmt
 void FmtLogMessageImpl(Class log_class, Level log_level, const char* filename, unsigned int line_num, const char* function, fmt::string_view format, const fmt::format_args& args);
 
+/// Writes a Critical message to the log file alone and flushes it, for the crash handler: the
+/// other backends take locks that a crashed thread may hold.
+void FmtCrashMessageImpl(const char* filename, unsigned int line_num, const char* function, fmt::string_view format, const fmt::format_args& args) noexcept;
+
+template <typename... Args>
+void FmtCrashMessage(const char* filename, unsigned int line_num, const char* function, fmt::format_string<Args...> format, const Args&... args) {
+    FmtCrashMessageImpl(filename, line_num, function, format.get(), fmt::make_format_args(args...));
+}
+
 /// Returns true if a message of this class and level would pass the global filter.
 [[nodiscard]] bool IsLevelEnabled(Class log_class, Level log_level);
 
@@ -146,11 +154,14 @@ void Stop();
 void SetGlobalFilter(const Filter& filter);
 void SetColorConsoleBackendEnabled(bool enabled);
 
-/// The message of an exception about to end the process, or why there is none.
-std::string DescribeException(std::exception_ptr exception);
-
-/// Logs (and flushes) why std::terminate ends the process, so an uncaught exception leaves more
-/// than a log cut off mid-line. MSVC keeps one handler per thread; SetCurrentThreadName installs it.
-void InstallTerminateHandler();
+/// A line kept by the in-memory log ring (the debug server's log tail).
+struct RingLine {
+    u64 sequence;
+    std::string text;
+};
+/// Keeps the last `capacity` formatted lines in memory; 0 turns the ring off and empties it.
+void SetRingCapacity(std::size_t capacity);
+/// The kept lines numbered above `after`, oldest first.
+[[nodiscard]] std::vector<RingLine> ReadRing(u64 after);
 
 } // namespace Common::Log

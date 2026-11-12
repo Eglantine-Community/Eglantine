@@ -12,10 +12,10 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <source_location>
 #include <vector>
 #include <span>
-
-#include <boost/container/small_vector.hpp>
+#include <unordered_map>
 
 #include "common/common_types.h"
 #include "common/range_mutex.h"
@@ -68,10 +68,26 @@ public:
 
     void Unmap(DAddr address, size_t size);
 
+    /// Device pages without memory that keep the bytes written to them until Map gives them
+    /// memory, which then holds those bytes (a Switch 2 sparse block waiting for its memory).
+    /// Reads see the kept bytes meanwhile; Unmap drops them.
+    void KeepWrites(DAddr address, size_t size);
+    /// Read or write [address, +size) when it has kept pages (or pages mapped meanwhile): mapped
+    /// pages as usual, the others from the kept bytes. False, doing nothing that counts, when it
+    /// has neither.
+    bool ReadKept(DAddr address, void* dest_pointer, size_t size);
+    bool WriteKept(DAddr address, const void* src_pointer, size_t size);
+
     void TrackContinuityImpl(DAddr address, VAddr virtual_address, size_t size, Asid asid);
     void TrackContinuity(DAddr address, VAddr virtual_address, size_t size, Asid asid) {
         std::scoped_lock lk(mapping_guard);
         TrackContinuityImpl(address, virtual_address, size, asid);
+    }
+
+    /// Changes whenever Map or Unmap ran: host pointers GetPointer returned before are only good
+    /// while it stays the same.
+    [[nodiscard]] u64 TranslationGeneration() const noexcept {
+        return translation_generation.load(std::memory_order_acquire);
     }
 
     // Write / Read
@@ -94,6 +110,11 @@ public:
         for (u32 value : buffer) {
             operation((DAddr(value) << page_bits) + subbits);
         }
+    }
+
+    /// Whether p points into the emulated physical memory, the only memory with device addresses.
+    bool IsPhysicalPointer(const u8* p) const {
+        return (GetRawPhysicalAddr(p) >> page_bits) < compressed_device_addr.size();
     }
 
     template <typename Func>
@@ -120,8 +141,10 @@ public:
     u8* GetSpan(const DAddr src_addr, const std::size_t size);
     const u8* GetSpan(const DAddr src_addr, const std::size_t size) const;
 
-    void ReadBlock(DAddr address, void* dest_pointer, size_t size);
-    void ReadBlockUnsafe(DAddr address, void* dest_pointer, size_t size);
+    void ReadBlock(DAddr address, void* dest_pointer, size_t size,
+                   std::source_location caller = std::source_location::current());
+    void ReadBlockUnsafe(DAddr address, void* dest_pointer, size_t size,
+                         std::source_location caller = std::source_location::current());
     void WriteBlock(DAddr address, const void* src_pointer, size_t size);
     void WriteBlockUnsafe(DAddr address, const void* src_pointer, size_t size);
 
@@ -136,11 +159,6 @@ public:
     /// Traps the next guest CPU read of these pages, to learn which GPU writes the CPU reads.
     void ArmReadTraps(DAddr addr, size_t size);
 
-    /// Returns the current page-mapping generation counter (bumped on Map and Unmap).
-    u64 MappingGeneration() const noexcept {
-        return translation_generation.load(std::memory_order_acquire);
-    }
-
 private:
     struct TranslationEntry {
         DAddr guest_page{};
@@ -152,10 +170,9 @@ private:
     /// cleared by Map on a service thread between the GPU thread's null check of an entry and
     /// its use, and the GPU thread copied from address 0 (title 1 crashed every few minutes).
     struct TranslationCache {
-        // Monotonic ID prevents address reuse while keeping the TLS cache trivially destructible.
-        u64 owner_id{};
+        const void* owner{};
         u64 generation{};
-        std::array<TranslationEntry, 16> slots{};
+        std::array<TranslationEntry, 4> slots{};
         u32 cursor{};
     };
     static inline thread_local TranslationCache t_cache{};
@@ -163,8 +180,8 @@ private:
     /// This thread's translations, emptied when Map or Unmap ran since they were made.
     TranslationCache& Translations() {
         const u64 current = translation_generation.load(std::memory_order_acquire);
-        if (t_cache.owner_id != instance_id || t_cache.generation != current) {
-            t_cache = TranslationCache{.owner_id = instance_id, .generation = current};
+        if (t_cache.owner != this || t_cache.generation != current) {
+            t_cache = TranslationCache{.owner = this, .generation = current};
         }
         return t_cache;
     }
@@ -245,9 +262,11 @@ private:
         tracked_entries.GetUnchecked(page_index).cpu_backing_address = address | (asid.id << asid_start_bit);
     }
 
-    static inline std::atomic<u64> next_instance_id{1};
-    const u64 instance_id{next_instance_id.fetch_add(1, std::memory_order_relaxed)};
-    std::atomic<u64> translation_generation{1}; ///< Bumped by Map and Unmap
+    /// Starts past every earlier manager's: one built where a destroyed one was must not match
+    /// the translations a thread kept for that one (Translations compares owner and generation).
+    static inline std::atomic<u64> next_generation_base{1};
+    /// Bumped by Map and Unmap
+    std::atomic<u64> translation_generation{next_generation_base.fetch_add(1ULL << 32)};
     using CounterType = u8;
     using CounterAtomicType = std::atomic_uint8_t;
     static constexpr size_t subentries = 8 / sizeof(CounterType);
@@ -278,6 +297,12 @@ private:
     std::unique_ptr<CachedPages> cached_pages;
     Common::RangeMutex counter_guard;
     std::mutex mapping_guard;
+
+    /// Taken before mapping_guard. The pages KeepWrites keeps, by device page; null reads zero.
+    std::mutex kept_mutex;
+    std::atomic<size_t> kept_count{};
+    using KeptPage = std::array<u8, size_t{1} << page_bits>;
+    std::unordered_map<size_t, std::unique_ptr<KeptPage>> kept_pages;
 
 
 };

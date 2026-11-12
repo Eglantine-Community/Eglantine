@@ -49,6 +49,32 @@ class RenderPassCache;
 class StagingBufferPool;
 class Scheduler;
 
+struct ByteAddressedShadow {
+    VkImage original{};
+    VkImage packed{};
+    VkImageView view{};
+    VkBuffer bridge{};
+    VkExtent2D extent{};
+};
+
+struct ByteAddressedRange {
+    DAddr address{};
+    u64 size{};
+
+    [[nodiscard]] bool Overlaps(const ByteAddressedRange& other) const noexcept {
+        return size != 0 && other.size != 0 &&
+               (address < other.address ? other.address - address < size
+                                        : address - other.address < other.size);
+    }
+};
+
+[[nodiscard]] inline std::optional<VkExtent2D> PackedByteAddressedExtent(u32 width, u32 height) {
+    if (width < 2 || (width & 1) != 0 || height == 0) {
+        return std::nullopt;
+    }
+    return VkExtent2D{width / 2, height};
+}
+
 class TextureCacheRuntime {
 public:
     explicit TextureCacheRuntime(const Device& device_, Scheduler& scheduler_,
@@ -91,7 +117,14 @@ public:
         return memory_allocator.MemoryPressureEvents();
     }
 
+    u32 FailedImages() const noexcept {
+        return memory_allocator.FailedImages();
+    }
+
     void LogMemoryStatistics() const;
+
+    /// EDEN_NX2_MEM_TRACE: staging buffers, then the process, DXGI and VMA (LogMemoryTrace).
+    void LogMemoryTrace();
 
     /// True when ASTC is re-compressed to BC3 and opaque images may use BC1 instead.
     bool UseOpaqueAstcFormat() const;
@@ -113,7 +146,7 @@ public:
     bool TemporalUpscale(Framebuffer* dst_framebuffer, ImageView& dst, ImageView& input_color,
                          ImageView& motion_vectors, ImageView* depth,
                          std::array<u32, 2> render_size, std::array<f32, 2> jitter,
-                         std::array<f32, 2> motion_scale);
+                         std::array<f32, 2> motion_scale, bool use_history);
 
     /// True when TemporalUpscale would use the depth (FSR 3.1 not forced off and not failed).
     [[nodiscard]] bool WantsTemporalUpscaleDepth() const;
@@ -133,6 +166,13 @@ public:
     bool ShouldReinterpret(Image& dst, Image& src);
 
     void ReinterpretImage(Image& dst, Image& src, std::span<const VideoCommon::ImageCopy> copies);
+
+    [[nodiscard]] ByteAddressedShadow CreateByteAddressedShadow(const ImageView& view);
+
+    void RetireByteAddressedShadow(const ByteAddressedShadow& shadow);
+
+    static void CopyByteAddressedShadow(vk::CommandBuffer cmdbuf,
+                                        const ByteAddressedShadow& shadow, bool unpack);
 
     void ConvertImage(Framebuffer* dst, ImageView& dst_view, ImageView& src_view);
 
@@ -218,6 +258,13 @@ public:
                          std::array<f32, 2> motion_scale);
     std::unique_ptr<Fsr3Upscaler> fsr3_upscaler;
     bool fsr3_unsupported{};
+
+    /// The LOD bias Ocarina's FSR adds to mipmapped samplers this session (0 for other games or
+    /// upscalers), resolved on first use.
+    [[nodiscard]] f32 OcarinaFsrLodBias();
+    std::optional<f32> ocarina_fsr_lod_bias;
+    /// Set when the Ocarina upscaler fails during the session: samplers drop the bias again.
+    bool ocarina_fsr_failed{};
     /// The game DLSS network's health check (ProbeGameDlssOutput), created on first use.
     std::unique_ptr<DlssNetworkProbe> dlss_network_probe;
     std::optional<std::chrono::steady_clock::time_point> fsr3_last_evaluation;
@@ -299,6 +346,14 @@ public:
     std::vector<MsaaScratchImage> msaa_scratch_images;
     ::Common::unordered_map<VkImage, ResolveShadow> resolve_shadows;
     std::vector<std::pair<u64, ResolveShadow>> pending_resolve_shadows;
+
+    struct PendingByteAddressedShadow {
+        u64 tick;
+        vk::Image image;
+        vk::ImageView view;
+        vk::Buffer bridge;
+    };
+    std::deque<PendingByteAddressedShadow> pending_byte_addressed_shadows;
 };
 
 class Framebuffer {
@@ -339,6 +394,10 @@ public:
 
     [[nodiscard]] VkExtent2D RenderArea() const noexcept {
         return render_area;
+    }
+
+    [[nodiscard]] u32 Layers() const noexcept {
+        return layers;
     }
 
     [[nodiscard]] VkSampleCountFlagBits Samples() const noexcept {
@@ -395,6 +454,7 @@ private:
     vk::Framebuffer framebuffer;
     VkRenderPass renderpass{};
     VkExtent2D render_area{};
+    u32 layers = 1;
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
     u32 num_color_buffers = 0;
     u32 num_images = 0;
@@ -429,6 +489,13 @@ public:
 
     Image(Image&&) = default;
     Image& operator=(Image&&) = default;
+
+    u32 HostMipLevels() const noexcept;
+
+    /// No memory was left to make it: the texture cache drops it instead of using it.
+    [[nodiscard]] bool OutOfMemory() const noexcept {
+        return !original_image && info.type != VideoCommon::ImageType::Buffer;
+    }
 
     void UploadMemory(VkBuffer buffer, VkDeviceSize offset,
                       std::span<const VideoCommon::BufferImageCopy> copies);
@@ -661,7 +728,7 @@ public:
     [[nodiscard]] VkImageView ColorView();
 
     [[nodiscard]] VkImageView StorageView(Shader::TextureType texture_type,
-                                          Shader::ImageFormat image_format);
+                                          Shader::ImageFormat image_format, bool is_byte_addressed);
 
     [[nodiscard]] bool IsRescaled() const noexcept;
 
@@ -715,8 +782,8 @@ public:
 
 private:
     struct StorageViews {
-        std::array<vk::ImageView, Shader::NUM_TEXTURE_TYPES> signeds;
-        std::array<vk::ImageView, Shader::NUM_TEXTURE_TYPES> unsigneds;
+        std::array<std::array<vk::ImageView, Shader::NUM_TEXTURE_TYPES>,
+                   static_cast<size_t>(Shader::ImageFormat::R32G32B32A32_UINT) + 1> formats;
     };
 
     [[nodiscard]] vk::ImageView MakeView(VkFormat vk_format, VkImageAspectFlags aspect_mask,
@@ -777,7 +844,7 @@ public:
 
     [[nodiscard]] VkSampler HandleFor(const ImageView& image_view, bool is_depth);
 
-    /// The guest descriptor and the host state built from it, for the frame dump.
+    /// The guest descriptor and the host state built from it, for EDEN_NX2_FRAME_DUMP_SAMPLED.
     [[nodiscard]] const Tegra::Texture::TSCEntry& Descriptor() const noexcept {
         return descriptor;
     }
@@ -793,6 +860,8 @@ private:
         bool drop_reduction;
         bool drop_custom_border;
         bool srgb_border;
+        bool drop_compare;
+        bool drop_lod_bias; ///< the image was written by the GPU: no Ocarina FSR LOD bias
         std::array<VkComponentSwizzle, 4> swizzle;
 
         bool operator==(const VariantKey&) const noexcept = default;
@@ -817,6 +886,7 @@ private:
     std::vector<Variant> variants;
 
     const Device* device_ptr{nullptr};
+    const bool* ocarina_fsr_failed{}; ///< TextureCacheRuntime::ocarina_fsr_failed
     Tegra::Texture::TSCEntry descriptor{};
     VkSamplerCreateInfo base_ci{};
     VkSamplerReductionModeEXT reduction_mode{VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE_EXT};
@@ -827,6 +897,7 @@ private:
     bool has_added_anisotropy{};
     bool has_linear_filtering{};
     bool has_depth_comparison{};
+    f32 added_lod_bias{}; ///< Ocarina FSR part of base_ci.mipLodBias
     bool has_minmax_reduction{};
     bool has_custom_border_colors{};
     bool has_srgb_border_color{};

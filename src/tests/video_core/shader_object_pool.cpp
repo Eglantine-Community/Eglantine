@@ -1,12 +1,8 @@
-// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
-
-#include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include "shader_recompiler/object_pool.h"
-#include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 
 namespace {
 struct Counted {
@@ -58,27 +54,3 @@ TEST_CASE("ObjectPool stays usable after Free", "[shader]") {
     }
     REQUIRE(Counted::live == 0);
 }
-
-TEST_CASE("ObjectPool compute storage is released only for synchronous compilation", "[shader]") {
-    for (const bool parallel : {false, true}) {
-        Vulkan::ShaderPools pools;
-        Shader::IR::Program program;
-        auto* const block = pools.block.Create(pools.inst);
-        program.blocks.push_back(block);
-        auto* const flow_block = pools.flow_block.Create();
-        flow_block->begin = Shader::Maxwell::Location{120};
-        std::vector<u32> code{1, 2, 3};
-        pools.ReleaseComputeContents(program, code, parallel);
-        REQUIRE(program.blocks.empty() == !parallel);
-        REQUIRE(code.empty() == !parallel);
-        if (!parallel) {
-            REQUIRE(code.capacity() == 0);
-        } else {
-            REQUIRE(program.blocks.front() == block);
-            REQUIRE(code[2] == 3);
-        }
-        REQUIRE(flow_block->begin == Shader::Maxwell::Location{120});
-        REQUIRE(pools.block.Create(pools.inst) != nullptr);
-    }
-}
-

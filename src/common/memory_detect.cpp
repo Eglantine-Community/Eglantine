@@ -4,24 +4,29 @@
 #ifdef _WIN32
 // clang-format off
 #include <windows.h>
-#include <psapi.h>
 #include <sysinfoapi.h>
+#include <psapi.h>
 // clang-format on
 #else
-#include <fstream>
 #include <sys/types.h>
 #if defined(__APPLE__) || defined(__FreeBSD__)
 #include <sys/sysctl.h>
 #elif defined(__linux__)
 #include <sys/sysinfo.h>
-#include <unistd.h>
 #else
 #include <unistd.h>
 #endif
 #endif
 
-#include <fmt/format.h>
+#ifdef __linux__
+#include <algorithm>
+#include <cstdlib>
+#include <fstream>
+#include <string>
+#include <string_view>
+#endif
 
+#include "common/literals.h"
 #include "common/memory_detect.h"
 
 namespace Common {
@@ -74,53 +79,71 @@ const MemoryInfo& GetMemInfo() {
     return mem_info;
 }
 
-HostResources QueryHostResources() {
-    HostResources resources{};
+HostRam GetHostRam() {
 #ifdef _WIN32
-    const HANDLE process = GetCurrentProcess();
-    PROCESS_MEMORY_COUNTERS_EX counters{};
-    counters.cb = sizeof(counters);
-    if (GetProcessMemoryInfo(process, reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
-                             sizeof(counters))) {
-        resources.process_commit = counters.PrivateUsage;
-        resources.process_resident = counters.WorkingSetSize;
-    }
-    MEMORYSTATUSEX status{};
-    status.dwLength = sizeof(status);
-    if (GlobalMemoryStatusEx(&status)) {
-        resources.host_commit_free = status.ullAvailPageFile;
-        resources.host_commit_limit = status.ullTotalPageFile;
-        resources.host_physical_free = status.ullAvailPhys;
-    }
-    resources.gdi_objects = GetGuiResources(process, GR_GDIOBJECTS);
-    resources.user_objects = GetGuiResources(process, GR_USEROBJECTS);
-    DWORD handles{};
-    if (GetProcessHandleCount(process, &handles)) {
-        resources.handles = handles;
-    }
-#elif defined(__linux__)
-    // Total size, then resident size, in pages. Linux has no commit charge: the data size
-    // counts the 512 GiB the guest address space reserves.
-    u64 size{}, resident{};
-    if (std::ifstream statm{"/proc/self/statm"}; statm >> size >> resident) {
-        resources.process_resident = resident * static_cast<u64>(sysconf(_SC_PAGE_SIZE));
+    ULONGLONG kilobytes{};
+    if (GetPhysicallyInstalledSystemMemory(&kilobytes) && kilobytes != 0) {
+        return {kilobytes * 1024, true};
     }
 #endif
-    return resources;
+#ifdef __APPLE__
+    return {GetMemInfo().TotalPhysicalMemory, true};
+#else
+    return {GetMemInfo().TotalPhysicalMemory, false};
+#endif
 }
 
-std::string DescribeHostResources(const HostResources& resources) {
-    std::string text = fmt::format("process {} MiB resident", resources.process_resident >> 20);
-    if (resources.host_commit_limit != 0) {
-        text += fmt::format(", {} MiB committed; host {} of {} MiB commit free, {} MiB RAM free",
-                            resources.process_commit >> 20, resources.host_commit_free >> 20,
-                            resources.host_commit_limit >> 20, resources.host_physical_free >> 20);
+bool IsBelowSwitch2RamMinimum(HostRam ram) {
+    using namespace Common::Literals;
+    return ram.bytes != 0 && ram.bytes < (ram.installed ? 16_GiB : 12_GiB);
+}
+
+ProcessMemoryUsage GetProcessMemoryUsage() {
+    ProcessMemoryUsage usage{};
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS_EX2 counters{};
+    counters.cb = sizeof(counters);
+    if (GetProcessMemoryInfo(GetCurrentProcess(),
+                             reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+                             sizeof(counters))) {
+        usage.commit = counters.PrivateUsage;
+        usage.working_set = counters.WorkingSetSize;
+        usage.private_working_set = counters.PrivateWorkingSetSize;
     }
-    if (resources.handles != 0) {
-        text += fmt::format("; {} GDI objects, {} USER objects, {} handles", resources.gdi_objects,
-                            resources.user_objects, resources.handles);
+    PERFORMANCE_INFORMATION performance{};
+    performance.cb = sizeof(performance);
+    if (GetPerformanceInfo(&performance, sizeof(performance))) {
+        usage.system_commit = u64{performance.CommitTotal} * performance.PageSize;
+        usage.system_commit_limit = u64{performance.CommitLimit} * performance.PageSize;
     }
-    return text;
+#elif defined(__linux__)
+    std::ifstream status{"/proc/self/status"};
+    for (std::string line; std::getline(status, line);) {
+        const auto field = [&line](std::string_view key) -> u64 {
+            if (!line.starts_with(key)) {
+                return 0;
+            }
+            return std::strtoull(line.c_str() + key.size(), nullptr, 10) << 10;
+        };
+        usage.commit = (std::max)(usage.commit, field("VmData:"));
+        usage.working_set = (std::max)(usage.working_set, field("VmRSS:"));
+        usage.private_working_set = (std::max)(usage.private_working_set, field("RssAnon:"));
+    }
+#endif
+    return usage;
+}
+
+std::optional<u64> GetSystemCommitRoom() {
+#ifdef _WIN32
+    PERFORMANCE_INFORMATION performance{};
+    performance.cb = sizeof(performance);
+    if (GetPerformanceInfo(&performance, sizeof(performance))) {
+        const u64 limit = performance.CommitLimit;
+        const u64 committed = performance.CommitTotal;
+        return (committed < limit ? limit - committed : 0) * performance.PageSize;
+    }
+#endif
+    return std::nullopt;
 }
 
 } // namespace Common

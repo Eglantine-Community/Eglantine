@@ -70,6 +70,10 @@ public:
         return last_usage_tick;
     }
 
+    [[nodiscard]] std::span<const u8> Mapped() const noexcept {
+        return buffer.IsHostCoherent() ? buffer.Mapped() : std::span<const u8>{};
+    }
+
     operator VkBuffer() const noexcept {
         return *buffer;
     }
@@ -127,6 +131,10 @@ public:
         return (vertex_repack_mask & (1U << binding)) != 0;
     }
 
+    bool AnyVertexRepacked() const {
+        return vertex_repack_mask != 0;
+    }
+
     u64 CurrentTick();
 
     bool IsFree(u64 tick);
@@ -138,6 +146,22 @@ public:
 
     void Finish();
 
+    void FinishForHostRead();
+
+    /// FinishForHostRead without the wait: submits, and returns the tick to wait for.
+    u64 SubmitForHostRead();
+
+    /// SubmitForHostRead without the submission: the copies go with the GPU thread's next one, as
+    /// a fence's do (Scheduler::DeferFlush). Returns the tick they go in.
+    u64 QueueForHostRead();
+
+    /// Waits for a SubmitForHostRead or QueueForHostRead tick, on any thread.
+    void WaitForHostRead(u64 tick);
+
+    /// Whether the host GPU completed `tick`, asking it when the tick is submitted but not known
+    /// to be done.
+    [[nodiscard]] bool IsFreeNow(u64 tick);
+
     u64 GetDeviceLocalMemory() const;
 
     u64 GetDeviceMemoryUsage() const;
@@ -147,6 +171,9 @@ public:
     u32 GetUniformBufferAlignment() const;
 
     u32 GetStorageBufferAlignment() const;
+
+    /// Largest range a storage buffer binding may have
+    u64 GetMaxStorageBufferRange() const;
 
     [[nodiscard]] StagingBufferRef UploadStagingBuffer(size_t size);
 
@@ -171,6 +198,12 @@ public:
                          u32 base_vertex, VkBuffer buffer, u32 offset, u32 size);
 
     void BindQuadIndexBuffer(PrimitiveTopology topology, u32 first, u32 count);
+
+    bool WidensUint8IndicesOnHost() const {
+        return device.IsMoltenVK() && !device.IsExtIndexTypeUint8Supported();
+    }
+
+    void BindHostUint8IndexBuffer(std::span<const u8> indices);
 
     void BindVertexBuffer(u32 index, VkBuffer buffer, u32 offset, u32 size, u32 stride);
 
@@ -322,6 +355,13 @@ private:
 
     bool limit_dynamic_storage_buffers = false;
     u32 max_dynamic_storage_buffers = (std::numeric_limits<u32>::max)();
+
+    /// The index buffer BindIndexBuffer recorded last, at scheduler recording epoch bound_index_epoch.
+    VkBuffer bound_index_buffer = VK_NULL_HANDLE;
+    VkDeviceSize bound_index_offset = 0;
+    VkIndexType bound_index_type = VK_INDEX_TYPE_UINT32;
+    u64 bound_index_epoch = 0;
+    bool bound_index_valid = false;
 };
 
 struct BufferCacheParams {

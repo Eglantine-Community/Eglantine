@@ -3,9 +3,11 @@
 
 #pragma once
 
+#include <atomic>
 #include <optional>
 
 #include "common/common_types.h"
+#include "video_core/renderer_base.h"
 #include "video_core/renderer_vulkan/present/frame_gen_pacer.h"
 #include "video_core/renderer_vulkan/present/lsfg_chain.h"
 #include "video_core/renderer_vulkan/present/lsfg_shaders.h"
@@ -25,15 +27,21 @@ public:
 
     void Process(const Device& device, Frame* frame, VkFormat format, VkExtent2D guest_extent);
 
+    /// Retains resources while invalidating pacing and history across a presentation gap.
+    void Pause();
+
     [[nodiscard]] size_t WantedGenerations(size_t capacity);
 
     [[nodiscard]] size_t GeneratedFrameCount() const;
 
     void GenerateInto(const Device& device, Frame* destination, size_t generation);
 
-private:
-    [[nodiscard]] bool UseFsr3() const noexcept;
+    [[nodiscard]] VideoCore::FrameGenStatus CurrentStatus() const {
+        return {.state = state.load(std::memory_order_relaxed),
+                .generated_frames = generated_frames.load(std::memory_order_relaxed)};
+    }
 
+private:
     void Rebuild(const Device& device, VkExtent2D extent, VkFormat format, f32 flow_scale);
     void DumpDebugImages(u64 count);
 
@@ -56,8 +64,8 @@ private:
     bool generated{};
     bool unavailable{};
     bool dumped{};
-    bool logged_active{};
-    bool logged_lsfg_fallback{};
+    std::atomic<VideoCore::FrameGenState> state{VideoCore::FrameGenState::Pending};
+    std::atomic<u64> generated_frames{};
 };
 
 } // namespace Vulkan

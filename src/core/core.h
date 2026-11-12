@@ -6,12 +6,14 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -118,6 +120,10 @@ namespace Core {
 
 /// Frames the guest has presented (Switch 2 vi2 present calls); input replay is locked to it.
 extern std::atomic<u64> g_nx2_present_count;
+/// Steady-clock time of each guest present, by present count; written only while the debug
+/// server runs (g_nx2_present_time_services: debug services alive), for its frame_times tool.
+extern std::array<std::atomic<u64>, 4096> g_nx2_present_times_ns;
+extern std::atomic<u32> g_nx2_present_time_services;
 
 class CpuManager;
 class Debugger;
@@ -133,6 +139,10 @@ struct PerfStatsResults;
 FileSys::VirtualFile GetGameFileFromPath(const FileSys::VirtualFilesystem& vfs,
                                          const std::string& path);
 
+/// The id of the Switch 2 program in a game file, or nothing for any other program.
+std::optional<u64> FindSwitch2Program(const FileSys::VirtualFile& file, u64 program_id,
+                                      std::size_t program_index);
+
 /// Enumeration representing the return values of the System Initialize and Load process.
 enum class SystemResultStatus : u32 {
     Success,             ///< Succeeded
@@ -143,6 +153,7 @@ enum class SystemResultStatus : u32 {
     ErrorVideoCore,      ///< Error in the video core
     ErrorUnknown,        ///< Any other error
     ErrorLoader,         ///< The base for loader errors (too many to repeat)
+    ErrorMemoryAllocation = 0x10007, ///< Outside ErrorLoader plus the u16 loader result range
 };
 
 class System {
@@ -162,8 +173,10 @@ public:
     /**
      * Initializes the system
      * This function will initialize core functionality used for system emulation
+     * Returns whether guest memory is available. Frontend services remain available on
+     * allocation failure, and Load retries guest memory before initializing the kernel.
      */
-    void Initialize();
+    bool Initialize();
 
     /**
      * Run the OS and Application

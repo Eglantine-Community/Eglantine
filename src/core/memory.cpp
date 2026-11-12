@@ -28,15 +28,18 @@
 #include "common/settings.h"
 #include "common/swap.h"
 #include "core/core.h"
+#include "core/core_timing.h"
 #include "core/device_memory.h"
 #include "core/gpu_dirty_memory_manager.h"
 #include "core/hardware_properties.h"
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/nx2_thread_stats.h"
 #include "core/memory.h"
 #include "video_core/gpu.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host1x/host1x.h"
+#include "video_core/nx2_async_readback.h"
 #include "video_core/rasterizer_download_area.h"
 
 namespace Core::Memory {
@@ -168,6 +171,24 @@ struct Memory::Impl {
             const u32 b{Read16(addr + sizeof(u16))};
             return (b << 16) | a;
         }
+    }
+
+    bool Read32Acquire(const Common::ProcessAddress addr, u32& value) {
+        value = 0;
+        if (!current_page_table || (addr & 3) != 0) {
+            return false;
+        }
+        auto* pointer = GetPointerImpl(GetInteger(addr), [] {}, [&] {
+            HandleRasterizerDownload(GetInteger(addr), sizeof(u32));
+        });
+        if (!pointer) {
+            return false;
+        }
+        u32_le actual{};
+        static_cast<void>(Common::AtomicCompareAndSwap(reinterpret_cast<u32_le*>(pointer),
+                                                     u32_le{0}, u32_le{0}, actual));
+        value = actual;
+        return true;
     }
 
     u64 Read64(const Common::ProcessAddress addr) {
@@ -490,7 +511,7 @@ struct Memory::Impl {
                 return value != nullptr && value[0] == '1';
             }();
             const bool reactive_flushing =
-                Settings::values.use_reactive_flushing.GetValue() &&
+                Settings::ReactiveFlushing() &&
                 !(nx2_no_reactive && Settings::CurrentProgramIsSwitch2());
             if (!reactive_flushing || !cached) {
                 perm |= Common::MemoryPermission::Read;
@@ -572,7 +593,7 @@ struct Memory::Impl {
             return value != nullptr && value[0] == '0';
         }();
         return !disabled && current_page_table->fastmem_arena &&
-               !Settings::values.use_reactive_flushing.GetValue() &&
+               !Settings::ReactiveFlushing() &&
                Settings::values.cpu_backend.GetValue() != Settings::CpuBackend::Nce;
     }
 
@@ -599,17 +620,27 @@ struct Memory::Impl {
         for (u64 page = vaddr >> YUZU_PAGEBITS; page != page_end; ++page) {
             const bool cached = std::as_const(current_page_table->entries)[page].Type() ==
                                 Common::PageType::RasterizerCachedMemory;
+            armed_read_trap_count.fetch_add(1, std::memory_order_relaxed);
             if (!cached || !armed_read_traps.insert(page).second) {
+                armed_read_trap_count.fetch_sub(1, std::memory_order_relaxed);
                 protect_run();
                 continue;
             }
-            armed_read_trap_count.fetch_add(1, std::memory_order_relaxed);
             if (run_pages == 0) {
                 run_begin = page;
             }
             ++run_pages;
         }
         protect_run();
+    }
+
+    bool ReadTrapArmed(u64 vaddr, u64 size) {
+        if (armed_read_trap_count.load(std::memory_order_relaxed) == 0) {
+            return false;
+        }
+        std::scoped_lock lk{read_trap_mutex};
+        const auto it = armed_read_traps.lower_bound(vaddr >> YUZU_PAGEBITS);
+        return it != armed_read_traps.end() && *it <= ((vaddr + size - 1) >> YUZU_PAGEBITS);
     }
 
     /// Takes read permission away again from armed pages that were just cached again.
@@ -780,7 +811,9 @@ struct Memory::Impl {
             }
             ++UnmappedReadFlag();
         }, [&]() {
-            HandleRasterizerDownload(addr, sizeof(T));
+            if (!ReadTrapsEnabled() || ReadTrapArmed(addr & 0xffffffffffffULL, sizeof(T))) {
+                HandleRasterizerDownload(addr, sizeof(T));
+            }
         }); ptr) [[likely]] {
             // It may be tempting to rewrite this particular section to use "reinterpret_cast";
             // afterall, it's trivially copyable so surely it can be copied ov- Alignment.
@@ -833,11 +866,46 @@ struct Memory::Impl {
         return true;
     }
 
+    /// A rasterizer-cached page whose host pointer is outside the emulated physical memory has no
+    /// device address to flush or invalidate (its lookup used to read far out of bounds).
+    void ReportForeignPointer(VAddr v_address, const u8* p) const {
+        static std::atomic<u32> reported{};
+        if (reported.fetch_add(1, std::memory_order_relaxed) >= 16) {
+            return;
+        }
+        const auto raw =
+            current_page_table->entries[(v_address & 0xffffffffffffULL) >> YUZU_PAGEBITS].Raw();
+        LOG_ERROR(HW_Memory,
+                  "Rasterizer access at {:#x}: host pointer {} is outside the emulated physical "
+                  "memory at {} (page type {}, block {})",
+                  v_address, fmt::ptr(p),
+                  fmt::ptr(system.DeviceMemory().buffer.BackingBasePointer()),
+                  static_cast<u32>(raw.type), static_cast<u32>(raw.block));
+    }
+
     void HandleRasterizerDownload(VAddr v_address, size_t size) {
+        if (!Kernel::Nx2ThreadStats::g_enabled) {
+            DownloadFromRasterizer(v_address, size);
+            return;
+        }
+        auto& timing = system.CoreTiming();
+        const u64 start = timing.GetClockTicks();
+        const u64 reads = VideoCore::AsyncReadback::t_reads;
+        DownloadFromRasterizer(v_address, size);
+        Kernel::Nx2ThreadStats::CountMemory(Kernel::Nx2ThreadStats::t_run,
+                                            timing.GetClockTicks() - start,
+                                            VideoCore::AsyncReadback::t_reads != reads);
+    }
+
+    void DownloadFromRasterizer(VAddr v_address, size_t size) {
         const auto* p = GetPointerImpl(
             v_address, []() {}, []() {});
         if (!gpu_device_memory) [[unlikely]] {
             gpu_device_memory = &system.Host1x().MemoryManager();
+        }
+        if (!gpu_device_memory->IsPhysicalPointer(p)) [[unlikely]] {
+            ReportForeignPointer(v_address, p);
+            return;
         }
         const size_t core = system.GetCurrentHostThreadID();
         if (core >= Core::Hardware::NUM_CPU_CORES) {
@@ -871,6 +939,18 @@ struct Memory::Impl {
     }
 
     void HandleRasterizerWrite(VAddr v_address, size_t size) {
+        if (!Kernel::Nx2ThreadStats::g_enabled) {
+            WriteToRasterizer(v_address, size);
+            return;
+        }
+        auto& timing = system.CoreTiming();
+        const u64 start = timing.GetClockTicks();
+        WriteToRasterizer(v_address, size);
+        Kernel::Nx2ThreadStats::CountMemory(Kernel::Nx2ThreadStats::t_run,
+                                            timing.GetClockTicks() - start, false);
+    }
+
+    void WriteToRasterizer(VAddr v_address, size_t size) {
         const auto* p = GetPointerImpl(
             v_address, []() {}, []() {});
         constexpr size_t sys_core = Core::Hardware::NUM_CPU_CORES - 1;
@@ -878,6 +958,10 @@ struct Memory::Impl {
                                      sys_core); // any other calls threads go to syscore.
         if (!gpu_device_memory) [[unlikely]] {
             gpu_device_memory = &system.Host1x().MemoryManager();
+        }
+        if (!gpu_device_memory->IsPhysicalPointer(p)) [[unlikely]] {
+            ReportForeignPointer(v_address, p);
+            return;
         }
         // Guard on sys_core;
         if (core == sys_core) [[unlikely]] {
@@ -889,13 +973,32 @@ struct Memory::Impl {
             }
         };
         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
-            gpu_dirty_managers[core].CollectWrite(
-                address, size, address >> YUZU_PAGEBITS, rasterizer_write_areas[core], [&] {
-                    // Short circuit the need to check for address/size
-                    return address != 0 && size != 0 && system.GPU().OnCPUWrite(address, size);
-                });
+            auto& current_area = rasterizer_write_areas[core];
+            PAddr subaddress = address >> YUZU_PAGEBITS;
+            // Performance note:
+            // It may not be a good idea to assume accesses are within the same subaddress (i.e same page)
+            // It is often the case the games like to access wildly different addresses. Hence why I propose
+            // we should let the compiler just do it's thing...
+            if (current_area.last_address != subaddress) {
+                // Short circuit the need to check for address/size
+                auto const do_collection = (address != 0 && size != 0)
+                    && system.GPU().OnCPUWrite(address, size);
+                if (do_collection) {
+                    current_area.last_address = subaddress;
+                } else {
+                    return;
+                }
+            }
+            gpu_dirty_managers[core].Collect(address, size);
+            // A download writing to guest memory here may have looked at the collected writes
+            // before this one: its bytes would land over the ones stored after this returns.
+            VideoCore::DownloadLanding::Await(address, size);
         });
     }
+
+    struct GPUDirtyState {
+        PAddr last_address;
+    };
 
     void InvalidateGPUMemory(u8* p, size_t size) {
         constexpr size_t sys_core = Core::Hardware::NUM_CPU_CORES - 1;
@@ -928,8 +1031,7 @@ struct Memory::Impl {
     std::set<u64> armed_read_traps;
     std::atomic<size_t> armed_read_trap_count{};
     std::mutex read_trap_mutex;
-    std::array<Core::GPUDirtyMemoryManager::ReportedPage, Core::Hardware::NUM_CPU_CORES>
-        rasterizer_write_areas{};
+    std::array<GPUDirtyState, Core::Hardware::NUM_CPU_CORES> rasterizer_write_areas{};
     std::array<Common::ScratchBuffer<u32>, Core::Hardware::NUM_CPU_CORES> scratch_buffers{};
     std::span<Core::GPUDirtyMemoryManager> gpu_dirty_managers;
     std::mutex sys_core_guard;
@@ -985,6 +1087,9 @@ bool Memory::IsValidVirtualAddress(const Common::ProcessAddress vaddr) const {
 
 bool Memory::IsValidVirtualAddressRange(Common::ProcessAddress base, u64 size) const {
     Common::ProcessAddress end = base + size;
+    if (end < base) {
+        return false;
+    }
     Common::ProcessAddress page = Common::AlignDown(GetInteger(base), YUZU_PAGESIZE);
 
     for (; page < end; page += YUZU_PAGESIZE) {
@@ -1018,6 +1123,10 @@ u16 Memory::Read16(const Common::ProcessAddress addr) {
 
 u32 Memory::Read32(const Common::ProcessAddress addr) {
     return impl->Read32(addr);
+}
+
+bool Memory::Read32Acquire(const Common::ProcessAddress addr, u32& value) {
+    return impl->Read32Acquire(addr, value);
 }
 
 u64 Memory::Read64(const Common::ProcessAddress addr) {

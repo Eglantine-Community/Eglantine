@@ -18,6 +18,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <regex>
 #include <string>
 #include "common/settings_enums.h"
@@ -30,8 +31,11 @@
 
 #include <fmt/ostream.h>
 
+#include "common/fs/fs_util.h"
+#include "common/fs/path_util.h"
+#include "common/literals.h"
 #include "common/logging.h"
-#include "common/nx2_sampler.h"
+#include "common/memory_detect.h"
 #include "common/scm_rev.h"
 #include "common/settings.h"
 #include "common/string_util.h"
@@ -39,6 +43,7 @@
 #include "core/core_timing.h"
 #include "core/cpu_manager.h"
 #include "core/crypto/key_manager.h"
+#include "core/file_sys/common_funcs.h"
 #include "core/file_sys/nup_writer.h"
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/vfs/vfs_real.h"
@@ -46,6 +51,7 @@
 #include "core/hle/service/filesystem/filesystem.h"
 #include "core/loader/loader.h"
 #include "frontend_common/config.h"
+#include "frontend_common/profile_import.h"
 #include "input_common/drivers/keyboard.h"
 #include "input_common/main.h"
 #include "network/network.h"
@@ -53,6 +59,7 @@
 #include "video_core/gpu.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
+#include "video_core/shader_warm/shader_warm_builder.h"
 #include "yuzu_cmd/emu_window/emu_window_sdl3.h"
 #ifdef HAS_OPENGL
 #include "yuzu_cmd/emu_window/emu_window_sdl3_gl.h"
@@ -68,6 +75,7 @@
 // windows.h needs to be included before shellapi.h
 #include <windows.h>
 #include <shellapi.h>
+#include "common/windows/crash_handler.h"
 #include "common/windows/timer_resolution.h"
 #endif
 
@@ -77,75 +85,6 @@ extern "C" {
 // graphics
 __declspec(dllexport) unsigned long NvOptimusEnablement = 0x00000001;
 __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
-}
-
-// EDEN_NX2_CRASH_DUMP=<dir>: on an unhandled exception (a real crash; fastmem faults are handled
-// before this), write <dir>/eden-crash-<pid>.dmp. A debugger changes the timing enough to hide
-// some crashes, so this catches them at full speed. dbghelp.dll is loaded only then.
-// Prints a code address as module+offset (resolve with llvm-symbolizer and the module's PDB).
-static void PrintCodeAddress(const char* label, const void* address) {
-    HMODULE module{};
-    char name[MAX_PATH] = "?";
-    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           static_cast<LPCSTR>(address), &module)) {
-        GetModuleFileNameA(module, name, sizeof(name));
-    }
-    const char* base_name = std::strrchr(name, '\\');
-    std::fprintf(stderr, "  %s %p %s+%#llx\n", label, address, base_name ? base_name + 1 : name,
-                 static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(address) -
-                                                 reinterpret_cast<uintptr_t>(module)));
-}
-
-static LONG WINAPI WriteCrashDump(EXCEPTION_POINTERS* exception) {
-    static std::atomic<bool> written{};
-    const char* directory = std::getenv("EDEN_NX2_CRASH_DUMP");
-    if (directory == nullptr || written.exchange(true)) {
-        return EXCEPTION_CONTINUE_SEARCH;
-    }
-    // The faulting address and stack first: they survive even if the dump fails.
-    const EXCEPTION_RECORD& record = *exception->ExceptionRecord;
-    std::fprintf(stderr, "Unhandled exception %#lx on thread %lu, info %#llx %#llx\n",
-                 record.ExceptionCode, GetCurrentThreadId(),
-                 static_cast<unsigned long long>(record.NumberParameters > 0 ? record.ExceptionInformation[0] : 0),
-                 static_cast<unsigned long long>(record.NumberParameters > 1 ? record.ExceptionInformation[1] : 0));
-    PrintCodeAddress("at", record.ExceptionAddress);
-    void* frames[48];
-    const USHORT count = RtlCaptureStackBackTrace(0, 48, frames, nullptr);
-    for (USHORT i = 0; i < count; ++i) {
-        PrintCodeAddress("frame", frames[i]);
-    }
-    std::fflush(stderr);
-    struct ExceptionInformation {
-        DWORD thread_id;
-        EXCEPTION_POINTERS* exception_pointers;
-        BOOL client_pointers;
-    };
-    using MiniDumpWriteDumpFn = BOOL(WINAPI*)(HANDLE, DWORD, HANDLE, int, const ExceptionInformation*,
-                                              const void*, const void*);
-    const HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
-    const auto write = dbghelp ? reinterpret_cast<MiniDumpWriteDumpFn>(
-                                     GetProcAddress(dbghelp, "MiniDumpWriteDump"))
-                               : nullptr;
-    if (write == nullptr) {
-        return EXCEPTION_CONTINUE_SEARCH;
-    }
-    char path[MAX_PATH];
-    std::snprintf(path, sizeof(path), "%s\\eden-crash-%lu.dmp", directory, GetCurrentProcessId());
-    const HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                                    FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file != INVALID_HANDLE_VALUE) {
-        const ExceptionInformation information{GetCurrentThreadId(), exception, FALSE};
-        // MiniDumpWithThreadInfo; the larger MiniDumpWithIndirectlyReferencedMemory failed on
-        // Eden's address space and left an empty file.
-        const BOOL ok = write(GetCurrentProcess(), GetCurrentProcessId(), file, 0x1000,
-                              &information, nullptr, nullptr);
-        const DWORD error = ok ? 0 : GetLastError();
-        CloseHandle(file);
-        std::fprintf(stderr, ok ? "Crash dump written to %s\n" : "Crash dump to %s failed (%#lx)\n",
-                     path, error);
-    }
-    return EXCEPTION_CONTINUE_SEARCH;
 }
 #endif
 
@@ -251,6 +190,88 @@ struct SdlState {
     std::unique_ptr<EmuWindow_SDL3> emu_window;
     bool network_initialized{};
 };
+
+constexpr int kRestartExitCode = 75;
+static std::atomic_bool restart_requested{false};
+
+// ExecuteProgram state for the restarted process: what the Qt frontend keeps in-process when it
+// reboots a game. Only read when the launcher sets EDEN_CLI_RESTART_HANDOFF, so a leftover file
+// never changes a normal launch.
+struct RestartHandoff {
+    u64 program_id{};
+    s32 program_index{};
+    s32 previous_program_index{-1};
+    std::vector<std::vector<u8>> user_channel;
+};
+
+static std::filesystem::path RestartHandoffPath() {
+    return Common::FS::GetEdenPath(Common::FS::EdenPath::EdenDir) / "restart-handoff.bin";
+}
+
+template <typename T>
+static void PutRaw(std::ostream& out, const T& value) {
+    out.write(reinterpret_cast<const char*>(&value), sizeof(value));
+}
+
+template <typename T>
+static void GetRaw(std::istream& in, T& value) {
+    in.read(reinterpret_cast<char*>(&value), sizeof(value));
+}
+
+// Bounds keep a damaged handoff from requesting huge allocations; the writer refuses anything the
+// reader would reject.
+constexpr u32 kHandoffMaxEntries = 256;
+constexpr u64 kHandoffMaxTotalSize = 64u << 20;
+
+static bool WriteRestartHandoff(const RestartHandoff& handoff) {
+    u64 total = 0;
+    for (const auto& entry : handoff.user_channel) {
+        total += entry.size();
+    }
+    if (handoff.user_channel.size() > kHandoffMaxEntries || total > kHandoffMaxTotalSize) {
+        return false;
+    }
+    std::ofstream out{RestartHandoffPath(), std::ios::binary | std::ios::trunc};
+    PutRaw(out, handoff.program_id);
+    PutRaw(out, handoff.program_index);
+    PutRaw(out, handoff.previous_program_index);
+    PutRaw(out, static_cast<u32>(handoff.user_channel.size()));
+    for (const auto& entry : handoff.user_channel) {
+        PutRaw(out, static_cast<u32>(entry.size()));
+        out.write(reinterpret_cast<const char*>(entry.data()), std::streamsize(entry.size()));
+    }
+    out.close();
+    return !out.fail();
+}
+
+// Leaves the file in place; the caller removes it once the game has loaded.
+static std::optional<RestartHandoff> ReadRestartHandoff() {
+    std::ifstream in{RestartHandoffPath(), std::ios::binary};
+    RestartHandoff handoff;
+    u32 count{};
+    GetRaw(in, handoff.program_id);
+    GetRaw(in, handoff.program_index);
+    GetRaw(in, handoff.previous_program_index);
+    GetRaw(in, count);
+    if (in.fail() || count > kHandoffMaxEntries) {
+        return std::nullopt;
+    }
+    u64 total = 0;
+    for (u32 i = 0; i < count; ++i) {
+        u32 size{};
+        GetRaw(in, size);
+        total += size;
+        if (in.fail() || total > kHandoffMaxTotalSize) {
+            return std::nullopt;
+        }
+        auto& entry = handoff.user_channel.emplace_back(size);
+        in.read(reinterpret_cast<char*>(entry.data()), std::streamsize(size));
+        if (in.fail()) {
+            return std::nullopt;
+        }
+    }
+    return handoff;
+}
 
 static std::atomic_bool pack_nup_cancel{false};
 static std::atomic_bool unpack_nup_cancel{false};
@@ -393,16 +414,76 @@ static bool EditNup(const Core::LaunchParams& lp) {
     }
 }
 
+/// Hidden test hook (not in --help): builds a game's shader precache file without booting it.
+///   yuzu-cmd --build-warm <game file> <title id hex> <output dir>
+static bool BuildWarm(Core::System& system, int argc, char** argv) {
+    namespace ShaderWarm = VideoCommon::ShaderWarm;
+    if (argc < 5) {
+        fmt::print(stderr, "usage: --build-warm <game> <title id> <output dir>\n");
+        return false;
+    }
+    system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
+    system.SetFilesystem(std::make_shared<FileSys::RealVfsFilesystem>());
+    const u64 title_id = std::strtoull(argv[3], nullptr, 16);
+    ShaderWarm::BuildOptions options;
+    options.output_dir = Common::FS::ToU8String(argv[4]);
+    std::string last_stage;
+    auto last_print = std::chrono::steady_clock::now();
+    const auto begin = last_print;
+    const auto on_progress = [&](const ShaderWarm::Progress& progress) {
+        const auto now = std::chrono::steady_clock::now();
+        if (progress.stage == last_stage && now - last_print < std::chrono::seconds{5}) {
+            return;
+        }
+        last_stage = progress.stage;
+        last_print = now;
+        fmt::print("{:7.1f} s  {}: {} / {}\n",
+                   std::chrono::duration<double>(now - begin).count(), progress.stage,
+                   progress.done, progress.total);
+        std::fflush(stdout);
+    };
+    const auto result = ShaderWarm::BuildWarmFilesWith(
+        system, Common::FS::ToU8String(argv[2]), title_id, options, on_progress, {});
+    // The error can hold a Windows path: escape it so the summary stays valid JSON.
+    std::string error;
+    for (const char c : result.error) {
+        switch (c) {
+        case '"':
+            error += "\\\"";
+            break;
+        case '\\':
+            error += "\\\\";
+            break;
+        case '\n':
+            error += "\\n";
+            break;
+        case '\r':
+            error += "\\r";
+            break;
+        case '\t':
+            error += "\\t";
+            break;
+        default:
+            if (static_cast<unsigned char>(c) < 0x20) {
+                error += fmt::format("\\u{:04x}", static_cast<unsigned>(c));
+            } else {
+                error += c;
+            }
+            break;
+        }
+    }
+    fmt::print("{{\"ok\": {}, \"error\": \"{}\", \"archives\": {}, \"compute\": {}, "
+               "\"skipped\": {}, \"seconds\": {:.1f}}}\n",
+               result.ok, error, result.archives, result.compute_programs, result.skipped,
+               std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
+    std::fflush(stdout);
+    return result.ok;
+}
+
 extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
-#ifdef _WIN32
-    SetUnhandledExceptionFilter(WriteCrashDump);
-#endif
-    Nx2Sampler::StartFromEnvironment();
     // SDL calls SDL_AppIterate back to back by default, which kept a host core at 100% polling
     // input; 240 Hz is plenty for input and the key script.
     SDL_SetHint(SDL_HINT_MAIN_CALLBACK_RATE, "240");
-    SdlState* state = new SdlState();
-    *appstate = state;
 
 #ifdef _WIN32
     if (AttachConsole(ATTACH_PARENT_PROCESS)) {
@@ -420,9 +501,30 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     }
 #endif
 
+    try {
+        FrontendCommon::CheckLegacyProfileBeforeConfig();
+    } catch (const std::exception& exception) {
+        fmt::print(stderr, "{}\n", exception.what());
+        return SDL_APP_FAILURE;
+    }
+
+    SdlState* state = new SdlState();
+    *appstate = state;
+
     Common::Log::Initialize();
     Common::Log::SetColorConsoleBackendEnabled(true);
     Common::Log::Start();
+#ifdef _WIN32
+    // EDEN_NX2_CRASH_DUMP=<dir> puts the dump somewhere other than the log directory.
+    const char* const crash_dump_dir = std::getenv("EDEN_NX2_CRASH_DUMP");
+    Common::Windows::InstallCrashHandler(
+        crash_dump_dir ? std::filesystem::path{crash_dump_dir}
+                       : Common::FS::GetEdenPath(Common::FS::EdenPath::LogDir));
+#endif
+
+    if (argc > 1 && std::string_view{argv[1]} == "--build-warm") {
+        return BuildWarm(state->system, argc, argv) ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
+    }
 
     int option_index = 0;
 #ifdef _WIN32
@@ -503,6 +605,10 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
 #endif
 
     state->system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
+    // Holds the updates and DLC an NX archive brings, as the Qt frontend does.
+    static FileSys::ManualContentProvider manual_provider;
+    state->system.RegisterContentProvider(FileSys::ContentProviderUnionSlot::FrontendManual,
+                                          &manual_provider);
     state->system.SetFilesystem(std::make_shared<FileSys::RealVfsFilesystem>());
     state->system.GetFileSystemController().CreateFactories(*state->system.GetFilesystem());
     state->system.GetUserChannel().clear();
@@ -510,12 +616,48 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     Service::AM::FrontendAppletParameters load_parameters{
         .applet_id = Service::AM::AppletId::Application,
     };
+    const char* const handoff_env = std::getenv("EDEN_CLI_RESTART_HANDOFF");
+    const bool restarted = handoff_env != nullptr && handoff_env[0] != '\0';
+    if (restarted) {
+        auto handoff = ReadRestartHandoff();
+        if (!handoff) {
+            // Booting as a frontend launch would clear the game's temp storage.
+            LOG_CRITICAL(Frontend, "Restart handoff {} is missing or damaged, not booting",
+                         Common::FS::PathToUTF8String(RestartHandoffPath()));
+            return SDL_APP_FAILURE;
+        }
+        state->system.GetUserChannel() = std::move(handoff->user_channel);
+        load_parameters.program_id = handoff->program_id;
+        load_parameters.launch_type = Service::AM::LaunchType::ApplicationInitiated;
+        load_parameters.program_index = handoff->program_index;
+        load_parameters.previous_program_index = handoff->previous_program_index;
+        LOG_INFO(Frontend, "Restarted by the game: program index {}, {} user channel entries",
+                 handoff->program_index, state->system.GetUserChannel().size());
+    }
     const Core::SystemResultStatus load_result = state->system.Load(*state->emu_window, lp.filepath, load_parameters);
     switch (load_result) {
     case Core::SystemResultStatus::Success:
+        if (restarted) {
+            std::error_code ec;
+            std::filesystem::remove(RestartHandoffPath(), ec);
+        } else if (const auto ram = Common::GetHostRam();
+                   Settings::CurrentProgramIsSwitch2() && Common::IsBelowSwitch2RamMinimum(ram)) {
+            using namespace Common::Literals;
+            fmt::print(stderr,
+                       "Warning: this PC has {:.3g} GB of RAM. Switch 2 games need at least 16 GB, "
+                       "and 32 GB is recommended.\nGames can crash, and can even freeze or crash "
+                       "the whole PC.\nThis setup isn't supported, so please don't open issues or "
+                       "ask for help about crashes on it.\n",
+                       static_cast<f64>(ram.bytes) / f64{1_GiB});
+        }
         break; // Expected case
     case Core::SystemResultStatus::ErrorGetLoader:
         LOG_CRITICAL(Frontend, "Failed to obtain loader for {}!", lp.filepath);
+        return SDL_APP_FAILURE;
+    case Core::SystemResultStatus::ErrorMemoryAllocation:
+        LOG_CRITICAL(Frontend,
+                     "Not enough host memory to start the game. Close other applications and "
+                     "check available memory and paging-file space, then try again.");
         return SDL_APP_FAILURE;
     case Core::SystemResultStatus::ErrorLoader:
         LOG_CRITICAL(Frontend, "Failed to load ROM!");
@@ -555,8 +697,7 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     state->system.GPU().Start();
     state->system.GetCpuManager().OnGpuReady();
 
-    if (Settings::values.use_disk_shader_cache.GetValue() ||
-        Settings::values.precompile_shaders.GetValue()) {
+    if (Settings::values.use_disk_shader_cache.GetValue()) {
         state->system.Renderer().ReadRasterizer()->LoadDiskResources(
             state->system.GetApplicationProcessProgramID(), std::stop_token{},
             [](VideoCore::LoadCallbackStage, size_t value, size_t total) {});
@@ -565,11 +706,35 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     // don't do anything, SDL3 already exists for us :D
     state->system.RegisterExitCallback([] {});
 
+    // A game executing a program (e.g. restarting after a settings change) writes its launch state
+    // to the restart handoff and quits with kRestartExitCode; the launcher boots the same file again
+    // with EDEN_CLI_RESTART_HANDOFF set. Mirrors MainWindow::OnExecuteProgram.
+    state->system.RegisterExecuteProgramCallback([system = &state->system](std::size_t program_index) {
+        RestartHandoff handoff{
+            .program_index = static_cast<s32>(program_index),
+            .user_channel = system->GetUserChannel(),
+        };
+        const u64 previous_program_id = system->GetApplicationProcessProgramID();
+        if (previous_program_id > static_cast<u64>(Service::AM::AppletProgramId::MaxProgramId)) {
+            handoff.previous_program_index =
+                static_cast<s32>(previous_program_id - FileSys::GetBaseTitleID(previous_program_id));
+            handoff.program_id = previous_program_id;
+        }
+        // Without the handoff, a relaunch would boot as a frontend launch and clear temp storage.
+        if (!WriteRestartHandoff(handoff)) {
+            LOG_CRITICAL(Frontend, "ExecuteProgram: could not write {}, not restarting",
+                         Common::FS::PathToUTF8String(RestartHandoffPath()));
+            return;
+        }
+        LOG_INFO(Frontend, "ExecuteProgram: program index {}, exiting with code {} to restart",
+                 program_index, kRestartExitCode);
+        restart_requested = true;
+    });
+
     // QLaunch launched applications (should) now reload shader cache.
     static std::mutex shader_cache_reload_mutex;
     state->system.RegisterApplicationChangedCallback([&state](u64 changed_program_id) {
-        if (!Settings::values.use_disk_shader_cache.GetValue() &&
-            !Settings::values.precompile_shaders.GetValue()) {
+        if (!Settings::values.use_disk_shader_cache.GetValue()) {
             return;
         }
 
@@ -598,70 +763,7 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
 // keys, by SDL scancode, that many seconds after start. Lets hidden test runs drive menus.
 double Nx2KeyClockSeconds(); // emu_window_sdl3.cpp
 
-// EDEN_NX2_DIAG_DIR=<dir>: keys.txt there is read and removed while the game runs, for scripted
-// control (tools/nx2/lab_ctl.py press). One entry per line: "<code>" press, "-<code>" release, or
-// "<code> <milliseconds>" press and release after that long. Codes are SDL scancodes.
-static void RunLiveKeys(InputCommon::InputSubsystem& input_subsystem, Core::System& system) {
-    static const std::filesystem::path file = [] {
-        const char* dir = std::getenv("EDEN_NX2_DIAG_DIR");
-        return dir && *dir ? std::filesystem::path{dir} / "keys.txt" : std::filesystem::path{};
-    }();
-    if (file.empty()) {
-        return;
-    }
-    static std::vector<std::pair<double, int>> releases;
-    static double last_check = 0.0;
-    const double now = Nx2KeyClockSeconds();
-    std::erase_if(releases, [&](const std::pair<double, int>& release) {
-        if (release.first > now) {
-            return false;
-        }
-        input_subsystem.GetKeyboard()->ReleaseKey(static_cast<std::size_t>(release.second));
-        return true;
-    });
-    if (now - last_check < 0.05) {
-        return;
-    }
-    last_check = now;
-    // Renamed first, so a writer replacing the file is never read halfway.
-    const auto taken = std::filesystem::path{file}.replace_extension(".taken");
-    std::error_code error;
-    std::filesystem::rename(file, taken, error);
-    if (error) {
-        return;
-    }
-    std::ifstream in{taken};
-    std::string line;
-    while (std::getline(in, line)) {
-        // "gpu low|high": sets the GPU accuracy, as the Qt app's Change GPU Mode hotkey.
-        if (line.starts_with("gpu ")) {
-            const bool high = line.substr(4) == "high";
-            Settings::values.gpu_accuracy.SetValue(high ? Settings::GpuAccuracy::High
-                                                        : Settings::GpuAccuracy::Low);
-            system.ApplySettings();
-            LOG_INFO(Frontend, "Live keys: GPU accuracy {}", high ? "high" : "low");
-            continue;
-        }
-        int code = 0, milliseconds = -1;
-        if (std::sscanf(line.c_str(), "%d %d", &code, &milliseconds) < 1 || code == 0) {
-            continue;
-        }
-        LOG_INFO(Frontend, "Live keys: {} {}{}", code < 0 ? "release" : "press", code < 0 ? -code : code,
-                 milliseconds >= 0 ? fmt::format(" for {} ms", milliseconds) : "");
-        if (code < 0) {
-            input_subsystem.GetKeyboard()->ReleaseKey(static_cast<std::size_t>(-code));
-            continue;
-        }
-        input_subsystem.GetKeyboard()->PressKey(static_cast<std::size_t>(code));
-        if (milliseconds >= 0) {
-            releases.emplace_back(now + milliseconds / 1000.0, code);
-        }
-    }
-    in.close();
-    std::filesystem::remove(taken, error);
-}
-
-static void RunKeyScript(InputCommon::InputSubsystem& input_subsystem, Core::System& system) {
+static void RunKeyScript(InputCommon::InputSubsystem& input_subsystem) {
     struct KeyEvent {
         double seconds; // when frame is 0
         u64 frame;      // "f<frame>:code": after that many presents
@@ -710,14 +812,16 @@ static void RunKeyScript(InputCommon::InputSubsystem& input_subsystem, Core::Sys
         }
         ++next;
     }
-    RunLiveKeys(input_subsystem, system);
 }
 
 extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
     SdlState *state = (SdlState *)appstate;
-    RunKeyScript(state->input_subsystem, state->system);
+    RunKeyScript(state->input_subsystem);
     if (state->emu_window) {
         state->emu_window->ApplyPendingTitle();
+    }
+    if (restart_requested) {
+        return SDL_APP_SUCCESS;
     }
     return state->emu_window && state->emu_window->IsOpen() ? SDL_APP_CONTINUE : SDL_APP_SUCCESS;
 }
@@ -737,7 +841,6 @@ extern "C" void SDL_AppQuit(void *appstate, SDL_AppResult result) {
     // --version): the kernel is uninitialised then, and Pause()/ShutdownMainProcess() would
     // dereference it.
     if (state->system.IsPoweredOn()) {
-        state->system.SetShuttingDown(true);
         void(state->system.Pause());
         state->system.ShutdownMainProcess();
     }
@@ -745,6 +848,11 @@ extern "C" void SDL_AppQuit(void *appstate, SDL_AppResult result) {
     delete state;
     if (network_initialized) {
         Network::Shutdown();
+    }
+    if (restart_requested) {
+        // SDL3 maps SDL_APP_SUCCESS to exit code 0; quit SDL ourselves to return the restart code.
+        SDL_Quit();
+        std::exit(kRestartExitCode);
     }
 }
 

@@ -31,12 +31,10 @@
 #include "common/fs/fs_paths.h"
 #include "common/fs/path_util.h"
 #include "common/literals.h"
-#include "common/log_ring.h"
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
 
 #include "common/logging.h"
-#include "common/memory_detect.h"
 #include "common/settings.h"
 #include "common/string_util.h"
 #include "common/bounded_threadsafe_queue.h"
@@ -159,9 +157,6 @@ struct Backend {
     virtual void Flush() noexcept = 0;
 };
 
-/// @brief Formatting specifier (to use with printf) of the equivalent fmt::format() expression
-#define CCB_PRINTF_FMT "[%4d.%06d] %s <%s> %s:%u:%s: %s"
-
 /// @brief Instead of using fmt::format() just use the system's formatting capabilities directly
 struct DirectFormatArgs {
     const char *class_name;
@@ -203,7 +198,13 @@ struct ColorConsoleBackend final : public Backend {
             }());
             SetConsoleTextAttribute(console_handle, color);
             auto const df = GetDirectFormatArgs(entry);
-            std::fprintf(stdout, CCB_PRINTF_FMT "\n", df.time_seconds, df.time_fractional, df.class_name, df.level_name, entry.filename, entry.line_num, entry.function, entry.message);
+            // One write per line: MinGW's fprintf emits each character separately, and stdout is
+            // unbuffered here, so every character became a WriteFile on the thread that logs.
+            fmt::memory_buffer line;
+            fmt::format_to(fmt::appender(line), "[{:4d}.{:06d}] {} <{}> {}:{}:{}: ", df.time_seconds, df.time_fractional, df.class_name, df.level_name, entry.filename, entry.line_num, entry.function);
+            line.append(entry.message, entry.message + entry.message_len);
+            line.push_back('\n');
+            std::fwrite(line.data(), 1, line.size(), stdout);
         }
     }
     void Flush() noexcept override {}
@@ -235,7 +236,9 @@ struct ColorConsoleBackend final : public Backend {
             std::fwrite("\x1b[0m\n", 1, sizeof("\x1b[0m\n"), stdout);
         }
     }
-    void Flush() noexcept override {}
+    void Flush() noexcept override {
+        std::fflush(stdout);
+    }
     std::atomic_bool enabled = false;
 #endif
 };
@@ -244,13 +247,34 @@ struct ColorConsoleBackend final : public Backend {
 /// @brief Backend that writes to a file passed into the constructor
 struct FileBackend final : public Backend {
     explicit FileBackend(const std::filesystem::path filename) noexcept {
-        auto old_filename = filename;
-        old_filename += ".old.txt";
-        // Existence checks are done within the functions themselves.
-        // We don't particularly care if these succeed or not.
-        void(FS::RemoveFile(old_filename));
-        void(FS::RenameFile(filename, old_filename));
-        file.emplace(filename, FS::FileAccessMode::Write, FS::FileType::TextFile);
+        // Move a log over its ".old.txt" copy. The rename replaces the copy atomically, and fails
+        // if the log is still open elsewhere (e.g. in a Lichii process that hasn't exited yet).
+        // A log that can't even be checked counts as a failure, so it is never truncated.
+        const auto rotate = [](const std::filesystem::path& path) {
+            std::error_code ec;
+            if (!std::filesystem::exists(path, ec))
+                return !ec;
+            auto old_path = path;
+            old_path += ".old.txt";
+            std::filesystem::rename(path, old_path, ec);
+            return !ec;
+        };
+        // If the log can't be moved, write this session to a second log (eden_log_2.txt) so that
+        // the previous session is kept and this one still gets the full size limit. If that one
+        // can't be moved either, append to it.
+        auto path = filename;
+        auto mode = FS::FileAccessMode::Write;
+        if (!rotate(path)) {
+            path = filename.parent_path() / filename.stem();
+            path += "_2";
+            path += filename.extension();
+            if (!rotate(path))
+                mode = FS::FileAccessMode::Append;
+        }
+        file.emplace(path, mode, FS::FileType::TextFile);
+        // Count what is already there so the size limit still applies when appending.
+        if (mode == FS::FileAccessMode::Append)
+            bytes_written = file->GetSize();
     }
     ~FileBackend() noexcept override = default;
 
@@ -446,28 +470,27 @@ void Stop() {
         logging_instance->ForEachBackend([](Backend& backend) { backend.Flush(); });
 }
 
-std::string DescribeException(std::exception_ptr exception) {
-    if (!exception) {
-        return "no active exception";
-    }
-    try {
-        std::rethrow_exception(exception);
-    } catch (const std::exception& e) {
-        return e.what();
-    } catch (...) {
-        return "non-standard exception";
-    }
-}
-
-void InstallTerminateHandler() {
-    std::set_terminate([] {
-        // Critical entries flush the file backend before the abort below.
-        LOG_CRITICAL(Common, "std::terminate: {}", DescribeException(std::current_exception()));
-        LOG_CRITICAL(Common, "Host resources: {}",
-                     Common::DescribeHostResources(Common::QueryHostResources()));
-        Stop();
-        std::abort();
-    });
+void FmtCrashMessageImpl(const char* filename, unsigned int line_num, const char* function, fmt::string_view format, const fmt::format_args& args) noexcept {
+#ifndef __OPENORBIS__
+    if (!logging_instance || !logging_instance->file_backend)
+        return;
+    char buffer[2048];
+    const auto result = fmt::vformat_to_n(buffer, sizeof(buffer) - 1, format, args);
+    const std::size_t length = (std::min)(result.size, sizeof(buffer) - 1);
+    buffer[length] = '\0';
+    const Entry e{
+        .message = buffer,
+        .message_len = length,
+        .timestamp = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - logging_instance->time_origin),
+        .log_class = Class::Common,
+        .log_level = Level::Critical,
+        .filename = TrimSourcePath(filename),
+        .function = function,
+        .line_num = line_num,
+    };
+    logging_instance->file_backend->Write(e);
+    logging_instance->file_backend->Flush();
+#endif
 }
 
 void SetGlobalFilter(const Filter& filter) {

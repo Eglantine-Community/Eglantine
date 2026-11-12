@@ -6,7 +6,6 @@
 #include <memory>
 #include <type_traits>
 #include <utility>
-#include <vector>
 
 namespace Shader {
 
@@ -24,9 +23,10 @@ public:
         return std::construct_at(Memory(), std::forward<Args>(args)...);
     }
 
-    /// Destroy objects and release their backing storage instead of retaining it for reuse.
+    /// Destroys the objects and returns their memory; ReleaseContents keeps it for reuse
     void Free() {
         chunks.clear();
+        chunks.shrink_to_fit();
         node = &chunks.emplace_back(new_chunk_size);
     }
 
