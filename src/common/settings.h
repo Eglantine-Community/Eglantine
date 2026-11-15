@@ -869,6 +869,11 @@ struct Values {
     // Ryuhdr 0.2.6's recommended mode. Read by the SDL driver on every vibration, so a change in
     // the HD Rumble dialog applies to connected controllers right away.
     Setting<bool> hd_rumble_enabled{linkage, true, "hd_rumble_enabled", Category::Controls};
+    // Set by the input layer when the RenHDrum library is actually loaded; never saved. HD Rumble
+    // can be enabled in the config with no library next to the emulator, in which case the standard
+    // rumble runs and the 15 ms packet filter has to stay in place.
+    Setting<bool> renhdrum_available{linkage, false, "renhdrum_available", Category::Controls,
+                                     Specialization::Default, false};
     // Amplitude gain in percent for everything RenHDrum plays. Switchable: some Switch 2 games
     // (Ocarina of Time) send amplitudes below 0.1 that the Joy-Con 2 still plays strongly.
     SwitchableSetting<int> hd_rumble_gain{linkage, 100, "hd_rumble_gain", Category::Controls};

@@ -57,6 +57,10 @@ ConfigureHdRumble::ConfigureHdRumble(QWidget* parent) : QDialog(parent) {
         missing->setOpenExternalLinks(true);
         root->addWidget(missing);
     }
+    root->addWidget(MakeNote(
+        tr("While HD Rumble is on, the \"Enable Accurate Vibration\" filter in the vibration "
+           "dialog is bypassed: this engine paces the 5 ms packets itself, and the 15 ms filter "
+           "would drop the short ticks Switch 2 games send.")));
 
     // Intensity: all controllers. Saved per game when the game has its own value.
     auto* gain_row = new QHBoxLayout;

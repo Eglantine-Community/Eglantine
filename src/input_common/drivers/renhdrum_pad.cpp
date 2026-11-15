@@ -91,6 +91,7 @@ const RenHDrumApi& Api() {
                    a.library.GetSymbol("renhdrum_dualsense_dsp_set_half_target",
                                        &a.dsp_set_half_target) &&
                    a.library.GetSymbol("renhdrum_dualsense_dsp_fill_f32", &a.dsp_fill_f32);
+        Settings::values.renhdrum_available.SetValue(a.loaded);
         if (a.loaded) {
             // Optional: a missing symbol leaves it null
             (void)a.library.GetSymbol("renhdrum_dualsense_dsp_build_bt_report",

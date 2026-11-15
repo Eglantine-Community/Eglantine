@@ -1269,7 +1269,13 @@ bool EmulatedController::SetVibration(DeviceIndex device_index, const VibrationV
         return false;
     }
 
-    if (!Settings::values.enable_accurate_vibrations.GetValue()) {
+    // RenHDrum paces short pulses itself; the 15 ms filter would drop Switch 2 titles' clicks.
+    // Only while it is actually loaded: without the library the standard rumble runs, and there
+    // the filter is what keeps SDL's rumble queue from saturating.
+    const bool hd_rumble_paces_packets =
+        Settings::values.hd_rumble_enabled.GetValue() &&
+        Settings::values.renhdrum_available.GetValue();
+    if (!Settings::values.enable_accurate_vibrations.GetValue() && !hd_rumble_paces_packets) {
         using std::chrono::duration_cast;
         using std::chrono::milliseconds;
         using std::chrono::steady_clock;
