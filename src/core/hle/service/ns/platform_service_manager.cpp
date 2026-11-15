@@ -191,6 +191,7 @@ IPlatformServiceManager::IPlatformServiceManager(Core::System& system_, const ch
         {2100, &IPlatformServiceManager::RequestLoadNxFont, "RequestLoadNxFont"},
         {2000, &IPlatformServiceManager::GetBuiltInFontSharedMemory, "GetBuiltInFontSharedMemory (Switch 2)"},
         {2010, &IPlatformServiceManager::GetBuiltInFontData, "GetBuiltInFontData (Switch 2)"},
+        {2020, &IPlatformServiceManager::GetBuiltInFontDataSet, "GetBuiltInFontDataSet (Switch 2)"},
     };
     // clang-format on
     RegisterHandlers(functions);
@@ -323,6 +324,36 @@ void IPlatformServiceManager::GetBuiltInFontSharedMemory(HLERequestContext& ctx)
     rb.Push(ResultSuccess);
     rb.Push<u32>(impl->builtin_font_memory_size);
     rb.PushCopyObjects(ctx, *impl->builtin_font_memory);
+}
+
+// The SDK accepts up to six u8 font types and a writable array of 12-byte descriptors.
+// Reply layout: bool available at offset 0, u32 descriptor count at offset 4.
+void IPlatformServiceManager::GetBuiltInFontDataSet(HLERequestContext& ctx) {
+    struct Descriptor {
+        u32_le flags;
+        u32_le offset;
+        u32_le size;
+    };
+    static_assert(sizeof(Descriptor) == 12);
+    const auto types = ctx.ReadBuffer();
+    const auto capacity = std::min<std::size_t>(6, ctx.GetWriteBufferSize() / sizeof(Descriptor));
+    const auto& regions = impl->builtin_font_regions;
+    std::vector<Descriptor> descriptors;
+    for (const auto type : types) {
+        if (descriptors.size() == capacity) {
+            break;
+        }
+        if (type < regions.size() && regions[type].size != 0) {
+            descriptors.push_back({0, regions[type].offset, regions[type].size});
+        }
+    }
+    ctx.WriteBuffer(descriptors);
+    LOG_INFO(Service_NS, "Built-in font set: {} requested, {} available", types.size(),
+             descriptors.size());
+    IPC::ResponseBuilder rb{ctx, 4};
+    rb.Push(ResultSuccess);
+    rb.Push<u32>(descriptors.empty() ? 0 : 1);
+    rb.Push<u32>(static_cast<u32>(descriptors.size()));
 }
 
 // nn::pl::GetBuiltInFontData(BuiltInFontDataOunce*, BuiltInFontTypeOunce, bool): returns a 16-byte
