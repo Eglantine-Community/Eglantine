@@ -232,14 +232,14 @@ in
     , ccache ? true
     , # environment for the build. Merged with the ccache variables when ccache
       # is on, so a caller can set its own without dropping them
-      , env ? { }
-      , meta ? { }
-      , # Extra directories to put on the binaries' RPATH. For a library the emulator opens at
-        # runtime: nothing in DT_NEEDED references it, so the fixup phase would otherwise prune the
-        # entry, and it has to be added after that pruning rather than before it.
-        extraRPath ? [ ]
-      , ...
-      }@args:
+      env ? { }
+    , meta ? { }
+    , # Extra directories to put on the binaries' RPATH. For a library the emulator opens at
+      # runtime: nothing in DT_NEEDED references it, so the fixup phase would otherwise prune the
+      # entry, and it has to be added after that pruning rather than before it.
+      extraRPath ? [ ]
+    , ...
+    }@args:
     stdenv.mkDerivation (
       {
         # Without this, stdenv word-splits every cmakeFlags entry on spaces, so
