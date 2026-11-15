@@ -474,7 +474,7 @@ struct RenHDrumPad::Impl {
         SDL_AudioStream* stream = nullptr;
         const bool inited = SDL_InitSubSystem(SDL_INIT_AUDIO);
         if (inited) {
-            stream = OpenDualSenseAudioStream(js);
+            stream = OpenDualSenseAudioStream(js, audio_attempts == 1);
         } else {
             LOG_WARNING(Input, "RenHDrum: SDL audio init failed: {}", SDL_GetError());
         }
@@ -615,7 +615,7 @@ struct RenHDrumPad::Impl {
     /// Finds the DualSense audio device and opens a stream on it, paused until it is published
     /// in `audio_stream`, or nullptr. Called without the mutex, with the SDL audio subsystem
     /// initialized.
-    SDL_AudioStream* OpenDualSenseAudioStream(SDL_Joystick* js) {
+    SDL_AudioStream* OpenDualSenseAudioStream(SDL_Joystick* js, bool verbose) {
         int count = 0;
         SDL_AudioDeviceID* devices = SDL_GetAudioPlaybackDevices(&count);
         SDL_AudioDeviceID matched = 0;
@@ -624,11 +624,36 @@ struct RenHDrumPad::Impl {
             SDL_AudioSpec spec{};
             const int channels =
                 SDL_GetAudioDeviceFormat(devices[i], &spec, nullptr) ? spec.channels : 0;
-            if (name && channels >= 4 &&
-                (std::strstr(name, "DualSense") != nullptr ||
-                 std::strstr(name, "Wireless Controller") != nullptr)) {
+            // Names differ per platform: WASAPI and PipeWire say "DualSense" or "Wireless
+            // Controller", CoreAudio spells out the whole product name.
+            const bool looks_like_dualsense =
+                name && (std::strstr(name, "DualSense") != nullptr ||
+                         std::strstr(name, "DualSense Edge") != nullptr ||
+                         std::strstr(name, "Wireless Controller") != nullptr);
+            if (!looks_like_dualsense) {
+                continue;
+            }
+            if (channels >= 4) {
                 matched = devices[i];
                 break;
+            }
+            // The voice coils live on channels 3-4. A two-channel endpoint means the OS exposed
+            // the pad as plain stereo (WASAPI shared mode does, and so does Bluetooth everywhere).
+            LOG_INFO(Input,
+                     "RenHDrum: \"{}\" exposes {} channel(s); haptics need 4, wired USB only",
+                     name, channels);
+        }
+        if (matched == 0 && verbose) {
+            // Once per attempt sequence, so a report from a platform we cannot test here says what
+            // the audio server actually offered.
+            LOG_INFO(Input, "RenHDrum: no 4-channel DualSense device yet, {} playback device(s):",
+                     count);
+            for (int i = 0; devices && i < count; ++i) {
+                SDL_AudioSpec spec{};
+                const int channels =
+                    SDL_GetAudioDeviceFormat(devices[i], &spec, nullptr) ? spec.channels : 0;
+                LOG_INFO(Input, "RenHDrum:   [{}] \"{}\" {} channel(s)", devices[i],
+                         SDL_GetAudioDeviceName(devices[i]), channels);
             }
         }
         SDL_free(devices);
