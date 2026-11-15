@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <map>
 #include <memory>
 #include <optional>
@@ -869,6 +870,10 @@ struct Values {
     // Ryuhdr 0.2.6's recommended mode. Read by the SDL driver on every vibration, so a change in
     // the HD Rumble dialog applies to connected controllers right away.
     Setting<bool> hd_rumble_enabled{linkage, true, "hd_rumble_enabled", Category::Controls};
+    // Switch 2 rumble Mode last sent by the guest (commands 213 / 214): 2 = Mode 2, anything else
+    // is played as Switch 1. Written by the HID service, read by the RenHDrum pad driver. Not a
+    // user setting and not saved.
+    std::atomic<int> nx2_active_mode{0};
     // Set by the input layer when the RenHDrum library is actually loaded; never saved. HD Rumble
     // can be enabled in the config with no library next to the emulator, in which case the standard
     // rumble runs and the 15 ms packet filter has to stay in place.

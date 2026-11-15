@@ -47,6 +47,8 @@ struct RenHDrumApi {
     // Optional (RenHDrum 0.4.0+): the resolver that reads no IPC and no flag files. Preferred,
     // because this host has no Brontide-App config and the plain resolver would look for one.
     decltype(&renhdrum_settings_resolve_pure) settings_resolve_pure{};
+    // Optional (RenHDrum 0.4.0+): the Switch 2 Mode 2 translation, chosen by the guest's Mode.
+    decltype(&renhdrum_set_nx2_mode) set_nx2_mode{};
     decltype(&renhdrum_dualsense_dsp_create) dsp_create{};
     decltype(&renhdrum_dualsense_dsp_destroy) dsp_destroy{};
     decltype(&renhdrum_dualsense_dsp_set_half_target) dsp_set_half_target{};
@@ -98,6 +100,7 @@ const RenHDrumApi& Api() {
         if (a.loaded) {
             // Optional: a missing symbol leaves it null
             (void)a.library.GetSymbol("renhdrum_settings_resolve_pure", &a.settings_resolve_pure);
+            (void)a.library.GetSymbol("renhdrum_set_nx2_mode", &a.set_nx2_mode);
             (void)a.library.GetSymbol("renhdrum_dualsense_dsp_build_bt_report",
                                       &a.dsp_build_bt_report);
             (void)a.library.GetSymbol("renhdrum_xbox_rumble_create", &a.xbox_create);
@@ -255,6 +258,8 @@ struct RenHDrumPad::Impl {
     int audio_attempts{};
     std::int64_t audio_next_us{};
     UserSettings user{};
+    // Switch 2 Mode last handed to the engine; -1 forces the first update
+    int nx2_mode{-1};
 
     RenHdcXboxRumble* xbox{};
     bool xbox_triggers{};
@@ -849,6 +854,15 @@ bool RenHDrumPad::Vibrate(std::int64_t now_us, bool is_right,
         change = impl->RefreshUserSettings();
         const auto& u = impl->user;
         const auto& api = Api();
+        // Guest Switch 2 Mode (commands 213 / 214): the engine picks its translation law from it.
+        // Process-wide, so only push it when it changed.
+        if (api.set_nx2_mode) {
+            const int mode = Settings::values.nx2_active_mode.load(std::memory_order_relaxed);
+            if (mode != impl->nx2_mode) {
+                api.set_nx2_mode(mode);
+                impl->nx2_mode = mode;
+            }
+        }
         if (impl->xbox && u.hd_enabled && u.xbox_enabled && u.xbox_direct) {
             // Both halves share one pad: each motor follows the stronger side
             const std::size_t side = is_right ? 1 : 0;
