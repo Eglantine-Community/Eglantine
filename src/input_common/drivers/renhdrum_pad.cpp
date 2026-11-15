@@ -226,6 +226,11 @@ float ShapeAmplitude(float amplitude, const UserSettings& u) {
 
 // Controllers RenHDrum drives, per kind, for the settings dialog
 std::array<std::atomic<int>, 3> connected_count{};
+
+// Pads per kind (0 Switch, 1 DualSense, 2 Xbox). Callers only index a kind they know is valid.
+constexpr std::size_t ConnectedCountIndex(int kind) {
+    return static_cast<std::size_t>(kind);
+}
 std::atomic<int> last_connected_kind{-1};
 // Connected Xbox-style controllers that expose trigger motors
 std::atomic<int> xbox_trigger_pads{};
@@ -745,7 +750,7 @@ std::shared_ptr<RenHDrumPad> RenHDrumPad::Create(SDL_Joystick* joystick, SDL_Gam
         state->OpenDualSenseAudio();
     }
     state->kind = xbox_pad ? 2 : switch_pad ? 0 : 1;
-    ++connected_count[state->kind];
+    ++connected_count[ConnectedCountIndex(state->kind)];
     if (state->xbox_triggers) {
         ++xbox_trigger_pads;
     }
@@ -759,11 +764,11 @@ std::shared_ptr<RenHDrumPad> RenHDrumPad::Create(SDL_Joystick* joystick, SDL_Gam
 
 int GetRenHDrumConnectedKind() {
     const int last = last_connected_kind.load();
-    if (last >= 0 && connected_count[last].load() > 0) {
+    if (last >= 0 && connected_count[ConnectedCountIndex(last)].load() > 0) {
         return last;
     }
     for (int kind = 0; kind < static_cast<int>(connected_count.size()); ++kind) {
-        if (connected_count[kind].load() > 0) {
+        if (connected_count[ConnectedCountIndex(kind)].load() > 0) {
             return kind;
         }
     }
@@ -805,7 +810,7 @@ void RenHDrumPad::Shutdown() {
         had_engine = impl->Release();
         had_xbox = impl->had_xbox;
         if (impl->kind >= 0) {
-            --connected_count[impl->kind];
+            --connected_count[ConnectedCountIndex(impl->kind)];
             if (impl->xbox_triggers) {
                 --xbox_trigger_pads;
             }
@@ -1027,7 +1032,7 @@ void RenHDrumPad::Tick(std::int64_t now_us) {
         send_xbox = impl->xbox && !impl->user.xbox_direct &&
                     Api().xbox_tick(impl->xbox, now_us, motors.data()) == 1;
         triggers = impl->xbox_triggers;
-        strength = impl->user.xbox_strength;
+        strength = static_cast<std::uint32_t>(impl->user.xbox_strength);
     }
     if (send_settle) {
         SDL_RumbleJoystick(joystick, settle[0], settle[1], 2000);
