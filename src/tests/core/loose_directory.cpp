@@ -56,8 +56,8 @@ TEST_CASE("Loose edition folders prefer a complete native program and retain leg
         REQUIRE(Loader::ResolveLooseProgramPath(directory) == programs / "1/exefs/main");
     }
     REQUIRE(Loader::LooseGameRootFromMain(programs / "1/exefs/main") == game);
-    auto main = Core::GetGameFileFromPath(std::make_shared<FileSys::RealVfsFilesystem>(),
-                                         Common::FS::PathToUTF8String(game));
+    const auto vfs = std::make_shared<FileSys::RealVfsFilesystem>();
+    auto main = Core::GetGameFileFromPath(vfs, Common::FS::PathToUTF8String(game));
     REQUIRE(main);
     CHECK(main->ReadAllBytes() == std::vector<u8>{'p', 'r', 'o', 'g', 'r', 'a', 'm', '1'});
     main.reset();
@@ -122,8 +122,8 @@ TEST_CASE("Loose nested updates select the newest complete program and preserve 
     for (const auto& package : {base, old / "1", newest / "0", newest / "1"}) {
         CHECK(Loader::LooseGameRootFromMain(package / "exefs/main") == game);
     }
-    auto main = Core::GetGameFileFromPath(std::make_shared<FileSys::RealVfsFilesystem>(),
-                                         Common::FS::PathToUTF8String(game));
+    const auto vfs = std::make_shared<FileSys::RealVfsFilesystem>();
+    auto main = Core::GetGameFileFromPath(vfs, Common::FS::PathToUTF8String(game));
     REQUIRE(main);
     CHECK(main->ReadAllBytes() == std::vector<u8>{'n', 'e', 'w', ' ', 'n', 'a', 't', 'i', 'v', 'e'});
     main.reset();
