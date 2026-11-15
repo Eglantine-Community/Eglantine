@@ -60,8 +60,8 @@ TEST_CASE("Loose consolidated cross-generation program1 layouts resolve to the n
     // The game root carries dlc/ and sidecars: unwinding package, program1 and version
     // folder must land here and not at the update package.
     CHECK(Loader::LooseGameRootFromMain(program1 / "exefs/main") == game);
-    auto main = Core::GetGameFileFromPath(std::make_shared<FileSys::RealVfsFilesystem>(),
-                                          Common::FS::PathToUTF8String(game));
+    const auto vfs = std::make_shared<FileSys::RealVfsFilesystem>();
+    auto main = Core::GetGameFileFromPath(vfs, Common::FS::PathToUTF8String(game));
     REQUIRE(main);
     CHECK(main->ReadAllBytes() == std::vector<u8>{'m', 'a', 'i', 'n'});
     main.reset();
