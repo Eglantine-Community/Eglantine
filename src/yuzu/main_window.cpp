@@ -479,7 +479,8 @@ MainWindow::MainWindow(bool has_broken_vulkan)
 #ifdef ENABLE_UPDATE_CHECKER
     connect(&update_watcher, &QFutureWatcher<UpdateChecker::CheckResult>::finished, this,
             &MainWindow::OnEmulatorUpdateAvailable);
-    if (TesterLauncher::IsTesterBuild()) {
+    // A CI build of a branch follows that branch, like a tester build does.
+    if (TesterLauncher::IsTesterBuild() || Common::g_build_follow_branch[0] != '\0') {
         tester_monitor = std::make_unique<TesterBuildMonitor>(
             [this] { return emulation_running; }, this);
         tester_monitor->Start();

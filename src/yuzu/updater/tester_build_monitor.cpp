@@ -4,6 +4,7 @@
 #include <QMessageBox>
 #include <QPushButton>
 #include <QtConcurrent>
+#include "common/logging.h"
 #include "qt_common/config/uisettings.h"
 #include "tester_build_monitor.h"
 
@@ -44,6 +45,8 @@ void TesterBuildMonitor::Check(bool manual) {
         }
         return;
     }
+    LOG_INFO(Frontend, "Tester build: checking {} for a new commit",
+             state.source->DisplayName());
     m_running = true;
     m_manual = manual;
     m_source = state.source;
@@ -67,6 +70,8 @@ void TesterBuildMonitor::OnResult() {
         return;
     }
     if (!result.info) {
+        LOG_WARNING(Frontend, "Tester build: could not read {} from GitHub (HTTP {})",
+                    state.source->DisplayName(), result.status);
         if (manual) {
             QMessageBox::warning(
                 m_window, title,
@@ -78,12 +83,22 @@ void TesterBuildMonitor::OnResult() {
         return;
     }
     const auto name = QString::fromStdString(state.source->DisplayName());
-    if (result.info->sha == state.built_sha) {
+    const auto current = TesterLauncher::CurrentCommit(state);
+    LOG_INFO(Frontend, "Tester build: {} is at {}, this build is {}", state.source->DisplayName(),
+             result.info->sha, current.value_or("unknown"));
+    if (!current) {
         if (manual) {
             QMessageBox::information(m_window, title,
-                                     tr("%1 is up to date (%2).")
-                                         .arg(name, QString::fromStdString(TesterBuild::ShortSha(
-                                                        state.built_sha))));
+                                     tr("No tester build of %1 is installed yet.").arg(name));
+        }
+        return;
+    }
+    if (result.info->sha == *current) {
+        if (manual) {
+            QMessageBox::information(
+                m_window, title,
+                tr("%1 is up to date (%2).")
+                    .arg(name, QString::fromStdString(TesterBuild::ShortSha(*current))));
         }
         return;
     }

@@ -22,6 +22,13 @@ QString SelfExe();
 // Whether this exe lies in the tester install folder.
 bool IsTesterBuild();
 
+// The commit this exe was built from when it is a CI build of the followed branch.
+std::optional<std::string> FollowedBranchCommit(const TesterBuild::State& state);
+
+// The commit a new one of the followed source is compared against: the installed tester build's,
+// else this exe's when it is a CI build of the followed branch.
+std::optional<std::string> CurrentCommit(const TesterBuild::State& state);
+
 // The exe that runs the builder: always the release build, as the followed branch may be older than
 // the builder. Inside a tester build that is the one the state remembers.
 QString BuilderExe(const TesterBuild::State& state);

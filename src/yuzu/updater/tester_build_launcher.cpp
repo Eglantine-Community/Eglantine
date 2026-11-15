@@ -253,6 +253,25 @@ bool IsTesterBuild() {
     return !root.empty() && TesterBuild::IsTesterInstall(SelfPath(), root);
 }
 
+std::optional<std::string> FollowedBranchCommit(const TesterBuild::State& state) {
+    const std::string follow = Common::g_build_follow_branch;
+    if (follow.empty() || IsTesterBuild() || !state.source ||
+        state.source->kind != TesterBuild::Source::Kind::Branch || state.source->branch != follow) {
+        return std::nullopt;
+    }
+    return TesterBuild::ParseRevParse(Common::g_scm_rev);
+}
+
+std::optional<std::string> CurrentCommit(const TesterBuild::State& state) {
+    if (IsTesterBuild() || TesterBuild::HasInstall(state)) {
+        if (state.built_sha.empty()) {
+            return std::nullopt;
+        }
+        return state.built_sha;
+    }
+    return FollowedBranchCommit(state);
+}
+
 QString BuilderExe(const TesterBuild::State& state) {
     if (IsTesterBuild()) {
         const auto release = QString::fromUtf8(state.release_exe);
@@ -392,11 +411,7 @@ std::optional<int> Run(int argc, char** argv) {
         return std::nullopt;
     }
     // This exe is the build of its own commit when it was made for the followed branch.
-    std::optional<std::string> self_commit;
-    if (!follow.empty() && state.source->kind == TesterBuild::Source::Kind::Branch &&
-        state.source->branch == follow) {
-        self_commit = TesterBuild::ParseRevParse(Common::g_scm_rev);
-    }
+    const auto self_commit = self_is_tester ? std::nullopt : FollowedBranchCommit(state);
     const bool release_flag = args.contains(QStringLiteral("--release")) || ShiftHeld();
     const bool install_exists = TesterBuild::HasInstall(state);
 
@@ -461,11 +476,9 @@ std::optional<int> Run(int argc, char** argv) {
         }
         return 0;
     };
-    // `watch` is false when the user was already asked something and the build just runs.
-    const auto start_tester = [&](bool watch) {
+    const auto start_tester = [&] {
         std::optional<int> exit_code;
-        const bool started =
-            StartAndWatch(install_exe, args, watch ? WatchMilliseconds : 0, exit_code);
+        const bool started = StartAndWatch(install_exe, args, WatchMilliseconds, exit_code);
         if (started && (!exit_code || *exit_code == 0)) {
             return 0;
         }
@@ -484,6 +497,12 @@ std::optional<int> Run(int argc, char** argv) {
         }
     };
 
+    const auto last_built = QObject::tr("Last built - %1 (%2)")
+                                .arg(name, QString::fromStdString(
+                                               TesterBuild::ShortSha(state.built_sha)));
+    const auto release = QObject::tr("Release");
+    const auto choose_text = QObject::tr("Which build of Eglantine do you want to start?");
+
     switch (action) {
     case Action::OfferFirstBuild:
         return ask(QObject::tr("No tester build of %1 is installed yet.").arg(name),
@@ -501,38 +520,45 @@ std::optional<int> Run(int argc, char** argv) {
                        ? start_builder(false)
                        : start_release();
         }
-        switch (ask(text,
-                    {QObject::tr("Build now"), QObject::tr("Later"),
-                     QObject::tr("Use release build")},
-                    1)) {
+        switch (ask(text, {QObject::tr("Build new commit"), last_built, release}, 1)) {
         case 0:
             return start_builder(false);
         case 2:
             return start_release();
         default:
-            return start_tester(false);
+            return start_tester();
         }
     }
     case Action::OfferClosedPullRequest: {
         const auto text = (remote->pr_merged ? QObject::tr("%1 was merged.")
                                              : QObject::tr("%1 was closed."))
                               .arg(name);
-        if (ask(text,
-                {QObject::tr("Keep using it"),
-                 QObject::tr("Use release build and stop following")},
-                0) == 1) {
+        switch (ask(text, {last_built, release, QObject::tr("Release and stop following")}, 0)) {
+        case 1:
+            return start_release();
+        case 2: {
             state.source.reset();
             std::error_code ec;
             TesterBuild::SaveState(StateFile(), state, ec);
             return start_release();
         }
-        return start_tester(false);
+        default:
+            return start_tester();
+        }
     }
     case Action::StartTester:
     case Action::RunRelease:
         break;
     }
-    return start_tester(true);
+    // Closing the window starts neither.
+    switch (ask(choose_text, {last_built, release, QObject::tr("Cancel")}, 2)) {
+    case 0:
+        return start_tester();
+    case 1:
+        return start_release();
+    default:
+        return 0;
+    }
 }
 
 } // namespace TesterLauncher
