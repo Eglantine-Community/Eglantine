@@ -914,7 +914,9 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline(bool is_indexed) {
 
     if (current_pipeline) {
         GraphicsPipeline* const next{current_pipeline->Next(graphics_key)};
-        if (next) {
+        // A refused pipeline draws nothing: take the slow path, which builds it again through the
+        // compute mesh emulation (ReplaceRefusedMesh).
+        if (next && !next->Failed()) {
             current_pipeline = next;
             current_pipeline->MarkUsed(frame_count);
             return BuiltPipeline(current_pipeline, is_indexed);
@@ -928,7 +930,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline(bool is_indexed) {
     // Every cached pipeline went through the slow path, so used_this_session already holds it.
     GraphicsPipeline*& fast_entry =
         graphics_fast_cache[GraphicsFastCacheSlot(graphics_key, GraphicsFastCacheSize)];
-    if (fast_entry != nullptr && fast_entry->Key() == graphics_key) {
+    if (fast_entry != nullptr && fast_entry->Key() == graphics_key && !fast_entry->Failed()) {
         bool use_fast = true;
         if (VideoCommon::Nx2Perf::Verify()) {
             const auto it = graphics_cache.find(graphics_key);
@@ -956,7 +958,8 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline(bool is_indexed) {
         }
     }
     GraphicsPipeline* const result = CurrentGraphicsPipelineSlowPath(is_indexed);
-    if (current_pipeline != nullptr && current_pipeline->Key() == graphics_key) {
+    if (current_pipeline != nullptr && current_pipeline->Key() == graphics_key &&
+        !current_pipeline->Failed()) {
         fast_entry = current_pipeline;
     }
     return result;
@@ -1352,7 +1355,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                                                  state.statistics.get(), false)};
 
             std::scoped_lock lock{state.mutex};
-            if (pipeline) {
+            // A pipeline the driver refused draws nothing, and caching it would keep its key
+            // from being built again; the first draw builds it instead.
+            if (pipeline && !pipeline->Failed()) {
                 graphics_cache.emplace(key, std::move(pipeline));
             } else {
                 disk_pipelines.erase(key.Hash());
@@ -1658,8 +1663,9 @@ u64 DrawGeometryKey(const Tegra::Engines::Maxwell3D& maxwell3d, bool is_indexed)
     return hash == 0 ? 1ULL : hash;
 }
 
-// Without VK_EXT_mesh_shader: logs, once per shader set, what a skipped task/mesh pipeline would
-// need from an emulation (task stage, per-primitive outputs, topology, output sizes).
+// Emulating a task/mesh pipeline (no VK_EXT_mesh_shader, or one the driver refused): logs, once
+// per shader set, what it needs from the emulation (task stage, per-primitive outputs, topology,
+// output sizes).
 template <typename Programs>
 void ReportUnsupportedMeshPipeline(const GraphicsPipelineCacheKey& key, const Programs& programs) {
     static std::mutex mutex;
@@ -1981,6 +1987,11 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath(bool is_indexed
         it = graphics_cache.find(graphics_key);
     }
     auto& pipeline{it->second};
+    // A refused pipeline can be in the cache already: built at boot, or built while its draw
+    // skipped unbuilt pipelines. Its draws would stay missing (Ocarina's foliage left white).
+    if (pipeline && pipeline->Failed()) {
+        ReplaceRefusedMesh(pipeline);
+    }
     if (!pipeline) {
         graphics_miss = "creation-failed";
         return nullptr;
@@ -2043,6 +2054,41 @@ void PipelineCache::TickFrame() {
             over_budget_mesh = 0;
         }
     }
+}
+
+void PipelineCache::ReplaceRefusedMesh(std::unique_ptr<GraphicsPipeline>& pipeline) {
+    // A native mesh pipeline the driver refused draws nothing (DirectMesh fails closed on the
+    // shapes no route proves, with VK_ERROR_FEATURE_NOT_PRESENT). Build it through the compute
+    // mesh emulation, the route devices without VK_EXT_mesh_shader take, which draws the same
+    // geometry. An eviction can have a refused key built natively again later in the session, and
+    // that build is replaced the same way. The emulation's own pipeline is left alone: if its
+    // build fails, building it again for every draw cannot help.
+    if (!pipeline->IsMeshPipeline() || pipeline->IsEmulatedMesh()) {
+        return;
+    }
+    const u64 hash = graphics_key.Hash();
+    LOG_WARNING(Render_Vulkan,
+                "Mesh pipeline {:#016x} was refused by the driver: built again through the "
+                "compute mesh emulation",
+                hash);
+    if (used_this_session.erase(pipeline.get()) != 0) {
+        used_and_evicted.insert(hash);
+    }
+    if (current_pipeline == pipeline.get()) {
+        current_pipeline = nullptr;
+    }
+    // Destroyed once the GPU is done with it, as an evicted pipeline is: draws and other
+    // pipelines' transitions may still name it.
+    evicted_pipelines.emplace_back(scheduler.CurrentTick(), std::move(pipeline));
+    for (auto& [key, other] : graphics_cache) {
+        if (other) {
+            other->ClearTransitions();
+        }
+    }
+    graphics_fast_cache.fill(nullptr);
+    skipped_geometry = {};
+    last_skipped_geometry_frame = ~u64{};
+    pipeline = CreateGraphicsPipeline(true);
 }
 
 void PipelineCache::EvictUnusedPipelines() {
@@ -2475,7 +2521,8 @@ struct PhaseTimer {
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     ShaderPools& pools, const GraphicsPipelineCacheKey& key,
     std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
-    bool build_in_parallel, bool native_turing, bool parallel_stages) try {
+    bool build_in_parallel, bool native_turing, bool parallel_stages,
+    bool force_mesh_emulation) try {
     auto hash = key.Hash();
     LOG_DEBUG(Render_Vulkan, "{:#016x}", hash);
     size_t env_index{0};
@@ -2582,16 +2629,19 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
 
         // Without VK_EXT_mesh_shader the driver cannot build a task/mesh pipeline; the draw is
         // skipped (see the pipeline check in the rasterizer). The stages are still translated
-        // so the skipped pipeline's needs can be reported below.
+        // so the skipped pipeline's needs can be reported below. `force_mesh_emulation` takes
+        // this route on a device that has mesh shaders for a pipeline the driver refuses.
         if ((env.ShaderStage() == Shader::Stage::Task ||
              env.ShaderStage() == Shader::Stage::Mesh) &&
-            !device.IsExtMeshShaderSupported()) {
-            static std::atomic<bool> logged{};
-            if (!logged.exchange(true, std::memory_order_relaxed)) {
-                LOG_WARNING(Render_Vulkan,
-                            "{} has no VK_EXT_mesh_shader: task/mesh pipelines run through the "
-                            "compute-based mesh emulation",
-                            device.GetModelName());
+            (!device.IsExtMeshShaderSupported() || force_mesh_emulation)) {
+            if (!device.IsExtMeshShaderSupported()) {
+                static std::atomic<bool> logged{};
+                if (!logged.exchange(true, std::memory_order_relaxed)) {
+                    LOG_WARNING(Render_Vulkan,
+                                "{} has no VK_EXT_mesh_shader: task/mesh pipelines run through "
+                                "the compute-based mesh emulation",
+                                device.GetModelName());
+                }
             }
             mesh_unsupported = true;
         }
@@ -2698,6 +2748,22 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                        programs[index].stage == Shader::Stage::Fragment;
         }
         if (!eligible) {
+            if (force_mesh_emulation) {
+                if (mesh_index != 0) {
+                    LOG_WARNING(Render_Vulkan,
+                                "Mesh emulation cannot draw the refused pipeline either: mesh "
+                                "stage {}, task {}, topology {}, {} primitive lines, {} vertex "
+                                "lines, at most {} vertices and {} primitives",
+                                mesh_index, has_task, mesh.mesh.topology,
+                                mesh.mesh.primitive_lines.size(), mesh.mesh.vertex_lines.size(),
+                                mesh.mesh.max_vertices, mesh.mesh.max_primitives);
+                } else {
+                    LOG_WARNING(Render_Vulkan,
+                                "Mesh emulation cannot draw the refused pipeline either: no mesh "
+                                "stage, task {}",
+                                has_task);
+                }
+            }
             return nullptr;
         }
         // The output buffer's binding follows every program's (unified bindings, one per
@@ -3057,7 +3123,7 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
 }
 } // Anonymous namespace
 
-std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
+std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(bool force_mesh_emulation) {
     const auto begin = std::chrono::steady_clock::now();
     const u64 key_hash = graphics_key.Hash();
     const bool after_eviction = evicted_keys.contains(key_hash);
@@ -3081,7 +3147,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
             }
             main_pools.ReleaseContents();
             auto pipeline{CreateGraphicsPipeline(main_pools, graphics_key, MakeSpan(env_ptrs),
-                                                 nullptr, true, native_turing)};
+                                                 nullptr, true, native_turing, false,
+                                                 force_mesh_emulation)};
             if (pipeline && !pipeline_cache_filename.empty()) {
                 QueueVulkanPipelineCacheFlush();
             }
@@ -3097,7 +3164,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
 
     main_pools.ReleaseContents();
     auto pipeline{CreateGraphicsPipeline(main_pools, graphics_key, environments.Span(), nullptr,
-                                         true, native_turing)};
+                                         true, native_turing, false, force_mesh_emulation)};
     if (pipeline) {
         StoreGraphicsPipeline(graphics_key, std::move(environments.envs),
                               pipeline->IsMeshPipeline());

@@ -198,7 +198,9 @@ private:
     /// when graphics_cache now holds it (null if the build failed).
     bool BuildNewGraphicsPipeline(bool is_indexed);
 
-    std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline();
+    /// Builds a graphics pipeline of the current key; with `force_mesh_emulation`, task/mesh
+    /// programs are drawn through the compute emulation (a pipeline the driver refused).
+    std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline(bool force_mesh_emulation = false);
 
     // Native graphics pipelines translated on worker threads (BuildNewGraphicsPipeline).
     using GraphicsEnvironmentArray =
@@ -254,7 +256,8 @@ private:
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline(
         ShaderPools& pools, const GraphicsPipelineCacheKey& key,
         std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
-        bool build_in_parallel, bool native_turing = false, bool parallel_stages = false);
+        bool build_in_parallel, bool native_turing = false, bool parallel_stages = false,
+        bool force_mesh_emulation = false);
 
     /// Runs task(0..count-1) on the translation workers and this thread; rethrows the first
     /// exception a task threw.
@@ -300,6 +303,12 @@ private:
 
     /// Destroys graphics pipelines unused for a while, once the GPU is done with them.
     void EvictUnusedPipelines();
+
+    /// Builds a cached pipeline whose build failed (the driver refused it) again through the
+    /// compute mesh emulation, in its place. Tried once per key: the refused one would otherwise
+    /// draw nothing for the rest of the session.
+    void ReplaceRefusedMesh(std::unique_ptr<GraphicsPipeline>& pipeline);
+
     u64 frame_count{};
     std::deque<std::pair<u64, std::unique_ptr<GraphicsPipeline>>> evicted_pipelines; ///< (tick, pipeline)
     std::unordered_set<u64> used_and_evicted; ///< Key hashes of pipelines used this session, evicted since
