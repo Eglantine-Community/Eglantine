@@ -673,22 +673,15 @@ struct RenHDrumPad::Impl {
                         SDL_GetError());
             return nullptr;
         }
-        // Four channels: front L/R, then the two voice coils. Without an explicit map the audio
-        // server guesses from position alone and links only what it recognises -- measured on
-        // PipeWire, the haptics stream was linked as two channels with FL going to the pad's rear
-        // left, so the coils got the silent front pair and nothing moved.
-        const SDL_AudioChannel channel_map[] = {
-            SDL_AUDIO_CHANNEL_FRONT_LEFT,
-            SDL_AUDIO_CHANNEL_FRONT_RIGHT,
-            SDL_AUDIO_CHANNEL_REAR_LEFT,
-            SDL_AUDIO_CHANNEL_REAR_RIGHT,
-        };
-        if (!SDL_SetAudioStreamInputChannelMap(stream, channel_map,
-                                               SDL_arraysize(channel_map)) ||
-            !SDL_SetAudioStreamOutputChannelMap(stream, channel_map,
-                                                SDL_arraysize(channel_map))) {
-            LOG_WARNING(Input, "RenHDrum: could not declare the DualSense channel map: {}",
-                        SDL_GetError());
+        // No channel-map call here: SDL 3.4.8's map only reorders or mutes channels (`{1,0}` swaps
+        // stereo) and has no way to name speaker positions -- that enum is a later SDL. So what the
+        // four channels are has to come from the device itself; this log line is how we tell
+        // whether the server gave us a four-channel endpoint or a downmix.
+        SDL_AudioSpec opened{};
+        int opened_channels = 0;
+        if (SDL_GetAudioStreamFormat(stream, &opened, &opened_channels)) {
+            LOG_INFO(Input, "RenHDrum: DualSense haptics stream: {} channel(s) at {} Hz on \"{}\"",
+                     opened.channels, opened.freq, SDL_GetAudioDeviceName(matched));
         }
         LOG_INFO(Input, "RenHDrum: DualSense haptics on \"{}\"", SDL_GetAudioDeviceName(matched));
         return stream;
