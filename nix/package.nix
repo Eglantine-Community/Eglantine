@@ -395,8 +395,6 @@ buildEdenEmulator (
         done
       '';
 
-    passthru = { debugPostFixup = postFixup; };
-
     # simple Nix-specific install rules
     postInstall = lib.optionalString isDarwin ''
       mkdir -p $out/Applications $out/bin
