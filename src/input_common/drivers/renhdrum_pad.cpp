@@ -667,7 +667,11 @@ struct RenHDrumPad::Impl {
             .channels = 4,
             .freq = 48000,
         };
+        // Give the stream a stable name so it is identifiable in an audio graph and can be pinned
+        // by a server-side rule; every stream would otherwise be called plain "eglantine".
+        SDL_SetHint(SDL_HINT_AUDIO_DEVICE_STREAM_NAME, "RenHDrum haptics");
         SDL_AudioStream* stream = SDL_OpenAudioDeviceStream(matched, &spec, &AudioCallback, this);
+        SDL_ResetHint(SDL_HINT_AUDIO_DEVICE_STREAM_NAME);
         if (!stream) {
             LOG_WARNING(Input, "RenHDrum: could not open the DualSense audio device: {}",
                         SDL_GetError());
