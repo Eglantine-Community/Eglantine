@@ -36,7 +36,11 @@ rustPlatform.buildRustPackage rec {
     library=${
       if stdenv.hostPlatform.isDarwin then "librenhdrum.dylib" else "librenhdrum.so"
     }
-    install -Dm755 "target/release/$library" "$out/lib/$library"
+    # cargoBuildHook builds for an explicit --target, so artifacts land under
+    # target/<triple>/release rather than target/release.
+    built=$(find target -name "$library" -path '*/release/*' -type f | head -1)
+    test -n "$built"
+    install -Dm755 "$built" "$out/lib/$library"
     install -Dm644 include/renhdrum.h "$out/include/renhdrum.h"
 
     runHook postInstall
