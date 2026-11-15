@@ -9,9 +9,11 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <renhdrum.h>
 
@@ -79,8 +81,29 @@ const RenHDrumApi& Api() {
 #else
         constexpr const char* name = "librenhdrum.so";
 #endif
-        a.library = Common::DynamicLibrary(name);
-        if (!a.library.IsOpen()) {
+        // dlopen does not look in the executable's directory the way LoadLibrary does on Windows,
+        // so "next to the emulator" only works if we name it ourselves. Try, in order: the
+        // RENHDRUM_LIBRARY override, the executable's directory, then the loader's search path.
+        std::vector<std::string> candidates;
+        if (const char* override_path = std::getenv("RENHDRUM_LIBRARY");
+            override_path != nullptr && *override_path != '\0') {
+            candidates.emplace_back(override_path);
+        }
+        // SDL3 owns the string; it must not be freed.
+        if (const char* base_path = SDL_GetBasePath()) {
+            candidates.emplace_back(std::string{base_path} + name);
+        }
+        candidates.emplace_back(name);
+
+        std::string opened;
+        for (const auto& candidate : candidates) {
+            a.library = Common::DynamicLibrary(candidate.c_str());
+            if (a.library.IsOpen()) {
+                opened = candidate;
+                break;
+            }
+        }
+        if (opened.empty()) {
             LOG_INFO(Input, "RenHDrum: {} not found, using the standard rumble", name);
             return a;
         }
@@ -109,9 +132,10 @@ const RenHDrumApi& Api() {
                                       &a.xbox_push_half_sample);
             (void)a.library.GetSymbol("renhdrum_xbox_rumble_tick", &a.xbox_tick);
             (void)a.library.GetSymbol("renhdrum_xbox_rumble_resend", &a.xbox_resend);
-            LOG_INFO(Input, "RenHDrum: loaded {}", name);
+            LOG_INFO(Input, "RenHDrum: loaded {}", opened);
         } else {
-            LOG_WARNING(Input, "RenHDrum: {} is missing functions, using the standard rumble", name);
+            LOG_WARNING(Input, "RenHDrum: {} is missing functions, using the standard rumble",
+                        opened);
         }
         return a;
     }();
