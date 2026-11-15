@@ -681,11 +681,14 @@ struct RenHDrumPad::Impl {
         // stereo) and has no way to name speaker positions -- that enum is a later SDL. So what the
         // four channels are has to come from the device itself; this log line is how we tell
         // whether the server gave us a four-channel endpoint or a downmix.
-        SDL_AudioSpec opened{};
-        int opened_channels = 0;
-        if (SDL_GetAudioStreamFormat(stream, &opened, &opened_channels)) {
-            LOG_INFO(Input, "RenHDrum: DualSense haptics stream: {} channel(s) at {} Hz on \"{}\"",
-                     opened.channels, opened.freq, SDL_GetAudioDeviceName(matched));
+        SDL_AudioSpec src_spec{};
+        SDL_AudioSpec dst_spec{};
+        if (SDL_GetAudioStreamFormat(stream, &src_spec, &dst_spec)) {
+            LOG_INFO(Input,
+                     "RenHDrum: DualSense haptics stream: feed {} channel(s) at {} Hz, device takes "
+                     "{} at {} Hz (\"{}\")",
+                     src_spec.channels, src_spec.freq, dst_spec.channels, dst_spec.freq,
+                     SDL_GetAudioDeviceName(matched));
         }
         LOG_INFO(Input, "RenHDrum: DualSense haptics on \"{}\"", SDL_GetAudioDeviceName(matched));
         return stream;
