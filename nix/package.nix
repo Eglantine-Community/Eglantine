@@ -379,21 +379,20 @@ buildEdenEmulator (
     # it is and the fixup phase therefore adds no RPATH for it. Put it on the real binaries' RPATH
     # by hand: that is what makes "installed like every other dependency" true here, instead of
     # requiring RENHDRUM_LIBRARY or a file dropped next to the executable.
-    postFixup =
-      if isDarwin then ''
-        for f in $out/bin/* $out/Applications/eglantine.app/Contents/MacOS/*; do
-          [ -f "$f" ] || continue
-          install_name_tool -add_rpath ${renhdrum}/lib "$f" 2>/dev/null || true
-          ${pkgs.darwin.signingUtils}/bin/codesign --force --sign - "$f"
-        done
-      '' else ''
-        for f in $out/bin/* $out/bin/.*; do
-          [ -f "$f" ] || continue
-          if patchelf --print-interpreter "$f" > /dev/null 2>&1; then
-            patchelf --add-rpath ${renhdrum}/lib "$f"
-          fi
-        done
-      '';
+    postFixup = ''
+      for f in $out/bin/* $out/bin/.*; do
+        [ -f "$f" ] || continue
+        if patchelf --print-interpreter "$f" > /dev/null 2>&1; then
+          patchelf --add-rpath ${renhdrum}/lib "$f"
+        fi
+      done
+    '' + lib.optionalString isDarwin ''
+      for f in $out/Applications/eglantine.app/Contents/MacOS/*; do
+        [ -f "$f" ] || continue
+        install_name_tool -add_rpath ${renhdrum}/lib "$f" 2>/dev/null || true
+        ${pkgs.darwin.signingUtils}/bin/codesign --force --sign - "$f"
+      done
+    '';
 
     # simple Nix-specific install rules
     postInstall = lib.optionalString isDarwin ''
