@@ -50,6 +50,11 @@ let
 
   isDarwin = pkgs.stdenv.hostPlatform.isDarwin;
 
+  # Runtime-loaded, never linked: the emulator dlopens it and falls back to its own rumble when it
+  # is absent. Packaged here so the store carries the exact version the vendored header describes,
+  # and so the binaries can reach it through RPATH instead of an environment variable.
+  renhdrum = pkgs.callPackage ./renhdrum.nix { };
+
   pgoBintools = lib.optional (pgo && !isDarwin) llvmPackages_23.bintools;
   pgoLinkerFlags = lib.optionals (pgo && !isDarwin) [
     "-DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld"
@@ -229,6 +234,10 @@ let
       # which does not apply to anything we build. Left to CPM it compiles from
       # source and insists on autoconf.
       libusb1
+
+      # RenHDrum is also in cpmfile.json's family of runtime pieces: not linked, so nothing here
+      # pulls it onto a link line, but it belongs in the closure and on the binaries' RPATH.
+      renhdrum
     ]
     ++ lib.optionals (!isDarwin) [
       gamemodePinned
@@ -365,6 +374,26 @@ buildEdenEmulator (
         cp ${pkgs.llvmPackages.libcxx}/lib/libc++experimental.a $out/lib/
       '')
     ];
+
+    # The emulator dlopens librenhdrum at runtime, so nothing in DT_NEEDED tells the loader where
+    # it is and the fixup phase therefore adds no RPATH for it. Put it on the real binaries' RPATH
+    # by hand: that is what makes "installed like every other dependency" true here, instead of
+    # requiring RENHDRUM_LIBRARY or a file dropped next to the executable.
+    postFixup =
+      if isDarwin then ''
+        for f in $out/bin/* $out/Applications/eglantine.app/Contents/MacOS/*; do
+          [ -f "$f" ] || continue
+          install_name_tool -add_rpath ${renhdrum}/lib "$f" 2>/dev/null || true
+          ${pkgs.darwin.signingUtils}/bin/codesign --force --sign - "$f"
+        done
+      '' else ''
+        for f in $out/bin/* $out/bin/.*; do
+          [ -f "$f" ] || continue
+          if patchelf --print-interpreter "$f" > /dev/null 2>&1; then
+            patchelf --add-rpath ${renhdrum}/lib "$f"
+          fi
+        done
+      '';
 
     # simple Nix-specific install rules
     postInstall = lib.optionalString isDarwin ''
