@@ -85,6 +85,11 @@ const RenHDrumApi& Api() {
         // so "next to the emulator" only works if we name it ourselves. Try, in order: the
         // RENHDRUM_LIBRARY override, the executable's directory, then the loader's search path.
         std::vector<std::string> candidates;
+#ifdef RENHDRUM_LIBRARY_PATH
+        // Where the packager installed it (nix/package.nix): a store path, so it is referenced and
+        // GC-safe, and nobody has to set an environment variable.
+        candidates.emplace_back(RENHDRUM_LIBRARY_PATH);
+#endif
         if (const char* override_path = std::getenv("RENHDRUM_LIBRARY");
             override_path != nullptr && *override_path != '\0') {
             candidates.emplace_back(override_path);

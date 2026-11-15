@@ -103,4 +103,8 @@ if (ENABLE_RENHDRUM AND NOT ANDROID)
     if (RENHDRUM_SDL_PATCHES)
         target_compile_definitions(input_common PRIVATE RENHDRUM_SDL_HDRUMBLE)
     endif()
+    if (RENHDRUM_LIBRARY_PATH)
+        target_compile_definitions(input_common PRIVATE
+            RENHDRUM_LIBRARY_PATH="${RENHDRUM_LIBRARY_PATH}")
+    endif()
 endif()

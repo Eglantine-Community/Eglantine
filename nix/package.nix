@@ -292,6 +292,13 @@ buildEdenEmulator (
       # else, so this costs a link step, not a new input.
       "-DUSE_DISCORD_PRESENCE=ON"
 
+      # RenHDrum is opened at runtime, so nothing links it and no RPATH entry points at it (the
+      # fixup phase prunes entries no DT_NEEDED library needs). Name the installed library at
+      # configure time: the binary references the store path directly, which is how it finds it
+      # and what keeps the package in the closure.
+      "-DENABLE_RENHDRUM=ON"
+      "-DRENHDRUM_LIBRARY_PATH=${renhdrum}/lib/librenhdrum.so"
+
       # Nix deviations:
       # 1. QT6 is found through the setup hook,
       #    so no prefix path is needed
@@ -380,10 +387,10 @@ buildEdenEmulator (
     # it is and the fixup phase therefore adds no RPATH for it. Put it on the real binaries' RPATH
     # by hand: that is what makes "installed like every other dependency" true here, instead of
     # requiring RENHDRUM_LIBRARY or a file dropped next to the executable.
-    # Nothing links librenhdrum, so nothing puts it on the RPATH and the fixup phase would prune
-    # an entry it cannot see a use for. The builder adds it after that pruning.
-    extraRPath = [ "${renhdrum}/lib" ];
-
+    # Nothing links librenhdrum, so no RPATH entry points at it and the fixup phase prunes any it
+    # cannot see a use for. Name the installed path at configure time instead: the binary then
+    # references the store path directly, which is both how it finds the library and what keeps it
+    # in the closure.
     # simple Nix-specific install rules
     postInstall = lib.optionalString isDarwin ''
       mkdir -p $out/Applications $out/bin
