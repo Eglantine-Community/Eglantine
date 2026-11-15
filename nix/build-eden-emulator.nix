@@ -232,10 +232,14 @@ in
     , ccache ? true
     , # environment for the build. Merged with the ccache variables when ccache
       # is on, so a caller can set its own without dropping them
-      env ? { }
-    , meta ? { }
-    , ...
-    }@args:
+      , env ? { }
+      , meta ? { }
+      , # Extra directories to put on the binaries' RPATH. For a library the emulator opens at
+        # runtime: nothing in DT_NEEDED references it, so the fixup phase would otherwise prune the
+        # entry, and it has to be added after that pruning rather than before it.
+        extraRPath ? [ ]
+      , ...
+      }@args:
     stdenv.mkDerivation (
       {
         # Without this, stdenv word-splits every cmakeFlags entry on spaces, so
@@ -290,6 +294,25 @@ in
         };
 
         # ccache is made to be optional
+        dontShrinkRPath = extraRPath != [ ];
+
+        postFixup = lib.optionalString (extraRPath != [ ]) (
+          if stdenv.hostPlatform.isDarwin then ''
+            for f in $out/bin/* $out/Applications/*/Contents/MacOS/*; do
+              [ -f "$f" ] || continue
+              install_name_tool -add_rpath "${lib.concatStringsSep ":" extraRPath}" "$f" 2>/dev/null || true
+              ${pkgs.darwin.signingUtils}/bin/codesign --force --sign - "$f"
+            done
+          '' else ''
+            for f in $out/bin/* $out/bin/.*; do
+              [ -f "$f" ] || continue
+              if patchelf --print-interpreter "$f" > /dev/null 2>&1; then
+                patchelf --add-rpath "${lib.concatStringsSep ":" extraRPath}" "$f"
+              fi
+            done
+          ''
+        );
+
         preConfigure = ''
           if mkdir -p "$CCACHE_DIR" 2>/dev/null && [ -w "$CCACHE_DIR" ]; then
             # Paths inside the preprocessed source have to be stable for a hit
