@@ -104,7 +104,18 @@ if (ENABLE_RENHDRUM AND NOT ANDROID)
         target_compile_definitions(input_common PRIVATE RENHDRUM_SDL_HDRUMBLE)
     endif()
     if (RENHDRUM_LIBRARY_PATH)
-        target_compile_definitions(input_common PRIVATE
-            RENHDRUM_LIBRARY_PATH="${RENHDRUM_LIBRARY_PATH}")
+        # A generated header rather than -DRENHDRUM_LIBRARY_PATH="...": CMake mangles the quotes
+        # of a compile definition that carries a path, and the loader then looks for a truncated
+        # filename. Fail the build here if the packager named something that is not there.
+        if (NOT EXISTS "${RENHDRUM_LIBRARY_PATH}")
+            message(FATAL_ERROR
+                "RENHDRUM_LIBRARY_PATH does not exist: ${RENHDRUM_LIBRARY_PATH}")
+        endif()
+        configure_file(
+            "${CMAKE_CURRENT_SOURCE_DIR}/renhdrum_library_path.h.in"
+            "${CMAKE_CURRENT_BINARY_DIR}/renhdrum_library_path.h"
+            @ONLY)
+        target_include_directories(input_common PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+        target_compile_definitions(input_common PRIVATE RENHDRUM_HAVE_PACKAGED_PATH)
     endif()
 endif()

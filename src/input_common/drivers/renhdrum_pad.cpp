@@ -17,6 +17,10 @@
 
 #include <renhdrum.h>
 
+#ifdef RENHDRUM_HAVE_PACKAGED_PATH
+#include "renhdrum_library_path.h"
+#endif
+
 #include "common/dynamic_library.h"
 #include "common/logging.h"
 #include "common/settings.h"
@@ -89,7 +93,7 @@ const RenHDrumApi& Api() {
             override_path != nullptr && *override_path != '\0') {
             candidates.emplace_back(override_path);
         }
-#ifdef RENHDRUM_LIBRARY_PATH
+#ifdef RENHDRUM_HAVE_PACKAGED_PATH
         // Where the packager installed it (nix/package.nix): a store path, so it is referenced and
         // GC-safe, and nobody has to set an environment variable. An explicit override still wins.
         candidates.emplace_back(RENHDRUM_LIBRARY_PATH);
