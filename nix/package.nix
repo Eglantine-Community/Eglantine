@@ -55,9 +55,16 @@ let
   # and so the binaries can reach it through RPATH instead of an environment variable.
   renhdrum = pkgs.callPackage ./renhdrum.nix { };
 
+  # The loader has to find a library nothing links, so the path is baked into the binaries at link
+  # time rather than discovered at runtime. dontShrinkRPath keeps the fixup phase from pruning an
+  # entry that -- by definition -- no DT_NEEDED library needs.
+  renhdrumRPath = "-Wl,-rpath,${renhdrum}/lib";
+
   pgoBintools = lib.optional (pgo && !isDarwin) llvmPackages_23.bintools;
-  pgoLinkerFlags = lib.optionals (pgo && !isDarwin) [
-    "-DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld"
+  pgoLinkerFlags = [
+    "-DCMAKE_EXE_LINKER_FLAGS=${lib.optionalString (pgo && !isDarwin) "-fuse-ld=lld "}${renhdrumRPath}"
+  ]
+  ++ lib.optionals (pgo && !isDarwin) [
     "-DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=lld"
     "-DCMAKE_MODULE_LINKER_FLAGS=-fuse-ld=lld"
   ];
@@ -379,20 +386,9 @@ buildEdenEmulator (
     # it is and the fixup phase therefore adds no RPATH for it. Put it on the real binaries' RPATH
     # by hand: that is what makes "installed like every other dependency" true here, instead of
     # requiring RENHDRUM_LIBRARY or a file dropped next to the executable.
-    postFixup = ''
-      for f in $out/bin/* $out/bin/.*; do
-        [ -f "$f" ] || continue
-        if patchelf --print-interpreter "$f" > /dev/null 2>&1; then
-          patchelf --add-rpath ${renhdrum}/lib "$f"
-        fi
-      done
-    '' + lib.optionalString isDarwin ''
-      for f in $out/Applications/eglantine.app/Contents/MacOS/*; do
-        [ -f "$f" ] || continue
-        install_name_tool -add_rpath ${renhdrum}/lib "$f" 2>/dev/null || true
-        ${pkgs.darwin.signingUtils}/bin/codesign --force --sign - "$f"
-      done
-    '';
+    # Keep the RPATH entry added through the linker flags: patchelf --shrink-rpath drops entries
+    # that no DT_NEEDED library needs, which is exactly this one.
+    dontShrinkRPath = true;
 
     # simple Nix-specific install rules
     postInstall = lib.optionalString isDarwin ''
