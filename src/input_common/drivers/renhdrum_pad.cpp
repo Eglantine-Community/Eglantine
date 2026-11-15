@@ -44,6 +44,9 @@ struct RenHDrumApi {
     decltype(&renhdrum_engine_push_half_sample) engine_push_half_sample{};
     decltype(&renhdrum_engine_tick) engine_tick{};
     decltype(&renhdrum_settings_resolve) settings_resolve{};
+    // Optional (RenHDrum 0.4.0+): the resolver that reads no IPC and no flag files. Preferred,
+    // because this host has no Brontide-App config and the plain resolver would look for one.
+    decltype(&renhdrum_settings_resolve_pure) settings_resolve_pure{};
     decltype(&renhdrum_dualsense_dsp_create) dsp_create{};
     decltype(&renhdrum_dualsense_dsp_destroy) dsp_destroy{};
     decltype(&renhdrum_dualsense_dsp_set_half_target) dsp_set_half_target{};
@@ -94,6 +97,7 @@ const RenHDrumApi& Api() {
         Settings::values.renhdrum_available.SetValue(a.loaded);
         if (a.loaded) {
             // Optional: a missing symbol leaves it null
+            (void)a.library.GetSymbol("renhdrum_settings_resolve_pure", &a.settings_resolve_pure);
             (void)a.library.GetSymbol("renhdrum_dualsense_dsp_build_bt_report",
                                       &a.dsp_build_bt_report);
             (void)a.library.GetSymbol("renhdrum_xbox_rumble_create", &a.xbox_create);
@@ -287,7 +291,10 @@ struct RenHDrumPad::Impl {
         config.hd_rumble_experimental_bt_after_input = user.bt_after_input;
         config.hd_rumble_experimental_bt_fast = user.bt_fast;
         config.hd_rumble_experimental_bt_crisp_notes = user.bt_crisp_notes;
-        return Api().settings_resolve(&config, &settings) == RENHDRUM_OK;
+        const auto& api = Api();
+        const auto resolve = api.settings_resolve_pure ? api.settings_resolve_pure
+                                                       : api.settings_resolve;
+        return resolve(&config, &settings) == RENHDRUM_OK;
     }
 
     /// Switches SDL's HD Rumble transport modes to match `settings`, then clears the modes SDL
