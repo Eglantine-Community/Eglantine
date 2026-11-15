@@ -667,6 +667,13 @@ struct RenHDrumPad::Impl {
             .channels = 4,
             .freq = 48000,
         };
+        // Four channels, because the DualSense voice coils listen on 3-4 and the pad exposes them
+        // only through its raw UAC endpoint. Anything that swallows the stream between us and that
+        // endpoint can flatten it to stereo and the coils fall silent: measured with a PipeWire
+        // filter-chain sink (JamesDSP) as the default sink, a four-channel feed arrived as two
+        // channels and the game audio took the pad's ports instead. Nothing on this side can see
+        // or fix that -- it is a routing decision above us -- so the device name and the channel
+        // counts below are logged to make it diagnosable in one run.
         // Give the stream a stable name so it is identifiable in an audio graph and can be pinned
         // by a server-side rule; every stream would otherwise be called plain "eglantine".
         SDL_SetHint(SDL_HINT_AUDIO_DEVICE_STREAM_NAME, "RenHDrum haptics");
