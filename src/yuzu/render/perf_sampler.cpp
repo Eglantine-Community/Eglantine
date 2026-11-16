@@ -18,6 +18,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <pdh.h>
+#include <pdhmsg.h>
 #include <psapi.h>
 #include <tlhelp32.h>
 #include <string_view>
