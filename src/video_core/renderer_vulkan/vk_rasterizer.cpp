@@ -1077,10 +1077,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         return;
     }
     if (frame_dump.Capturing()) {
-        frame_dump.NoteKeys(pipeline->ShaderHashes(),
-                            pipeline_cache.GraphicsNativeKeys(pipeline->ShaderHashes()));
+        const auto& shader_hashes = pipeline->ShaderHashes();
+        frame_dump.NoteKeys(shader_hashes, pipeline_cache.GraphicsNativeKeys(shader_hashes));
         FrameDumpPass(texture_cache.GetFramebuffer());
-        frame_dump.NoteDraw(pipeline->ShaderHashes());
+        frame_dump.NoteDraw(shader_hashes);
         bool recorded = false;
         if (frame_dump.CapturingSampled()) {
             boost::container::small_vector<FrameDump::Sampled, 16> sampled;
@@ -1091,8 +1091,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
             recorded = frame_dump.NoteSampled(sampled);
         }
         if (frame_dump.CapturingBuffers()) {
-            recorded |= FrameDumpBuffers(false, pipeline->ShaderHashes());
-        }
+            recorded |= FrameDumpBuffers(false, shader_hashes);
         if (recorded) {
             scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
         }
