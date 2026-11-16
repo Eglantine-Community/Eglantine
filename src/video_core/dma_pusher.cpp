@@ -146,6 +146,9 @@ bool DmaPusher::Step() {
     }
 
     if (header.size > 0) {
+        // The entry is the 5-word record of a DrawIndexedIndirect call the host GPU draws from
+        // guest memory (Maxwell3D::FrontTakeIndirectRecord): its words are not needed fresh.
+        bool skip_record_read = false;
         if (header.sync && g_nx2_ampere.load(std::memory_order_relaxed)) {
             VideoCommon::GpuSplit::Get().NoteSync();
         }
@@ -162,6 +165,13 @@ bool DmaPusher::Step() {
             if (kepler_payload || macro_payload) {
                 const size_t words = std::min<size_t>(dma_state.method_count, header.size);
                 auto* const engine_state = subchannels[dma_state.subchannel];
+                if (macro_payload && words == 5 && header.size == 5 &&
+                    dma_state.method_count == 5 && command_resume_offset == 0 &&
+                    VideoCommon::GpuSplit::Get().Active() &&
+                    static_cast<Engines::Maxwell3D*>(engine_state)
+                        ->FrontTakeIndirectRecord(dma_state.method, dma_state.dma_get)) {
+                    skip_record_read = true;
+                }
                 if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
                     const bool front_3d_macro =
                         macro_payload && split.FrontMacros() &&
@@ -221,7 +231,7 @@ bool DmaPusher::Step() {
         // written by a dispatch or copy still queued for it reads as unwritten, and its words as
         // stale (Fast Fusion's culling fills in instanced draws' arguments; stale ones asked for
         // billions of instances and lost the device loading a race).
-        bool gpu_written =
+        bool gpu_written = !skip_record_read &&
             IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
         // EDEN_NX2_ENTRY_WRITER_STATS=1 counts these waits and how many found newly GPU-written
         // words; =2 also skips the wait (unsafe, measurement only).
@@ -229,7 +239,8 @@ bool DmaPusher::Step() {
             const char* text = std::getenv("EDEN_NX2_ENTRY_WRITER_STATS");
             return text != nullptr ? std::atoi(text) : 0;
         }();
-        if (!gpu_written && VideoCommon::GpuSplit::Get().Active() && entry_writer_stats != 2 &&
+        if (!skip_record_read && !gpu_written && VideoCommon::GpuSplit::Get().Active() &&
+            entry_writer_stats != 2 &&
             VideoCommon::GpuSplit::Get().WaitForWriters()) {
             gpu_written =
                 IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
@@ -325,6 +336,12 @@ bool DmaPusher::Step() {
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         } else if (use_safe) {
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::SafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
+            const std::span<const CommandHeader> commands{headers.data(), headers.size()};
+            RecordParsedEntry(header, commands);
+            command_resume_offset +=
+                ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+        } else if (skip_record_read) {
+            Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::UnsafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
             RecordParsedEntry(header, commands);
             command_resume_offset +=
