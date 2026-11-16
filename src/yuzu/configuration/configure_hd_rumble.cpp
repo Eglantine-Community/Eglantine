@@ -157,7 +157,16 @@ QWidget* ConfigureHdRumble::CreateSwitchPage() {
     auto* layout = new QVBoxLayout(page);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->addWidget(MakeNote(tr("Pro Controller and Joy-Con: the game's HD Rumble sent with "
-                                  "full detail instead of a plain motor rumble.")));
+                                   "full detail instead of a plain motor rumble.")));
+    // The built-in driver is a different path entirely: it talks to the controller over raw HID and
+    // never goes through SDL, so this engine never sees those pads. Its own rumble sends a single
+    // sample per packet with both motors mirrored, which is coarser than what is configured here.
+    layout->addWidget(MakeNote(tr("Eglantine's built-in Joy-Con/Pro Controller driver (Settings, "
+                                   "Advanced) owns the controller instead of SDL and is not driven "
+                                   "by this engine. The Pro Controller driver is off by default; "
+                                   "the Joy-Con driver is on, so turning it off hands Joy-Cons to "
+                                   "this path as well. The built-in driver is still what provides "
+                                   "the IR camera, amiibo and the Ring-Con.")));
 
     wired_group = new QGroupBox(tr("Wired (USB)"));
     auto* wired = new QFormLayout(wired_group);
