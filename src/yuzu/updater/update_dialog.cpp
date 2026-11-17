@@ -73,9 +73,14 @@ UpdateDialog::UpdateDialog(const Common::Net::Release& release, UpdateChecker::C
     connect(skip, &QPushButton::clicked, this, [this] { done(SkipVersion); });
 
     // TODO(crueter): Find a way to set default
-    const auto assets = release.GetPlatformAssets(
-        UpdateChecker::DownloadPlatform(UISettings::values.update_variant.GetValue()),
-        Common::Net::CurrentLinuxPackage());
+#ifdef ENABLE_UPDATE_CHECKER
+    const auto platform =
+        UpdateChecker::DownloadPlatform(UISettings::values.update_variant.GetValue());
+#else
+    const std::string platform{Common::g_build_release_platform};
+#endif
+    const auto assets =
+        release.GetPlatformAssets(platform, Common::Net::CurrentLinuxPackage());
 
     ui->buttonBox->button(QDialogButtonBox::Yes)
         ->setText(assets.empty() ? tr("Open Release Page") : tr("Download"));
