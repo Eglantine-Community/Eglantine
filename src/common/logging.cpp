@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -33,6 +36,7 @@
 #include "common/literals.h"
 #include "common/log_ring.h"
 #include "common/polyfill_thread.h"
+#include "common/terminate_handler.h"
 #include "common/thread.h"
 
 #include "common/logging.h"
@@ -443,6 +447,7 @@ void Initialize() {
         void(CreateDir(log_dir));
         logging_instance->file_backend.emplace(log_dir / LOG_FILE);
 #endif
+        InstallTerminateHandler();
     }
 }
 
