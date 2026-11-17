@@ -1075,7 +1075,7 @@ u32 ComputeEnvironment::ReadViewportTransformState() {
     return viewport_transform_state;
 }
 
-void FileEnvironment::Deserialize(std::ifstream& file, bool with_mesh_state) {
+void FileEnvironment::Deserialize(std::ifstream& file, bool with_mesh_state, u64 remaining) {
     u64 code_size{};
     u64 num_texture_types{};
     u64 num_texture_pixel_formats{};
@@ -1098,6 +1098,24 @@ void FileEnvironment::Deserialize(std::ifstream& file, bool with_mesh_state) {
         .read(reinterpret_cast<char*>(&read_highest), sizeof(read_highest))
         .read(reinterpret_cast<char*>(&viewport_transform_state), sizeof(viewport_transform_state))
         .read(reinterpret_cast<char*>(&stage), sizeof(stage));
+    // Every length above comes from the file, so a damaged or a stale record from an older layout
+    // picks its own allocation size here. Walk a budget over what the file still holds and refuse
+    // the record before anything is sized; the throw is the truncation path LoadPipelines already
+    // handles by deleting the cache and rebuilding it.
+    u64 budget{remaining};
+    const auto take = [&budget](u64 count, u64 per_entry) {
+        const u64 per{(std::max)(per_entry, u64{1})};
+        if (count > budget / per) {
+            throw std::ios_base::failure{"pipeline cache record runs past the end of its file"};
+        }
+        budget -= count * per;
+    };
+    take(code_size, 1);
+    take(num_texture_types, sizeof(u32) + sizeof(Shader::TextureType));
+    take(num_texture_pixel_formats, sizeof(u32) + sizeof(Shader::TexturePixelFormat));
+    take(num_cbuf_values, sizeof(u64) + sizeof(u32));
+    take(num_storage_pointer_types, sizeof(u64) + sizeof(u8));
+    take(num_cbuf_replacement_values, sizeof(u64) + sizeof(Shader::ReplaceConstant));
     code.resize(Common::DivCeil(code_size, sizeof(u64)));
     file.read(reinterpret_cast<char*>(code.data()), code_size);
     for (size_t i = 0; i < num_texture_types; ++i) {
@@ -1403,6 +1421,12 @@ void LoadPipelines(
         file.exceptions(std::ifstream::failbit);
         const auto end{file.tellg()};
         file.seekg(0, std::ios::beg);
+        const std::streamoff file_end{static_cast<std::streamoff>(end)};
+        /// Bytes still to come; 0 rather than a huge number when the stream refused to tell.
+        const auto bytes_left = [&file, file_end]() -> u64 {
+            const std::streamoff here{static_cast<std::streamoff>(file.tellg())};
+            return here < 0 ? u64{0} : static_cast<u64>(file_end - here);
+        };
 
         std::array<char, 8> magic_number;
         u32 cache_version;
@@ -1463,9 +1487,18 @@ void LoadPipelines(
             const auto record_begin{file.tellg()};
             u32 num_envs{};
             file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
+            // One record is one pipeline: at least one environment, and each costs its six-word
+            // header before any of its variable parts. A count that the rest of the file cannot
+            // hold is a damaged record, and `envs.front()` below would not survive it either.
+            constexpr u64 min_env_bytes{6 * sizeof(u64)};
+            const u64 record_left{bytes_left()};
+            if (num_envs == 0 || record_left < min_env_bytes ||
+                static_cast<u64>(num_envs) > record_left / min_env_bytes) {
+                throw std::ios_base::failure{"pipeline cache record has an implausible count"};
+            }
             std::vector<FileEnvironment> envs(num_envs);
             for (FileEnvironment& env : envs) {
-                env.Deserialize(file, with_mesh_state);
+                env.Deserialize(file, with_mesh_state, bytes_left());
             }
             const bool is_compute{envs.front().ShaderStage() == Shader::Stage::Compute};
             if (is_compute) {

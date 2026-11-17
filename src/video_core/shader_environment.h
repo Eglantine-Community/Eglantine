@@ -323,7 +323,11 @@ public:
     FileEnvironment& operator=(const FileEnvironment&) = delete;
     FileEnvironment(const FileEnvironment&) = delete;
 
-    void Deserialize(std::ifstream& file, bool with_mesh_state = false);
+    /// `remaining` is the number of bytes left in the file. Every length in a record comes out of
+    /// that file, so a damaged or stale cache can otherwise choose its own allocation size; the
+    /// budget refuses such a record before anything is sized. The default is unbounded, which is
+    /// what callers reading records this build wrote get.
+    void Deserialize(std::ifstream& file, bool with_mesh_state = false, u64 remaining = ~u64{0});
 
     [[nodiscard]] u64 ReadInstruction(u32 address) override;
 
