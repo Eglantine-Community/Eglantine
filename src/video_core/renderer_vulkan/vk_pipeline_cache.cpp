@@ -2172,7 +2172,11 @@ void PipelineCache::StartShaderPrecache(u64 title_id) {
             u32 num_envs{};
             file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
             FileEnvironment env;
-            env.Deserialize(file);
+            // Bound the record by what is left in the file: a damaged warm file otherwise picks its
+            // own allocation size here, and the short read that rejects it comes only afterwards.
+            // Its own reader, so nothing deletes this file on rejection — the version check above
+            // already sent a stale one back for a rebuild.
+            env.Deserialize(file, false, static_cast<u64>(end - file.tellg()));
             if (num_envs != 1 || env.ShaderStage() != Shader::Stage::Compute) {
                 throw std::runtime_error("unexpected entry");
             }
