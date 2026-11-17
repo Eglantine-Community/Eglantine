@@ -1092,6 +1092,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         }
         if (frame_dump.CapturingBuffers()) {
             recorded |= FrameDumpBuffers(false, shader_hashes);
+        }
         if (recorded) {
             scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
         }
