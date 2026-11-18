@@ -7,7 +7,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <span>
 #include <thread>
+#include <utility>
 
 #ifdef _MSC_VER
 #include <intrin.h>
@@ -189,6 +191,11 @@ void GpuSplit::Stop() {
     repeat_end = ~u64{0};
     publish_every = PublishEvery;
     front_engine = nullptr;
+    state_engine = nullptr;
+    state_count = 0;
+    state_effect = Effect::None;
+    state_epoch = 0;
+    state_flags.fill(0);
     back_engine = nullptr;
     front_macros = false;
     published.store(0, std::memory_order_relaxed);
@@ -232,6 +239,7 @@ void GpuSplit::WaitForSpace(size_t words) {
 }
 
 void GpuSplit::Publish() {
+    FlushState();
     if (published_local == write_position) {
         return;
     }
@@ -248,6 +256,7 @@ void GpuSplit::Drain(DrainSite site) {
     if (!active) {
         return;
     }
+    FlushState();
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache == write_position && BackQuiet()) {
         return;
@@ -280,14 +289,17 @@ void GpuSplit::Drain(DrainSite site) {
 }
 
 bool GpuSplit::WaitForWriters() {
+    FlushState();
     return WaitFor(std::min(last_writer_position, write_position), DrainSite::ListWriters);
 }
 
 bool GpuSplit::WaitForSync() {
+    FlushState();
     return WaitFor(std::min(last_sync_position, write_position), DrainSite::ListSync);
 }
 
 bool GpuSplit::WaitFor(u64 target, DrainSite site) {
+    FlushState();
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache >= target) {
         return false;
@@ -323,6 +335,25 @@ void GpuSplit::Backoff(u32 spins, u64 target) {
         front_wake.wait(seen, std::memory_order_seq_cst);
     }
     front_waiting.store(false, std::memory_order_relaxed);
+}
+
+void GpuSplit::FlushStateSlow() {
+    // Cleared first: SelectEngine, Reserve and Commit flush again.
+    const u32 count = std::exchange(state_count, 0);
+    const Effect effect = std::exchange(state_effect, Effect::None);
+    const u64 epoch = std::exchange(state_epoch, u64{0});
+    const auto flags = state_flags;
+    state_flags.fill(0);
+    SelectEngine(state_engine);
+    const size_t size = 1 + StateFlagWords + count;
+    u64* const entry = Reserve(size);
+    entry[0] = static_cast<u64>(Kind::State) | (u64{count} << 32);
+    std::memcpy(entry + 1, flags.data(), sizeof(flags));
+    std::memcpy(entry + 1 + StateFlagWords, state_writes.data(), size_t{count} * sizeof(u64));
+    if (epoch != 0 && effect == Effect::Draw) {
+        writes.DrawEpoch(epoch);
+    }
+    Commit(size, effect);
 }
 
 void GpuSplit::SwitchEngine(Tegra::Engines::EngineInterface* engine) {
@@ -451,11 +482,13 @@ void GpuSplit::OverlayConstBufferWords(u64 consumed_position, u64 begin, u64 siz
 }
 
 u64 GpuSplit::SettleWrites() {
+    FlushState();
     WaitFor((std::min)(last_function_position, write_position), DrainSite::Map);
     return RetireWrites();
 }
 
 u64 GpuSplit::RetireWrites() {
+    FlushState();
     consumed_cache = consumed.load(std::memory_order_acquire);
     writes.Retire(consumed_cache);
     while (!cb_words.empty() && cb_words.front().position <= consumed_cache) {
@@ -632,6 +665,14 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
         const size_t payload = static_cast<size_t>((head >> 8) & 0xffffff);
         reinterpret_cast<void (*)(const u64*)>(entry[1])(entry + 2);
         return 2 + payload;
+    }
+    case Kind::State: {
+        const u32 count = static_cast<u32>(head >> 32);
+        static_cast<Tegra::Engines::Maxwell3D*>(back_engine)
+            ->WriteStateRegisters(*system,
+                                  std::span<const u64, StateFlagWords>{entry + 1, StateFlagWords},
+                                  std::span<const u64>{entry + 1 + StateFlagWords, count});
+        return 1 + StateFlagWords + count;
     }
     }
     return 1;

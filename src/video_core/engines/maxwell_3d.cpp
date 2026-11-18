@@ -9,7 +9,9 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <bitset>
+#include <chrono>
 #include <atomic>
 #include <cstring>
 #include <limits>
@@ -723,6 +725,152 @@ size_t Maxwell3D::CallStateMethodRun(const u64* entry, size_t max_words) {
     return count;
 }
 
+namespace {
+bool RegBlockVerifyEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_REG_BLOCK_VERIFY");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+bool StateBlocksEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_STATE_BLOCKS");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+} // namespace
+
+void Maxwell3D::WriteStateRegisters(Core::System& system, std::span<const u64, 4> flags,
+                                    std::span<const u64> writes) {
+    ConsumeSink(system);
+    // The front sends only writes that change its copy of the register, which matches the back's
+    // except for registers the back changes itself: when every write changes the back's register
+    // and no special path applies, storing the registers and setting the combined dirty flags is
+    // identical to CallMethod for each write.
+    bool changes = fast_maxwell3d && executing_macro == 0 && !VideoCommon::Nx2Perf::Verify() &&
+                   SkipSameValueWrites() &&
+                   shadow_state.shadow_ram_control != Regs::ShadowRamControl::Replay &&
+                   !draw_manager.HasDeferredDraw();
+    for (size_t i = 0; changes && i < writes.size(); ++i) {
+        changes = regs.reg_array[static_cast<u32>(writes[i])] != static_cast<u32>(writes[i] >> 32);
+    }
+    if (RegBlockVerifyEnabled()) [[unlikely]] {
+        return VerifyStateRegisters(system, flags, writes, changes);
+    }
+    if (!changes) {
+        for (const u64 write : writes) {
+            CallMethod(system, static_cast<u32>(write), static_cast<u32>(write >> 32), true);
+        }
+        return;
+    }
+    StoreStateRegisters(flags, writes);
+}
+
+void Maxwell3D::StoreStateRegisters(std::span<const u64, 4> flags, std::span<const u64> writes) {
+    const auto control = shadow_state.shadow_ram_control;
+    const bool tracked = control == Regs::ShadowRamControl::Track ||
+                         control == Regs::ShadowRamControl::TrackWithFilter;
+    for (const u64 write : writes) {
+        const u32 method = static_cast<u32>(write);
+        const u32 value = static_cast<u32>(write >> 32);
+        regs.reg_array[method] = value;
+        if (tracked) {
+            shadow_state.reg_array[method] = value;
+        }
+    }
+    for (size_t word = 0; word < flags.size(); ++word) {
+        for (u64 bits = flags[word]; bits != 0; bits &= bits - 1) {
+            dirty.flags[word * 64 + static_cast<size_t>(std::countr_zero(bits))] = true;
+        }
+    }
+}
+
+void Maxwell3D::VerifyStateRegisters(Core::System& system, std::span<const u64, 4> flags,
+                                     std::span<const u64> writes, bool changes) {
+    static u64 blocks{};
+    static u64 block_writes{};
+    static u64 by_write{};
+    static u64 differences{};
+    static u64 total_differences{};
+    static auto last_report = std::chrono::steady_clock::now();
+    const auto one_by_one = [&] {
+        for (const u64 write : writes) {
+            CallMethod(system, static_cast<u32>(write), static_cast<u32>(write >> 32), true);
+        }
+    };
+    const auto method_at = [&writes](size_t i) { return static_cast<u32>(writes[i]); };
+    if (!changes) {
+        ++by_write;
+        one_by_one();
+    } else {
+        ++blocks;
+        block_writes += writes.size();
+        std::vector<u32> before(writes.size() * 2);
+        for (size_t i = 0; i < writes.size(); ++i) {
+            before[i * 2] = regs.reg_array[method_at(i)];
+            before[i * 2 + 1] = shadow_state.reg_array[method_at(i)];
+        }
+        const DirtyState::Flags flags_before = dirty.flags;
+        StoreStateRegisters(flags, writes);
+        std::vector<u32> stored(writes.size() * 2);
+        for (size_t i = 0; i < writes.size(); ++i) {
+            stored[i * 2] = regs.reg_array[method_at(i)];
+            stored[i * 2 + 1] = shadow_state.reg_array[method_at(i)];
+        }
+        const DirtyState::Flags stored_flags = dirty.flags;
+        for (size_t i = writes.size(); i-- > 0;) {
+            regs.reg_array[method_at(i)] = before[i * 2];
+            shadow_state.reg_array[method_at(i)] = before[i * 2 + 1];
+        }
+        dirty.flags = flags_before;
+        one_by_one();
+        std::string register_differences;
+        for (size_t i = 0; i < writes.size(); ++i) {
+            const u32 method = method_at(i);
+            if (stored[i * 2] != regs.reg_array[method] ||
+                stored[i * 2 + 1] != shadow_state.reg_array[method]) {
+                register_differences += fmt::format(
+                    " {:#x}={:#x}/{:#x} (one by one {:#x}/{:#x})", method, stored[i * 2],
+                    stored[i * 2 + 1], regs.reg_array[method], shadow_state.reg_array[method]);
+            }
+        }
+        const DirtyState::Flags flag_differences = stored_flags ^ dirty.flags;
+        if (!register_differences.empty() || flag_differences.any()) {
+            ++differences;
+            if (++total_differences <= 16) {
+                std::string flag_list;
+                for (size_t i = 0; i < flag_differences.size(); ++i) {
+                    if (flag_differences[i]) {
+                        flag_list += fmt::format(" {}={}", i, stored_flags[i] ? 1 : 0);
+                    }
+                }
+                LOG_ERROR(HW_GPU,
+                          "Register block verify: a block of {} writes differs from them one by "
+                          "one: registers (block/shadow){}, block dirty flags{}",
+                          writes.size(), register_differences, flag_list);
+            }
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(now - last_report).count();
+    if (seconds < 10.0) {
+        return;
+    }
+    last_report = now;
+    LOG_INFO(HW_GPU,
+             "Register block verify (EDEN_NX2_REG_BLOCK_VERIFY) in {:.1f} s: {} blocks of {} "
+             "writes compared with the writes one by one, {} differ ({} in all); {} blocks "
+             "written one by one",
+             seconds, blocks, block_writes, differences, total_differences, by_write);
+    blocks = 0;
+    block_writes = 0;
+    by_write = 0;
+    differences = 0;
+}
+
 void Maxwell3D::CallMethodSlow(Core::System& system, u32 method, u32 method_argument, bool is_last_call) {
     // It is an error to write to a register other than the current macro's ARG register before
     // it has finished execution.
@@ -1143,6 +1291,7 @@ struct Maxwell3D::FrontState {
     bool same_first{};  ///< Nx2Perf FrontSameFirst, read once
     bool class_table{}; ///< Nx2Perf FrontClassTable, read once
     bool draw_begin_coalesce{}; ///< Nx2Perf DrawBeginCoalesce, read once
+    bool state_blocks{}; ///< GpuSplit::StateWrite block batching, read once
     bool verify{};      ///< Nx2Perf::Verify(), read once
     /// MacroReadWriterSet (FrontDrawEffect): the last lookup of the programs the registers bind,
     /// valid while those registers, the program epoch, the proofs and the GPU map are unchanged.
@@ -1500,6 +1649,8 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
         front->draw_begin_coalesce =
             VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::DrawBeginCoalesce);
         front->verify = VideoCommon::Nx2Perf::Verify();
+        front->state_blocks =
+            front->skip_same && fast_maxwell3d && !front->verify && StateBlocksEnabled();
         front->executing_macro = executing_macro;
         front->parameters = std::move(macro_params);
         macro_params.clear();
@@ -1532,7 +1683,8 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
             Profile::Add(Profile::Counter::CbWords, 1);
         }
     }
-    if (fs.unknown_count != 0 && fs.unknown_regs[method]) [[unlikely]] {
+    const bool was_unknown = fs.unknown_count != 0 && fs.unknown_regs[method];
+    if (was_unknown) [[unlikely]] {
         // dma_forward: a tracked write sets both the register and its shadow copy again; any
         // other mode keeps or reads one of them, so take the back's values first.
         if (fs.control == Regs::ShadowRamControl::Track ||
@@ -1610,6 +1762,12 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         fs.regs[method] = value;
         if (IsDrawProgramRegister(method)) {
             fs.draw_key_valid = false;
+        }
+        if (fs.state_blocks && !was_unknown && fs.control != Regs::ShadowRamControl::Replay &&
+            method < Regs::NUM_REGS) {
+            split.StateWrite(this, method, value, {dirty.tables[0][method], dirty.tables[1][method]},
+                             effect);
+            return;
         }
         if (from_macro) {
             split.MacroWrite(this, method, argument, effect);

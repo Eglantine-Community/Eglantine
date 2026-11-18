@@ -41,7 +41,8 @@ struct GpuSplitTestAccess {
         split.publish_every = GpuSplit::RingWords;
     }
 
-    static u64 End(const GpuSplit& split) {
+    static u64 End(GpuSplit& split) {
+        split.FlushState();
         return split.write_position;
     }
 
@@ -715,6 +716,72 @@ TEST_CASE("GpuSplit counts a draw.begin repeat only into the unpublished entry b
         position = Access::Execute(split, position, Access::End(split));
     }
     REQUIRE(f.fast.draw_manager.draw_state.instance_count == 9);
+}
+
+TEST_CASE("GpuSplit 3D state register blocks match CallMethod across modes, wraps, and limits",
+          "[video_core][maxwell_fast_method][state_blocks]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    for (const bool wrap : {false, true}) {
+        CAPTURE(wrap);
+        Fixture f;
+        VideoCommon::GpuSplit split;
+        const u64 start = wrap ? Access::NearWrap() - 10 : 0;
+        Access::Initialize(split, f.system, start);
+
+        std::mt19937 rng{0x51A7E};
+        for (u32 step = 0; step < 3000; ++step) {
+            const u32 choice = rng() % 20;
+            if (choice < 14) {
+                const u32 method = f.state_methods[rng() % f.state_methods.size()];
+                const u32 value = rng() % 16;
+                f.fast.FrontCallMethod(f.system, split, method, value, true);
+                f.slow.CallMethod(f.system, method, value, true);
+            } else if (choice == 14) {
+                // Shadow RAM control transitions: Track (0), TrackWithFilter (1), Passthrough (2),
+                // Replay (3).
+                const u32 mode = rng() % 4;
+                f.fast.FrontCallMethod(f.system, split, ShadowControl, mode, true);
+                f.slow.CallMethod(f.system, ShadowControl, mode, true);
+            } else if (choice == 15) {
+                // Burst > MaxStateWrites (128) to exercise automatic block splitting.
+                for (u32 i = 0; i < 160; ++i) {
+                    const u32 method = f.state_methods[(step + i) % f.state_methods.size()];
+                    const u32 value = 0x100 + step * 256 + i;
+                    f.fast.FrontCallMethod(f.system, split, method, value, true);
+                    f.slow.CallMethod(f.system, method, value, true);
+                }
+            } else if (choice == 16) {
+                // Deferred instance loop followed by state block fallback.
+                constexpr u32 first = 4;
+                constexpr u32 subsequent = (1u << 26) | 4;
+                for (const u32 arg : {first, subsequent}) {
+                    f.fast.FrontCallMethod(f.system, split, DrawBegin, arg, true);
+                    f.fast.FrontCallMethod(f.system, split,
+                                           MAXWELL3D_REG_INDEX(vertex_buffer.count), 3, true);
+                    f.fast.FrontCallMethod(f.system, split, DrawEnd, 0, true);
+                    f.slow.CallMethod(f.system, DrawBegin, arg, true);
+                    f.slow.CallMethod(f.system, MAXWELL3D_REG_INDEX(vertex_buffer.count), 3, true);
+                    f.slow.CallMethod(f.system, DrawEnd, 0, true);
+                }
+            } else {
+                const u32 method = executable_methods[rng() % executable_methods.size()];
+                const u32 value = rng() % 32;
+                f.fast.FrontCallMethod(f.system, split, method, value, true);
+                f.slow.CallMethod(f.system, method, value, true);
+            }
+        }
+
+        u64 position = start;
+        const u64 end = Access::End(split);
+        while (position < end) {
+            position = Access::Execute(split, position, end);
+            REQUIRE(position <= end);
+        }
+        // ReleaseFront is only for accuracy switches; ensure sink is consumed on slow too.
+        f.slow.ConsumeSink(f.system);
+        f.fast.ConsumeSink(f.system);
+        f.Compare();
+    }
 }
 
 TEST_CASE("Maxwell3D fast method dispatch cost", "[.][maxwell_fast_method_bench]") {

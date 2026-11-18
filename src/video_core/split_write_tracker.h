@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <deque>
+#include <utility>
 
 #include "common/common_types.h"
 
@@ -69,6 +70,9 @@ public:
     /// (Tegra::g_nx2_code_epoch). Without it a Draw entry never validates (DrawsValid).
     void DrawEpoch(u64 epoch) {
         entry_epoch = entry_epoch == 0 ? epoch : (std::min)(entry_epoch, epoch);
+    }
+    [[nodiscard]] u64 TakeEntryEpoch() {
+        return std::exchange(entry_epoch, u64{0});
     }
 
     /// The entry that ends at `end` writes the guest memory in [begin, end_address). Ends never

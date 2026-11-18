@@ -167,6 +167,7 @@ public:
     /// counted. Returns whether it was (or would have been) counted.
     bool RepeatableMethod(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument,
                           bool is_last, bool direct, Effect effect, bool verify) {
+        FlushState();
         const u64 word = static_cast<u64>(Kind::Method) |
                          (direct ? IsLast | Direct : (is_last ? IsLast : 0)) |
                          (u64{method & 0xffff} << 8) | (u64{argument} << 32);
@@ -192,6 +193,26 @@ public:
         Commit(1, effect);
         repeat_end = write_position;
         return flagged;
+    }
+
+    /// Gathers consecutive 3D state register writes (not in execution_mask, not Replay) on the
+    /// front and sends them as one Kind::State entry before any other entry, publish or wait;
+    /// the back stores them and applies their dirty flags at once (Maxwell3D::WriteStateRegisters).
+    void StateWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 value,
+                    std::array<u8, 2> flags, Effect effect = Effect::None) {
+        const u64 epoch = writes.TakeEntryEpoch();
+        if (engine != state_engine || state_count == MaxStateWrites) {
+            FlushState();
+            state_engine = engine;
+        }
+        state_writes[state_count++] = u64{method} | (u64{value} << 32);
+        for (const u8 flag : flags) {
+            state_flags[flag / 64] |= u64{1} << (flag % 64);
+        }
+        if (epoch != 0) {
+            state_epoch = state_epoch == 0 ? epoch : (std::min)(state_epoch, epoch);
+        }
+        state_effect = SplitWriteTracker::Combine(state_effect, effect);
     }
 
     /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
@@ -232,6 +253,7 @@ public:
 
     /// Compute or copy work was just sent: what can write GPU-written command lists.
     void NoteWriter() {
+        FlushState();
         last_writer_position = write_position;
         if (eager_publish) {
             Publish(); // the fetch that waits for this entry usually follows within microseconds
@@ -244,6 +266,7 @@ public:
     /// bit; semaphore acquires drain): the guest's GPU work before it is complete before the
     /// commands after it are fetched.
     void NoteSync() {
+        FlushState();
         last_sync_position = write_position;
     }
     /// Waits until the back executed the work sent before the last NoteSync. Returns whether any
@@ -308,7 +331,8 @@ public:
         return newest;
     }
     /// Front: the ring position after the last entry sent.
-    [[nodiscard]] u64 WritePosition() const {
+    [[nodiscard]] u64 WritePosition() {
+        FlushState();
         return write_position;
     }
     /// The back's position right now.
@@ -326,6 +350,7 @@ public:
     /// Waits until the back consumed `position` (not what came after). Returns whether it had
     /// not yet.
     bool WaitUntil(u64 position, DrainSite site) {
+        FlushState();
         return WaitFor((std::min)(position, write_position), site);
     }
 
@@ -338,10 +363,13 @@ private:
         Method, ///< Bits 8-23 method, 32-63 argument; flags IsLast, HasSegment (word 1)
         Multi,  ///< Bits 8-23 method, 32-63 amount; word 1 methods pending, [segment], words
         Call,   ///< Bits 8-31 payload size in words; word 1 thunk, then the payload
+        State,  ///< Bits 32-63 count; words 1-4 dirty flags; then (method | value << 32) per write
     };
     static constexpr u64 IsLast = 1 << 4;
     static constexpr u64 HasSegment = 1 << 5;
     static constexpr u64 Direct = 1 << 6; ///< Method: call it even if not executable (macros)
+    static constexpr size_t StateFlagWords = 4;
+    static constexpr u32 MaxStateWrites = 128;
     /// Method, EDEN_NX2_PERF_VERIFY with draw_begin_coalesce: the front would have counted this
     /// entry into the one before it (RepeatableMethod)
     static constexpr u64 Repeatable = 1 << 7;
@@ -361,8 +389,17 @@ private:
         (*reinterpret_cast<const Func*>(payload))();
     }
 
+    /// Sends the state writes gathered so far (before any other entry, publish or wait).
+    void FlushState() {
+        if (state_count != 0) {
+            FlushStateSlow();
+        }
+    }
+    void FlushStateSlow();
+
     /// Room for an entry of `words` at the write position (never across the ring's end).
     u64* Reserve(size_t words) {
+        FlushState();
         const size_t index = write_position & RingMask;
         if (index + words <= RingWords && write_position + words - consumed_cache <= RingWords)
             [[likely]] {
@@ -384,6 +421,7 @@ private:
     }
     void WaitForSpace(size_t words);
     void SelectEngine(Tegra::Engines::EngineInterface* engine) {
+        FlushState();
         if (engine != front_engine) [[unlikely]] {
             SwitchEngine(engine);
         }
@@ -448,6 +486,13 @@ private:
     /// Words between publishes: small right after a drain, while the back has nothing to do.
     size_t publish_every{PublishEvery};
     Tegra::Engines::EngineInterface* front_engine{};
+    /// The state writes being gathered (StateWrite).
+    Tegra::Engines::EngineInterface* state_engine{};
+    u32 state_count{};
+    Effect state_effect{Effect::None};
+    u64 state_epoch{};
+    std::array<u64, StateFlagWords> state_flags{};
+    std::array<u64, MaxStateWrites> state_writes{};
 
     // Back side.
     Tegra::Engines::EngineInterface* back_engine{};

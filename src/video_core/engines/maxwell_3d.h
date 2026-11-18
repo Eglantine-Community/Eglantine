@@ -3223,6 +3223,14 @@ public:
     /// register writes from the SPSC ring in one loop.
     size_t CallStateMethodRun(const u64* entry, size_t max_words);
 
+    /// GpuSplit's back: applies a block of front-gathered state writes and pre-aggregated dirty
+    /// flags (GpuSplit::StateWrite), falling back to CallMethod one by one when needed.
+    void WriteStateRegisters(Core::System& system, std::span<const u64, 4> flags,
+                             std::span<const u64> writes);
+    void StoreStateRegisters(std::span<const u64, 4> flags, std::span<const u64> writes);
+    void VerifyStateRegisters(Core::System& system, std::span<const u64, 4> flags,
+                              std::span<const u64> writes, bool changes);
+
     /// GPU thread split with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2), called by
     /// the front instead of CallMethod: runs macros and macro uploads against a copy of the
     /// registers and sends the register writes to the back thread.
