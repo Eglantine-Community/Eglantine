@@ -527,8 +527,8 @@ public:
     /// Front thread: Synced when guest memory holds the page `device_addr` lies in (flushed and
     /// written by no GPU work since), else Copied with `out` filled from the copy of its last
     /// write once the GPU is done with it. Unknown otherwise: the caller drains and flushes.
-    /// Pages draws write are only Synced or Unknown, and NeedsSync until `past_sync`: the
-    /// split's back ran the work before the last host-level wait (GpuSplit::WaitForSync).
+    /// Pages draws write are NeedsSync until `past_sync`: once the split's back ran the work
+    /// before the last host-level wait (GpuSplit::WaitForSync), they are Synced or Copied too.
     /// With `pending_tick`, a copy the GPU has not finished returns Pending and sets the tick
     /// instead of waiting for it.
     Nx2ListRead Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool past_sync,
