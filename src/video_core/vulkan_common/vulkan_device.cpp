@@ -1898,11 +1898,15 @@ void Device::CollectPhysicalMemoryInfo() {
         const VkMemoryHeap& main = mem_properties.memoryHeaps[main_heap];
         u64 heap_size = mem_properties.memoryHeaps[element].size;
         if (is_heap_local) {
-            if ((main.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0 || heap_size > main.size) {
+            if (!is_integrated &&
+                ((main.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0 || heap_size > main.size)) {
                 main_heap = element;
             }
             heap_size = limit(heap_size);
             local_memory += heap_size;
+        }
+        if (is_integrated && heap_size > limit(main.size)) {
+            main_heap = element;
         }
         if (extensions.memory_budget) {
             device_initial_usage += budget.heapUsage[element];
@@ -1914,8 +1918,20 @@ void Device::CollectPhysicalMemoryInfo() {
     }
     if (is_integrated) {
         const s64 available_memory = static_cast<s64>(device_access_memory - device_initial_usage);
-        const u64 memory_size = Settings::values.vram_usage_mode.GetValue() == Settings::VramUsageMode::Aggressive ? 6_GiB : 4_GiB;
-        device_access_memory = static_cast<u64>(std::max<s64>(std::min<s64>(available_memory - 8_GiB, memory_size), std::min<s64>(local_memory, memory_size)));
+        const u64 memory_size =
+            Settings::values.vram_usage_mode.GetValue() == Settings::VramUsageMode::Aggressive
+                ? 6_GiB
+                : 4_GiB;
+        // Linux RADV exposes full host RAM here (> 8 GiB on 16 GiB systems), while Windows WDDM
+        // already halves host RAM into the shared GPU heap (~7.3 GiB on 16 GiB systems) alongside
+        // a small BIOS UMA carveout (often 64-512 MiB). Subtracting 8 GiB again on Windows went
+        // negative and collapsed device_access_memory to the 64 MiB carveout.
+        const s64 system_share = available_memory > static_cast<s64>(8_GiB)
+                                     ? available_memory - static_cast<s64>(8_GiB)
+                                     : (available_memory * 3) / 4;
+        device_access_memory = static_cast<u64>(
+            std::max<s64>(std::min<s64>(system_share, memory_size),
+                          std::min<s64>(local_memory, memory_size)));
     } else {
         const u64 reserve_memory = Settings::GetVramReserve(device_access_memory);
         device_access_memory -= reserve_memory;

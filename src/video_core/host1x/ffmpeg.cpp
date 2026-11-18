@@ -240,14 +240,19 @@ bool HardwareContext::InitializeForDecoder(DecoderContext& decoder_context, cons
             continue;
         }
 
+        // Check codec support before creating the device: creating FFmpeg's Vulkan device for a
+        // codec that cannot use it (e.g. AV1 via libdav1d on AMD GPUs without AV1 hardware decode)
+        // risks crashing the driver.
+        if (!decoder.SupportsDecodingOnDevice(&hw_pix_fmt, type)) {
+            continue;
+        }
+
         if (!this->InitializeWithType(type)) {
             continue;
         }
 
-        if (decoder.SupportsDecodingOnDevice(&hw_pix_fmt, type)) {
-            decoder_context.InitializeHardwareDecoder(*this, hw_pix_fmt);
-            return true;
-        }
+        decoder_context.InitializeHardwareDecoder(*this, hw_pix_fmt);
+        return true;
     }
 
     return false;

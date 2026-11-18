@@ -390,7 +390,35 @@ vk::Image MemoryAllocator::CreateUnbackedImage(const VkImageCreateInfo &ci, bool
 VmaAllocation MemoryAllocator::AllocateSparseMemory(const VkMemoryRequirements &requirements,
                                                    VkDeviceMemory &memory,
                                                    VkDeviceSize &offset) const {
-    const VmaAllocationCreateInfo alloc_ci{
+    const auto try_allocate = [&](const VmaAllocationCreateInfo& alloc_ci) -> VmaAllocation {
+        VmaAllocation allocation{};
+        VmaAllocationInfo info{};
+        u32 memory_type{};
+        if (requirements.size <= Device::SeparatePoolBlockSize / 2 &&
+            vmaFindMemoryTypeIndex(allocator, requirements.memoryTypeBits, &alloc_ci,
+                                   &memory_type) == VK_SUCCESS) {
+            if (const VmaPool pool =
+                    device.GetSeparatePool(Device::SeparatePool::SparsePages, memory_type)) {
+                VmaAllocationCreateInfo pool_ci = alloc_ci;
+                pool_ci.pool = pool;
+                if (vmaAllocateMemory(allocator, &requirements, &pool_ci, &allocation, &info) ==
+                    VK_SUCCESS) {
+                    memory = info.deviceMemory;
+                    offset = info.offset;
+                    return allocation;
+                }
+            }
+        }
+        if (vmaAllocateMemory(allocator, &requirements, &alloc_ci, &allocation, &info) !=
+            VK_SUCCESS) {
+            return VK_NULL_HANDLE;
+        }
+        memory = info.deviceMemory;
+        offset = info.offset;
+        return allocation;
+    };
+
+    const VmaAllocationCreateInfo device_ci{
         .flags = 0,
         .usage = VMA_MEMORY_USAGE_UNKNOWN,
         .requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
@@ -400,32 +428,22 @@ VmaAllocation MemoryAllocator::AllocateSparseMemory(const VkMemoryRequirements &
         .pUserData = nullptr,
         .priority = 0.f,
     };
-    VmaAllocation allocation{};
-    VmaAllocationInfo info{};
-    // In a pool of their own (see Device::SeparatePool); anything over half a block, or a pool
-    // allocation that fails, takes the default blocks.
-    u32 memory_type{};
-    if (requirements.size <= Device::SeparatePoolBlockSize / 2 &&
-        vmaFindMemoryTypeIndex(allocator, requirements.memoryTypeBits, &alloc_ci, &memory_type) ==
-            VK_SUCCESS) {
-        if (const VmaPool pool =
-                device.GetSeparatePool(Device::SeparatePool::SparsePages, memory_type)) {
-            VmaAllocationCreateInfo pool_ci = alloc_ci;
-            pool_ci.pool = pool;
-            if (vmaAllocateMemory(allocator, &requirements, &pool_ci, &allocation, &info) ==
-                VK_SUCCESS) {
-                memory = info.deviceMemory;
-                offset = info.offset;
-                return allocation;
-            }
-        }
+    if (const VmaAllocation allocation = try_allocate(device_ci)) {
+        return allocation;
     }
-    if (vmaAllocateMemory(allocator, &requirements, &alloc_ci, &allocation, &info) != VK_SUCCESS) {
-        return VK_NULL_HANDLE;
-    }
-    memory = info.deviceMemory;
-    offset = info.offset;
-    return allocation;
+    // Windows integrated GPUs expose a tiny DEVICE_LOCAL carveout (e.g. 64 MiB on AMD APUs) and a
+    // multi-GiB shared heap without DEVICE_LOCAL_BIT that supports optimal tiled sparse images.
+    const VmaAllocationCreateInfo shared_ci{
+        .flags = 0,
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        .requiredFlags = 0,
+        .preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        .memoryTypeBits = requirements.memoryTypeBits,
+        .pool = VK_NULL_HANDLE,
+        .pUserData = nullptr,
+        .priority = 0.f,
+    };
+    return try_allocate(shared_ci);
 }
 
 void MemoryAllocator::FreeSparseMemory(VmaAllocation allocation) const {
@@ -457,14 +475,39 @@ bool MemoryAllocator::CreateBufferInSeparatePool(const VkBufferCreateInfo& ci, M
         }
     }
     const VmaPool pool = device.GetSeparatePool(Device::SeparatePool::DeviceBuffers, memory_type);
-    if (pool == VK_NULL_HANDLE) {
+    if (pool != VK_NULL_HANDLE) {
+        VmaAllocationCreateInfo pool_ci = alloc_ci;
+        pool_ci.pool = pool;
+        pool_ci.memoryTypeBits = 0;
+        if (vmaCreateBuffer(allocator, &ci, &pool_ci, &handle, &allocation, &alloc_info) ==
+            VK_SUCCESS) {
+            return true;
+        }
+    }
+    // If a small BIOS carveout heap filled up (e.g. 64 MiB DEVICE_LOCAL on Windows APUs), move
+    // the cached buffer type to the next eligible heap so subsequent buffers still use a pool.
+    VmaAllocationCreateInfo fallback_ci = alloc_ci;
+    fallback_ci.memoryTypeBits = alloc_ci.memoryTypeBits & ~(1u << memory_type);
+    u32 alt_type{};
+    if (vmaFindMemoryTypeIndexForBufferInfo(allocator, &ci, &fallback_ci, &alt_type) != VK_SUCCESS) {
         return false;
     }
-    VmaAllocationCreateInfo pool_ci = alloc_ci;
-    pool_ci.pool = pool;
-    pool_ci.memoryTypeBits = 0;
-    return vmaCreateBuffer(allocator, &ci, &pool_ci, &handle, &allocation, &alloc_info) ==
-           VK_SUCCESS;
+    const VmaPool alt_pool = device.GetSeparatePool(Device::SeparatePool::DeviceBuffers, alt_type);
+    if (alt_pool == VK_NULL_HANDLE) {
+        return false;
+    }
+    VmaAllocationCreateInfo alt_pool_ci = alloc_ci;
+    alt_pool_ci.pool = alt_pool;
+    alt_pool_ci.memoryTypeBits = 0;
+    if (vmaCreateBuffer(allocator, &ci, &alt_pool_ci, &handle, &allocation, &alloc_info) !=
+        VK_SUCCESS) {
+        return false;
+    }
+    {
+        std::scoped_lock lk{buffer_type_mutex};
+        buffer_memory_types[(u64{ci.usage} << 32) | ci.flags] = alt_type;
+    }
+    return true;
 }
 
 vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage) const {

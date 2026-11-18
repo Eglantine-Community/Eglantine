@@ -230,12 +230,19 @@ public:
         }
         const size_t virtual_end = virtual_offset + length;
 
+        // Protect a range inside one mapped view directly without placeholder_mutex; VirtualProtect
+        // refuses ranges spanning placeholders or multiple views, which fall through to the locked
+        // per-view loop below.
+        DWORD old_flags{};
+        if (VirtualProtect(virtual_base + virtual_offset, length, new_flags, &old_flags)) {
+            return;
+        }
+
         std::scoped_lock lock{placeholder_mutex};
         auto [it, end] = placeholders.equal_range({virtual_offset, virtual_end});
         while (it != end) {
             const size_t offset = (std::max)(it->lower(), virtual_offset);
             const size_t protect_length = (std::min)(it->upper(), virtual_end) - offset;
-            DWORD old_flags{};
             if (!VirtualProtect(virtual_base + offset, protect_length, new_flags, &old_flags)) {
                 LOG_CRITICAL(HW_Memory, "Failed to change virtual memory protect rules");
             }
