@@ -83,7 +83,6 @@ using Maxwell = Tegra::Engines::Maxwell3D::Regs;
 using VideoCommon::ImageViewId;
 using VideoCommon::ImageViewType;
 
-
 namespace {
 /// read_gpu_memory: the first address space (the bound channel's first) that maps the whole range,
 /// read as the GPU reads it, without flushing GPU caches.
@@ -481,8 +480,20 @@ void RasterizerVulkan::Nx2ProveNonWriterDraw(const GraphicsPipeline& pipeline) {
     Tegra::Nx2DrawPrograms programs;
     if (!Tegra::Engines::Maxwell3D::Nx2DrawProgramsOf(
             maxwell3d->regs, maxwell3d->GetNativeMacroEngine().native_turing, gpu_memory->GetID(),
-            map, programs) ||
-        Tegra::Nx2IsNonWriterDraw(programs, epoch)) {
+            map, programs)) {
+        return;
+    }
+    static constexpr bool reuse_proof = true;
+    if (reuse_proof && last_non_writer_epoch == epoch &&
+        last_non_writer_programs == programs &&
+        Tegra::g_nx2_code_epoch.load(std::memory_order_acquire) == epoch) {
+        return;
+    }
+    if (Tegra::Nx2IsNonWriterDraw(programs, epoch)) {
+        if (reuse_proof) {
+            last_non_writer_programs = programs;
+            last_non_writer_epoch = epoch;
+        }
         return;
     }
     // The indirect reset program is drawn by writing guest memory on the host.
@@ -506,6 +517,10 @@ void RasterizerVulkan::Nx2ProveNonWriterDraw(const GraphicsPipeline& pipeline) {
         return;
     }
     Tegra::Nx2InsertNonWriterDraw(programs, epoch);
+    if (reuse_proof) {
+        last_non_writer_programs = programs;
+        last_non_writer_epoch = epoch;
+    }
 }
 
 // Experimental adaptation of PokeDinner commit 76df4591a747: execute the reset shader's
@@ -1077,10 +1092,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         return;
     }
     if (frame_dump.Capturing()) {
-        frame_dump.NoteKeys(pipeline->ShaderHashes(),
-                            pipeline_cache.GraphicsNativeKeys(pipeline->ShaderHashes()));
+        const auto& shader_hashes = pipeline->ShaderHashes();
+        frame_dump.NoteKeys(shader_hashes, pipeline_cache.GraphicsNativeKeys(shader_hashes));
         FrameDumpPass(texture_cache.GetFramebuffer());
-        frame_dump.NoteDraw(pipeline->ShaderHashes());
+        frame_dump.NoteDraw(shader_hashes);
         bool recorded = false;
         if (frame_dump.CapturingSampled()) {
             boost::container::small_vector<FrameDump::Sampled, 16> sampled;
@@ -1091,7 +1106,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
             recorded = frame_dump.NoteSampled(sampled);
         }
         if (frame_dump.CapturingBuffers()) {
-            recorded |= FrameDumpBuffers(false, pipeline->ShaderHashes());
+            recorded |= FrameDumpBuffers(false, shader_hashes);
         }
         if (recorded) {
             scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
@@ -1172,7 +1187,6 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         }
     }
 }
-
 
 namespace {
 // EDEN_NX2_WINDOW_TRACE: describe clears and draws into screen-sized colour targets (debug aid).
@@ -1838,6 +1852,8 @@ void RasterizerVulkan::Clear(u32 layer_count) {
             cmdbuf.ClearAttachments(attachment, clear_rect);
         });
     }
+    // The depth/stencil attachment was written (BarrierFeedbackLoop).
+    scheduler.NoteDepthStencilWrite();
 }
 
 namespace {
@@ -1854,6 +1870,16 @@ bool SyncFixEnabled() {
 
 void RasterizerVulkan::DispatchCompute() {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Compute};
+    static constexpr bool writer_preflush = true;
+    if (writer_preflush && submit_while_waited &&
+        Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
+        VideoCommon::GpuSplit::OnBackThread() &&
+        VideoCommon::GpuSplit::Get().FrontWaitsForBack() && scheduler.IsRenderPassActive() &&
+        scheduler.DrawsSinceSubmit() != 0) {
+        // Start the graphics tail while this dispatch's resources are prepared.
+        VideoCommon::Nx2Profile::FlushOriginTag tag{VideoCommon::Nx2Profile::FlushOrigin::Waited};
+        scheduler.Flush();
+    }
     FlushWork();
     gpu_memory->FlushCaching();
     if (frame_dump.Capturing()) {
@@ -2090,10 +2116,8 @@ void RasterizerVulkan::NoteWriterDeps(const ComputePipeline& pipeline) {
 }
 
 void RasterizerVulkan::SubmitNx2ListCopies() {
-    // Submitted at once: ReadGpuWrittenCommands waits on these copies, so they can't sit out
-    // the longer DeferFlush interval (#161).
-    if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick()) &&
-        (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::FenceFlush) || !scheduler.DeferFlush())) {
+    // Only short bursts coalesce; a reader requests the deferred submission from its owner.
+    if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick()) && !scheduler.DeferListCopyFlush()) {
         VideoCommon::Nx2Profile::FlushOriginTag tag{VideoCommon::Nx2Profile::FlushOrigin::ListCopy};
         scheduler.Flush();
     }
@@ -2132,6 +2156,9 @@ void RasterizerVulkan::NoteGpuWrittenCommandListSynced(DAddr page) {
 }
 
 void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
+    if (addr != 0 && query_cache.TryFlushHostQueryRegion(addr, size)) {
+        return;
+    }
     if (addr == 0 || size == 0 || !query_cache.SemiFlushRegion(addr, size)) {
         return;
     }
@@ -2147,17 +2174,30 @@ bool RasterizerVulkan::WaitQueryResultsFence(DAddr addr) {
         std::mutex mutex;
         std::condition_variable cv;
         bool written{};
+        std::atomic<bool> observed{};
     };
     const auto state = std::make_shared<WaitState>();
     fence_manager.SyncOperation([state] {
         std::scoped_lock lock{state->mutex};
         state->written = true;
+        if (Nx2Sync::MergeWaits()) {
+            state->observed.store(true, std::memory_order_release);
+        }
         state->cv.notify_all();
     });
     fence_manager.SignalFence([] {});
     scheduler.FlushDeferred();
     // Never hang the GPU thread on it: wait in slices, submitting deferred work again, and give up
     // after 2 s (the read may then see older report values).
+    if (Nx2Sync::MergeWaits()) {
+        const auto spin_end = std::chrono::steady_clock::now() + std::chrono::microseconds{20};
+        do {
+            if (state->observed.load(std::memory_order_acquire)) {
+                return true;
+            }
+            Common::CpuRelax();
+        } while (std::chrono::steady_clock::now() < spin_end);
+    }
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     std::unique_lock lock{state->mutex};
     while (!state->cv.wait_for(lock, std::chrono::milliseconds(5),
@@ -2498,6 +2538,25 @@ void RasterizerVulkan::WaitForIdle() {
     }
 
     query_cache.NotifyWFI();
+
+    // Inside a render pass whose draws wrote no storage buffers or transform feedback, the
+    // draws after the wait need nothing from the draws before it that rasterization order does
+    // not already give: the barrier waits until the pass ends (Scheduler::DeferWaitForIdle).
+    // Ocarina of Time ended 820-1,200 render passes a second here. EDEN_NX2_WFI_DEFER=0 ends
+    // the pass every time, as before; so does EGLANTINE_SYNC_FIX=0.
+    static const bool defer_wfi = [] {
+        const char* env = std::getenv("EDEN_NX2_WFI_DEFER");
+        return env == nullptr || std::string_view{env} != "0";
+    }();
+    if (defer_wfi && SyncFixEnabled() && scheduler.IsRenderPassActive() &&
+        !scheduler.RenderPassHasStores() &&
+        maxwell3d != nullptr && maxwell3d->regs.transform_feedback_enabled == 0) {
+        scheduler.DeferWaitForIdle(flags);
+        VideoCommon::Nx2Profile::Scope profile_scope{
+            VideoCommon::Nx2Profile::Zone::SignalOrdering};
+        fence_manager.SignalOrdering();
+        return;
+    }
 
     scheduler.RequestOutsideRenderPassOperationContext();
     if (SyncFixEnabled()) {
@@ -2986,8 +3045,8 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
     const bool defer = VideoCommon::Nx2Knob::Live(defer_start, VideoCommon::Nx2Knob::InlineDefer);
     // One cache at a time: holding both while waiting for either (std::lock) waited longer, the
     // fencing thread and CPU write traps holding one of them most of the time.
-    bool uploaded;
-    {
+    bool uploaded = false;
+    if (!defer || !buffer_cache.CanSkipInlineMemory(*cpu_addr, copy_size)) {
         VideoCommon::Nx2DrawStats::LockTimer lock_probe{VideoCommon::Nx2DrawStats::Site::LockInlineMemory};
         std::scoped_lock lock{buffer_cache.mutex};
         lock_probe.Acquired();
@@ -3147,7 +3206,11 @@ void RasterizerVulkan::FlushWork() {
                                      ? native_draws
                                      : DRAWS_TO_DISPATCH;
     if (draw_counter < draws_to_dispatch) {
-        scheduler.DispatchWork();
+        static constexpr bool batch_dispatch = true;
+        if (!batch_dispatch || !maxwell3d->GetNativeMacroEngine().native_turing ||
+            (draw_counter & 127) == 0) {
+            scheduler.DispatchWork();
+        }
         return;
     }
     {
@@ -3207,7 +3270,8 @@ bool AccelerateDMA::BufferCopy(GPUVAddr src_address, GPUVAddr dest_address, u64 
     std::scoped_lock lock{buffer_cache.mutex};
     buffer_cache.Nx2CollectListCopies(true);
     const bool copied = buffer_cache.DMACopy(src_address, dest_address, amount);
-    if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
+    if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick()) &&
+        (!Nx2Sync::MergeWaits() || !scheduler.DeferListCopyFlush())) {
         VideoCommon::Nx2Profile::FlushOriginTag tag{VideoCommon::Nx2Profile::FlushOrigin::ListCopy};
         scheduler.Flush();
     }
@@ -3401,6 +3465,7 @@ void RasterizerVulkan::UpdateDynamicStates(const GraphicsPipeline* pipeline) {
                         return attrib.type == Maxwell3D::Regs::VertexAttribute::Type::Float;
                     });
                 regs.logic_op.enable = static_cast<u32>(!has_float);
+                maxwell3d->dirty.pipeline_state_dirty = true;
             }
             UpdateLogicOpEnable(regs);
             UpdateDepthClampEnable(regs);
@@ -3446,6 +3511,8 @@ void RasterizerVulkan::HandleTransformFeedback() {
     query_cache.CounterEnable(VideoCommon::QueryType::StreamingByteCount,
                               regs.transform_feedback_enabled);
     if (regs.transform_feedback_enabled != 0) {
+        // Transform feedback writes buffers from inside the pass (WaitForIdle may not defer).
+        scheduler.NoteRenderPassStores();
         // Log extension usage for transform feedback
         if (GPU::Logging::IsActive()) {
             GPU::Logging::GPULogger::GetInstance().LogExtensionUsage(
@@ -4195,7 +4262,6 @@ void RasterizerVulkan::UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs) 
     const u32 max_bindings =
         static_cast<u32>(std::min<size_t>(Maxwell::NumVertexArrays,
                                           device.GetMaxVertexInputBindings()));
-
 
     for (u32 index = 0; index < max_attributes; ++index) {
         const Maxwell::VertexAttribute attribute{regs.vertex_attrib_format[index]};
