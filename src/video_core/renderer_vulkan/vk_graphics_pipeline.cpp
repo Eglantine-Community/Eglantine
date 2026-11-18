@@ -927,6 +927,39 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         }
     }
 
+    const bool needs_build_wait{!is_built.load(std::memory_order::acquire)};
+    const auto make_build_wait = [&] {
+        const auto& regs{maxwell3d->regs};
+        const auto& draw_state{maxwell3d->draw_manager.draw_state};
+        const GPUVAddr rt0_addr{regs.rt[0].Address()};
+        const u32 rt0_w{regs.rt[0].width};
+        const u32 rt0_h{regs.rt[0].height};
+        const u32 elem_count{draw_state.draw_element_count};
+        const u32 inst_count{draw_state.instance_count + 1};
+        const u32 zeta{regs.zeta_enable};
+        const u32 num_rt{static_cast<u32>(NumAttachments(key.state))};
+        const bool mesh{IsMeshPipeline()};
+        const bool indirect{elem_count == 0 && !mesh};
+        return [this, rt0_addr, rt0_w, rt0_h, elem_count, inst_count, is_indexed, indirect, zeta,
+                num_rt, mesh](vk::CommandBuffer) {
+            if (is_built.load(std::memory_order::acquire)) {
+                return;
+            }
+            const auto begin = std::chrono::steady_clock::now();
+            RunBuild();
+            {
+                std::unique_lock lock{build_mutex};
+                build_condvar.wait(lock,
+                                   [this] { return is_built.load(std::memory_order::acquire); });
+            }
+            const std::string details = fmt::format(
+                " (rt0={:#x} {}x{} elems={} inst={} {}{} zeta={} rts={}{})", rt0_addr, rt0_w,
+                rt0_h, elem_count, inst_count, is_indexed ? "indexed" : "array",
+                indirect ? "-indirect" : "", zeta, num_rt, mesh ? " mesh" : "");
+            ReportPipelineBuildWait("Graphics", key.Hash(), begin, details);
+        };
+    };
+
     // The set the emulation's dispatch commits and its draw binds. Per draw: the dispatches of
     // a render pass's emulated draws can all run before the pass (RecordBeforeRenderPass).
     std::shared_ptr<VkDescriptorSet> mesh_set_slot;
@@ -945,6 +978,11 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             // Before the pass: the same programs, one command per stage, without barriers of
             // their own (the scheduler puts one between stages for all the pass's draws).
             const bool has_task{mesh_emulation->has_task};
+            if (needs_build_wait) {
+                scheduler.RecordBeforeRenderPass(
+                    has_task ? Scheduler::PrePassStage::Task : Scheduler::PrePassStage::Mesh,
+                    make_build_wait());
+            }
             const auto program_state = [this, rescaling_data = rescaling.Data(),
                                         is_rescaling = texture_cache.IsRescaling(),
                                         uses_render_area = render_area.uses_render_area,
@@ -1066,6 +1104,9 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                     });
             }
         } else {
+            if (needs_build_wait) {
+                scheduler.Record(make_build_wait());
+            }
             scheduler.Record([this, descriptor_data, groups = mesh_groups, capacity = mesh_capacity,
                               task_buffers = mesh_task_buffers, set_slot = mesh_set_slot,
                               rescaling_data = rescaling.Data(), is_rescaling = texture_cache.IsRescaling(),
@@ -1199,34 +1240,8 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         (maxwell3d->regs.depth_write_enabled != 0 || maxwell3d->regs.stencil_enable != 0)) {
         scheduler.NoteDepthStencilWrite();
     }
-    if (!is_built.load(std::memory_order::relaxed)) {
-        // Wait for the pipeline to be built
-        const auto& regs{maxwell3d->regs};
-        const auto& draw_state{maxwell3d->draw_manager.draw_state};
-        const GPUVAddr rt0_addr{regs.rt[0].Address()};
-        const u32 rt0_w{regs.rt[0].width};
-        const u32 rt0_h{regs.rt[0].height};
-        const u32 elem_count{draw_state.draw_element_count};
-        const u32 inst_count{draw_state.instance_count + 1};
-        const u32 zeta{regs.zeta_enable};
-        const u32 num_rt{static_cast<u32>(NumAttachments(key.state))};
-        const bool mesh{IsMeshPipeline()};
-        const bool indirect{elem_count == 0 && !mesh};
-        scheduler.Record([this, rt0_addr, rt0_w, rt0_h, elem_count, inst_count, is_indexed,
-                          indirect, zeta, num_rt, mesh](vk::CommandBuffer) {
-            const auto begin = std::chrono::steady_clock::now();
-            RunBuild();
-            {
-                std::unique_lock lock{build_mutex};
-                build_condvar.wait(lock,
-                                   [this] { return is_built.load(std::memory_order::relaxed); });
-            }
-            const std::string details = fmt::format(
-                " (rt0={:#x} {}x{} elems={} inst={} {}{} zeta={} rts={}{})", rt0_addr, rt0_w,
-                rt0_h, elem_count, inst_count, is_indexed ? "indexed" : "array",
-                indirect ? "-indirect" : "", zeta, num_rt, mesh ? " mesh" : "");
-            ReportPipelineBuildWait("Graphics", key.Hash(), begin, details);
-        });
+    if (!mesh_emulation && needs_build_wait) {
+        scheduler.Record(make_build_wait());
     }
     const bool is_rescaling{texture_cache.IsRescaling()};
     const bool update_rescaling{scheduler.UpdateRescaling(is_rescaling)};
@@ -1301,8 +1316,10 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             return;
         }
         if (mesh_emulation) {
-            // The set the emulation's dispatch committed (see above).
-            if (mesh_set_slot && *mesh_set_slot) {
+            // Skip the draw if the compute pass did not commit a descriptor set or write draw args.
+            const bool missing = !pipeline || !mesh_set_slot || !*mesh_set_slot;
+            scheduler.SetGraphicsPipelineMissing(missing);
+            if (!missing) {
                 cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout, 0,
                                           *mesh_set_slot, nullptr);
             }
