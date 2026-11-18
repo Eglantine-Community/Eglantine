@@ -2047,9 +2047,16 @@ private:
                 100'000'000'000LL * swap_interval / refresh_rate / Settings::SpeedLimit()};
         }
         m_release_time = interval.count() == 0 ? now : (std::max)(now, m_release_time);
-        system.CoreTiming().ScheduleEvent(m_release_time, m_release_timer, true);
+        const u32 next_value = ++m_release_value;
+        auto& syncpoints = system.Host1x().GetSyncpointManager();
+        if (m_release_time <= now &&
+            syncpoints.GetGuestSyncpointValue(m_release_syncpoint) == next_value - 1) {
+            syncpoints.IncrementGuest(m_release_syncpoint);
+        } else {
+            system.CoreTiming().ScheduleEvent(m_release_time, m_release_timer, true);
+        }
         m_release_time += interval;
-        return {~m_release_syncpoint, 0, ++m_release_value, 0};
+        return {~m_release_syncpoint, 0, next_value, 0};
     }
 
     u32 m_release_syncpoint{~0U};

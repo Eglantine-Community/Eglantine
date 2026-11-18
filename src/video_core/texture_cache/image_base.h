@@ -134,6 +134,7 @@ struct ImageBase {
     VAddr cpu_addr_end = 0;
 
     u64 modification_tick = 0;
+    u64 newest_alias_tick = 0;
     /// Tick of the latest CPU write: an upload of that data is as new as the write, not newer.
     u64 cpu_modification_tick = 0;
     u64 first_written_frame = 0; ///< First frame_tick+1 a non-clear GPU write modified this image.
@@ -181,5 +182,14 @@ struct ImageAllocBase {
 };
 
 bool AddImageAlias(ImageBase& lhs, ImageBase& rhs, ImageId lhs_id, ImageId rhs_id);
+
+template <typename Images>
+void SetModificationTick(Images& images, ImageBase& image, u64 tick) {
+    image.modification_tick = tick;
+    for (const AliasedImage& alias : image.aliased_images) {
+        u64& newest = images[alias.id].newest_alias_tick;
+        newest = (std::max)(newest, tick);
+    }
+}
 
 } // namespace VideoCommon

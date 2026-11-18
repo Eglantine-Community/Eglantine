@@ -27,15 +27,25 @@ constexpr bool IsValidVirtualCoreId(int32_t core_id) {
 }
 
 // Switch 2 hardware has eight cores. Six are emulated (the most an application is given), so
-// fold any id past them back onto the low cores, both in core ids and in affinity masks.
+// fold any id past them onto the high emulated cores (e.g. 6 -> 5, 7 -> 4) rather than Core 0
+// where the application's main render thread lives.
 constexpr int32_t FoldExtraCoreId(int32_t core_id) {
     constexpr auto num_cores = static_cast<int32_t>(Core::Hardware::NUM_CPU_CORES);
-    return core_id >= num_cores && core_id < 2 * num_cores ? core_id - num_cores : core_id;
+    return core_id >= num_cores && core_id < 2 * num_cores
+               ? (num_cores - 1) - (core_id - num_cores)
+               : core_id;
 }
 
 constexpr u64 FoldExtraCoreMask(u64 mask) {
-    constexpr u64 low = (1ULL << Core::Hardware::NUM_CPU_CORES) - 1;
-    return (mask & low) | ((mask >> Core::Hardware::NUM_CPU_CORES) & low);
+    constexpr auto num_cores = static_cast<int32_t>(Core::Hardware::NUM_CPU_CORES);
+    constexpr u64 low = (1ULL << num_cores) - 1;
+    u64 folded = mask & low;
+    for (int32_t c = num_cores; c < 2 * num_cores; ++c) {
+        if ((mask & (1ULL << c)) != 0) {
+            folded |= 1ULL << FoldExtraCoreId(c);
+        }
+    }
+    return folded;
 }
 
 } // Anonymous namespace

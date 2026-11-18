@@ -1849,10 +1849,17 @@ void EmitContext::DefineInputs(const IR::Program& program) {
                                 input_type == AttributeType::UnsignedInt;
         if (runtime_info.per_primitive_generics.test(index)) {
             // Written per primitive by a mesh program: constant over the primitive.
-            AddExtension("SPV_EXT_mesh_shader");
-            AddCapability(spv::Capability::MeshShadingEXT);
-            Decorate(id, spv::Decoration::PerPrimitiveEXT);
-            if (is_integer) {
+            // Without VK_EXT_mesh_shader, EmitMeshEmulationVertex writes the same primitive
+            // attribute value to every corner of the primitive, so Flat interpolation yields
+            // the exact constant value without requiring SPV_EXT_mesh_shader.
+            if (profile.support_mesh_shader) {
+                AddExtension("SPV_EXT_mesh_shader");
+                AddCapability(spv::Capability::MeshShadingEXT);
+                Decorate(id, spv::Decoration::PerPrimitiveEXT);
+                if (is_integer) {
+                    Decorate(id, spv::Decoration::Flat);
+                }
+            } else {
                 Decorate(id, spv::Decoration::Flat);
             }
             continue;

@@ -20,10 +20,19 @@ namespace Common {
 
 class Event {
 public:
+#ifdef _WIN32
+    ~Event();
+#endif
+
     void Set() {
         std::scoped_lock lk{mutex};
         if (!is_set) {
             is_set = true;
+#ifdef _WIN32
+            if (sleepers != 0) {
+                WakeSleeper();
+            }
+#endif
             condvar.notify_one();
         }
     }
@@ -35,6 +44,9 @@ public:
     }
 
     bool WaitFor(const std::chrono::nanoseconds time);
+
+    /// Like WaitFor, but blocks in the OS using a high-resolution waitable timer on Windows.
+    bool SleepFor(const std::chrono::nanoseconds time);
 
     template<class Clock, class Duration>
     bool WaitUntil(const std::chrono::time_point<Clock, Duration> time) {
@@ -57,9 +69,17 @@ public:
     }
 
 private:
+#ifdef _WIN32
+    void WakeSleeper();
+#endif
+
     alignas(64) std::atomic<bool> is_set{false};
     std::condition_variable condvar;
     std::mutex mutex;
+#ifdef _WIN32
+    void* sleep_wake{};
+    u32 sleepers{};
+#endif
 };
 
 class Barrier {
@@ -121,5 +141,20 @@ void PinCurrentThread(PinnedRole role);
 
 void RefreshThreadPolicies();
 void PollThreadPolicies();
+
+constexpr std::chrono::nanoseconds NextPollWindow(std::chrono::nanoseconds poll,
+                                                  std::chrono::nanoseconds waited,
+                                                  std::chrono::nanoseconds limit) {
+    if (waited <= poll) {
+        return poll;
+    }
+    if (waited <= limit) {
+        return (std::min)(poll * 2, limit);
+    }
+    return (std::max)(poll / 2, limit / 8);
+}
+
+/// Waits until flag is true or the deadline passes, using MWAITX/UMWAIT when supported.
+bool WaitForFlag(const std::atomic<bool>& flag, std::chrono::steady_clock::time_point deadline);
 
 } // namespace Common

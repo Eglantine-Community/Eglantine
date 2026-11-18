@@ -271,4 +271,11 @@ void SinkStream::SignalPause() {
     release_cv.notify_one();
 }
 
+void SinkStream::AdvancePlayedSampleCount(u64 num_frames) {
+    std::scoped_lock lk{sample_count_lock};
+    last_sample_count_update_time = system.CoreTiming().GetGlobalTimeNs();
+    min_played_sample_count = max_played_sample_count;
+    max_played_sample_count += num_frames;
+}
+
 } // namespace AudioCore::Sink

@@ -54,6 +54,30 @@ MasterSemaphore::MasterSemaphore(const Device& device_) : device(device_) {
     };
     semaphore = device.GetLogical().CreateSemaphore(semaphore_ci);
 
+    if (Tegra::Nx2PendingWake::On()) {
+        Tegra::g_pending_gpu_tick.Reset();
+        tick_wait_thread = std::jthread([this](std::stop_token stop_token) {
+            while (!stop_token.stop_requested()) {
+                const u64 wanted = Tegra::g_pending_gpu_tick.Wanted();
+                if (wanted == Tegra::PendingGpuTick::NoTick) {
+                    Tegra::g_pending_gpu_tick.WaitForWatch();
+                    continue;
+                }
+                if (!IsFree(wanted)) {
+                    try {
+                        (void)semaphore.Wait(wanted, 5'000'000);
+                    } catch (const vk::Exception&) {
+                        return;
+                    }
+                }
+                Refresh();
+                if (IsFree(wanted)) {
+                    NotifyCompletedGpuTick(KnownGpuTick());
+                }
+            }
+        });
+    }
+
     if (!Settings::values.renderer_debug) {
         return;
     }
@@ -70,7 +94,13 @@ MasterSemaphore::MasterSemaphore(const Device& device_) : device(device_) {
     });
 }
 
-MasterSemaphore::~MasterSemaphore() = default;
+MasterSemaphore::~MasterSemaphore() {
+    if (tick_wait_thread.joinable()) {
+        tick_wait_thread.request_stop();
+        Tegra::g_pending_gpu_tick.WakeAll();
+        tick_wait_thread.join();
+    }
+}
 
 void MasterSemaphore::Refresh() {
     if (!semaphore) {
@@ -83,7 +113,8 @@ void MasterSemaphore::Refresh() {
     do {
         this_tick = gpu_tick.load(std::memory_order_acquire);
         counter = semaphore.GetCounter();
-        if (counter < this_tick) {
+        // Unchanged: no store, which would take the cache line from the threads reading it.
+        if (counter <= this_tick) {
             return;
         }
     } while (!gpu_tick.compare_exchange_weak(this_tick, counter, std::memory_order_release,

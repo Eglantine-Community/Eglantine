@@ -2220,8 +2220,9 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     image.flags &= ~ImageFlagBits::CpuModified;
     image.flags &= ~ImageFlagBits::GpuModified;
     // Aliases the GPU wrote after this data was written stay newer, so they are copied over it.
-    image.modification_tick =
-        image.cpu_modification_tick != 0 ? image.cpu_modification_tick : ++modification_tick;
+    SetModificationTick(slot_images, image,
+                        image.cpu_modification_tick != 0 ? image.cpu_modification_tick
+                                                         : ++modification_tick);
 
     // Images uploaded by layer stay tracked while some of their layers are dirty.
     if (False(image.flags & ImageFlagBits::Tracked)) {
@@ -3666,7 +3667,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                 continue;
             }
             CopyImage(new_image_id, aliased->id, aliased->copies);
-            new_image.modification_tick = overlap.modification_tick;
+            SetModificationTick(slot_images, new_image, overlap.modification_tick);
             continue;
         }
         if (True(overlap.flags & ImageFlagBits::GpuModified)) {
@@ -3681,7 +3682,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             } else {
                 runtime.CopyImage(new_image, overlap, copies);
             }
-            new_image.modification_tick = overlap.modification_tick;
+            SetModificationTick(slot_images, new_image, overlap.modification_tick);
         }
         if (True(overlap.flags & ImageFlagBits::Tracked)) {
             UntrackImage(overlap, copy_object.id);
@@ -4488,13 +4489,16 @@ void TextureCache<P>::RemoveFramebuffers(std::span<const ImageViewId> removed_vi
 template <class P>
 void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
     image.flags |= ImageFlagBits::GpuModified;
-    image.modification_tick = ++modification_tick;
+    SetModificationTick(slot_images, image, ++modification_tick);
 }
 
 template <class P>
 void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
-    boost::container::small_vector<const AliasedImage*, 8> aliased_images;
     Image& image = slot_images[image_id];
+    if (image.newest_alias_tick <= image.modification_tick) {
+        return;
+    }
+    boost::container::small_vector<const AliasedImage*, 8> aliased_images;
     bool any_rescaled = True(image.flags & ImageFlagBits::Rescaled);
     bool any_modified = True(image.flags & ImageFlagBits::GpuModified);
     u64 most_recent_tick = image.modification_tick;
@@ -4511,6 +4515,7 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
         }
     }
     if (aliased_images.empty()) {
+        image.newest_alias_tick = image.modification_tick;
         return;
     }
     const bool can_rescale = ImageCanRescale(image);
@@ -4521,7 +4526,8 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
             ScaleDown(image);
         }
     }
-    image.modification_tick = most_recent_tick;
+    SetModificationTick(slot_images, image, most_recent_tick);
+    image.newest_alias_tick = most_recent_tick;
     if (any_modified) {
         image.flags |= ImageFlagBits::GpuModified;
     }

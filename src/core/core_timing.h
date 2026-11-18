@@ -134,6 +134,10 @@ public:
     /// Checks for events manually and returns time in nanoseconds for next event, threadsafe.
     std::optional<s64> Advance();
 
+private:
+    void WaitForEvent(s64 next_time);
+
+public:
 #ifdef _WIN32
     void SetTimerResolutionNs(std::chrono::nanoseconds ns);
 #endif

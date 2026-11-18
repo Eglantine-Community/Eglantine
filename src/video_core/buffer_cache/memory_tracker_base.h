@@ -20,6 +20,7 @@
 #include "common/alignment.h"
 #include "common/common_types.h"
 #include "video_core/buffer_cache/word_manager.h"
+#include "video_core/page_filter.h"
 
 namespace VideoCommon {
 
@@ -74,20 +75,70 @@ public:
     }
 
     /// Nx2Perf bind_memo: bumped whenever CPU-modified bits may be set (cpu) and whenever
-    /// GPU-modified bits change (gpu). A binding synced clean stays clean while cpu is unchanged.
+    /// GPU-modified bits change (gpu). Tracked per 4 MiB chunk so unrelated writes don't
+    /// invalidate every bound buffer's memo.
     [[nodiscard]] u64 CpuEpoch() const noexcept {
         return cpu_epoch;
     }
     [[nodiscard]] u64 GpuEpoch() const noexcept {
         return gpu_epoch;
     }
+    [[nodiscard]] u64 CpuRangeEpoch(VAddr addr, u64 size) const noexcept {
+        const size_t first = addr >> HIGHER_PAGE_BITS;
+        const size_t last = (addr + (std::max<u64>)(size, 1) - 1) >> HIGHER_PAGE_BITS;
+        if (last - first >= MAX_RANGE_EPOCH_CHUNKS) {
+            return (u64{1} << 63) | cpu_epoch;
+        }
+        u64 sum = structural_cpu_epoch;
+        for (size_t page = first; page <= last; ++page) {
+            sum += cpu_chunk_epochs[page & (CHUNK_EPOCH_SLOTS - 1)];
+        }
+        return sum & ~(u64{1} << 63);
+    }
+    [[nodiscard]] u64 GpuRangeEpoch(VAddr addr, u64 size) const noexcept {
+        const size_t first = addr >> HIGHER_PAGE_BITS;
+        const size_t last = (addr + (std::max<u64>)(size, 1) - 1) >> HIGHER_PAGE_BITS;
+        if (last - first >= MAX_RANGE_EPOCH_CHUNKS) {
+            return (u64{1} << 63) | gpu_epoch;
+        }
+        u64 sum = structural_gpu_epoch;
+        for (size_t page = first; page <= last; ++page) {
+            sum += gpu_chunk_epochs[page & (CHUNK_EPOCH_SLOTS - 1)];
+        }
+        return sum & ~(u64{1} << 63);
+    }
     void BumpGpuEpoch() noexcept {
         ++gpu_epoch;
+        ++structural_gpu_epoch;
+    }
+    void BumpGpuRangeEpoch(VAddr addr, u64 size) noexcept {
+        ++gpu_epoch;
+        const size_t first = addr >> HIGHER_PAGE_BITS;
+        const size_t last = (addr + (std::max<u64>)(size, 1) - 1) >> HIGHER_PAGE_BITS;
+        if (last - first >= CHUNK_EPOCH_SLOTS) {
+            ++structural_gpu_epoch;
+            return;
+        }
+        for (size_t page = first; page <= last; ++page) {
+            ++gpu_chunk_epochs[page & (CHUNK_EPOCH_SLOTS - 1)];
+        }
+    }
+    void BumpCpuRangeEpoch(VAddr addr, u64 size) noexcept {
+        ++cpu_epoch;
+        const size_t first = addr >> HIGHER_PAGE_BITS;
+        const size_t last = (addr + (std::max<u64>)(size, 1) - 1) >> HIGHER_PAGE_BITS;
+        if (last - first >= CHUNK_EPOCH_SLOTS) {
+            ++structural_cpu_epoch;
+            return;
+        }
+        for (size_t page = first; page <= last; ++page) {
+            ++cpu_chunk_epochs[page & (CHUNK_EPOCH_SLOTS - 1)];
+        }
     }
 
     /// Mark region as CPU modified, notifying the device_tracker about this change
     void MarkRegionAsCpuModified(VAddr dirty_cpu_addr, u64 query_size) {
-        ++cpu_epoch;
+        BumpCpuRangeEpoch(dirty_cpu_addr, query_size);
         IteratePages<true>(dirty_cpu_addr, query_size, [](Manager* manager, u64 offset, size_t size) {
             manager->ChangeRegionState(Type::CPU, true, manager->cpu_addr + offset, size);
         });
@@ -95,6 +146,7 @@ public:
 
     /// Unmark region as CPU modified, notifying the device_tracker about this change
     void UnmarkRegionAsCpuModified(VAddr dirty_cpu_addr, u64 query_size) {
+        ever_synchronized_pages.Mark(dirty_cpu_addr, query_size);
         IteratePages<true>(dirty_cpu_addr, query_size, [](Manager* manager, u64 offset, size_t size) {
             manager->ChangeRegionState(Type::CPU, false, manager->cpu_addr + offset, size);
         });
@@ -102,7 +154,8 @@ public:
 
     /// Mark region as modified from the host GPU
     void MarkRegionAsGpuModified(VAddr dirty_cpu_addr, u64 query_size) noexcept {
-        ++gpu_epoch;
+        ever_synchronized_pages.Mark(dirty_cpu_addr, query_size);
+        BumpGpuRangeEpoch(dirty_cpu_addr, query_size);
         IteratePages<true>(dirty_cpu_addr, query_size, [](Manager* manager, u64 offset, size_t size) {
             manager->ChangeRegionState(Type::GPU, true, manager->cpu_addr + offset, size);
         });
@@ -110,6 +163,7 @@ public:
 
     /// Mark region as modified from the host GPU
     void MarkRegionAsPreflushable(VAddr dirty_cpu_addr, u64 query_size) noexcept {
+        ever_synchronized_pages.Mark(dirty_cpu_addr, query_size);
         IteratePages<true>(dirty_cpu_addr, query_size, [](Manager* manager, u64 offset, size_t size) {
             manager->ChangeRegionState(Type::Preflushable, true, manager->cpu_addr + offset, size);
         });
@@ -117,7 +171,7 @@ public:
 
     /// Unmark region as modified from the host GPU
     void UnmarkRegionAsGpuModified(VAddr dirty_cpu_addr, u64 query_size) noexcept {
-        ++gpu_epoch;
+        BumpGpuRangeEpoch(dirty_cpu_addr, query_size);
         IteratePages<true>(dirty_cpu_addr, query_size, [](Manager* manager, u64 offset, size_t size) {
             manager->ChangeRegionState(Type::GPU, false, manager->cpu_addr + offset, size);
         });
@@ -142,7 +196,7 @@ public:
 
     /// Flushes cached CPU writes, and notify the device_tracker about the deltas
     void FlushCachedWrites(VAddr query_cpu_addr, u64 query_size) noexcept {
-        ++cpu_epoch;
+        BumpCpuRangeEpoch(query_cpu_addr, query_size);
         IteratePages<false>(query_cpu_addr, query_size, [](Manager* manager, [[maybe_unused]] u64 offset, [[maybe_unused]] size_t size) {
             manager->FlushCachedWrites();
         });
@@ -151,6 +205,7 @@ public:
     void FlushCachedWrites() noexcept {
         ++cpu_epoch;
         for (auto id : cached_pages) {
+            ++cpu_chunk_epochs[id & (CHUNK_EPOCH_SLOTS - 1)];
             top_tier[id]->FlushCachedWrites();
         }
         cached_pages.clear();
@@ -159,15 +214,21 @@ public:
     /// Call 'func' for each CPU modified range and unmark those pages as CPU modified
     template <typename Func>
     void ForEachUploadRange(VAddr query_cpu_range, u64 query_size, Func&& func) {
-        IteratePages<true>(query_cpu_range, query_size, [&func](Manager* manager, u64 offset, size_t size) {
-            manager->ForEachModifiedRange(Type::CPU, true, manager->cpu_addr + offset, size, func);
+        const auto upload = [this, &func](VAddr address, u64 size) {
+            ever_synchronized_pages.Mark(address, size);
+            func(address, size);
+        };
+        IteratePages<true>(query_cpu_range, query_size, [&upload](Manager* manager, u64 offset, size_t size) {
+            manager->ForEachModifiedRange(Type::CPU, true, manager->cpu_addr + offset, size, upload);
         });
     }
 
     /// Call 'func' for each GPU modified range and unmark those pages as GPU modified
     template <typename Func>
     void ForEachDownloadRange(VAddr query_cpu_range, u64 query_size, bool clear, Func&& func) {
-        gpu_epoch += clear ? 1 : 0;
+        if (clear) {
+            BumpGpuRangeEpoch(query_cpu_range, query_size);
+        }
         IteratePages<false>(query_cpu_range, query_size, [&func, clear](Manager* manager, u64 offset, size_t size) {
             manager->ForEachModifiedRange(Type::GPU, clear, manager->cpu_addr + offset, size, func);
         });
@@ -183,7 +244,7 @@ public:
 
     template <typename Func>
     void ForEachDownloadRangeAndClear(VAddr query_cpu_range, u64 query_size, Func&& func) {
-        ++gpu_epoch;
+        BumpGpuRangeEpoch(query_cpu_range, query_size);
         IteratePages<false>(query_cpu_range, query_size, [&func](Manager* manager, u64 offset, size_t size) {
             manager->ForEachModifiedRange(Type::GPU, true, manager->cpu_addr + offset, size, func);
         });
@@ -193,7 +254,11 @@ public:
     /// part of the range: they have nothing to find or change. A per-word form of PR #161's skip.
     template <typename Func>
     void ForEachDirtyUploadRange(VAddr query_cpu_range, u64 query_size, Func&& func) {
-        IteratePages<true>(query_cpu_range, query_size, [&func](Manager* manager, u64 offset, size_t size) {
+        const auto upload = [this, &func](VAddr address, u64 size) {
+            ever_synchronized_pages.Mark(address, size);
+            func(address, size);
+        };
+        IteratePages<true>(query_cpu_range, query_size, [&upload](Manager* manager, u64 offset, size_t size) {
             const u64 dirty =
                 manager->DirtyWords(offset / BYTES_PER_WORD, (offset + size - 1) / BYTES_PER_WORD);
             if (dirty == 0) {
@@ -203,8 +268,14 @@ public:
             const u64 end =
                 (std::min<u64>)(offset + size, (64 - std::countl_zero(dirty)) * BYTES_PER_WORD);
             manager->ForEachModifiedRange(Type::CPU, true, manager->cpu_addr + begin,
-                                          static_cast<s64>(end - begin), func);
+                                          static_cast<s64>(end - begin), upload);
         });
+    }
+
+    /// Whether a page of the range ever left the CPU-modified state (an upload or an unmark) or
+    /// was marked GPU-modified or preflushable. Any thread, without a lock.
+    [[nodiscard]] bool IsRegionEverSynchronized(VAddr query_cpu_addr, u64 query_size) const noexcept {
+        return ever_synchronized_pages.Any(query_cpu_addr, query_size);
     }
     /// Verify mode: true when the clean words of the managers over a range match a recount.
     [[nodiscard]] bool CleanWordsHold(VAddr query_cpu_addr, u64 query_size) const noexcept {
@@ -295,6 +366,7 @@ private:
 
     void CreateRegion(std::size_t page_index) {
         ++cpu_epoch; // A new manager starts with every page CPU-modified
+        ++cpu_chunk_epochs[page_index & (CHUNK_EPOCH_SLOTS - 1)];
         const VAddr base_cpu_addr = page_index << HIGHER_PAGE_BITS;
         top_tier[page_index] = GetNewManager(base_cpu_addr);
     }
@@ -314,13 +386,21 @@ private:
         return new_manager;
     }
 
+    static constexpr size_t CHUNK_EPOCH_SLOTS = 1024;
+    static constexpr size_t MAX_RANGE_EPOCH_CHUNKS = 8;
+
     std::array<Manager*, NUM_HIGH_PAGES> top_tier{};
     std::deque<std::array<Manager, MANAGER_POOL_SIZE>> manager_pool;
     std::deque<Manager*> free_managers;
     ::Common::unordered_set<u32> cached_pages;
+    PageFilter ever_synchronized_pages;
     DeviceTracker* device_tracker = nullptr;
     u64 cpu_epoch{};
     u64 gpu_epoch{};
+    u64 structural_cpu_epoch{};
+    u64 structural_gpu_epoch{};
+    std::array<u64, CHUNK_EPOCH_SLOTS> cpu_chunk_epochs{};
+    std::array<u64, CHUNK_EPOCH_SLOTS> gpu_chunk_epochs{};
 };
 
 } // namespace VideoCommon

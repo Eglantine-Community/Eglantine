@@ -142,11 +142,16 @@ std::vector<Feature> FeaturesFor(Platform platform) {
                  "then wedge the guest while the fence is waited for: without it, Splatoon "
                  "Raiders freezes on AMD a few seconds after load and Mario Kart World"
                  "deadlocked about one boot in three."),
-             platform == Platform::Amd, [](const Context& context) {
+#ifdef _WIN32
+             false,
+#else
+             platform == Platform::Amd,
+#endif
+             [](const Context&) {
                  Verdict verdict;
                  verdict.note = QObject::tr(
-                     "This was measured on RADV on Linux; other drivers may "
-                     "behave differently. Please report if it does not work on your AMD GPU.");
+                     "This was measured on RADV on Linux; on Windows it adds host fence latency "
+                     "and is off by default.");
                  return verdict;
              }});
     }

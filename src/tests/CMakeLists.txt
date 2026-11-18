@@ -24,6 +24,7 @@ add_executable(tests
     video_core/pending_gpu_tick.cpp
     video_core/gpu_timestamp_delta.cpp
     video_core/command_words_pool.cpp
+    video_core/command_snapshot_suspensions.cpp
     video_core/vertex_input_cache.cpp
     video_core/buffer_dependency_trace.cpp
     video_core/nx2_written_pages.cpp
@@ -92,6 +93,7 @@ add_executable(tests
     video_core/vertex_repack.cpp
     video_core/virtual_range_cache.cpp
     video_core/query_copy.cpp
+    video_core/query_stream.cpp
     video_core/ampere_lowering.cpp
     video_core/spirv_software_matrix.cpp
     video_core/ampere_geometry.cpp
@@ -118,6 +120,7 @@ add_executable(tests
     video_core/ampere_vote.cpp
     video_core/shader_attributes.cpp
     video_core/indirect_reset.cpp
+    video_core/nx2_list_grid.cpp
     video_core/ocarina_upscale.cpp
     input_common/calibration_configuration_job.cpp
 )
@@ -137,6 +140,10 @@ target_link_libraries(tests PRIVATE common core input_common video_core)
 if (ENABLE_MCP_SERVER)
     target_sources(tests PRIVATE mcp/protocol.cpp)
     target_link_libraries(tests PRIVATE mcp)
+endif()
+if (TARGET dynarmic::dynarmic)
+    target_sources(tests PRIVATE core/jit_codegen_options.cpp)
+    target_link_libraries(tests PRIVATE dynarmic::dynarmic)
 endif()
 target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain Threads::Threads)
 

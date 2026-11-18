@@ -7,7 +7,9 @@
 #pragma once
 
 #include <deque>
+#include <mutex>
 #include <optional>
+#include <span>
 #include <vector>
 
 #include "common/assert.h"
@@ -69,6 +71,13 @@ public:
 
     virtual void Free(size_t query_id) = 0;
 
+    /// Free for each id, as one batch.
+    virtual void FreeMany(std::span<const size_t> query_ids) {
+        for (const size_t query_id : query_ids) {
+            Free(query_id);
+        }
+    }
+
     size_t GetId() const {
         return id;
     }
@@ -121,17 +130,28 @@ protected:
         ReleaseQuery(query_id);
     }
 
+    virtual void FreeMany(std::span<const size_t> query_ids) override {
+        std::scoped_lock lk(guard);
+        for (const size_t query_id : query_ids) {
+            ReleaseQuery(query_id);
+        }
+    }
+
     template <typename... Args, typename = decltype(QueryType(std::declval<Args>()...))>
     size_t BuildQuery(Args&&... args) {
-        std::scoped_lock lk(guard);
-        if (!old_queries.empty()) {
-            size_t new_id = old_queries.front();
-            old_queries.pop_front();
-            new (&slot_queries[new_id]) QueryType(std::forward<Args>(args)...);
-            return new_id;
+        if (reusable_head == reusable.size()) {
+            reusable.clear();
+            reusable_head = 0;
+            std::scoped_lock lk(guard);
+            if (old_queries.empty()) {
+                size_t new_id = slot_queries.size();
+                slot_queries.emplace_back(std::forward<Args>(args)...);
+                return new_id;
+            }
+            reusable.swap(old_queries);
         }
-        size_t new_id = slot_queries.size();
-        slot_queries.emplace_back(std::forward<Args>(args)...);
+        const size_t new_id = reusable[reusable_head++];
+        new (&slot_queries[new_id]) QueryType(std::forward<Args>(args)...);
         return new_id;
     }
 
@@ -146,7 +166,9 @@ protected:
 
     std::mutex guard;
     std::deque<QueryType> slot_queries;
-    std::deque<size_t> old_queries;
+    std::vector<size_t> old_queries;
+    std::vector<size_t> reusable;
+    size_t reusable_head{};
 };
 
 } // namespace VideoCommon

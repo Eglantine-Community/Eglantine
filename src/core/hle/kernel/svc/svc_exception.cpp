@@ -129,6 +129,13 @@ void Break(Core::System& system, BreakReason reason, u64 info1, u64 info2) {
         auto* thread = system.Kernel().GetCurrentEmuThread();
         system.GetDebugger().NotifyThreadStopped(thread);
         thread->RequestSuspend(system.Kernel(), Kernel::SuspendType::Debug);
+    } else if (should_break &&
+               (break_reason == BreakReason::Panic || break_reason == BreakReason::Assert)) {
+        // Returning from a fatal Abort() svcBreak lands in nn::diag::detail::Abort's infinite
+        // `b .` loop, burning 100% of a guest core forever. Suspend the aborted thread instead.
+        if (auto* thread = system.Kernel().GetCurrentEmuThread(); thread != nullptr) {
+            thread->RequestSuspend(system.Kernel(), Kernel::SuspendType::Debug);
+        }
     }
 }
 

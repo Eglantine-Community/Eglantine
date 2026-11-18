@@ -33,6 +33,7 @@
 #include "video_core/nx2_knobs.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/pending_gpu_tick.h"
 #include "video_core/texture_cache/util.h"
 
 namespace VideoCommon {
@@ -303,6 +304,28 @@ void BufferCache<P>::CachedWriteMemory(DAddr device_addr, u64 size) {
 }
 
 template <class P>
+bool BufferCache<P>::ConstantDataReachesBuffers(DAddr device_addr, u64 size) const {
+    if (memory_tracker.IsRegionEverSynchronized(device_addr, size) ||
+        Tegra::Nx2MayBeGpuWritten(device_addr, size)) {
+        return true;
+    }
+    if (Tegra::g_nx2_has_command_list_pages.load(std::memory_order_relaxed)) {
+        for (DAddr page = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
+             page < device_addr + size; page += Core::DEVICE_PAGESIZE) {
+            if (Tegra::Nx2IsCommandListPage(page)) {
+                return true;
+            }
+        }
+    }
+    if constexpr (requires { runtime.AnyVertexRepacked(); }) {
+        if (runtime.AnyVertexRepacked()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+template <class P>
 bool BufferCache<P>::OnCPUWrite(DAddr device_addr, u64 size) {
     const bool is_dirty = IsRegionRegistered(device_addr, size);
     if (!is_dirty) {
@@ -466,7 +489,8 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
 
 template <class P>
 void BufferCache<P>::ClearDownload(DAddr device_addr, u64 size) {
-    memory_tracker.BumpGpuEpoch();
+    Nx2ForgetKeptWords(device_addr, size);
+    memory_tracker.BumpGpuRangeEpoch(device_addr, size);
     for (auto& ranges : pending_download_ranges) {
         ranges.Subtract(device_addr, size);
     }
@@ -491,6 +515,7 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
 
     ClearDownload(*cpu_dest_address, amount);
     MarkVertexBuffersStale(*cpu_dest_address, amount);
+    Nx2NoteListHostWrite(*cpu_dest_address, amount);
 
     BufferId buffer_a;
     BufferId buffer_b;
@@ -515,6 +540,9 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
         const DAddr diff = base_address - *cpu_src_address;
         const DAddr new_base_address = *cpu_dest_address + diff;
         tmp_intervals.push_back({new_base_address, size});
+        if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
+            Tegra::Nx2MarkGpuWritten(new_base_address, size);
+        }
         QueueGpuWrite(new_base_address, size);
     };
     gpu_modified_ranges.ForEachInRange(*cpu_src_address, amount, mirror);
@@ -528,7 +556,6 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
                                   {BufferDependencyTrace::Producer::Other, 0, frame_tick});
         }
         if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
-            Tegra::Nx2MarkGpuWritten(pair.first, pair.second);
             Nx2NoteListWrite(buffer_b, pair.first, pair.second);
         }
     }
@@ -557,14 +584,15 @@ bool BufferCache<P>::DMAClear(GPUVAddr dst_address, u64 amount, u32 value) {
     if (!cpu_dst_address) {
         return false;
     }
-    const bool dest_dirty = IsRegionRegistered(*cpu_dst_address, amount);
+    const size_t size = amount * sizeof(u32);
+    const bool dest_dirty = IsRegionRegistered(*cpu_dst_address, size);
     if (!dest_dirty) {
         return false;
     }
 
-    const size_t size = amount * sizeof(u32);
     ClearDownload(*cpu_dst_address, size);
     gpu_modified_ranges.Subtract(*cpu_dst_address, size);
+    Nx2NoteListHostWrite(*cpu_dst_address, size);
 
     const BufferId buffer = FindBuffer(*cpu_dst_address, static_cast<u32>(size), false);
     Buffer& dest_buffer = slot_buffers[buffer];
@@ -1311,6 +1339,10 @@ void BufferCache<P>::PopAsyncBuffers() {
             written_bytes += end - start;
         });
     }
+    if (written_bytes != 0 && Tegra::Nx2PendingWake::On()) {
+        Tegra::Nx2PendingWake::Wake(Tegra::g_pending_gpu_tick_sequence,
+                                    Tegra::PendingGpuTickWakeReason);
+    }
     if (Nx2Profile::Enabled()) {
         Nx2Profile::g_fencing_written_bytes.fetch_add(written_bytes, std::memory_order_relaxed);
     }
@@ -1723,7 +1755,12 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                                     Nx2Perf::On(Nx2Perf::Opt::BankOncePerFrame);
         const bool skip_this_frame = once_per_frame && !Nx2Perf::Verify();
         const bool seen_this_frame = shadow->last_frame_tick == frame_tick;
-        if (skip_this_frame && seen_this_frame) {
+        const u64 frozen_recheck_frames = 64ULL + ((device_addr >> 16) & 31ULL);
+        const bool skip_frozen_bank =
+            skip_this_frame && !seen_this_frame && shadow->unchanged_streak >= 4 &&
+            shadow->last_frame_tick != ~u64{0} &&
+            (frame_tick - shadow->last_frame_tick) < frozen_recheck_frames;
+        if (skip_this_frame && (seen_this_frame || skip_frozen_bank)) {
             if (Nx2Profile::Enabled() &&
                 shadow->last_draw_ticket != native_indirect_uniform_draw_ticket &&
                 shadow->last_skipped_draw_ticket != native_indirect_uniform_draw_ticket &&
@@ -1745,6 +1782,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                          device_memory.template GetPointer<u8>(device_addr + check_size - 1));
                 u32 offset_in_bank = 0;
                 u32 page_idx = 0;
+                bool any_changed = false;
                 while (offset_in_bank < check_size) {
                     const DAddr cur_addr = device_addr + offset_in_bank;
                     const u64 page_offset = cur_addr & Core::DEVICE_PAGEMASK;
@@ -1758,11 +1796,11 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                     }
                     const u32 page_bit = 1U << (page_idx & 31);
                     const bool page_initialized = (shadow->initialized_mask & page_bit) != 0;
-                    const bool already_cpu_modified =
-                        memory_tracker.IsRegionCpuModified(cur_addr, chunk_size);
                     u8* const shadow_dst = shadow->bytes.data() + offset_in_bank;
-                    if (!page_initialized || already_cpu_modified ||
-                        std::memcmp(shadow_dst, ptr, chunk_size) != 0) {
+                    if (!page_initialized || std::memcmp(shadow_dst, ptr, chunk_size) != 0) {
+                        any_changed = true;
+                        const bool already_cpu_modified =
+                            memory_tracker.IsRegionCpuModified(cur_addr, chunk_size);
                         if (check_late && page_initialized && !already_cpu_modified)
                             [[unlikely]] {
                             static std::atomic<u64> late_changes{};
@@ -1791,6 +1829,8 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                     offset_in_bank += chunk_size;
                     ++page_idx;
                 }
+                shadow->unchanged_streak =
+                    any_changed ? 0U : (std::min<u32>)(shadow->unchanged_streak + 1U, 1024U);
             }
         }
     }
@@ -1850,7 +1890,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         // The sync would have found nothing to upload and returned true.
         ++channel_state->uniform_cache_hits[0];
     } else {
-        const u64 cpu_epoch = memory_tracker.CpuEpoch();
+        const u64 cpu_epoch = memory_tracker.CpuRangeEpoch(device_addr, size);
         TouchBuffer(buffer, binding.buffer_id);
         // Classic cached path
         if (SynchronizeBuffer(buffer, device_addr, size)) {
@@ -1986,7 +2026,7 @@ void BufferCache<P>::BindHostGraphicsStorageBuffers(size_t stage) {
             BindMemoHit(*memo, buffer, binding.buffer_id, binding.device_addr, binding.size,
                         buffer.Offset(binding.device_addr), "storage", stage, index) &&
             memo->usage_marked;
-        const u64 cpu_epoch = memory_tracker.CpuEpoch();
+        const u64 cpu_epoch = memory_tracker.CpuRangeEpoch(binding.device_addr, binding.size);
         if (!memo_hit) {
             TouchBuffer(buffer, binding.buffer_id);
         }
@@ -2561,6 +2601,7 @@ void BufferCache<P>::UpdateComputeTextureBuffers() {
 template <class P>
 void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u32 size,
                                        bool needs_sync) {
+    Nx2ForgetKeptWords(device_addr, size);
     if (nx2_buffer_deps) {
         using Producer = BufferDependencyTrace::Producer;
         const u64 shader = nx2_buffer_deps->ActiveShader();
@@ -2584,9 +2625,12 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
     MarkVertexBuffersStale(device_addr, size);
     last_synced_count = 0;
     gpu_modified_ranges.Add(device_addr, size);
-    QueueGpuWrite(device_addr, size);
-    if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
+    const bool ampere = Tegra::g_nx2_ampere.load(std::memory_order_relaxed);
+    if (ampere) {
         Tegra::Nx2MarkGpuWritten(device_addr, size);
+    }
+    QueueGpuWrite(device_addr, size);
+    if (ampere) {
         Nx2NoteListWrite(buffer_id, device_addr, size);
     }
 }
@@ -2622,6 +2666,11 @@ void BufferCache<P>::Nx2NoteListWrite(BufferId buffer_id, DAddr device_addr, u64
                                                        nx2_collect_list_copies);
                     }
                     ++entry.writes;
+                    constexpr DAddr page_size = DAddr{1} << page_bits;
+                    Nx2MarkListWords(entry, (std::max)(device_addr, page_addr) - page_addr,
+                                     (std::min)(device_addr + size, page_addr + page_size) -
+                                         page_addr,
+                                     true);
                     if (!nx2_collect_list_copies && !entry.draw_written) {
                         entry.draw_written = true;
                         LOG_INFO(HW_GPU, "Command list page {:#x} is written by draws too: its "
@@ -2796,8 +2845,11 @@ auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool 
                 // Past the sync the back noted every write the list can see: a copy made after
                 // the last of them holds the page, without a flush and Scheduler::Finish.
             }
-            // Pages the CPU writes the lists of (GPU-written once, long before) stay synced.
-            if (entry.synced_writes == entry.writes) {
+            // Pages the CPU writes the lists of (GPU-written once, long before) stay synced, and
+            // a list on none of the words GPU work wrote since the page was flushed is in guest
+            // memory too: it waits for no copy.
+            if (entry.synced_writes == entry.writes ||
+                (entry.flushed && !Nx2HasListWords(entry, offset, offset + out.size()))) {
                 if (nx2_list_copy_log) {
                     ++nx2_list_copy_stats.synced;
                 }
@@ -2822,7 +2874,7 @@ auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool 
                     nx2_writer_trace->NoteFrontRead(
                         reinterpret_cast<uintptr_t>(entry.copy->mapped_span.data()), offset, out.size());
                 }
-                std::memcpy(out.data(), entry.copy->mapped_span.data() + offset, out.size());
+                Nx2ReadListWords(entry, device_addr, offset, out);
                 return Nx2ListRead::Copied;
             }
             tick = entry.copy_tick;
@@ -2864,9 +2916,57 @@ auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool 
             nx2_writer_trace->NoteFrontRead(
                 reinterpret_cast<uintptr_t>(it->second.copy->mapped_span.data()), offset, out.size());
         }
-        std::memcpy(out.data(), it->second.copy->mapped_span.data() + offset, out.size());
+        Nx2ReadListWords(it->second, device_addr, offset, out);
         return Nx2ListRead::Copied;
     }
+}
+
+template <class P>
+void BufferCache<P>::Nx2ReadListWords(const Nx2ListPage& entry, DAddr device_addr, u64 offset,
+                                      std::span<u8> out) {
+    if constexpr (!IS_OPENGL) {
+        const u8* const copy = entry.copy->mapped_span.data();
+        const u64 end = offset + out.size();
+        bool all_gpu = true;
+        for (u64 word = offset / 4; word < (end + 3) / 4 && all_gpu; ++word) {
+            all_gpu = entry.gpu_words.test(static_cast<size_t>(word));
+        }
+        if (all_gpu || !entry.flushed) {
+            std::memcpy(out.data(), copy + offset, out.size());
+            return;
+        }
+        device_memory.ReadBlockUnsafe(device_addr, out.data(), out.size());
+        for (u64 byte = offset; byte < end;) {
+            const u64 next = (std::min)((byte / 4 + 1) * 4, end);
+            if (entry.gpu_words.test(static_cast<size_t>(byte / 4))) {
+                std::memcpy(out.data() + (byte - offset), copy + byte, next - byte);
+            }
+            byte = next;
+        }
+    }
+}
+
+template <class P>
+void BufferCache<P>::Nx2MarkListWords(Nx2ListPage& entry, u64 begin, u64 end, bool set) {
+    if (begin >= end) {
+        return;
+    }
+    const u64 first = set ? begin / 4 : (begin + 3) / 4;
+    const u64 last = (std::min<u64>)(set ? (end + 3) / 4 : end / 4, Nx2ListPageWords);
+    for (u64 word = first; word < last; ++word) {
+        entry.gpu_words.set(static_cast<size_t>(word), set);
+    }
+}
+
+template <class P>
+bool BufferCache<P>::Nx2HasListWords(const Nx2ListPage& entry, u64 begin, u64 end) {
+    const u64 last = (std::min<u64>)((end + 3) / 4, Nx2ListPageWords);
+    for (u64 word = begin / 4; word < last; ++word) {
+        if (entry.gpu_words.test(static_cast<size_t>(word))) {
+            return true;
+        }
+    }
+    return false;
 }
 
 template <class P>
@@ -2875,11 +2975,14 @@ void BufferCache<P>::Nx2NoteListSynced(DAddr page) {
         std::scoped_lock lock{nx2_list_mutex};
         Nx2ListPage& entry = nx2_list_pages[page];
         entry.synced_writes = entry.writes;
+        entry.gpu_words.reset();
+        entry.flushed = true;
     }
 }
 
 template <class P>
 void BufferCache<P>::Nx2NoteListHostWrite(DAddr device_addr, u64 size, std::span<const u8> data) {
+    Nx2ForgetKeptWords(device_addr, size);
     if (nx2_buffer_deps) {
         nx2_buffer_deps->Forget(device_addr, size);
     }
@@ -2916,6 +3019,9 @@ void BufferCache<P>::Nx2NoteListHostWrite(DAddr device_addr, u64 size, std::span
             if (synced) {
                 entry.synced_writes = entry.writes;
             }
+            Nx2MarkListWords(entry, (std::max<u64>)(device_addr, page_addr) - page_addr,
+                             (std::min<u64>)(device_addr + size, page_addr + page_size) - page_addr,
+                             false);
             if (!data.empty() && copy_valid && runtime.IsFree(entry.copy_tick)) {
                 const u64 range_start = (std::max<u64>)(device_addr, page_addr);
                 const u64 range_end = (std::min<u64>)(device_addr + size, page_addr + page_size);
@@ -3158,9 +3264,9 @@ bool BufferCache<P>::BindMemoHit(const BindMemo& memo, Buffer& buffer, BufferId 
     } else {
         if (!memo.valid || memo.channel != channel_state || memo.buffer_id != buffer_id ||
             memo.device_addr != device_addr || memo.size != size ||
-            memo.cpu_epoch != memory_tracker.CpuEpoch() ||
-            memo.gpu_epoch != memory_tracker.GpuEpoch() || memo.frame != frame_tick ||
-            memo.tick != runtime.CurrentTick()) {
+            memo.cpu_epoch != memory_tracker.CpuRangeEpoch(device_addr, size) ||
+            memo.gpu_epoch != memory_tracker.GpuRangeEpoch(device_addr, size) ||
+            memo.frame != frame_tick || memo.tick != runtime.CurrentTick()) {
             Nx2Profile::Add(Nx2Profile::Counter::BindMemoMisses, 1);
             return false;
         }
@@ -3194,7 +3300,7 @@ void BufferCache<P>::BindMemoNote(BindMemo& memo, BufferId buffer_id, DAddr devi
     if constexpr (!IS_OPENGL) {
         // A walk of the range leaves it clean unless something marked it meanwhile; a deduped
         // sync did not walk it, so check.
-        if (memory_tracker.CpuEpoch() != cpu_epoch_before ||
+        if (memory_tracker.CpuRangeEpoch(device_addr, size) != cpu_epoch_before ||
             (last_sync_deduped && memory_tracker.IsRegionCpuModified(device_addr, size))) {
             memo.valid = false;
             return;
@@ -3207,7 +3313,7 @@ void BufferCache<P>::BindMemoNote(BindMemo& memo, BufferId buffer_id, DAddr devi
             .valid = true,
             .usage_marked = false,
             .cpu_epoch = cpu_epoch_before,
-            .gpu_epoch = memory_tracker.GpuEpoch(),
+            .gpu_epoch = memory_tracker.GpuRangeEpoch(device_addr, size),
             .tick = runtime.CurrentTick(),
             .frame = frame_tick,
         };

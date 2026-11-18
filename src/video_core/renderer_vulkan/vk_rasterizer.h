@@ -14,6 +14,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <unordered_map>
 
 #include <boost/container/static_vector.hpp>
 
@@ -22,6 +23,7 @@
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_list_grid.h"
 #include "video_core/ocarina_upscale.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/vertex_input_cache.h"
@@ -116,6 +118,12 @@ public:
                                              u64* pending_tick = nullptr) override;
     bool IsGpuTickDone(u64 tick) override;
     void NoteGpuWrittenCommandListSynced(DAddr page) override;
+    [[nodiscard]] bool Nx2ListGridSupported() const override;
+    void Nx2KeepListWords(u64 keep_id, GPUVAddr address, u64 hash,
+                          std::span<const u32> real) override;
+    void Nx2ExpectKeptWord(DAddr device_addr, u64 keep_id, u32 index) override;
+    [[nodiscard]] bool Nx2ReadKeptListWords(u64 keep_id, std::span<u32> words) override;
+    [[nodiscard]] std::optional<u64> Nx2FindKeptWord(DAddr device_addr, u32 marker) override;
     bool MustFlushRegion(DAddr addr, u64 size,
                          VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;
@@ -123,6 +131,8 @@ public:
                           VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     void PrepareRegionWrite(DAddr addr, u64 size, VideoCommon::CacheType which) override;
     void InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) override;
+    void InvalidateConstantBufferData(
+        std::span<const std::pair<DAddr, std::size_t>> sequences) override;
     void OnCacheInvalidation(DAddr addr, u64 size) override;
     void OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) override;
     bool TryCacheInvalidation(DAddr addr, u64 size) override;
@@ -149,6 +159,7 @@ public:
                                const Tegra::Engines::Fermi2D::Config& copy_config) override;
     bool SupportsGameDlssNetwork() const override;
     bool UsesNvidiaDlss() const override;
+    bool IsLowMemoryIntegratedGpu() const override;
     bool CanProbeGameDlssOutput() const override {
         return true;
     }
@@ -205,6 +216,14 @@ private:
     /// Records the copies of the command list pages the work just recorded wrote and submits, so
     /// the GPU makes them now (BufferCache::Nx2CopyListPages).
     void SubmitNx2ListCopies();
+    /// Verify mode (nx2_list_grid.h): an indirect dispatch's kept grid against the real one.
+    void VerifyKeptGrid(u64 keep_id);
+    /// AccelerateInlineToMemory for a write that carries list-fed grid markers: uploaded at once,
+    /// with the kept words copied over the markers on the host GPU.
+    void InlineKeptWords(DAddr device_addr, std::span<const u8> data,
+                         std::span<const Tegra::Nx2ListGrid::KeptPatch> patches);
+    /// Nx2ExpectKeptWord's words not yet written: keep id and word by device address (back).
+    std::unordered_map<DAddr, std::pair<u64, u32>> nx2_expected_words;
     /// EDEN_NX2_WRITER_DEPS (diagnostic): what a command-list-writing dispatch samples.
     void NoteWriterDeps(const ComputePipeline& pipeline);
     /// The split back's idle hook: submits pending list copies and deferred work.
@@ -401,6 +420,8 @@ private:
     u64 mesh_arena_size{64ULL << 20};
     /// The current submission's arena, after its counter is reset.
     const MeshArena& AcquireMeshArena();
+    void InvalidateCachedWrites(std::span<const std::pair<DAddr, std::size_t>> sequences,
+                                bool constant_buffer_data);
 
     struct IndirectTrace {
         vk::Buffer readback;

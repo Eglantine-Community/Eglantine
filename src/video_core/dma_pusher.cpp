@@ -8,17 +8,26 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <bit>
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
+#include <mutex>
 #include <string>
 #include <span>
+#include <thread>
 #include <utility>
 #include <vector>
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
 #include "video_core/pending_gpu_tick.h"
 
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#include "common/thread.h"
 #include "core/core.h"
 #include "core/memory.h"
 #include "video_core/nx2_profile.h"
@@ -26,11 +35,13 @@
 #include "video_core/control/channel_state.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/engines/maxwell_dma.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_list_grid.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/rasterizer_interface.h"
 
@@ -57,6 +68,157 @@ bool DmaPusher::IsMemoryWriter(const Engines::EngineInterface& engine, Engines::
 }
 constexpr u32 ComputeInline = 0x6D;
 
+namespace {
+std::atomic<u64> g_last_copy_writer{};
+
+[[nodiscard]] bool CopyWritersPending(VideoCommon::GpuSplit& split) {
+    u64 pos = g_last_copy_writer.load(std::memory_order_relaxed);
+    if (pos > split.SentPosition()) {
+        g_last_copy_writer.store(0, std::memory_order_relaxed);
+        pos = 0;
+    }
+    return !split.Ran(pos);
+}
+
+void CopierPause() {
+#if defined(_M_X64) || defined(__x86_64__)
+    _mm_pause();
+#else
+    std::this_thread::yield();
+#endif
+}
+
+/// Copies command lists queued behind a resumed acquire again (DmaPusher::Step) on a thread of
+/// its own, in the order they were queued, while the GPU thread goes on with the list it resumed
+/// in and waits for a list's copy only once it reaches it.
+class SnapshotCopier {
+public:
+    struct Job {
+        const MemoryManager* memory;
+        CommandList* list;
+    };
+
+    static SnapshotCopier& Get() {
+        static SnapshotCopier copier;
+        started.store(true, std::memory_order_release);
+        return copier;
+    }
+    [[nodiscard]] static bool Started() {
+        return started.load(std::memory_order_acquire);
+    }
+
+    u64 Queue(const Job& job) {
+        std::scoped_lock lock{queue_mutex};
+        const u64 queued = published.load(std::memory_order_relaxed);
+        if (queued - completed.load(std::memory_order_acquire) >= Capacity) {
+            return 0;
+        }
+        jobs[queued % Capacity] = job;
+        published.store(queued + 1, std::memory_order_seq_cst);
+        if (sleeping.load(std::memory_order_seq_cst)) {
+            wake.fetch_add(1, std::memory_order_seq_cst);
+            wake.notify_one();
+        }
+        return queued + 1;
+    }
+
+    void WaitFor(u64 number) const {
+        for (u32 spins = 0; completed.load(std::memory_order_acquire) < number; ++spins) {
+            if (spins < 4096) {
+                CopierPause();
+            } else {
+                std::this_thread::yield();
+            }
+        }
+    }
+    void WaitIdle() const {
+        WaitFor(published.load(std::memory_order_acquire));
+    }
+
+private:
+    SnapshotCopier() : thread{[this](std::stop_token token) { Loop(token); }} {}
+    ~SnapshotCopier() {
+        thread.request_stop();
+        wake.fetch_add(1, std::memory_order_seq_cst);
+        wake.notify_one();
+    }
+
+    void Loop(std::stop_token token) {
+        Common::SetCurrentThreadName("GPUSnapshot");
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
+        u64 done = 0;
+        while (!token.stop_requested()) {
+            u64 available = published.load(std::memory_order_acquire);
+            for (u32 spins = 0; available == done && spins < 2048; ++spins) {
+                CopierPause();
+                available = published.load(std::memory_order_acquire);
+            }
+            if (available == done) {
+                sleeping.store(true, std::memory_order_seq_cst);
+                const u32 seen = wake.load(std::memory_order_seq_cst);
+                if (published.load(std::memory_order_seq_cst) == done && !token.stop_requested()) {
+                    wake.wait(seen, std::memory_order_seq_cst);
+                }
+                sleeping.store(false, std::memory_order_relaxed);
+                continue;
+            }
+            for (; done != available; ++done) {
+                Copy(jobs[done % Capacity]);
+                completed.store(done + 1, std::memory_order_release);
+            }
+        }
+    }
+
+    static void Copy(const Job& job) {
+        CommandList& list = *job.list;
+        for (size_t i = 0; i < list.command_lists.size() && i < list.submitted_offsets.size();
+             ++i) {
+            const CommandListHeader& entry = list.command_lists[i];
+            const u32 offset = list.submitted_offsets[i];
+            if (offset + entry.size > list.submitted_words.size()) {
+                continue;
+            }
+            job.memory->ReadBlockUnsafe(entry.addr, list.submitted_words.data() + offset,
+                                        entry.size * sizeof(u32));
+        }
+    }
+
+    static constexpr u64 Capacity = 256;
+    static inline std::atomic<bool> started{};
+    std::mutex queue_mutex;
+    std::array<Job, Capacity> jobs{};
+    alignas(64) std::atomic<u64> published{};
+    alignas(64) std::atomic<u64> completed{};
+    std::atomic<bool> sleeping{};
+    std::atomic<u32> wake{};
+    std::jthread thread;
+};
+
+void WaitForCopyJob(CommandList& list) {
+    if (list.copy_job != 0) {
+        SnapshotCopier::Get().WaitFor(list.copy_job);
+        list.copy_job = 0;
+    }
+}
+} // namespace
+
+void DmaPusher::WaitForSnapshotCopies() {
+    if (SnapshotCopier::Started()) {
+        SnapshotCopier::Get().WaitIdle();
+    }
+}
+
+bool DmaPusher::QueueSnapshotCopy(CommandList& list, u64 now) {
+    const u64 number = SnapshotCopier::Get().Queue({&memory_manager, &list});
+    if (number == 0) {
+        return false;
+    }
+    list.copy_job = number;
+    list.snapshot_suspensions = now;
+    list.deferred_entries.clear();
+    return true;
+}
+
 DmaPusher::DmaPusher(Core::System& system_, MemoryManager& memory_manager_, Control::ChannelState& channel_state_)
     : system{system_}
     , memory_manager{memory_manager_}
@@ -66,6 +228,7 @@ DmaPusher::DmaPusher(Core::System& system_, MemoryManager& memory_manager_, Cont
 {}
 
 DmaPusher::~DmaPusher() {
+    WaitForSnapshotCopies();
     dma_pushbuffer.clear();
     CommandWordsPool::Trim();
 }
@@ -107,6 +270,7 @@ bool DmaPusher::Step() {
     if (!ib_enable || dma_pushbuffer.empty()) {
         return false;
     }
+    WaitForCopyJob(dma_pushbuffer.front());
     // Waiting for the GPU's copy of a command list this channel reads next (ReadGpuWrittenCommands).
     if (pending_list_tick) {
         if (!rasterizer->IsGpuTickDone(*pending_list_tick)) {
@@ -131,12 +295,23 @@ bool DmaPusher::Step() {
     // as this frame's commands (methods on unbound subchannels, garbage QMDs, then a channel
     // waiting forever on a release it never got). The acquire is released now, so the commands
     // are written and the memory not yet reused: copy them here. EDEN_NX2_RESNAPSHOT=0: off.
+    // The current list's entries before this one ran already, and an entry the acquire suspended
+    // inside reads its remaining words from memory anyway. The list it resumes in is copied here;
+    // the snapshot copier copies the later ones meanwhile.
     if (ResnapshotEnabled() && suspensions.load(std::memory_order_relaxed) != suspensions_before) {
         const u64 now = suspensions.load(std::memory_order_acquire);
+        if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+            split.Publish();
+        }
+        size_t first_entry = dma_pushbuffer_subindex + (command_resume_offset != 0 ? 1 : 0);
+        bool current = true;
         for (CommandList& list : dma_pushbuffer) {
-            if (!list.submitted_offsets.empty()) {
-                RefreshSnapshot(list, now);
+            if (!list.submitted_offsets.empty() &&
+                (current || !QueueSnapshotCopy(list, now))) {
+                RefreshSnapshot(list, now, first_entry);
             }
+            first_entry = 0;
+            current = false;
         }
     }
 
@@ -268,18 +443,28 @@ bool DmaPusher::Step() {
             const char* text = std::getenv("EDEN_NX2_ENTRY_WRITER_STATS");
             return text != nullptr ? std::atoi(text) : 0;
         }();
+        // Entries that begin between methods are CPU-written command buffers; GPU-written indirect
+        // parameter lists continue inside an unfinished method unless copy engine work is queued.
+        static const bool skip_between_methods = [] {
+            const char* value = std::getenv("EDEN_NX2_LIST_WAIT_SKIP");
+            return value == nullptr || value[0] != '0';
+        }();
         if (!skip_record_read && !gpu_written && VideoCommon::GpuSplit::Get().Active() &&
-            entry_writer_stats != 2 &&
-            VideoCommon::GpuSplit::Get().WaitForWriters()) {
-            gpu_written =
-                IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
-            if (entry_writer_stats != 0) {
-                static u64 waits{}, found{};
-                ++waits;
-                found += gpu_written ? 1 : 0;
-                if (waits % 20000 == 0) {
-                    LOG_INFO(HW_GPU, "nx2 entry writer waits: {} ({} found GPU-written words)",
-                             waits, found);
+            entry_writer_stats != 2) {
+            auto& split = VideoCommon::GpuSplit::Get();
+            const bool skip = skip_between_methods && dma_state.method_count == 0 &&
+                              command_resume_offset == 0 && !CopyWritersPending(split);
+            if (!skip && split.WaitForSyncedWriters()) {
+                gpu_written =
+                    IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
+                if (entry_writer_stats != 0) {
+                    static u64 waits{}, found{};
+                    ++waits;
+                    found += gpu_written ? 1 : 0;
+                    if (waits % 20000 == 0) {
+                        LOG_INFO(HW_GPU, "nx2 entry writer waits: {} ({} found GPU-written words)",
+                                 waits, found);
+                    }
                 }
             }
         }
@@ -375,6 +560,8 @@ bool DmaPusher::Step() {
             RecordParsedEntry(header, commands);
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+        } else if (gpu_written && TakeListGrid(dma_state.dma_get, static_cast<u32>(header.size))) {
+            // Nothing to parse: the words stay on the host GPU (nx2_list_grid.h).
         } else if (bool pending = false;
                    ReadGpuWrittenCommands(dma_state.dma_get, static_cast<u32>(header.size),
                                           &pending) ||
@@ -734,6 +921,9 @@ void DmaPusher::CallMethod(u32 argument) {
         SCOPE_EXIT {
             if (writer) {
                 split.NoteWriter();
+                if (engine_type == Engines::EngineTypes::MaxwellDMA) {
+                    g_last_copy_writer.store(split.SentPosition(), std::memory_order_relaxed);
+                }
             }
         };
         if (split.Active()) {
@@ -759,6 +949,9 @@ void DmaPusher::CallMethod(u32 argument) {
             }
             split.Method(subchannel, dma_state.method, argument, dma_state.is_last_call,
                          opt_segment, effect);
+            if (engine_type == Engines::EngineTypes::MaxwellDMA) {
+                NoteDmaSemaphore(dma_state.method, argument);
+            }
             return;
         }
         if (!subchannel->execution_mask[dma_state.method]) {
@@ -798,6 +991,9 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
         SCOPE_EXIT {
             if (writer) {
                 split.NoteWriter();
+                if (engine_type == Engines::EngineTypes::MaxwellDMA) {
+                    g_last_copy_writer.store(split.SentPosition(), std::memory_order_relaxed);
+                }
             }
         };
         if (split.Active()) {
@@ -823,6 +1019,12 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
             }
             split.MultiMethod(subchannel, dma_state.method, base_start, num_methods,
                               dma_state.method_count, opt_segment, effect);
+            if (engine_type == Engines::EngineTypes::MaxwellDMA) {
+                for (u32 i = 0; i < num_methods; ++i) {
+                    NoteDmaSemaphore(dma_state.method + (dma_state.non_incrementing ? 0 : i),
+                                     base_start[i]);
+                }
+            }
             return;
         }
         VideoCommon::Nx2Profile::Scope method_scope{VideoCommon::Nx2Profile::Zone::Method};
@@ -832,9 +1034,39 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
     }
 }
 
-void DmaPusher::RefreshSnapshot(CommandList& list, u64 now) {
+void DmaPusher::NoteDmaSemaphore(u32 method, u32 argument) {
+    using Engines::MaxwellDMA;
+    if (method >= MaxwellDMA::SemaphoreMethod && method < MaxwellDMA::SemaphoreMethod + 3) {
+        dma_semaphore[method - MaxwellDMA::SemaphoreMethod] = argument;
+        return;
+    }
+    if (method != MaxwellDMA::LaunchDmaMethod) {
+        return;
+    }
+    using SemaphoreType = MaxwellDMA::LaunchDMA::SemaphoreType;
+    const auto launch = std::bit_cast<MaxwellDMA::LaunchDMA>(argument);
+    const auto type = launch.semaphore_type.Value();
+    if (type != SemaphoreType::RELEASE_ONE_WORD_SEMAPHORE &&
+        type != SemaphoreType::RELEASE_FOUR_WORD_SEMAPHORE) {
+        return;
+    }
+    const GPUVAddr address = MaxwellDMA::PackedGPUVAddr{dma_semaphore[0], dma_semaphore[1]};
+    const auto device = memory_manager.GpuToCpuAddress(address);
+    if (!device) {
+        return;
+    }
+    const bool known = launch.reduction_enable == 0;
+    auto& split = VideoCommon::GpuSplit::Get();
+    split.NoteSemaphoreWrite(*device, dma_semaphore[2], known);
+    if (type == SemaphoreType::RELEASE_FOUR_WORD_SEMAPHORE) {
+        split.NoteSemaphoreWrite(*device + 4, 0, known);
+    }
+}
+
+void DmaPusher::RefreshSnapshot(CommandList& list, u64 now, size_t first_entry) {
+    WaitForCopyJob(list);
     list.snapshot_suspensions = now;
-    for (size_t i = 0; i < list.command_lists.size() && i < list.submitted_offsets.size(); ++i) {
+    for (size_t i = first_entry; i < list.command_lists.size() && i < list.submitted_offsets.size(); ++i) {
         const CommandListHeader& entry = list.command_lists[i];
         const u32 offset = list.submitted_offsets[i];
         if (offset + entry.size > list.submitted_words.size()) {
@@ -875,6 +1107,79 @@ bool DmaPusher::IsGpuWrittenCommands(GPUVAddr address, size_t size) {
     return false;
 }
 
+bool DmaPusher::TakeListGrid(GPUVAddr address, u32 count) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    // The three words are all the parameters of a compute macro call begun in the entry before,
+    // on one mapped page.
+    if (count != 3 || dma_state.method_count != 3 || command_resume_offset != 0 ||
+        rasterizer == nullptr || !split.Active() || !split.FrontMacros() ||
+        dma_state.method < MacroRegistersStart || (dma_state.method & 1) != 0 ||
+        (address & 0xfff) > 0x1000 - 3 * sizeof(u32) ||
+        subchannels[dma_state.subchannel] == nullptr ||
+        subchannel_type[dma_state.subchannel] != Engines::EngineTypes::KeplerCompute ||
+        !memory_manager.GpuToCpuAddress(address)) {
+        return false;
+    }
+    auto* const compute = static_cast<Engines::KeplerCompute*>(subchannels[dma_state.subchannel]);
+    if (!compute->FrontRunsMacros()) {
+        return false;
+    }
+    const std::optional<u64> keep_id = compute->FrontClaimListGrid(split, dma_state.method);
+    if (!keep_id) {
+        return false;
+    }
+    // Verify mode: the words the old way too, for the checks to compare against.
+    std::array<u32, 3> real{};
+    if (Nx2ListGrid::g_verify) {
+        if (ReadGpuWrittenCommands(address, count)) {
+            std::memcpy(real.data(), command_headers.data(), sizeof(real));
+        } else {
+            FlushGpuWrittenCommands(address, sizeof(real));
+            memory_manager.ReadBlockUnsafe(address, real.data(), sizeof(real));
+        }
+    }
+    const Nx2ListGrid::ListReader reader{
+        [](void* self, GPUVAddr list, u64 keep_id, std::span<u32> words) {
+            return static_cast<DmaPusher*>(self)->ReadListWords(list, keep_id, words);
+        },
+        this};
+    compute->FrontTakeListGrid(split, dma_state.method, *keep_id, address, reader,
+                               Nx2ListGrid::g_verify ? std::span<const u32>{real}
+                                                     : std::span<const u32>{});
+    dma_state.method_count = 0;
+    dma_state.is_last_call = true;
+    return true;
+}
+
+bool DmaPusher::ReadListWords(GPUVAddr address, u64 keep_id, std::span<u32> words) {
+    if (rasterizer == nullptr || words.size() != 3) {
+        return false;
+    }
+    // The copy the back kept at the list's place in the stream: the words as the list had them,
+    // whatever later work wrote there. Its slot is reused only after the list's markers were
+    // resolved (Nx2ListGrid::ClaimSlot).
+    auto& split = VideoCommon::GpuSplit::Get();
+    bool kept = false;
+    split.Run([&] { kept = rasterizer->Nx2ReadKeptListWords(keep_id, words); },
+              VideoCommon::DrainSite::ListFlush);
+    if (kept) {
+        return true;
+    }
+    // No copy (the back found no buffer for the list): the old way, the list as it is after
+    // everything sent so far.
+    if (!memory_manager.GpuToCpuAddress(address)) {
+        LOG_ERROR(HW_GPU, "List-fed grid: list {} at {:#x} is neither kept nor mapped", keep_id,
+                  address);
+        return false;
+    }
+    LOG_WARNING(HW_GPU, "List-fed grid: list {} at {:#x} has no kept copy, read from memory",
+                keep_id, address);
+    split.Drain(VideoCommon::DrainSite::ListFlush);
+    FlushGpuWrittenCommands(address, words.size_bytes());
+    memory_manager.ReadBlockUnsafe(address, words.data(), words.size_bytes());
+    return true;
+}
+
 bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count, bool* pending) {
     // The pages are marked as command list pages: from the next write on, the buffer cache copies
     // them to host memory right after the dispatch or copy that writes them and submits. The
@@ -905,7 +1210,15 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count, bool* pendin
     // meanwhile too.
     const bool resumed = std::exchange(resumed_list_read, false);
     if (split.Active() && !resumed) {
-        split.WaitForWriters();
+        static const bool wait_all_writers = [] {
+            const char* value = std::getenv("EDEN_NX2_LIST_WAIT_ALL");
+            return value != nullptr && value[0] == '1';
+        }();
+        if (wait_all_writers) {
+            split.WaitForWriters();
+        } else {
+            split.WaitForSyncedWriters(VideoCommon::DrainSite::ListCopies);
+        }
     }
     bool past_sync = !split.Active();
     using GpuWrittenList = VideoCore::RasterizerInterface::GpuWrittenList;
@@ -931,6 +1244,12 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count, bool* pendin
             if (where == GpuWrittenList::Pending) {
                 // The copy is still on the GPU: the channel waits for it without blocking the
                 // others (Step parses this entry again once IsGpuTickDone).
+                if (split.Active()) {
+                    split.RequestIdleHook();
+                }
+                if (Nx2PendingWake::On()) {
+                    g_pending_gpu_tick.Watch(tick);
+                }
                 pending_list_tick = tick;
                 *pending = true;
                 return false;

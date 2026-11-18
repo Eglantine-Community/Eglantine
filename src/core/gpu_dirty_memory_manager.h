@@ -31,27 +31,18 @@ public:
     ~GPUDirtyMemoryManager() = default;
 
     void Collect(PAddr address, size_t size) {
-        TransformAddress t = BuildTransform(address, size);
-        TransformAddress tmp, original;
-        do {
-            tmp = current.load(std::memory_order_acquire);
-            original = tmp;
-            if (tmp.address != t.address) {
-                if (IsValid(tmp.address)) {
-                    std::scoped_lock lk(guard);
-                    back_buffer.emplace_back(tmp);
-                    current.exchange(t, std::memory_order_relaxed);
-                    return;
-                }
-                tmp.address = t.address;
-                tmp.mask = 0;
-            }
-            if ((tmp.mask | t.mask) == tmp.mask) {
-                return;
-            }
-            tmp.mask |= t.mask;
-        } while (!current.compare_exchange_weak(original, tmp, std::memory_order_release,
-                                                std::memory_order_relaxed));
+        PAddr current_address = address;
+        size_t remaining = size;
+        while (remaining > 0) {
+            const size_t in_page = (std::min)(page_size - (current_address & page_mask), remaining);
+            CollectInPage(current_address, in_page);
+            current_address += in_page;
+            remaining -= in_page;
+        }
+    }
+
+    [[nodiscard]] bool MayHavePending() const noexcept {
+        return IsValid(current.load(std::memory_order_acquire).address);
     }
 
     /// Calls `callback` for each write collected and not yet gathered, without consuming them.
@@ -126,8 +117,37 @@ private:
     constexpr static size_t align_mask = align_size - 1;
     constexpr static TransformAddress default_transform = {.address = ~0U, .mask = 0U};
 
-    bool IsValid(PAddr address) {
-        return address < (1ULL << 39);
+    static constexpr bool IsValid(u32 page_address) noexcept {
+        return page_address != default_transform.address;
+    }
+
+    void CollectInPage(PAddr address, size_t size) {
+        TransformAddress t = BuildTransform(address, size);
+        TransformAddress tmp, original;
+        do {
+            tmp = current.load(std::memory_order_acquire);
+            original = tmp;
+            if (tmp.address != t.address) {
+                if (IsValid(tmp.address)) {
+                    std::scoped_lock lk(guard);
+                    const TransformAddress prev = current.exchange(t, std::memory_order_acq_rel);
+                    if (IsValid(prev.address)) {
+                        back_buffer.emplace_back(prev);
+                    }
+                    if (prev.address != tmp.address || (prev.mask & tmp.mask) != tmp.mask) {
+                        back_buffer.emplace_back(tmp);
+                    }
+                    return;
+                }
+                tmp.address = t.address;
+                tmp.mask = 0;
+            }
+            if ((tmp.mask | t.mask) == tmp.mask) {
+                return;
+            }
+            tmp.mask |= t.mask;
+        } while (!current.compare_exchange_weak(original, tmp, std::memory_order_release,
+                                                std::memory_order_relaxed));
     }
 
     template <typename T>

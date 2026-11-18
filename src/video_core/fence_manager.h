@@ -107,9 +107,15 @@ public:
             if (delay_fence) {
                 uncommitted_operations.emplace_back(std::move(func));
             }
+            OperationList recycled;
+            if (!free_operation_lists.empty()) {
+                recycled = std::move(free_operation_lists.back());
+                free_operation_lists.pop_back();
+            } else {
+                recycled.reserve(64);
+            }
             pending_operations.emplace_back(std::move(uncommitted_operations));
-            uncommitted_operations.clear(); // moved-from: make it empty explicitly
-            uncommitted_operations.reserve(64);
+            uncommitted_operations = std::move(recycled);
         }
         pending_flushes.push_back(committed_flushes);
         QueueFence(new_fence);
@@ -121,8 +127,11 @@ public:
             rasterizer.FlushCommands();
         }
         if constexpr (can_async_check) {
+            const bool wake = fence_thread_waiting;
             guard.unlock();
-            cv.notify_all();
+            if (wake) {
+                cv.notify_one();
+            }
         }
         rasterizer.InvalidateGPUCache();
     }
@@ -223,6 +232,7 @@ private:
             for (auto& operation : operations) {
                 operation();
             }
+            RecycleOperationList(std::move(operations));
             {
                 std::unique_lock lock(ring_guard);
                 delayed_destruction_ring.Push(std::move(current_fence));
@@ -262,7 +272,9 @@ private:
         while (!stop_token.stop_requested()) {
             {
                 std::unique_lock lock(guard);
+                fence_thread_waiting = true;
                 cv.wait(lock, [&] { return stop_token.stop_requested() || !fences.empty(); });
+                fence_thread_waiting = false;
                 if (stop_token.stop_requested()) [[unlikely]] {
                     return;
                 }
@@ -308,6 +320,7 @@ private:
                 for (auto& operation : released.operations) {
                     operation();
                 }
+                RecycleOperationList(std::move(released.operations));
             }
             {
                 std::unique_lock lock(ring_guard);
@@ -396,15 +409,29 @@ private:
         }
     }
 
+    using OperationList = std::vector<std::function<void()>>;
+
+    void RecycleOperationList(OperationList&& list) {
+        list.clear();
+        if (list.capacity() == 0) {
+            return;
+        }
+        std::scoped_lock lock{uncommitted_guard};
+        if (free_operation_lists.size() < 32) {
+            free_operation_lists.push_back(std::move(list));
+        }
+    }
+
     std::queue<TFence> fences;
     // LOCAL TEST (Zelda): vectors, not deques. MSVC's deque of std::function holds one element per
     // block, so every queued operation (one per query report, ~1000 objects a frame in Ocarina's
     // Kokiri Forest) allocated a block.
-    using OperationList = std::vector<std::function<void()>>;
     OperationList uncommitted_operations;
+    std::vector<OperationList> free_operation_lists;
     std::deque<OperationList> pending_operations;
     std::deque<u8> pending_flushes; ///< Per fence: the caches that committed downloads
     u32 skipped_fences{}; ///< Empty fences skipped since the last one made (GPU thread only)
+    bool fence_thread_waiting{};
 
     std::mutex guard;
     std::mutex ring_guard;

@@ -435,6 +435,8 @@ private:
     std::atomic<s64> precache_paused_us{};
     /// steady_clock ticks of the last pipeline the game built or queued.
     std::atomic<s64> last_runtime_build{};
+    std::atomic<s64> last_active_3d_frame{};
+    u32 frame_graphics_draws{};
     std::atomic_bool precache_stop{};
     std::atomic<size_t> precache_left{};
     std::atomic<size_t> precache_built{};

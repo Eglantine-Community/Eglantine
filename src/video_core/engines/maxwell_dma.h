@@ -239,6 +239,9 @@ public:
     };
     static_assert(sizeof(RemapConst) == 12);
 
+    static constexpr u32 SemaphoreMethod = 0x90;
+    static constexpr u32 LaunchDmaMethod = 0xC0;
+
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
 
     explicit MaxwellDMA(MemoryManager& memory_manager_);

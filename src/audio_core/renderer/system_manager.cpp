@@ -29,14 +29,33 @@ void SystemManager::InitializeUnsafe() {
         thread = std::jthread([this](std::stop_token stop_token) {
             Common::SetCurrentThreadName("AudioRenderSystemManager");
             Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
+            u32 fast_spin_streak = 0;
             while (active && !stop_token.stop_requested()) {
+                const auto iter_start = std::chrono::steady_clock::now();
+                bool any_active = false;
                 {
                     std::scoped_lock l{mutex1};
-                    for (auto system : systems)
+                    for (auto system : systems) {
+                        any_active |= system->IsActive();
                         system->SendCommandToDsp();
+                    }
                 }
                 audio_renderer.Signal();
                 audio_renderer.Wait();
+                const auto elapsed = std::chrono::steady_clock::now() - iter_start;
+                if (!any_active) {
+                    fast_spin_streak = 0;
+                    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+                } else if (elapsed < std::chrono::microseconds{250}) {
+                    if (++fast_spin_streak > 4) {
+                        // Stream is paused or unthrottled: pace to the 5 ms ADSP frame period
+                        // instead of spinning at 100% CPU and flooding adsp_rendered_event.
+                        std::this_thread::sleep_for(std::chrono::milliseconds{5} -
+                                                    std::chrono::duration_cast<std::chrono::microseconds>(elapsed));
+                    }
+                } else {
+                    fast_spin_streak = 0;
+                }
             }
         });
     }

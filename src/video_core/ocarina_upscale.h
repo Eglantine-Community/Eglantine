@@ -50,6 +50,7 @@ constexpr u64 OutputPassScaledFieldHash = 0x9302bc0d6d1d9bc1ULL;
 constexpr u64 OutputPassScaledHandheldKey = 0xd8efd9f0c95abd80ULL;
 constexpr u64 OutputPassScaledHandheldHash = 0x03bf0ffc7d2d0bedULL;
 constexpr u64 OutputPassScaledMenuHash = 0x4c1ae2fe58f30a97ULL;
+constexpr u64 OutputPassFullSizeHash = 0xc033c3ddc9f0897bULL;
 
 [[nodiscard]] constexpr bool IsInputPass(u64 native_key, u64 shader_hash) noexcept {
     return shader_hash == InputPassHash || native_key == InputPassKey ||
@@ -61,8 +62,9 @@ constexpr u64 OutputPassScaledMenuHash = 0x4c1ae2fe58f30a97ULL;
            shader_hash == OutputPassUpscaleV111Hash || shader_hash == OutputPassDockedHash ||
            shader_hash == OutputPassScaledFieldHash ||
            shader_hash == OutputPassScaledHandheldHash ||
-           shader_hash == OutputPassScaledMenuHash || native_key == OutputPassUpscaleKey ||
-           native_key == OutputPassDockedKey || native_key == OutputPassScaledFieldKey ||
+           shader_hash == OutputPassScaledMenuHash || shader_hash == OutputPassFullSizeHash ||
+           native_key == OutputPassUpscaleKey || native_key == OutputPassDockedKey ||
+           native_key == OutputPassScaledFieldKey ||
            native_key == OutputPassScaledHandheldKey || native_key == OutputPassHash;
 }
 

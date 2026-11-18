@@ -427,6 +427,23 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         config.fastmem_pointer = std::nullopt;
         config.fastmem_exclusive_access = false;
     }
+#if defined(ARCHITECTURE_x86_64)
+    if (Settings::values.cpu_accuracy.GetValue() != Settings::CpuAccuracy::Paranoid) {
+        config.spill_to_free_gpr = true;
+        config.scratch_copy_to_free_reg = true;
+        config.elide_redundant_zext = true;
+        config.fold_address_offsets = true;
+        config.omit_block_frame = true;
+        config.fast_dispatch_table_bits = 16;
+        config.fast_dispatch_set_associative = true;
+        config.rsb_size = 32;
+        config.compact_block_exits = true;
+        config.far_code = true;
+        config.reuse_host_flags = !config.enable_cycle_counting;
+        config.halt_check_on_back_edges = !config.enable_cycle_counting;
+        config.host_call_return = !config.enable_cycle_counting;
+    }
+#endif
     m_jit.emplace(config);
 }
 

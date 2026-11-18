@@ -49,6 +49,8 @@ namespace Tegra::Engines {
 
 class Puller final {
 public:
+    ~Puller();
+
     struct MethodCall {
         u32 method{};
         u32 argument{};
@@ -82,9 +84,11 @@ public:
         u32 operation;
         std::chrono::steady_clock::time_point since;
         std::chrono::steady_clock::time_point last_fences; ///< When it last released fences
+        std::chrono::steady_clock::time_point last_drain;  ///< When it last drained the split
         bool reported;
 
         [[nodiscard]] bool Matches(u32 current) const;
+        [[nodiscard]] bool WaitsToReach() const;
     };
 
     [[nodiscard]] bool HasPendingAcquire() const {

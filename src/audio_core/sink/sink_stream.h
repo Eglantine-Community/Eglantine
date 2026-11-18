@@ -217,13 +217,15 @@ public:
     /**
      * Waits for free space in the sample ring buffer
      */
-    void WaitFreeSpace(std::stop_token stop_token);
+    virtual void WaitFreeSpace(std::stop_token stop_token);
 
 protected:
     /**
      * Unblocks the ADSP if the stream is paused.
      */
     void SignalPause();
+
+    void AdvancePlayedSampleCount(u64 num_frames);
 
 protected:
     /// Core system

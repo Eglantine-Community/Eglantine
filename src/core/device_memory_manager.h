@@ -75,6 +75,12 @@ public:
         TrackContinuityImpl(address, virtual_address, size, asid);
     }
 
+    /// Changes whenever Map or Unmap ran: host pointers GetPointer returned before are only good
+    /// while it stays the same.
+    [[nodiscard]] u64 TranslationGeneration() const noexcept {
+        return translation_generation.load(std::memory_order_acquire);
+    }
+
     // Write / Read
     template <typename T>
     T* GetPointer(DAddr address);
@@ -133,6 +139,13 @@ public:
 
     // New batch API to update multiple ranges with a single lock acquisition.
     void UpdatePagesCachedBatch(std::span<const std::pair<DAddr, size_t>> ranges, s32 delta);
+
+    void BeginDeferredCachedUpdates() {
+        deferred_cached_updates.fetch_add(1, std::memory_order_relaxed);
+    }
+    void EndDeferredCachedUpdates() {
+        deferred_cached_updates.fetch_sub(1, std::memory_order_release);
+    }
 
     /// Traps the next guest CPU read of these pages, to learn which GPU writes the CPU reads.
     void ArmReadTraps(DAddr addr, size_t size);
@@ -271,6 +284,7 @@ private:
     std::unique_ptr<CachedPages> cached_pages;
     Common::RangeMutex counter_guard;
     std::mutex mapping_guard;
+    std::atomic<u32> deferred_cached_updates{};
 
 
 };

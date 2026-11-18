@@ -138,6 +138,9 @@ struct CommandList final {
     /// that waited behind one, reads memory instead: games write the commands it runs before they
     /// release the acquire.
     u64 snapshot_suspensions = 0;
+    /// The snapshot copier's job that copies the words again (DmaPusher::QueueSnapshotCopy), 0
+    /// for none: the GPU thread waits for it before it parses or copies the list itself.
+    u64 copy_job = 0;
 };
 
 /// FNV-1a over pushbuffer words (EDEN_NX2_PB_CHECK).
@@ -212,6 +215,7 @@ private:
     void VerifyFrontRun(Engines::Maxwell3D& maxwell3d, std::span<const CommandHeader> commands,
                         size_t word_offset, size_t& index);
     [[nodiscard]] bool WantsSegment() const;
+    void NoteDmaSemaphore(u32 method, u32 argument);
     void ReportUnboundSubchannel();
     void WatchArgument(u32 method, u32 argument) const;
 
@@ -223,8 +227,15 @@ public:
     void RecordParsedEntry(const CommandListHeader& header, std::span<const CommandHeader> commands);
     /// Whether the entry lies on device pages the GPU has written (NX2).
     bool IsGpuWrittenCommands(GPUVAddr address, size_t size);
-    /// Copies the list's words from memory again, as of suspension count `now`.
-    void RefreshSnapshot(CommandList& list, u64 now);
+    /// Copies the list's words from memory again, as of suspension count `now`, from entry
+    /// `first_entry` on (the entries before it ran already). Waits for the list's copier job first.
+    void RefreshSnapshot(CommandList& list, u64 now, size_t first_entry = 0);
+    /// RefreshSnapshot on the snapshot copier's thread. False when its queue is full (the caller
+    /// copies).
+    bool QueueSnapshotCopy(CommandList& list, u64 now);
+    /// Waits until the snapshot copier copied everything queued (before work that may change the
+    /// GPU's mappings, and before a channel goes away).
+    static void WaitForSnapshotCopies();
     /// Copies the list's deferred entries (CommandList::deferred_entries) from memory.
     void RefreshDeferredEntries(CommandList& list);
 
@@ -242,6 +253,13 @@ public:
     /// flushes and reads guest memory. With `pending`, a copy the GPU has not finished sets
     /// `*pending` and pending_list_tick instead of waiting (the result is false then).
     bool ReadGpuWrittenCommands(GPUVAddr address, u32 count, bool* pending = nullptr);
+    /// List-fed grid macros (nx2_list_grid.h): the entry at `address` is the three GPU-written
+    /// parameters of a call the compute engine stores as markers. Returns whether it took them
+    /// without reading them (no wait for the back, the host GPU or a copy).
+    bool TakeListGrid(GPUVAddr address, u32 count);
+    /// The three words of the list kept as `keep_id`, after everything sent so far (a wait for
+    /// the back and the host GPU). False if they are no longer kept.
+    bool ReadListWords(GPUVAddr address, u64 keep_id, std::span<u32> words);
     /// Brings command list words the GPU wrote (still only in host buffers) to guest memory.
     void FlushGpuWrittenCommands(GPUVAddr address, size_t size);
 
@@ -296,6 +314,7 @@ public:
 
     std::array<Engines::EngineInterface*, max_subchannels> subchannels{};
     std::array<Engines::EngineTypes, max_subchannels> subchannel_type;
+    std::array<u32, 3> dma_semaphore{};
 
     Engines::Puller puller;
     std::mutex sync_mutex;

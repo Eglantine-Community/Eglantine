@@ -22,11 +22,14 @@
 #include "core/hle/kernel/kernel.h"
 #include "core/memory.h"
 #include "tests/core/system_test_context.h"
+#include "core/gpu_dirty_memory_manager.h"
+#include "video_core/buffer_cache/memory_tracker_base.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/renderer_null/null_rasterizer.h"
 
 namespace VideoCommon {
@@ -59,6 +62,19 @@ struct GpuSplitTestAccess {
         const size_t size = split.Execute(
             &split.ring[index], std::min<u64>(available - position, GpuSplit::RingWords - index));
         return position + (size != 0 ? size : GpuSplit::RingWords - index);
+    }
+
+    static void SetConsumed(GpuSplit& split, u64 position) {
+        split.consumed.store(position, std::memory_order_release);
+        split.consumed_cache = position;
+    }
+
+    static void SetBackIdleAt(GpuSplit& split, u64 position) {
+        split.back_idle_at.store(position, std::memory_order_relaxed);
+    }
+
+    static u64 Published(const GpuSplit& split) {
+        return split.published.load(std::memory_order_acquire);
     }
 };
 
@@ -849,4 +865,103 @@ TEST_CASE("Maxwell3D fast method dispatch cost", "[.][maxwell_fast_method_bench]
     const double run_ns = words(true);
     WARN("Three constant buffer words: " << single_ns << " ns one by one, " << run_ns
                                          << " ns as a run (unmapped buffer)");
+}
+
+TEST_CASE("GpuSplit tracks queued semaphore writes, synced writers, and idle publish",
+          "[video_core][maxwell_fast_method]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    VideoCommon::GpuSplit split;
+    Access::Initialize(split, f.system, 0);
+
+    split.Defer([] {}, VideoCommon::GpuSplit::Effect::None);
+    split.NoteSemaphoreWrite(0x1000, 42, true);
+    const u64 first_pos = Access::End(split);
+    auto queued = split.QueuedSemaphoreWriteAt(0x1000);
+    REQUIRE(queued.has_value());
+    REQUIRE(queued->known);
+    REQUIRE(queued->payload == 42);
+
+    // Unsynced writer does not block WaitForSyncedWriters until NoteSync captures it.
+    split.NoteWriter();
+    REQUIRE(!split.WaitForSyncedWriters());
+    split.NoteSync();
+    Access::SetConsumed(split, first_pos);
+    REQUIRE(!split.WaitForSyncedWriters());
+
+    // Early publish after PublishAfterWait (8 words) when back_idle_at matches published_local.
+    const u64 pub_before = Access::Published(split);
+    Access::SetBackIdleAt(split, Access::End(split));
+    split.Publish();
+    const u64 idle_pos = Access::Published(split);
+    Access::SetBackIdleAt(split, idle_pos);
+    for (u32 i = 0; i < 9; ++i) {
+        split.MacroWrite(&f.fast, DrawEnd, 0, VideoCommon::GpuSplit::Effect::None);
+    }
+    REQUIRE(Access::Published(split) > idle_pos);
+    (void)pub_before;
+}
+
+TEST_CASE("Nx2SemaphoreWaiters tracks lock-free latches and host memory word stores",
+          "[video_core][maxwell_fast_method]") {
+    auto& waiters = Tegra::Nx2SemaphoreWaiters::Get();
+    alignas(4) u32 word = 10;
+    int owner_a = 0;
+    int owner_b = 0;
+    REQUIRE(waiters.Add(&owner_a, 0x2000, 20, Tegra::Nx2SemaphoreWaiters::AcquireGequal, &word));
+    REQUIRE(waiters.Add(&owner_b, 0x3000, 5, Tegra::Nx2SemaphoreWaiters::AcquireEqual, nullptr));
+    REQUIRE(!waiters.Latched(&owner_a));
+    REQUIRE(!waiters.WordStored());
+
+    std::atomic_ref<u32>{word}.store(15, std::memory_order_relaxed);
+    REQUIRE(waiters.WordStored());
+    REQUIRE(!waiters.WordStored());
+
+    waiters.OnWrite(0x2000, 20);
+    REQUIRE(waiters.Latched(&owner_a));
+    REQUIRE(!waiters.Latched(&owner_b));
+
+    waiters.Remove(&owner_a);
+    waiters.Remove(&owner_b);
+    REQUIRE(!waiters.Latched(&owner_a));
+}
+
+TEST_CASE("GPUDirtyMemoryManager splits page-crossing collects and reports MayHavePending",
+          "[video_core][maxwell_fast_method]") {
+    Core::GPUDirtyMemoryManager manager;
+    REQUIRE(!manager.MayHavePending());
+    // Crosses two 2 KiB page boundaries (600 + 3600 = 4200 > 4096).
+    manager.Collect(0x10000 + 600, 3600);
+    REQUIRE(manager.MayHavePending());
+    size_t total_bytes = 0;
+    std::function<void(PAddr, size_t)> cb = [&](PAddr, size_t size) { total_bytes += size; };
+    manager.Gather(cb);
+    REQUIRE(total_bytes >= 3600);
+    REQUIRE(!manager.MayHavePending());
+}
+
+TEST_CASE("MemoryTrackerBase isolates per-chunk CPU and GPU range epochs",
+          "[video_core][maxwell_fast_method]") {
+    struct DummyDeviceTracker {
+        void UpdatePagesCachedCount(DAddr, size_t, s32) {}
+        void UpdatePagesCachedBatch(std::span<const std::pair<DAddr, size_t>>, s32) {}
+    } dummy;
+    VideoCommon::MemoryTrackerBase<DummyDeviceTracker> tracker{dummy};
+    constexpr VAddr chunk_a = 0x1000000; // chunk 4
+    constexpr VAddr chunk_b = 0x2000000; // chunk 8
+    tracker.UnmarkRegionAsCpuModified(chunk_a, 0x1000);
+    tracker.UnmarkRegionAsCpuModified(chunk_b, 0x1000);
+
+    const u64 cpu_a0 = tracker.CpuRangeEpoch(chunk_a, 0x1000);
+    const u64 cpu_b0 = tracker.CpuRangeEpoch(chunk_b, 0x1000);
+    const u64 gpu_a0 = tracker.GpuRangeEpoch(chunk_a, 0x1000);
+    const u64 gpu_b0 = tracker.GpuRangeEpoch(chunk_b, 0x1000);
+
+    tracker.MarkRegionAsCpuModified(chunk_a, 0x1000);
+    REQUIRE(tracker.CpuRangeEpoch(chunk_a, 0x1000) > cpu_a0);
+    REQUIRE(tracker.CpuRangeEpoch(chunk_b, 0x1000) == cpu_b0);
+
+    tracker.MarkRegionAsGpuModified(chunk_a, 0x1000);
+    REQUIRE(tracker.GpuRangeEpoch(chunk_a, 0x1000) > gpu_a0);
+    REQUIRE(tracker.GpuRangeEpoch(chunk_b, 0x1000) == gpu_b0);
 }

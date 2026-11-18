@@ -130,3 +130,28 @@ TEST_CASE("Uniform stream reuse preserves data through mutation and session rese
         bind(stage, slot, address, size);
     }
 }
+
+TEST_CASE("Uniform stream reuse enters direct mode after miss streak and resumes comparing",
+          "[video_core][uniform_stream_reuse]") {
+    using VideoCommon::BindSmallUniformReusing;
+    Memory memory;
+    Runtime runtime;
+    VideoCommon::ResetUniformStreamReuse<Runtime>();
+    for (u32 i = 0; i < 8; ++i) {
+        memory.bytes[0] = static_cast<u8>(i + 1);
+        REQUIRE(BindSmallUniformReusing(runtime, memory, 0, 0, 0, 0, 64));
+        CheckBound(runtime, memory, 0, 64);
+    }
+    REQUIRE(runtime.allocations.size() == 8);
+    // Next 64 binds go direct even if identical, then bind 65 compares against bind 64's bytes.
+    for (u32 i = 0; i < 64; ++i) {
+        memory.bytes[0] = static_cast<u8>(100 + (i / 2));
+        REQUIRE(BindSmallUniformReusing(runtime, memory, 0, 0, 0, 0, 64));
+        CheckBound(runtime, memory, 0, 64);
+    }
+    REQUIRE(runtime.allocations.size() == 72);
+    // Identical to the 64th direct bind: must reuse without allocating.
+    REQUIRE(BindSmallUniformReusing(runtime, memory, 0, 0, 0, 0, 64));
+    REQUIRE(runtime.allocations.size() == 72);
+    CheckBound(runtime, memory, 0, 64);
+}

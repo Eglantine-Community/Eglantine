@@ -129,9 +129,8 @@ void ReportPendingWake(PendingWakeStats& stats) {
 void PendingWakeSleep(PendingWakeStats& stats, u64 push_seen, u64 latch_seen, u64 tick_seen) {
     namespace Wake = Tegra::Nx2PendingWake;
     namespace Profile = VideoCommon::Nx2Profile;
-    Wake::wake_event.Reset();
     Wake::wake_reasons.store(0, std::memory_order_relaxed);
-    Wake::front_sleeping.store(true, std::memory_order_seq_cst);
+    Wake::wake_flag.store(false, std::memory_order_seq_cst);
     u32 reason = 0;
     if (Wake::push_seq.load(std::memory_order_seq_cst) != push_seen) {
         reason |= Wake::ByPush;
@@ -144,16 +143,38 @@ void PendingWakeSleep(PendingWakeStats& stats, u64 push_seen, u64 latch_seen, u6
     }
     const bool skipped = reason != 0;
     bool woke = skipped;
+    bool by_word = false;
     if (!skipped) {
-        woke = Wake::wake_event.WaitFor(std::chrono::milliseconds{1});
-        reason = woke ? Wake::wake_reasons.load(std::memory_order_relaxed) : 0;
+        auto& waiters = Tegra::Nx2SemaphoreWaiters::Get();
+        const auto sleep_end = std::chrono::steady_clock::now() + std::chrono::microseconds{500};
+        if (waiters.HasCpuWordWaiters()) {
+            while (true) {
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= sleep_end) {
+                    break;
+                }
+                const auto slice_end = (std::min)(now + std::chrono::microseconds{50}, sleep_end);
+                if (Common::WaitForFlag(Wake::wake_flag, slice_end)) {
+                    woke = true;
+                    reason = Wake::wake_reasons.load(std::memory_order_relaxed);
+                    break;
+                }
+                if (waiters.WordStored()) {
+                    woke = true;
+                    by_word = true;
+                    break;
+                }
+            }
+        } else {
+            woke = Common::WaitForFlag(Wake::wake_flag, sleep_end);
+            reason = woke ? Wake::wake_reasons.load(std::memory_order_relaxed) : 0;
+        }
     }
-    Wake::front_sleeping.store(false, std::memory_order_seq_cst);
     // Verify checks the resumes the next polls make.
     Wake::verify_resume = reason != 0 && VideoCommon::Nx2Perf::Verify();
 
     const bool by_push = (reason & Wake::ByPush) != 0;
-    const bool by_latch = !by_push && (reason & Wake::ByLatch) != 0;
+    const bool by_latch = (!by_push && (reason & Wake::ByLatch) != 0) || by_word;
     ++stats.waits;
     stats.by_push += by_push ? 1 : 0;
     stats.by_latch += by_latch ? 1 : 0;
@@ -213,6 +234,7 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 s64 latch_ns_seen{};
                 if (pending_wake) [[unlikely]] {
                     namespace Wake = Tegra::Nx2PendingWake;
+                    Wake::wake_flag.store(false, std::memory_order_seq_cst);
                     push_seen = Wake::push_seq.load(std::memory_order_seq_cst);
                     latch_seen = Wake::latch_seq.load(std::memory_order_seq_cst);
                     tick_seen = Tegra::g_pending_gpu_tick_sequence.load(std::memory_order_seq_cst);
@@ -240,25 +262,43 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     Tegra::Nx2PendingWake::verify_resume = false;
                 }
                 if (!state.queue.TryPop(next)) {
-                    // The CPU usually releases the semaphore soon after: poll for half a
-                    // millisecond before sleeping, or every wait also waits out a host sleep
-                    // (title 1 waits ~25 times a second).
+                    if (!scheduler.HasPendingChannels()) {
+                        continue;
+                    }
                     Profile::Scope scope{Profile::Zone::PendingSleep};
-                    if (std::chrono::steady_clock::now() - last_progress <
-                        (short_pending_poll ? std::chrono::microseconds{500}
-                                            : std::chrono::microseconds{100})) {
+                    split.SettleIdleBack();
+                    constexpr auto PendingPoll = std::chrono::microseconds{500};
+                    constexpr auto PendingPollPeriod = std::chrono::microseconds{20};
+                    constexpr auto WordCheckPeriod = std::chrono::microseconds{2};
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now - last_progress < PendingPoll) {
+                        if (pending_wake) {
+                            auto& waiters = Tegra::Nx2SemaphoreWaiters::Get();
+                            const auto poll_end =
+                                (std::min)(now + PendingPollPeriod, last_progress + PendingPoll);
+                            auto until = now;
+                            do {
+                                until = (std::min)(std::chrono::steady_clock::now() + WordCheckPeriod,
+                                                   poll_end);
+                                if (Common::WaitForFlag(Tegra::Nx2PendingWake::wake_flag, until) ||
+                                    waiters.WordStored()) {
+                                    break;
+                                }
+                            } while (until < poll_end);
+                        } else {
 #if defined(ARCHITECTURE_x86_64)
-                        for (int i = 0; i < 32; ++i) {
-                            _mm_pause();
-                        }
+                            for (int i = 0; i < 32; ++i) {
+                                _mm_pause();
+                            }
 #endif
-                        std::this_thread::yield();
+                            std::this_thread::yield();
+                        }
                     } else if (short_pending_poll) {
                         std::this_thread::sleep_for(std::chrono::microseconds{50});
-                    } else if (pending_wake) [[unlikely]] {
+                    } else if (pending_wake) {
                         PendingWakeSleep(pending_wake_stats, push_seen, latch_seen, tick_seen);
                     } else {
-                        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+                        std::this_thread::sleep_for(std::chrono::microseconds{500});
                     }
                     continue;
                 }
@@ -281,6 +321,9 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 // Only command lists are parsed here; everything else runs on the back thread
                 // in order, and so does the signal that the command ran.
                 auto* const rasterizer_ptr = renderer.ReadRasterizer();
+                if (!std::holds_alternative<SubmitListCommand>(next.data)) {
+                    Tegra::DmaPusher::WaitForSnapshotCopies();
+                }
                 if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
                     Profile::Scope scope{Profile::Zone::Push};
                     if (VideoCommon::Nx2Hazard::Enabled()) {
@@ -331,6 +374,9 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     VideoCommon::GpuSplit::Effect::None);
                 split.Publish();
                 continue;
+            }
+            if (!std::holds_alternative<SubmitListCommand>(next.data)) {
+                Tegra::DmaPusher::WaitForSnapshotCopies();
             }
             if (auto* submit_list = std::get_if<SubmitListCommand>(&next.data)) {
                 Profile::Scope scope{Profile::Zone::Push};
@@ -423,6 +469,7 @@ void ThreadManager::NotifyShutdown() {
         thread.request_stop();
         thread.join();
     }
+    Tegra::DmaPusher::WaitForSnapshotCopies();
     VideoCommon::GpuSplit::Get().Stop();
 }
 

@@ -29,6 +29,7 @@
 #include "video_core/engines/engine_upload.h"
 #include "video_core/gpu.h"
 #include "video_core/macro.h"
+#include "video_core/nx2_list_grid.h"
 #include "video_core/split_write_tracker.h"
 #include "video_core/textures/texture.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -3238,6 +3239,9 @@ public:
                          u32 argument, bool is_last_call);
     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                               const u32* base_start, u32 amount, u32 methods_pending);
+    /// List-fed grid macros (nx2_list_grid.h): the markers of the data RAM, which the compute
+    /// engine shares and stores them in (KeplerCompute::FrontTakeListGrid).
+    Nx2ListGrid::GridMarker grid_marker;
     /// Split front, before an entry holding the remaining 5 parameters (at `record`) of the
     /// pending macro call: true when that macro is DrawIndexedIndirect with a topology the host
     /// draws indirectly. The host GPU then reads the record itself (the words may still be
@@ -3318,6 +3322,10 @@ public:
     /// Handles a write to the CB_BIND register.
     void ProcessCBBind(size_t stage_index);
 
+    /// Writes constant buffer data at `offset` (`bytes` within the buffer) through the buffer
+    /// CB_ADDRESS and CB_SIZE select, translated once per selection and memory map.
+    bool WriteBoundConstantBuffer(u32 offset, const void* data, u32 bytes);
+
     /// Handles a write to the CB_DATA[i] register.
     void ProcessCBData(u32 value);
     void ProcessCBMultiData(const u32* start_base, u32 amount);
@@ -3396,6 +3404,13 @@ private:
 
     MemoryManager& memory_manager;
 
+    struct BoundConstantBuffer {
+        GPUVAddr address{};
+        u32 size{};
+        u64 map_serial{};
+        DAddr device{}; ///< 0: the general path writes its data
+    } bound_constant_buffer;
+
     VideoCore::RasterizerInterface* rasterizer = nullptr;
 
     /// Start offsets of each macro in macro_memory
@@ -3448,6 +3463,7 @@ private:
     void ReleaseFront();
     void FrontWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
                     bool is_last_call, bool from_macro);
+    void FrontNoteReport(VideoCommon::GpuSplit& split, const FrontState& state);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state,
                        std::span<const u32> borrowed = {});
     void FrontTrackInstanceLoop(FrontState& state, u32 method, u32 value);

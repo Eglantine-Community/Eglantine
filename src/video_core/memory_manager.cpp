@@ -684,6 +684,34 @@ void MemoryManager::WriteWordsCached(GPUVAddr gpu_dest_addr, const u32* words, s
     }
 }
 
+void MemoryManager::WriteConstantBufferData(DAddr device_addr, const void* data, std::size_t size) {
+    const auto* src = static_cast<const u8*>(data);
+    for (DAddr address = device_addr; address < device_addr + size;) {
+        const std::size_t amount = (std::min<std::size_t>)(
+            device_addr + size - address, Core::DEVICE_PAGESIZE - (address & Core::DEVICE_PAGEMASK));
+        if (u8* const physical = memory.GetPointer<u8>(address)) [[likely]] {
+            std::memcpy(physical, src, amount);
+        } else {
+            memory.WriteBlockUnsafe(address, src, amount);
+        }
+        address += amount;
+        src += amount;
+    }
+    if (size != 0 && Tegra::g_nx2_has_proven_code.load(std::memory_order_acquire)) [[unlikely]] {
+        Tegra::Nx2NoteDeferredCodeWrite(device_addr, size);
+    }
+    if (!constant_buffer_writes.empty()) {
+        auto& [last, last_size] = constant_buffer_writes.back();
+        if (device_addr <= last + last_size && last <= device_addr + size) {
+            const DAddr end = (std::max)(last + last_size, device_addr + size);
+            last = (std::min)(last, device_addr);
+            last_size = end - last;
+            return;
+        }
+    }
+    constant_buffer_writes.emplace_back(device_addr, size);
+}
+
 void MemoryManager::FlushQueryResults(GPUVAddr gpu_addr, size_t size) const {
     constexpr GPUVAddr flush_page = 0x1000;
     const GPUVAddr end = gpu_addr + size;
@@ -1091,6 +1119,16 @@ MemoryManager::GetSubmappedRange(GPUVAddr gpu_addr, std::size_t size) const {
     return result;
 }
 
+boost::container::small_vector<std::pair<DAddr, std::size_t>, 32>
+MemoryManager::GetSubmappedDeviceRange(GPUVAddr gpu_addr, std::size_t size) const {
+    boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> result{};
+    if (IsWithinGPUAddressRange(gpu_addr)) {
+        GetSubmappedRangeImpl<false>(
+            gpu_addr, (std::min<u64>)(size, address_space_size - gpu_addr), result);
+    }
+    return result;
+}
+
 template <bool is_gpu_address>
 void MemoryManager::GetSubmappedRangeImpl(GPUVAddr gpu_addr, std::size_t size, boost::container::small_vector<std::pair<std::conditional_t<is_gpu_address, GPUVAddr, DAddr>, std::size_t>, 32>& result)
     const {
@@ -1163,6 +1201,10 @@ void MemoryManager::FlushCaching() {
     })) {
         rasterizer->InnerInvalidation(page_stash2);
         page_stash2.clear();
+    }
+    if (!constant_buffer_writes.empty()) {
+        rasterizer->InvalidateConstantBufferData(constant_buffer_writes);
+        constant_buffer_writes.clear();
     }
 }
 

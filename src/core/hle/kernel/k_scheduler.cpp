@@ -246,9 +246,11 @@ u64 KScheduler::UpdateHighestPriorityThreadsImpl(KernelCore& kernel) {
         cores_needing_scheduling |= kernel.Scheduler(core_id).UpdateHighestPriorityThread(kernel, top_threads[core_id]);
     }
 
-    // Idle cores are bad. We're going to try to migrate threads to each idle core in turn.
+    // Idle cores are bad. We're going to try to migrate threads to each idle core in turn,
+    // preferring higher core IDs first so multi-core background workers stay off Core 0 when
+    // higher cores are also idle.
     while (idle_cores != 0) {
-        const s32 core_id = static_cast<s32>(std::countr_zero(idle_cores));
+        const s32 core_id = static_cast<s32>(Common::BitSize<u64>() - 1 - std::countl_zero(idle_cores));
 
         if (KThread* suggested = priority_queue.GetSuggestedFront(core_id); suggested != nullptr) {
             s32 migration_candidates[Core::Hardware::NUM_CPU_CORES];

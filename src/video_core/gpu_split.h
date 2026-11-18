@@ -13,12 +13,14 @@
 #include <deque>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
 
 #include "common/common_types.h"
+#include "common/container/unordered_map.h"
 #include "video_core/split_write_tracker.h"
 
 namespace Core {
@@ -45,6 +47,7 @@ enum class DrainSite : u32 {
     SemaphoreFlush, ///< The acquired semaphore is in the buffer cache
     FenceRelease,   ///< The puller's acquires release the pending fences
     ListWriters,    ///< GPU-written command lists: the dispatches and copies sent before them
+    ListCopies,     ///< GPU-written command lists: synced writers before reading page copies
     ListSync,       ///< Command lists on draw-written pages: the work before the last host sync
     ListFlush,      ///< Command lists on GPU-written pages: drain and flush the pages
     MacroDmaRead,   ///< The front's macros read memory (MME DMA)
@@ -60,8 +63,8 @@ enum class DrainSite : u32 {
 inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> drain_site_names{
     "other",       "fetch drain",     "acquire",    "acquire trigger", "acquire poll",
     "semaphore flush", "fence release",
-    "list writers", "list sync",      "list flush", "macro dma read",  "macro dma writes",
-    "macro dma flush",
+    "list writers", "list copy writers", "list sync", "list flush", "macro dma read",
+    "macro dma writes", "macro dma flush",
     "gp sync fence", "map",           "front start", "front verify",
 };
 
@@ -111,9 +114,11 @@ public:
     [[nodiscard]] bool BackRunning() const {
         return back_running.load(std::memory_order_acquire);
     }
-    /// Any thread: has the back call the idle hook soon, between entries or before it sleeps.
+    /// Any thread: has the back call the idle hook soon, between entries or at once if it sleeps.
     void RequestIdleHook() {
         hook_requested.store(true, std::memory_order_seq_cst);
+        wake.fetch_add(1, std::memory_order_seq_cst);
+        wake.notify_one();
     }
     /// Any thread, a hint (relaxed loads): whether the front waits for the back now, for a ring
     /// position (WaitFor), a drain or a submission (hook_requested), or asleep in Backoff.
@@ -248,6 +253,18 @@ public:
 
     /// Makes what was sent visible to the back.
     void Publish();
+    /// Flushes deferred back work without waiting when the back has consumed everything queued.
+    void SettleIdleBack() {
+        if (state_count != 0) {
+            Publish();
+            return;
+        }
+        if (hook_requested.load(std::memory_order_relaxed) || BackQuiet() ||
+            consumed.load(std::memory_order_acquire) != write_position) {
+            return;
+        }
+        RequestIdleHook();
+    }
     /// Waits until the back executed everything sent so far.
     void Drain(DrainSite site = DrainSite::Other);
 
@@ -255,23 +272,40 @@ public:
     void NoteWriter() {
         FlushState();
         last_writer_position = write_position;
-        if (eager_publish) {
-            Publish(); // the fetch that waits for this entry usually follows within microseconds
-        }
     }
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
     /// Returns whether any of it was still queued.
     bool WaitForWriters();
     /// A host-level wait was just sent (a syncpoint acquire, a host WFI, a GP entry with its sync
-    /// bit; semaphore acquires drain): the guest's GPU work before it is complete before the
-    /// commands after it are fetched.
+    /// bit; semaphore acquires drain, or note it when a release still queued meets them): the
+    /// guest's GPU work before it is complete before the commands after it are fetched.
     void NoteSync() {
         FlushState();
         last_sync_position = write_position;
+        synced_writer_position = last_writer_position;
     }
     /// Waits until the back executed the work sent before the last NoteSync. Returns whether any
     /// of it was still queued.
     bool WaitForSync();
+    /// Waits until the back executed the compute and copy work sent before the last NoteSync.
+    bool WaitForSyncedWriters(DrainSite site = DrainSite::ListWriters);
+    /// Whether the back executed the work sent before `position`.
+    [[nodiscard]] bool Ran(u64 position) const {
+        return consumed.load(std::memory_order_acquire) >= position;
+    }
+    /// Front: the current write position without flushing buffered state.
+    [[nodiscard]] u64 SentPosition() const {
+        return write_position;
+    }
+    /// A semaphore release was just sent to `device_address`.
+    void NoteSemaphoreWrite(u64 device_address, u32 payload, bool known);
+    struct QueuedSemaphoreWrite {
+        u32 payload;
+        bool known;
+    };
+    /// The last write sent to the semaphore word at `device_address` if not yet consumed.
+    [[nodiscard]] std::optional<QueuedSemaphoreWrite> QueuedSemaphoreWriteAt(
+        u64 device_address) const;
     /// The entry just sent also writes [address, address + size) of `memory`, noted by device
     /// page (other mappings may alias it, and the caches keep state per page). Returns whether
     /// it was noted by range (not as an unknown write).
@@ -383,6 +417,7 @@ private:
     static constexpr size_t RingMask = RingWords - 1;
     static constexpr u32 MaxMultiWords = 8192;
     static constexpr size_t PublishEvery = 256;
+    static constexpr size_t PublishAfterWait = 8;
 
     template <typename Func>
     static void CallThunk(const u64* payload) {
@@ -411,11 +446,11 @@ private:
     void Commit(size_t words, Effect effect) {
         write_position += words;
         writes.Entry(effect, write_position);
-        // EagerPublish: while the back has nothing to do, every entry goes out at once instead of
-        // waiting for the next 256-word batch (the back idled while the front filled it, then the
-        // front waited for the back to catch up).
-        if (write_position - published_local >= publish_every ||
-            (eager_publish && back_idle.load(std::memory_order_relaxed))) {
+        const u64 unpublished = write_position - published_local;
+        if (unpublished >= publish_every ||
+            (unpublished >= PublishAfterWait &&
+             (back_idle_at.load(std::memory_order_relaxed) == published_local ||
+              (eager_publish && back_idle.load(std::memory_order_relaxed))))) {
             Publish();
         }
     }
@@ -462,7 +497,15 @@ private:
     u64 write_position{};
     u64 last_writer_position{};
     u64 last_sync_position{};
+    u64 synced_writer_position{};
     u64 last_function_position{};
+    struct SemaphoreWrite {
+        u64 position;
+        u32 payload;
+        bool known;
+    };
+    Common::unordered_map<u64, SemaphoreWrite> semaphore_writes;
+    size_t semaphore_writes_limit{1024};
     SplitWriteTracker writes;
     /// MacroReadCbOverlay: queued constant buffer words, oldest first, popped by RetireWrites.
     struct ConstBufferWord {
@@ -534,6 +577,7 @@ private:
     bool any_async_write{};
     /// A position the front waits for (WaitFor): the back stores `consumed` once past it.
     alignas(128) std::atomic<u64> wait_target{~u64{0}};
+    alignas(128) std::atomic<u64> back_idle_at{~u64{0}};
     alignas(128) std::atomic<bool> back_waiting{};
     std::atomic<bool> back_idle{}; ///< The back is spinning or sleeping for work (EagerPublish)
     std::atomic<u32> wake{};

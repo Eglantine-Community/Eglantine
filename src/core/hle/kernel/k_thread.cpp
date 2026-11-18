@@ -660,10 +660,15 @@ namespace Kernel {
                 m_physical_ideal_core_id = core_id;
                 m_physical_affinity_mask.SetAffinityMask(p_affinity_mask);
 
-                if (m_physical_affinity_mask.GetAffinityMask() != old_mask.GetAffinityMask()) {
-                    const s32 active_core = GetActiveCore();
+                const s32 active_core = GetActiveCore();
+                const bool relocate_from_core0 =
+                    active_core == 0 && m_physical_ideal_core_id == Svc::IdealCoreDontCare &&
+                    GetPriority() >= 45 && (m_physical_affinity_mask.GetAffinityMask() & ~1ULL) != 0;
 
-                    if (active_core >= 0 && !m_physical_affinity_mask.GetAffinity(active_core)) {
+                if (m_physical_affinity_mask.GetAffinityMask() != old_mask.GetAffinityMask() ||
+                    relocate_from_core0) {
+                    if ((active_core >= 0 && !m_physical_affinity_mask.GetAffinity(active_core)) ||
+                        relocate_from_core0) {
                         const s32 new_core = static_cast<s32>(
                             m_physical_ideal_core_id >= 0
                                 ? m_physical_ideal_core_id

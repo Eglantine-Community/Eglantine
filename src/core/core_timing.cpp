@@ -26,6 +26,10 @@ namespace Core::Timing {
 
 constexpr s64 MAX_SLICE_LENGTH = 10000;
 
+// Sleep in the OS for the full wait window using the high-resolution waitable timer rather than
+// spinning a physical core in MONITORX/MWAITX for sub-millisecond intervals.
+constexpr s64 HOST_WAIT_MARGIN_NS = 0;
+
 constexpr u32 CPU_CLOCK_BASE_MHZ = 1020;
 constexpr u32 CPU_CLOCK_BOOST_MHZ = 1734;
 constexpr u32 CPU_CLOCK_OVERCLOCK_MHZ = 2040;
@@ -76,7 +80,7 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
     if (is_multicore) {
         timer_thread = std::jthread([this](std::stop_token stop_token) {
             Common::SetCurrentThreadName("HostTiming");
-            Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
+            Common::SetCurrentThreadPriority(Common::ThreadPriority::VeryHigh);
             Common::SetCurrentThreadToPerformanceCores();
             on_thread_init();
             has_started = true;
@@ -87,10 +91,7 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
                     paused_set = false;
                     if (auto const next_time = Advance(); next_time) {
                         // There are more events left in the queue, wait until the next event.
-                        auto const wait_time = *next_time - GetGlobalTimeNs().count();
-                        if (wait_time > 0) {
-                            event.WaitFor(std::chrono::nanoseconds(wait_time));
-                        }
+                        WaitForEvent(*next_time);
                     } else {
                         // Queue is empty, wait until another event is scheduled and signals us to
                         // continue.
@@ -103,6 +104,21 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
                 pause_event.Wait();
             }
         });
+    }
+}
+
+void CoreTiming::WaitForEvent(s64 next_time) {
+    s64 now = GetGlobalTimeNs().count();
+    if (next_time <= now) {
+        return;
+    }
+    bool signalled = false;
+    if (next_time - now > HOST_WAIT_MARGIN_NS) {
+        signalled = event.SleepFor(std::chrono::nanoseconds{next_time - HOST_WAIT_MARGIN_NS - now});
+        now = GetGlobalTimeNs().count();
+    }
+    if (!signalled && next_time > now) {
+        event.WaitFor(std::chrono::nanoseconds{next_time - now});
     }
 }
 

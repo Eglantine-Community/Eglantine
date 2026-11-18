@@ -22,11 +22,58 @@ class NullSinkStreamImpl final : public SinkStream {
 public:
     explicit NullSinkStreamImpl(Core::System& system_, StreamType type_)
         : SinkStream{system_, type_} {}
-    ~NullSinkStreamImpl() override {}
-    void AppendBuffer(SinkBuffer&, std::span<s16>) override {}
+    ~NullSinkStreamImpl() override = default;
+
+    void Start(bool /*resume*/ = false) override {
+        std::scoped_lock lk{pace_mutex};
+        paused = false;
+        next_deadline = std::chrono::steady_clock::now();
+    }
+
+    void Stop() override {
+        {
+            std::scoped_lock lk{pace_mutex};
+            paused = true;
+        }
+        pace_cv.notify_all();
+    }
+
+    void AppendBuffer(SinkBuffer& buffer, std::span<s16>) override {
+        if (type == StreamType::In) {
+            return;
+        }
+        const u64 frames = buffer.frames != 0 ? buffer.frames : TargetSampleCount;
+        AdvancePlayedSampleCount(frames);
+        const auto duration =
+            std::chrono::nanoseconds{(frames * 1'000'000'000ULL) / TargetSampleRate};
+        const auto now = std::chrono::steady_clock::now();
+        std::scoped_lock lk{pace_mutex};
+        if (next_deadline < now) {
+            next_deadline = now;
+        }
+        next_deadline += duration;
+    }
+
+    void WaitFreeSpace(std::stop_token stop_token) override {
+        constexpr auto max_lead =
+            std::chrono::nanoseconds{(u64{TargetSampleCount} * 3 * 1'000'000'000ULL) /
+                                     TargetSampleRate};
+        std::unique_lock lk{pace_mutex};
+        const auto now = std::chrono::steady_clock::now();
+        if (next_deadline > now + max_lead) {
+            pace_cv.wait_until(lk, stop_token, next_deadline - max_lead,
+                               [this] { return paused.load(std::memory_order_relaxed); });
+        }
+    }
+
     std::vector<s16> ReleaseBuffer(u64) override {
         return {};
     }
+
+private:
+    std::mutex pace_mutex;
+    std::condition_variable_any pace_cv;
+    std::chrono::steady_clock::time_point next_deadline{};
 };
 
 /**

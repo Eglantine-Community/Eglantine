@@ -178,7 +178,10 @@ void GpuSplit::Stop() {
     write_position = 0;
     last_writer_position = 0;
     last_sync_position = 0;
+    synced_writer_position = 0;
     last_function_position = 0;
+    semaphore_writes.clear();
+    semaphore_writes_limit = 1024;
     writes.Reset();
     std::ranges::fill(async_writes, u64{0});
     any_async_write = false;
@@ -200,6 +203,7 @@ void GpuSplit::Stop() {
     front_macros = false;
     published.store(0, std::memory_order_relaxed);
     consumed.store(0, std::memory_order_relaxed);
+    back_idle_at.store(~u64{0}, std::memory_order_relaxed);
     back_waiting.store(false, std::memory_order_relaxed);
     back_idle.store(false, std::memory_order_relaxed);
     front_waiting.store(false, std::memory_order_relaxed);
@@ -262,7 +266,6 @@ void GpuSplit::Drain(DrainSite site) {
         return;
     }
     Publish();
-    hook_requested.store(true, std::memory_order_release);
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
     const u64 start = Nx2Profile::Enabled() ? Nx2Profile::Now() : 0;
     // Everything consumed is not enough: the back submits deferred work (Scheduler::DeferFlush)
@@ -276,13 +279,16 @@ void GpuSplit::Drain(DrainSite site) {
                 Nx2Profile::AddDrain(site, start);
                 return;
             }
-            if (!hook_asked) {
+            if (!hook_asked || !hook_requested.load(std::memory_order_relaxed)) {
                 RequestIdleHook();
                 hook_asked = true;
             }
-        }
-        if (consumed_cache == write_position && !hook_requested.load(std::memory_order_relaxed)) {
-            hook_requested.store(true, std::memory_order_release);
+            if (spins < 16384) {
+                Pause();
+            } else {
+                std::this_thread::yield();
+            }
+            continue;
         }
         Backoff(spins, write_position);
     }
@@ -296,6 +302,33 @@ bool GpuSplit::WaitForWriters() {
 bool GpuSplit::WaitForSync() {
     FlushState();
     return WaitFor(std::min(last_sync_position, write_position), DrainSite::ListSync);
+}
+
+bool GpuSplit::WaitForSyncedWriters(DrainSite site) {
+    FlushState();
+    return WaitFor(std::min(synced_writer_position, write_position), site);
+}
+
+void GpuSplit::NoteSemaphoreWrite(u64 device_address, u32 payload, bool known) {
+    FlushState();
+    if (semaphore_writes.size() >= semaphore_writes_limit) {
+        const u64 done = consumed.load(std::memory_order_acquire);
+        boost::unordered::erase_if(
+            semaphore_writes, [done](const auto& entry) { return entry.second.position <= done; });
+        semaphore_writes_limit = std::max<size_t>(1024, semaphore_writes.size() * 2);
+    }
+    semaphore_writes.insert_or_assign(device_address & ~u64{3},
+                                      SemaphoreWrite{write_position, payload, known});
+}
+
+std::optional<GpuSplit::QueuedSemaphoreWrite> GpuSplit::QueuedSemaphoreWriteAt(
+    u64 device_address) const {
+    const auto it = semaphore_writes.find(device_address & ~u64{3});
+    if (it == semaphore_writes.end() ||
+        it->second.position <= consumed.load(std::memory_order_acquire)) {
+        return std::nullopt;
+    }
+    return QueuedSemaphoreWrite{it->second.payload, it->second.known};
 }
 
 bool GpuSplit::WaitFor(u64 target, DrainSite site) {
@@ -703,6 +736,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         if (available == read_position) {
             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
             back_idle.store(true, std::memory_order_relaxed);
+            back_idle_at.store(read_position, std::memory_order_relaxed);
             // The front usually sends more within microseconds: spin briefly before sleeping.
             for (u32 spins = 0; spins < 8192 && available == read_position &&
                                 !hook_requested.load(std::memory_order_relaxed);
@@ -723,16 +757,12 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
                 available = published.load(std::memory_order_acquire);
             }
             if (available == read_position) {
-                // Publish bumps `wake` when it sees back_waiting: read it before the last look
-                // at `published`, so a publish in between ends the wait at once.
                 back_waiting.store(true, std::memory_order_seq_cst);
-                while (available == read_position && !stop_token.stop_requested()) {
-                    const u32 seen = wake.load(std::memory_order_seq_cst);
-                    available = published.load(std::memory_order_seq_cst);
-                    if (available == read_position && !stop_token.stop_requested()) {
-                        wake.wait(seen, std::memory_order_seq_cst);
-                        available = published.load(std::memory_order_acquire);
-                    }
+                const u32 seen = wake.load(std::memory_order_seq_cst);
+                available = published.load(std::memory_order_seq_cst);
+                if (available == read_position && !stop_token.stop_requested() &&
+                    !hook_requested.load(std::memory_order_seq_cst)) {
+                    wake.wait(seen, std::memory_order_seq_cst);
                 }
                 back_waiting.store(false, std::memory_order_seq_cst);
                 back_idle.store(false, std::memory_order_relaxed);
@@ -740,6 +770,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             }
             back_idle.store(false, std::memory_order_relaxed);
         }
+        back_idle_at.store(~u64{0}, std::memory_order_relaxed);
         u64 last_store = read_position;
         // Before any entry runs, so a front that sees these entries consumed also sees this.
         back_quiet.store(false, std::memory_order_seq_cst);
@@ -762,17 +793,10 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
             if ((read_position - last_store >= 4096 ||
                  read_position >= wait_target.load(std::memory_order_relaxed)) &&
                 read_position != available) {
-                if (idle_hook != nullptr &&
-                    read_position >= wait_target.load(std::memory_order_relaxed)) {
-                    RunIdleHook();
-                }
                 consumed.store(read_position, std::memory_order_seq_cst);
                 last_store = read_position;
                 NotifyFront();
             }
-        }
-        if (idle_hook != nullptr) {
-            RunIdleHook();
         }
         consumed.store(read_position, std::memory_order_seq_cst);
         NotifyFront();

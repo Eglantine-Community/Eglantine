@@ -12,8 +12,10 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <bitset>
 #include <cstdlib>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -49,6 +51,7 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/types.h"
@@ -268,6 +271,12 @@ public:
 
     void CachedWriteMemory(DAddr device_addr, u64 size);
 
+    /// Whether constant buffer data written to [device_addr, device_addr + size) must reach
+    /// WriteMemory. Pages no buffer was ever uploaded from and the GPU never wrote stay
+    /// CPU-modified, so WriteMemory changes nothing there that streamed uniform buffers need.
+    /// Drawing thread, without the lock.
+    [[nodiscard]] bool ConstantDataReachesBuffers(DAddr device_addr, u64 size) const;
+
     /// Cancels pending downloads over the range, so a fence can't write them over newer bytes.
     void ClearDownload(DAddr base_addr, u64 size);
 
@@ -293,6 +302,37 @@ public:
     }
 
     bool InlineMemory(DAddr dest_address, size_t copy_size, std::span<const u8> inlined_buffer);
+
+    /// List-fed grid macros (nx2_list_grid.h): an inline write whose words at the `patches`'
+    /// offsets are markers. It is uploaded at once, not left to a later invalidation that would
+    /// upload guest memory's markers over the copies. Then `copy(buffer, offset, patch)` records
+    /// the host GPU's copy of the patch's kept word over it; those words are GPU-written from now
+    /// on, and registered to their list until another write reaches them (Nx2KeptWordList).
+    template <typename Patch, typename Copy>
+    void Nx2InlineKeptWords(DAddr dest_address, std::span<const u8> data,
+                            std::span<const Patch> patches, Copy&& copy) {
+        InlineMemoryImplementation(dest_address, data.size(), data);
+        if (nx2_kept_words.size() >= 0x10000) {
+            nx2_kept_words.clear(); // Only the QMD reads' fallback to the host GPU's words then
+        }
+        for (const Patch& patch : patches) {
+            const DAddr address = dest_address + patch.offset;
+            const BufferId buffer_id = FindBuffer(address, sizeof(u32), false);
+            Buffer& buffer = slot_buffers[buffer_id];
+            const u32 offset = buffer.Offset(address);
+            copy(buffer, offset, patch);
+            // As a3acb026c1 does for indirect arguments: no later upload is reordered ahead.
+            buffer.MarkUsage(offset, sizeof(u32));
+            MarkWrittenBuffer(buffer_id, address, sizeof(u32));
+            nx2_kept_words[address] = {patch.keep_id, patch.index};
+        }
+    }
+    /// The list and word Nx2InlineKeptWords last patched at `device_addr`, unless a CPU, inline,
+    /// DMA or storage write reached the word since.
+    [[nodiscard]] std::optional<std::pair<u64, u32>> Nx2KeptWordList(DAddr device_addr) const {
+        const auto it = nx2_kept_words.find(device_addr);
+        return it != nx2_kept_words.end() ? std::optional{it->second} : std::nullopt;
+    }
 
     void BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr, u32 size) {
         auto& current = channel_state->uniform_buffers[stage][index];
@@ -628,6 +668,7 @@ public:
         u64 last_frame_tick{~u64{0}};
         u64 last_skipped_draw_ticket{~u64{0}}; ///< Profiler only: bank_once_per_frame skips
         u32 initialized_mask{};
+        u32 unchanged_streak{};
         std::array<u8, 0x10000> bytes{};
     };
     std::unordered_map<DAddr, NativeUniformBankShadow> native_indirect_uniform_shadow;
@@ -857,6 +898,18 @@ private:
     /// Writes downloaded bytes to guest memory, except over `cpu_written`.
     void WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_written, DAddr device_addr,
                                const u8* data, u64 size);
+    void Nx2ForgetKeptWords(DAddr device_addr, u64 size) {
+        if (nx2_kept_words.empty()) {
+            return;
+        }
+        auto it = nx2_kept_words.lower_bound(device_addr & ~DAddr{3});
+        while (it != nx2_kept_words.end() && it->first < device_addr + size) {
+            it = nx2_kept_words.erase(it);
+        }
+    }
+    /// Nx2InlineKeptWords' patched words: keep id and word index by device address.
+    std::map<DAddr, std::pair<u64, u32>> nx2_kept_words;
+
     void InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
                                     std::span<const u8> inlined_buffer);
 
@@ -1066,8 +1119,9 @@ private:
 
     /// A command list page (Nx2CopyListPages): the GPU writes noted to it and the last copy.
     using Nx2Staging = decltype(std::declval<Runtime&>().DownloadStagingBuffer(size_t{}, true));
+    static constexpr size_t Nx2ListPageWords = (size_t{1} << Tegra::Nx2WrittenPageBits) / 4;
     struct Nx2ListPage {
-        u64 writes{};      ///< GPU writes noted to the page
+        u64 writes{};      ///< GPU and host writes noted to the page
         u64 copy_writes{}; ///< `writes` when the copy was made: the copy is current while equal
         u64 copy_tick{};   ///< GPU tick that completes the copy
         u64 copy_time{};   ///< Nx2Profile::Now when the copy was recorded (0 unless profiling)
@@ -1082,9 +1136,17 @@ private:
         /// wait and no write came since the front flushed the page (Nx2ReadListCopy).
         bool draw_written{};
         bool copy_read{};
+        /// 4-byte words GPU work wrote that guest memory lacks: cleared on full host word writes
+        /// and when the page is flushed (`flushed`).
+        std::bitset<Nx2ListPageWords> gpu_words{};
+        bool flushed{};
         ListCopyDemand demand;
         std::optional<Nx2Staging> copy;
     };
+    static void Nx2MarkListWords(Nx2ListPage& entry, u64 begin, u64 end, bool set);
+    [[nodiscard]] static bool Nx2HasListWords(const Nx2ListPage& entry, u64 begin, u64 end);
+    void Nx2ReadListWords(const Nx2ListPage& entry, DAddr device_addr, u64 offset,
+                          std::span<u8> out);
     std::mutex nx2_list_mutex; ///< nx2_list_pages: the split's front reads the copies
     std::optional<ListWriterTrace> nx2_writer_trace = []() -> std::optional<ListWriterTrace> {
         const char* value = std::getenv("EDEN_NX2_WRITER_DEPS");

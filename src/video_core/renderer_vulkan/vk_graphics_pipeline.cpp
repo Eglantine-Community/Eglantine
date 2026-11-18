@@ -1854,7 +1854,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         .pInputAssemblyState = mesh_emulation ? &emulation_input_assembly
                                : is_mesh      ? nullptr
                                               : &input_assembly_ci,
-        .pTessellationState = is_mesh ? nullptr : &tessellation_ci,
+        .pTessellationState = has_tess_stages ? &tessellation_ci : nullptr,
         .pViewportState = &viewport_ci,
         .pRasterizationState = &rasterization_ci,
         .pMultisampleState = &multisample_ci,

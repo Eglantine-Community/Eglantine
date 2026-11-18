@@ -925,13 +925,15 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
 }
 
 void SetCurrentThreadName(const char* name) {
-#ifdef _MSC_VER
-    // Sets the debugger-visible name of the current thread.
-    if (auto pf = (decltype(&SetThreadDescription))(void*)GetProcAddress(GetModuleHandle(TEXT("KernelBase.dll")), "SetThreadDescription"); pf)
+#ifdef _WIN32
+    // Sets the debugger- and profiler-visible name of the current thread (MSVC and MinGW).
+    if (auto pf = reinterpret_cast<decltype(&SetThreadDescription)>(
+            reinterpret_cast<void*>(GetProcAddress(GetModuleHandle(TEXT("KernelBase.dll")),
+                                                   "SetThreadDescription")));
+        pf) {
         pf(GetCurrentThread(), UTF8ToUTF16W(name).data()); // Windows 10+
-    else
-        ; // No-op
-#elif  defined(__APPLE__)
+    }
+#elif defined(__APPLE__)
     pthread_setname_np(name);
 #elif defined(__HAIKU__)
     rename_thread(find_thread(NULL), name);
@@ -950,11 +952,6 @@ void SetCurrentThreadName(const char* name) {
         buf[len] = '\0';
         pthread_setname_np(pthread_self(), buf);
     }
-#elif defined(_WIN32)
-    // MinGW with the POSIX threading model does not support pthread_setname_np
-    // See for reference
-    // https://gitlab.freedesktop.org/mesa/mesa/-/blame/main/src/util/u_thread.c?ref_type=heads#L75
-    (void)name;
 #else
     pthread_setname_np(pthread_self(), name);
 #endif
@@ -988,6 +985,7 @@ void PinCurrentThread(PinnedRole role) {
         std::vector<ULONG> front;
         std::vector<ULONG> back;
         std::vector<ULONG> guest;
+        std::size_t performance_cores{};
     };
     static const PinnedCpuSets pinned = [] {
         const GpuThreadPinning plan = PlanGpuThreadPinning(CpuSets().processors);
@@ -998,13 +996,19 @@ void PinCurrentThread(PinnedRole role) {
             return PinnedCpuSets{};
         }
         LOG_INFO(Common,
-                 "GPU thread pinning: front and back on a physical core each, guest cores on the "
-                 "other {} performance cores ({} logical processors)",
-                 plan.performance_cores - 2, plan.guest.size());
+                 "GPU thread pinning: front and back on a physical core each, guest cores on "
+                 "{} performance cores ({} logical processors)",
+                 plan.performance_cores < 8 ? plan.performance_cores : plan.performance_cores - 2,
+                 plan.performance_cores < 8 ? CpuSets().processors.size() : plan.guest.size());
         return PinnedCpuSets{{plan.front.begin(), plan.front.end()},
                              {plan.back.begin(), plan.back.end()},
-                             {plan.guest.begin(), plan.guest.end()}};
+                             {plan.guest.begin(), plan.guest.end()},
+                             plan.performance_cores};
     }();
+    if (role == PinnedRole::GuestCore && pinned.performance_cores < 8) {
+        // Switch 2 runs 6 guest cores: locking them onto 4 cores on a 6-core CPU starves main/job threads.
+        return;
+    }
     const std::vector<ULONG>& ids = role == PinnedRole::GpuFront  ? pinned.front
                                     : role == PinnedRole::GpuBack ? pinned.back
                                                                   : pinned.guest;
@@ -1249,6 +1253,118 @@ bool Event::WaitFor(const std::chrono::nanoseconds time) {
     is_set = false;
     return true;
 #endif
+}
+#endif
+
+#if defined(ARCHITECTURE_x86_64) && defined(__clang__)
+__attribute__((target("waitpkg,mwaitx")))
+#endif
+bool WaitForFlag(const std::atomic<bool>& flag, std::chrono::steady_clock::time_point deadline) {
+#ifdef ARCHITECTURE_x86_64
+    if (const auto& caps = Common::g_cpu_caps; caps.monitorx || caps.waitpkg) {
+        auto* const line = const_cast<std::atomic<bool>*>(std::addressof(flag));
+        const u64 ticks_per_second = Common::g_wall_clock.NsToTicks(std::chrono::seconds{1});
+        while (true) {
+            if (caps.monitorx) {
+                _mm_monitorx(line, 0, 0);
+            } else {
+                _umonitor(line);
+            }
+            if (flag.load(std::memory_order_acquire)) {
+                return true;
+            }
+            const u32 cycles = MwaitxTimeoutCycles(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    deadline - std::chrono::steady_clock::now()),
+                ticks_per_second);
+            if (cycles == 0) {
+                return false;
+            }
+            if (caps.monitorx) {
+                _mm_mwaitx(1 << 1, 0u, cycles);
+            } else {
+                _umwait(0, Common::X64::FencedRDTSC() + cycles);
+            }
+        }
+    }
+#endif
+    while (!flag.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    return flag.load(std::memory_order_acquire);
+}
+
+#ifdef _WIN32
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
+Event::~Event() {
+    if (sleep_wake) {
+        CloseHandle(sleep_wake);
+    }
+}
+
+void Event::WakeSleeper() {
+    SetEvent(sleep_wake);
+}
+
+bool Event::SleepFor(const std::chrono::nanoseconds time) {
+    struct Timer {
+        Timer() {
+            handle = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                            TIMER_ALL_ACCESS);
+            if (!handle) {
+                handle = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+            }
+        }
+        ~Timer() {
+            if (handle) {
+                CloseHandle(handle);
+            }
+        }
+        HANDLE handle;
+    };
+    static thread_local Timer timer;
+    using TimerTicks = std::chrono::duration<s64, std::ratio<1, 10'000'000>>;
+
+    std::unique_lock lk{mutex};
+    const auto deadline = std::chrono::steady_clock::time_point{EventWaitDeadline(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()), time)};
+    if (!sleep_wake) {
+        sleep_wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    }
+    while (!is_set.load()) {
+        const auto remaining = deadline - std::chrono::steady_clock::now();
+        if (remaining <= std::chrono::nanoseconds::zero()) {
+            return false;
+        }
+        LARGE_INTEGER due{};
+        due.QuadPart = -std::chrono::ceil<TimerTicks>(remaining).count();
+        if (!sleep_wake || !timer.handle ||
+            !SetWaitableTimerEx(timer.handle, &due, 0, nullptr, nullptr, nullptr, 0)) {
+            condvar.wait_until(lk, deadline, [this] { return is_set.load(); });
+            continue;
+        }
+        ++sleepers;
+        lk.unlock();
+        const HANDLE handles[]{static_cast<HANDLE>(sleep_wake), timer.handle};
+        const auto backstop = std::chrono::ceil<std::chrono::milliseconds>(remaining).count() + 1;
+        const DWORD result = WaitForMultipleObjects(
+            2, handles, FALSE, static_cast<DWORD>((std::min<s64>)(backstop, INFINITE - 1)));
+        lk.lock();
+        --sleepers;
+        if (result == WAIT_FAILED) {
+            condvar.wait_until(lk, deadline, [this] { return is_set.load(); });
+        }
+    }
+    is_set = false;
+    return true;
+}
+#else
+bool Event::SleepFor(const std::chrono::nanoseconds time) {
+    return WaitFor(time);
 }
 #endif
 

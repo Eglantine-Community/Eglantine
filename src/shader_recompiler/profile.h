@@ -111,6 +111,8 @@ struct Profile {
     bool has_broken_spirv_subgroup_shuffle{};
     /// The guest's HMMA.16816.F16 runs on a cooperative matrix, in compute shaders
     bool support_cooperative_hmma{};
+    /// VK_EXT_mesh_shader is enabled (false when mesh pipelines use compute+vertex emulation)
+    bool support_mesh_shader{};
     bool has_broken_spirv_fragment_shuffle{};
     u32 max_subgroup_size{};
 

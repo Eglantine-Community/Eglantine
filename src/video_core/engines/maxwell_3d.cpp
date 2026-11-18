@@ -35,6 +35,7 @@
 #include "video_core/rasterizer_interface.h"
 #include "video_core/textures/texture.h"
 #include "video_core/macro_dma_forward.h"
+#include "video_core/macro_turing.h"
 #ifdef ARCHITECTURE_x86_64
 #include "video_core/macro_turing_jit.h"
 #endif
@@ -654,7 +655,9 @@ void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods,
     for (u32 i = 0; i < count; ++i) {
         ProcessDirtyRegisters(methods[i], ProcessShadowRam(methods[i], arguments[i]));
     }
-    memory_manager.WriteWordsCached(address + offset, values.data(), count);
+    if (!WriteBoundConstantBuffer(offset, values.data(), static_cast<u32>(bytes))) {
+        memory_manager.WriteWordsCached(address + offset, values.data(), count);
+    }
     regs.const_buffer.offset += static_cast<u32>(bytes);
 }
 
@@ -1169,6 +1172,33 @@ void Maxwell3D::ProcessCBBind(size_t stage_index) {
     rasterizer->BindGraphicsUniformBuffer(stage_index, bind_data.shader_slot, gpu_addr, size);
 }
 
+bool Maxwell3D::WriteBoundConstantBuffer(u32 offset, const void* data, u32 bytes) {
+    if (!fast_maxwell3d) {
+        return false;
+    }
+    const GPUVAddr address = regs.const_buffer.Address();
+    const u32 size = regs.const_buffer.size;
+    const u64 map_serial = memory_manager.GetMapSerial();
+    BoundConstantBuffer& bound = bound_constant_buffer;
+    if (bound.address != address || bound.size != size || bound.map_serial != map_serial) {
+        bound = {address, size, map_serial, 0};
+        if (address != 0 && size != 0 && memory_manager.IsContinuousRange(address, size)) {
+            if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+                bound.device = *device;
+            }
+        }
+    }
+    const GPUVAddr begin = address + offset;
+    // Words on Switch 2 sparse memory go one at a time, as Nx2BackSparseWrite saw them.
+    if (bound.device == 0 ||
+        (begin + bytes > Tegra::g_nx2_sparse_low.load(std::memory_order_relaxed) &&
+         begin < Tegra::g_nx2_sparse_high.load(std::memory_order_relaxed))) {
+        return false;
+    }
+    memory_manager.WriteConstantBufferData(bound.device + offset, data, bytes);
+    return true;
+}
+
 void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
     // Write the input value to the current const buffer at the current position.
     const GPUVAddr buffer_address = regs.const_buffer.Address();
@@ -1182,7 +1212,10 @@ void Maxwell3D::ProcessCBMultiData(const u32* start_base, u32 amount) {
     const size_t write_size = std::min(copy_size, room / sizeof(u32) * sizeof(u32));
     if (write_size != 0) {
         const GPUVAddr address{buffer_address + regs.const_buffer.offset};
-        memory_manager.WriteBlockCached(address, start_base, write_size);
+        if (!WriteBoundConstantBuffer(regs.const_buffer.offset, start_base,
+                                      static_cast<u32>(write_size))) {
+            memory_manager.WriteBlockCached(address, start_base, write_size);
+        }
     }
     if (write_size != copy_size) {
         static std::atomic<bool> warned{};
@@ -1306,6 +1339,10 @@ struct Maxwell3D::FrontState {
     /// change of program epoch makes every entry until then a writer.
     bool draw_window_writer{};
     u64 draw_window_epoch{};
+    /// By start in the macro code of data_ram_generation: 0 unknown, 1 the macro can't use the
+    /// data RAM, 2 it can.
+    std::vector<u8> data_ram_macros;
+    u64 data_ram_generation{~u64{0}};
 };
 
 namespace {
@@ -1664,6 +1701,10 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
 // split stopped (accuracy settings changed mid-game). Hand the macros back: the front's copy
 // goes stale from now on, and a restart copies the registers again (Front).
 void Maxwell3D::ReleaseFront() {
+    // The engine's macros run unguarded from now on.
+    if (grid_marker.set) {
+        Nx2ListGrid::ResolveCells(grid_marker, native_data_ram);
+    }
     executing_macro = front->executing_macro;
     macro_params = std::move(front->parameters);
     std::memcpy(shadow_state.reg_array.data(), front->shadow.data(), sizeof(front->shadow));
@@ -1859,6 +1900,26 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
     } else if (method == MAXWELL3D_REG_INDEX(report_semaphore.query)) {
         split.NoteWrite(memory_manager, ReportAddress(fs.regs), ReportBytes);
         NoteLateReport(split, memory_manager, fs.regs);
+        FrontNoteReport(split, fs);
+    }
+}
+
+void Maxwell3D::FrontNoteReport(VideoCommon::GpuSplit& split, const FrontState& fs) {
+    Regs::ReportSemaphore report;
+    std::memcpy(&report, &fs.regs[MAXWELL3D_REG_INDEX(report_semaphore)], sizeof(report));
+    const auto operation = report.query.operation.Value();
+    if (operation != Regs::ReportSemaphore::Operation::Release &&
+        operation != Regs::ReportSemaphore::Operation::ReportOnly) {
+        return;
+    }
+    const auto device = memory_manager.GpuToCpuAddress(report.Address());
+    if (!device) {
+        return;
+    }
+    const bool payload = report.query.report == Regs::ReportSemaphore::Report::Payload;
+    split.NoteSemaphoreWrite(*device, report.payload, payload);
+    if (report.query.short_query == 0) {
+        split.NoteSemaphoreWrite(*device + 4, 0, payload);
     }
 }
 
@@ -2030,6 +2091,7 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
     } else if (method == MAXWELL3D_REG_INDEX(report_semaphore.query) && amount != 0) {
         split.NoteWrite(memory_manager, ReportAddress(fs.regs), ReportBytes);
         NoteLateReport(split, memory_manager, fs.regs);
+        FrontNoteReport(split, fs);
     }
 }
 
@@ -2047,6 +2109,25 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     auto& engine = GetNativeMacroEngine();
     const auto positions = GetNativeMacroPositions();
     const u32 start = positions[((method - MacroRegistersStart) >> 1) % positions.size()];
+    // List-fed grid markers (nx2_list_grid.h) in the data RAM: a 3D macro that can read it gets
+    // the real words first.
+    if (grid_marker.set && grid_marker.In(native_data_ram)) {
+        if (fs.data_ram_generation != engine.native_code_generation) {
+            fs.data_ram_macros.assign(engine.native_code.size() / 3, 0);
+            fs.data_ram_generation = engine.native_code_generation;
+        }
+        if (start < fs.data_ram_macros.size()) {
+            u8& uses = fs.data_ram_macros[start];
+            if (uses == 0) {
+                uses = TuringMacroInterpreter::AnalyzeEffects(engine.native_code, start).data_ram
+                           ? 2
+                           : 1;
+            }
+            if (uses == 2) {
+                Nx2ListGrid::ResolveCells(grid_marker, native_data_ram);
+            }
+        }
+    }
     const auto& options = FrontMacroOptions();
     const bool profile = Profile::Enabled();
     // EDEN_NX2_MACRO_TRACE=<macro index>: log the first 32 calls of one macro (its parameters,

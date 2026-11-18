@@ -134,6 +134,10 @@ public:
     void WriteBlockCached(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size);
     /// WriteBlockCached of `count` consecutive words within one device page, in a single write.
     void WriteWordsCached(GPUVAddr gpu_dest_addr, const u32* words, std::size_t count);
+    /// Constant buffer data to device memory the caller translated (not Switch 2 sparse memory).
+    /// FlushCaching hands the written ranges, merged, to the rasterizer's
+    /// InvalidateConstantBufferData instead of InnerInvalidation.
+    void WriteConstantBufferData(DAddr device_addr, const void* data, std::size_t size);
 
     /**
      * Checks if a gpu region can be simply read with a pointer.
@@ -156,6 +160,11 @@ public:
      * vector will be returned;
      */
     boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 32> GetSubmappedRange(
+        GPUVAddr gpu_addr, std::size_t size) const;
+
+    /// The device ranges [gpu_addr, gpu_addr + size) maps to (contiguous pages merged), up to the
+    /// end of the address space.
+    boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> GetSubmappedDeviceRange(
         GPUVAddr gpu_addr, std::size_t size) const;
 
     GPUVAddr Map(GPUVAddr gpu_addr, DAddr dev_addr, std::size_t size,
@@ -194,6 +203,16 @@ public:
 
     [[nodiscard]] u64 GetMapSerial() const noexcept {
         return map_serial.load(std::memory_order_acquire);
+    }
+
+    [[nodiscard]] u64 MapSerial() const noexcept {
+        return map_serial.load(std::memory_order_acquire);
+    }
+
+    /// Changes whenever this address space or the device memory behind it is mapped or unmapped:
+    /// a host pointer GetPointer returned is only good while it stays the same.
+    [[nodiscard]] u64 HostPointerSerial() const {
+        return MapSerial() + memory.TranslationGeneration();
     }
 
     /// GetMemoryLayoutSize from the kind map under its lock (the answer with Nx2Perf off).
@@ -314,6 +333,7 @@ private:
 
     const size_t unique_identifier;
     VideoCommon::InvalidationAccumulator accumulator;
+    boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> constant_buffer_writes;
 
     static std::atomic<size_t> unique_identifier_generator;
 

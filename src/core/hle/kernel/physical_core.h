@@ -77,6 +77,7 @@ private:
     KThread* m_current_thread{};
     std::atomic<bool> m_is_interrupted{};
     bool m_is_single_core{};
+    std::chrono::nanoseconds m_idle_poll{};
 };
 
 } // namespace Kernel

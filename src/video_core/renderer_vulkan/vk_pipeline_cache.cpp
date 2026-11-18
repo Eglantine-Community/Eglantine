@@ -636,6 +636,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .max_user_clip_distances = device.GetMaxUserClipDistances()};
     profile.support_cooperative_hmma =
         device.IsCooperativeHmmaSupported() && TestCooperativeHmma(device);
+    profile.support_mesh_shader = device.IsExtMeshShaderSupported();
 
     host_info = Shader::HostTranslateInfo{
         .min_ssbo_alignment = device.GetStorageBufferAlignment(),
@@ -923,7 +924,7 @@ size_t GraphicsFastCacheSlot(const GraphicsPipelineCacheKey& key, size_t size) {
 } // Anonymous namespace
 
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline(bool is_indexed) {
-
+    ++frame_graphics_draws;
     if (!RefreshStages(graphics_key.unique_hashes)) {
         current_pipeline = nullptr;
         graphics_miss = "stage-rejected";
@@ -1385,7 +1386,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     }};
     VideoCommon::LoadPipelines(stop_loading, pipeline_cache_filename, CACHE_VERSION, load_compute,
                                load_graphics, false, MIN_COMPATIBLE_CACHE_VERSION, &main_upgrade);
-    if (device.IsExtMeshShaderSupported()) {
+    // Mesh pipelines are serialized to vulkan_mesh.bin both with VK_EXT_mesh_shader and when
+    // emulated via compute+vertex shaders on GPUs without mesh shader support.
+    if (!mesh_pipeline_cache_filename.empty()) {
         loading_mesh_file = true;
         VideoCommon::LoadPipelines(stop_loading, mesh_pipeline_cache_filename, CACHE_VERSION,
                                    load_compute, load_graphics, true, MIN_COMPATIBLE_CACHE_VERSION,
@@ -2038,6 +2041,10 @@ void PipelineCache::TickFrame() {
     } else {
         priority_build_key_count = 0;
     }
+    if (std::exchange(frame_graphics_draws, 0U) > 64) {
+        last_active_3d_frame.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+                                   std::memory_order_relaxed);
+    }
     ++frame_count;
     while (!evicted_pipelines.empty() && scheduler.IsFree(evicted_pipelines.front().first)) {
         evicted_pipelines.pop_front();
@@ -2291,10 +2298,15 @@ void PipelineCache::StartShaderPrecache(u64 title_id) {
 bool PipelineCache::RuntimeBuildsBusy() const {
     // Long enough to cover the gaps between a loading burst's pipelines.
     constexpr std::chrono::milliseconds Quiet{250};
+    const auto now = std::chrono::steady_clock::now();
     const auto last = std::chrono::steady_clock::time_point{
         std::chrono::steady_clock::duration{last_runtime_build.load(std::memory_order_relaxed)}};
+    const auto last_3d = std::chrono::steady_clock::time_point{
+        std::chrono::steady_clock::duration{last_active_3d_frame.load(std::memory_order_relaxed)}};
     return (translation_workers && translation_workers->PendingWork() != 0) ||
-           workers.PendingWork() != 0 || std::chrono::steady_clock::now() - last < Quiet;
+           workers.PendingWork() != 0 || now - last < Quiet ||
+           (device.IsIntegrated() && device.GetDeviceLocalMemory() <= (u64{3} << 30) &&
+            now - last_3d < std::chrono::milliseconds{500});
 }
 
 void PipelineCache::WaitForIdleRuntimeBuilds() {
