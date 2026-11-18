@@ -21,6 +21,10 @@ add_executable(tests
     video_core/split_write_tracker.cpp
     video_core/list_writer_trace.cpp
     video_core/list_copy_demand.cpp
+    video_core/pending_gpu_tick.cpp
+    video_core/gpu_timestamp_delta.cpp
+    video_core/command_words_pool.cpp
+    video_core/vertex_input_cache.cpp
     video_core/buffer_dependency_trace.cpp
     video_core/nx2_written_pages.cpp
     video_core/frame_dump_schedule.cpp
@@ -37,6 +41,7 @@ add_executable(tests
     common/cityhash.cpp
     common/container_hash.cpp
     common/cpu_layout.cpp
+    common/core_pinning.cpp
     common/event.cpp
     common/fibers.cpp
     common/game_presets.cpp

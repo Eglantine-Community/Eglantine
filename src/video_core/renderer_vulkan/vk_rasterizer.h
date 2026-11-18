@@ -11,6 +11,7 @@
 
 #include <array>
 #include <chrono>
+#include <memory>
 #include <optional>
 #include <span>
 
@@ -23,6 +24,7 @@
 #include "video_core/nx2.h"
 #include "video_core/ocarina_upscale.h"
 #include "video_core/rasterizer_interface.h"
+#include "video_core/vertex_input_cache.h"
 #include "video_core/renderer_vulkan/blit_image.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
@@ -59,6 +61,7 @@ namespace Vulkan {
 struct FramebufferTextureInfo;
 
 class StateTracker;
+class GpuTimingCapture;
 
 class AccelerateDMA : public Tegra::Engines::AccelerateDMAInterface {
 public:
@@ -109,8 +112,9 @@ public:
     void FlushRegion(DAddr addr, u64 size,
                      VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     void FlushQueryResults(DAddr addr, u64 size) override;
-    GpuWrittenList ReadGpuWrittenCommandList(DAddr addr, std::span<u8> out,
-                                             bool past_sync) override;
+    GpuWrittenList ReadGpuWrittenCommandList(DAddr addr, std::span<u8> out, bool past_sync,
+                                             u64* pending_tick = nullptr) override;
+    bool IsGpuTickDone(u64 tick) override;
     void NoteGpuWrittenCommandListSynced(DAddr page) override;
     bool MustFlushRegion(DAddr addr, u64 size,
                          VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
@@ -260,6 +264,11 @@ private:
     void UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs);
 
     Tegra::GPU& gpu;
+    struct VertexInputState {
+        boost::container::static_vector<VkVertexInputBindingDescription2EXT, 32> bindings;
+        boost::container::static_vector<VkVertexInputAttributeDescription2EXT, 32> attributes;
+    };
+    VideoCommon::VertexInputCache<VertexInputState> vertex_input_cache;
     Tegra::MaxwellDeviceMemoryManager& device_memory;
 
     const Device& device;
@@ -267,6 +276,7 @@ private:
     StateTracker& state_tracker;
     s32 bound_channel_id = -1;
     Scheduler& scheduler;
+    std::unique_ptr<GpuTimingCapture> gpu_timing;
 
     StagingBufferPool staging_pool;
     DescriptorPool descriptor_pool;

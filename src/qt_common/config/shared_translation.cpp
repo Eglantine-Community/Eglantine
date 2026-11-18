@@ -284,6 +284,12 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Determines the number of depth slices processed in a single dispatch.\n"
               "Increasing this can improve throughput on high-end GPUs but may cause TDR or driver "
               "timeouts on weaker hardware."));
+    INSERT(Settings, pin_gpu_threads, tr("Pin GPU threads to their own cores (experimental)"),
+           tr("Pins the emulator's GPU threads to dedicated physical CPU cores and keeps the "
+              "emulated CPU cores off them.\n"
+              "Can hurt performance on CPUs with few cores. Skipped on CPUs with fewer than 6 "
+              "physical performance cores.\n"
+              "Windows only. Takes effect when a game starts."));
 
     INSERT(Settings, use_mesh_shaders, tr("Use mesh shaders"),
            tr("Draws the task and mesh shader geometry of Switch 2 games with the GPU's own mesh "

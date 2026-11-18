@@ -11,11 +11,22 @@
 
 #include <ranges>
 #include "common/settings.h"
+#include "video_core/nx2.h"
+#include "video_core/pending_gpu_tick.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace Vulkan {
+
+namespace {
+void NotifyCompletedGpuTick(u64 tick) {
+    if (Tegra::Nx2PendingWake::On() && Tegra::g_pending_gpu_tick.Complete(tick)) {
+        Tegra::Nx2PendingWake::Wake(Tegra::g_pending_gpu_tick_sequence,
+                                  Tegra::PendingGpuTickWakeReason);
+    }
+}
+} // namespace
 
 constexpr u64 FENCE_RESERVE_SIZE = 8;
 
@@ -77,6 +88,9 @@ void MasterSemaphore::Refresh() {
         }
     } while (!gpu_tick.compare_exchange_weak(this_tick, counter, std::memory_order_release,
                                              std::memory_order_relaxed));
+    if (counter > this_tick) {
+        NotifyCompletedGpuTick(counter);
+    }
 }
 
 void MasterSemaphore::Wait(u64 tick) {
@@ -363,6 +377,7 @@ void MasterSemaphore::WaitThread(std::stop_token token) {
             gpu_tick.store(host_tick, std::memory_order_release);
         }
         gpu_tick.notify_one();
+        NotifyCompletedGpuTick(host_tick);
     }
 }
 

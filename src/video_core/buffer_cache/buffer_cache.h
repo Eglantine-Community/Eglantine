@@ -2753,8 +2753,8 @@ bool BufferCache<P>::Nx2CopyListPages(u64 tick) {
 }
 
 template <class P>
-auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool past_sync)
-    -> Nx2ListRead {
+auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool past_sync,
+                                     u64* pending_tick) -> Nx2ListRead {
     if constexpr (IS_OPENGL) {
         return Nx2ListRead::Unknown;
     } else {
@@ -2827,6 +2827,10 @@ auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool 
             copy_time = entry.copy_time;
             if (nx2_list_copy_log) {
                 ++nx2_list_copy_stats.waits;
+            }
+            if (pending_tick != nullptr) {
+                *pending_tick = tick;
+                return Nx2ListRead::Pending;
             }
         }
         // Submitted with the work that wrote the page (Nx2CopyListPages's caller flushes). The

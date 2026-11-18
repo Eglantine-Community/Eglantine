@@ -24,6 +24,7 @@
 #include "common/scratch_buffer.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/engines/puller.h"
+#include "video_core/command_words_pool.h"
 
 namespace Core {
 class System;
@@ -128,7 +129,7 @@ struct CommandList final {
     std::vector<u64> submit_hashes;
     /// The entries' words when they were submitted (NX2), each entry's at submitted_offsets[i]:
     /// executed instead of the memory, which the game may already be refilling for a later frame.
-    std::vector<CommandHeader> submitted_words;
+    std::vector<CommandHeader, CommandWordsAllocator<CommandHeader>> submitted_words;
     std::vector<u32> submitted_offsets;
     /// Entries (ascending) not copied when submitted, because a GPU map still queued covers them:
     /// DmaPusher::Push copies them after the map, and until then they read memory.
@@ -178,13 +179,12 @@ public:
 
     void DispatchCalls();
 
-    /// Switch 2: true while the channel is suspended on a semaphore acquire.
+    /// Switch 2: true while the channel is suspended, on a semaphore acquire or on the GPU's copy
+    /// of a command list it reads next.
     [[nodiscard]] bool HasPendingAcquire() const {
-        return puller.HasPendingAcquire();
+        return puller.HasPendingAcquire() || pending_list_tick.has_value();
     }
-    [[nodiscard]] bool CanResumeAcquire() {
-        return puller.CanResumeAcquire(*this);
-    }
+    [[nodiscard]] bool CanResumeAcquire();
 
     void BindSubchannel(Engines::EngineInterface* engine, u32 subchannel_id, Engines::EngineTypes engine_type) {
         subchannels[subchannel_id] = engine;
@@ -239,8 +239,9 @@ public:
     /// Reads a command list on pages the GPU wrote into command_headers, from the copies the
     /// buffer cache made after the work that wrote them or from guest memory for pages flushed
     /// since. False when not all are current (or the list isn't GPU-written): the caller drains,
-    /// flushes and reads guest memory.
-    bool ReadGpuWrittenCommands(GPUVAddr address, u32 count);
+    /// flushes and reads guest memory. With `pending`, a copy the GPU has not finished sets
+    /// `*pending` and pending_list_tick instead of waiting (the result is false then).
+    bool ReadGpuWrittenCommands(GPUVAddr address, u32 count, bool* pending = nullptr);
     /// Brings command list words the GPU wrote (still only in host buffers) to guest memory.
     void FlushGpuWrittenCommands(GPUVAddr address, size_t size);
 
@@ -301,6 +302,10 @@ public:
     std::condition_variable sync_cv;
 
     VideoCore::RasterizerInterface* rasterizer = nullptr;
+    /// Host GPU tick of the command list copy this channel waits for (ReadGpuWrittenCommands).
+    std::optional<u64> pending_list_tick;
+    /// The entry parsed next was suspended on pending_list_tick, which is done now.
+    bool resumed_list_read{};
 
     const bool ib_enable : 1 = true; ///< IB mode enabled
     bool dma_increment_once : 1 = false;

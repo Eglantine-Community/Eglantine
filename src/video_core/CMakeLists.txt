@@ -121,6 +121,12 @@ add_library(video_core STATIC
     nx2_diag.h
     nx2_gpu_latency.h
     nx2_profile.h
+    pending_gpu_tick.h
+    vertex_input_cache.h
+    command_words_pool.h
+    command_words_pool.cpp
+    gpu_timestamp_delta.h
+    renderer_vulkan/vk_gpu_timing_capture.h
     nx2_spikes.cpp
     nx2_spikes.h
     nx2_timeline.cpp

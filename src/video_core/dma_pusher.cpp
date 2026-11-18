@@ -12,7 +12,10 @@
 #include <cstdlib>
 #include <cstdio>
 #include <string>
+#include <span>
+#include <utility>
 #include <vector>
+#include "video_core/pending_gpu_tick.h"
 
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -62,7 +65,20 @@ DmaPusher::DmaPusher(Core::System& system_, MemoryManager& memory_manager_, Cont
     , synced{false}
 {}
 
-DmaPusher::~DmaPusher() = default;
+DmaPusher::~DmaPusher() {
+    dma_pushbuffer.clear();
+    CommandWordsPool::Trim();
+}
+
+bool DmaPusher::CanResumeAcquire() {
+    if (pending_list_tick) {
+        if (Nx2PendingWake::On()) {
+            g_pending_gpu_tick.Watch(*pending_list_tick);
+        }
+        return rasterizer->IsGpuTickDone(*pending_list_tick);
+    }
+    return puller.CanResumeAcquire(*this);
+}
 
 void DmaPusher::DispatchCalls() {
     // The sub-index is kept: a channel suspended on a semaphore resumes inside its command list.
@@ -91,6 +107,19 @@ bool DmaPusher::Step() {
     if (!ib_enable || dma_pushbuffer.empty()) {
         return false;
     }
+    // Waiting for the GPU's copy of a command list this channel reads next (ReadGpuWrittenCommands).
+    if (pending_list_tick) {
+        if (!rasterizer->IsGpuTickDone(*pending_list_tick)) {
+            return false;
+        }
+        pending_list_tick.reset();
+        resumed_list_read = true;
+    }
+    // Only for the entry that suspended: an acquire still waiting, the safe-read path or a stopped
+    // split must not leave it set for a later list (which would then skip its writer wait).
+    SCOPE_EXIT {
+        resumed_list_read = false;
+    };
     const u64 suspensions_before = suspensions.load(std::memory_order_relaxed);
     if (!puller.ResumeAcquire(*this)) {
         return false;
@@ -346,7 +375,14 @@ bool DmaPusher::Step() {
             RecordParsedEntry(header, commands);
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
-        } else if (ReadGpuWrittenCommands(dma_state.dma_get, static_cast<u32>(header.size))) {
+        } else if (bool pending = false;
+                   ReadGpuWrittenCommands(dma_state.dma_get, static_cast<u32>(header.size),
+                                          &pending) ||
+                   pending) {
+            if (pending) {
+                // Parsed again once the GPU copied the list; other channels run meanwhile.
+                return false;
+            }
             const std::span<const CommandHeader> commands{command_headers.data(), header.size};
             RecordParsedEntry(header, commands);
             command_resume_offset +=
@@ -839,7 +875,7 @@ bool DmaPusher::IsGpuWrittenCommands(GPUVAddr address, size_t size) {
     return false;
 }
 
-bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
+bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count, bool* pending) {
     // The pages are marked as command list pages: from the next write on, the buffer cache copies
     // them to host memory right after the dispatch or copy that writes them and submits. The
     // front then waits only for the back to run that work and for the GPU to finish the copy, not
@@ -864,7 +900,11 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
         return false;
     }
     auto& split = VideoCommon::GpuSplit::Get();
-    if (split.Active()) {
+    // Resuming after the copy's tick: the back ran the list's writer before the suspension
+    // (this wait ran then), and waiting again would wait for the other channels' work queued
+    // meanwhile too.
+    const bool resumed = std::exchange(resumed_list_read, false);
+    if (split.Active() && !resumed) {
         split.WaitForWriters();
     }
     bool past_sync = !split.Active();
@@ -880,11 +920,20 @@ bool DmaPusher::ReadGpuWrittenCommands(GPUVAddr address, u32 count) {
         }
         GpuWrittenList where = GpuWrittenList::Synced;
         if (Tegra::Nx2IsGpuWritten(*device)) {
-            where = rasterizer->ReadGpuWrittenCommandList(*device, part, past_sync);
+            u64 tick = 0;
+            u64* const pending_tick = pending != nullptr ? &tick : nullptr;
+            where = rasterizer->ReadGpuWrittenCommandList(*device, part, past_sync, pending_tick);
             if (where == GpuWrittenList::NeedsSync) {
                 split.WaitForSync();
                 past_sync = true;
-                where = rasterizer->ReadGpuWrittenCommandList(*device, part, true);
+                where = rasterizer->ReadGpuWrittenCommandList(*device, part, true, pending_tick);
+            }
+            if (where == GpuWrittenList::Pending) {
+                // The copy is still on the GPU: the channel waits for it without blocking the
+                // others (Step parses this entry again once IsGpuTickDone).
+                pending_list_tick = tick;
+                *pending = true;
+                return false;
             }
         }
         if (where == GpuWrittenList::Unknown) {

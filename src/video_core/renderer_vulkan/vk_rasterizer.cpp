@@ -32,6 +32,7 @@
 #include <boost/container/small_vector.hpp>
 #include <fmt/format.h>
 
+#include "video_core/buffer_cache/indirect_buffer.h"
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 
 #include "common/assert.h"
@@ -60,6 +61,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/renderer_vulkan/vk_gpu_timing_capture.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
@@ -467,6 +469,7 @@ RasterizerVulkan::~RasterizerVulkan() {
     state_tracker.ClearChannel();
     scheduler.WaitWorker();
     scheduler.Finish();
+    gpu_timing.reset();
     delete std::exchange(g_diag_pool, nullptr);
 }
 
@@ -893,6 +896,14 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         submitted = true;
         return;
     }
+    const u32 gpu_time_query = gpu_timing
+                                  ? gpu_timing->Begin("graphics", pipeline->ShaderHashes())
+                                  : GpuTimingCapture::Invalid;
+    SCOPE_EXIT {
+        if (gpu_timing) {
+            gpu_timing->End(gpu_time_query);
+        }
+    };
     // Task/mesh pipelines: the draw's vertex count is the number of task workgroups.
     mesh_draw = pipeline->IsMeshPipeline();
     // EDEN_NX2_NO_MESH=1: skip task/mesh draws as before they were supported (A/B comparisons).
@@ -1869,6 +1880,15 @@ void RasterizerVulkan::DispatchCompute() {
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute pipeline unavailable");
         return;
     }
+    const std::array shader_hashes{pipeline->ShaderHash()};
+    const u32 gpu_time_query = gpu_timing
+                                  ? gpu_timing->Begin("compute", shader_hashes, native_key)
+                                  : GpuTimingCapture::Invalid;
+    SCOPE_EXIT {
+        if (gpu_timing) {
+            gpu_timing->End(gpu_time_query);
+        }
+    };
     if (kepler_compute->IsNativeMode() &&
         kepler_compute->ProcessOcarinaUpscale(Settings::GetCurrentProgramID(), native_key,
                                               pipeline->ShaderHash())) {
@@ -1969,10 +1989,7 @@ void RasterizerVulkan::DispatchCompute() {
     };
     if (indirect_address) {
         // DispatchIndirect
-        static constexpr auto sync_info = VideoCommon::ObtainBufferSynchronize::FullSynchronize;
-        const auto post_op = VideoCommon::ObtainBufferOperation::DiscardWrite;
-        const auto [buffer, offset] =
-            buffer_cache.ObtainBuffer(*indirect_address, 12, sync_info, post_op);
+        const auto [buffer, offset] = VideoCommon::ObtainIndirectBuffer(buffer_cache, *indirect_address);
         scheduler.RequestOutsideRenderPassOperationContext();
         if (SyncFixEnabled()) {
             record_read_barrier();
@@ -2111,22 +2128,37 @@ void RasterizerVulkan::FlushSplitIdle() {
 }
 
 VideoCore::RasterizerInterface::GpuWrittenList RasterizerVulkan::ReadGpuWrittenCommandList(
-    DAddr addr, std::span<u8> out, bool past_sync) {
+    DAddr addr, std::span<u8> out, bool past_sync, u64* pending_tick) {
     if (!VideoCommon::GpuSplit::Get().Active() && buffer_cache.HasPendingNx2ListCopies()) {
         std::scoped_lock lock{buffer_cache.mutex};
         SubmitNx2ListCopies();
     }
     // No cache lock: the front only reads the copies, under their own lock.
-    switch (buffer_cache.Nx2ReadListCopy(addr, out, past_sync)) {
+    switch (buffer_cache.Nx2ReadListCopy(addr, out, past_sync, pending_tick)) {
     case BufferCache::Nx2ListRead::Copied:
         return GpuWrittenList::Copied;
     case BufferCache::Nx2ListRead::Synced:
         return GpuWrittenList::Synced;
     case BufferCache::Nx2ListRead::NeedsSync:
         return GpuWrittenList::NeedsSync;
+    case BufferCache::Nx2ListRead::Pending:
+        return GpuWrittenList::Pending;
     default:
         return GpuWrittenList::Unknown;
     }
+}
+
+bool RasterizerVulkan::IsGpuTickDone(u64 tick) {
+    if (scheduler.IsFree(tick)) {
+        return true;
+    }
+    // A deferred submission (Scheduler::DeferFlush) is only made by the split's back: ask it to
+    // submit, or the tick never completes while the front polls.
+    if (!scheduler.IsSubmitted(tick) && VideoCommon::GpuSplit::Get().Active()) {
+        VideoCommon::GpuSplit::Get().RequestIdleHook();
+    }
+    scheduler.GetMasterSemaphore().Refresh();
+    return scheduler.IsFree(tick);
 }
 
 void RasterizerVulkan::NoteGpuWrittenCommandListSynced(DAddr page) {
@@ -2573,6 +2605,12 @@ void RasterizerVulkan::FlushCommands() {
 
 void RasterizerVulkan::TickFrame() {
     draw_counter = 0;
+    if (!gpu_timing && std::getenv("EDEN_NX2_GPU_TIMING_FILE") != nullptr) {
+        gpu_timing = std::make_unique<GpuTimingCapture>(device, scheduler);
+    }
+    if (gpu_timing) {
+        gpu_timing->TickFrame();
+    }
     // Debug server requests (docs/nx2/debug-mcp.md), taken between frames on the owning thread.
     if (VideoCore::Nx2Debug::HasRequests()) {
         if (auto capture = VideoCore::Nx2Debug::TakeCapture()) {
@@ -4209,8 +4247,6 @@ void RasterizerVulkan::UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs) 
     }
     dirty[Dirty::VertexInput] = false;
 
-    boost::container::static_vector<VkVertexInputBindingDescription2EXT, 32> bindings;
-    boost::container::static_vector<VkVertexInputAttributeDescription2EXT, 32> attributes;
 
     const u32 max_attributes =
         static_cast<u32>(std::min<size_t>(Maxwell::NumVertexAttributes,
@@ -4220,34 +4256,56 @@ void RasterizerVulkan::UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs) 
                                           device.GetMaxVertexInputBindings()));
 
 
+    VideoCommon::VertexInputKey key{.num_attributes = max_attributes,
+                                    .num_bindings = max_bindings};
     for (u32 index = 0; index < max_attributes; ++index) {
-        const Maxwell::VertexAttribute attribute{regs.vertex_attrib_format[index]};
-        const u32 binding{attribute.buffer};
-        if (attribute.constant || binding >= max_bindings) {
-            continue;
-        }
-        attributes.push_back({
-            .sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT,
-            .pNext = nullptr,
-            .location = index,
-            .binding = binding,
-            .format = MaxwellToVK::VertexFormat(device, attribute.type, attribute.size),
-            .offset = attribute.offset +
-                      (buffer_cache_runtime.IsVertexRepacked(binding) && attribute.offset >= 65 ? 3 : 0),
-        });
+        key.attributes[index] = regs.vertex_attrib_format[index].hex;
     }
-
     for (u32 binding = 0; binding < max_bindings; ++binding) {
-        const auto& input_binding{regs.vertex_streams[binding]};
-        const bool is_instanced{regs.vertex_stream_instances.IsInstancingEnabled(binding)};
-        bindings.push_back({
-            .sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT,
-            .pNext = nullptr,
-            .binding = binding,
-            .stride = buffer_cache_runtime.IsVertexRepacked(binding) ? 72U : input_binding.stride.Value(),
-            .inputRate = is_instanced ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX,
-            .divisor = is_instanced ? input_binding.frequency : 1,
-        });
+        key.strides[binding] = regs.vertex_streams[binding].stride.Value();
+        key.divisors[binding] = regs.vertex_streams[binding].frequency;
+        key.instanced |= (regs.vertex_stream_instances.IsInstancingEnabled(binding) ? 1U : 0U)
+                         << binding;
+        key.repacked |= (buffer_cache_runtime.IsVertexRepacked(binding) ? 1U : 0U) << binding;
+    }
+    const u64 hash = key.Hash();
+    auto state = vertex_input_cache.Find(key, hash);
+    if (!state) {
+        auto built = std::make_shared<VertexInputState>();
+        auto& bindings = built->bindings;
+        auto& attributes = built->attributes;
+        for (u32 index = 0; index < max_attributes; ++index) {
+            const Maxwell::VertexAttribute attribute{regs.vertex_attrib_format[index]};
+            const u32 binding{attribute.buffer};
+            if (attribute.constant || binding >= max_bindings) {
+                continue;
+            }
+            attributes.push_back({
+                .sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT,
+                .pNext = nullptr,
+                .location = index,
+                .binding = binding,
+                .format = MaxwellToVK::VertexFormat(device, attribute.type, attribute.size),
+                .offset = attribute.offset +
+                          (buffer_cache_runtime.IsVertexRepacked(binding) && attribute.offset >= 65 ? 3 : 0),
+            });
+        }
+
+        for (u32 binding = 0; binding < max_bindings; ++binding) {
+            const auto& input_binding{regs.vertex_streams[binding]};
+            const bool is_instanced{regs.vertex_stream_instances.IsInstancingEnabled(binding)};
+            bindings.push_back({
+                .sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT,
+                .pNext = nullptr,
+                .binding = binding,
+                .stride = buffer_cache_runtime.IsVertexRepacked(binding) ? 72U : input_binding.stride.Value(),
+                .inputRate = is_instanced ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX,
+                .divisor = is_instanced ? input_binding.frequency : 1,
+            });
+        }
+
+        state = std::move(built);
+        vertex_input_cache.Insert(key, hash, state);
     }
 
     for (size_t index = 0; index < Maxwell::NumVertexAttributes; ++index) {
@@ -4257,8 +4315,8 @@ void RasterizerVulkan::UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs) 
         dirty[Dirty::VertexBinding0 + index] = false;
     }
 
-    scheduler.Record([bindings, attributes](vk::CommandBuffer cmdbuf) {
-        cmdbuf.SetVertexInputEXT(bindings, attributes);
+    scheduler.Record([state = std::move(state)](vk::CommandBuffer cmdbuf) {
+        cmdbuf.SetVertexInputEXT(state->bindings, state->attributes);
     });
 }
 

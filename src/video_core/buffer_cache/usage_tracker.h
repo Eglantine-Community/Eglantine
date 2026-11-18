@@ -39,7 +39,9 @@ public:
             return;
         }
         touched = false;
-        std::ranges::fill(pages, 0ULL);
+        std::fill(pages.begin() + set_begin, pages.begin() + set_end, 0ULL);
+        set_begin = 0;
+        set_end = 0;
         recent.fill({~u64{0}, 0});
         full_begin = 0;
         full_end = 0;
@@ -64,6 +66,8 @@ public:
         if (page_end < page || page_end >= pages.size()) {
             return;
         }
+        set_begin = set_end == 0 ? page : (std::min)(set_begin, page);
+        set_end = (std::max)(set_end, page_end + 1);
         TrackPage(page, offset, size);
         if (page == page_end) {
             return;
@@ -178,6 +182,9 @@ private:
     /// Pages known to be all ones (FillPages).
     size_t full_begin{};
     size_t full_end{};
+    /// Only words in this extent can have been set since Reset (Lichii 5e428570d2).
+    size_t set_begin{};
+    size_t set_end{};
 };
 
 } // namespace VideoCommon
