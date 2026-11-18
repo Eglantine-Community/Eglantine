@@ -149,3 +149,35 @@ TEST_CASE("Ocarina upscale rejects a singular camera", "[ocarina_upscale]") {
     REQUIRE_FALSE(Ocarina::Reprojection(screen, Ocarina::Matrix{}));
     REQUIRE(Ocarina::Invert(Ocarina::Multiply(screen, *Ocarina::Invert(screen))));
 }
+
+TEST_CASE("Ocarina bypass window skips upstream AA passes only after confirmed output copy",
+          "[ocarina_upscale]") {
+    Ocarina::BypassWindow window;
+    Tegra::Texture::TICEntry dummy_tic{};
+
+    // Frame 1: nothing replaced yet, so every upstream pass runs.
+    REQUIRE_FALSE(window.OnPrepass());
+    REQUIRE_FALSE(window.ShouldSkipUnusedDispatch(Ocarina::UnusedDispatchKey));
+    window.input = dummy_tic;
+    REQUIRE_FALSE(window.ShouldSkipInputPass());
+    window.OnOutputResult(true);
+
+    // Frame 2: output was replaced, so prepass, unused dispatch (by native key only), and input
+    // pass skip once input is captured.
+    REQUIRE(window.OnPrepass());
+    REQUIRE(window.ShouldSkipUnusedDispatch(Ocarina::UnusedDispatchKey));
+    REQUIRE_FALSE(window.ShouldSkipUnusedDispatch(0xd9ee412f00ce399aULL));
+    REQUIRE_FALSE(window.ShouldSkipUnusedDispatch(Ocarina::PrepassKey));
+    window.input.reset();
+    REQUIRE_FALSE(window.ShouldSkipInputPass());
+    window.input = dummy_tic;
+    REQUIRE(window.ShouldSkipInputPass());
+    window.OnOutputResult(true);
+
+    // Unrecognized output pass (no OnOutputResult before the next prepass): restore full chain.
+    REQUIRE(window.OnPrepass());
+    REQUIRE_FALSE(window.OnPrepass());
+    REQUIRE_FALSE(window.ShouldSkipUnusedDispatch(Ocarina::UnusedDispatchKey));
+    window.input = dummy_tic;
+    REQUIRE_FALSE(window.ShouldSkipInputPass());
+}

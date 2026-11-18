@@ -23,10 +23,14 @@ namespace VideoCommon::OcarinaUpscale {
 
 constexpr u64 ProgramId = 0x0400486024DEC000ULL;
 
-// The post-tonemap chain is four dispatches; the third samples the tonemapped 3D scene frame and
-// the fourth writes the anti-aliased / upscaled result before HUD rendering.
+// The post-tonemap chain is four dispatches; the first two prepare intermediate state, the third
+// samples the tonemapped 3D scene frame and runs the network, and the fourth writes the
+// anti-aliased / upscaled result before HUD rendering.
 // Match by either lowered ShaderInfo::unique_identifier (*Hash) or raw guest code key (*Key):
-// - Pass 3 (input pass, cs=0x11483c1100):
+// - Pass 1 (prepass) and Pass 2 (network setup):
+constexpr u64 PrepassKey = 0x8475d671e6967428ULL;
+constexpr u64 UnusedDispatchKey = 0x9387db798781f081ULL;
+// - Pass 3 (input / network pass, cs=0x11483c1100):
 constexpr u64 InputPassHash = 0xa2fcaa95c5a162f3ULL;
 constexpr u64 InputPassKey = 0x42593194bb0b2b32ULL;
 // - Pass 4 (output pass):
@@ -51,6 +55,36 @@ constexpr u64 OutputPassDockedKey = 0xda6df3e54c716df2ULL;
            shader_hash == OutputPassDockedHash || native_key == OutputPassUpscaleKey ||
            native_key == OutputPassDockedKey || native_key == OutputPassHash;
 }
+
+/// Shared across compute channels on one rasterizer: tracks the input image and whether the
+/// output pass is actively being replaced by EDEN_NX2_OOT_AA=0 so the three upstream AA passes
+/// can be skipped safely once replacement is confirmed.
+struct BypassWindow {
+    std::optional<Tegra::Texture::TICEntry> input;
+    bool output_replaced{};
+    bool output_pending{};
+
+    [[nodiscard]] constexpr bool OnPrepass() noexcept {
+        if (std::exchange(output_pending, false) && std::exchange(output_replaced, false)) {
+            return false;
+        }
+        output_pending = output_replaced;
+        return output_replaced;
+    }
+
+    [[nodiscard]] constexpr bool ShouldSkipUnusedDispatch(u64 native_key) const noexcept {
+        return native_key == UnusedDispatchKey && output_replaced && output_pending;
+    }
+
+    [[nodiscard]] constexpr bool ShouldSkipInputPass() const noexcept {
+        return output_replaced && input.has_value();
+    }
+
+    constexpr void OnOutputResult(bool replaced) noexcept {
+        output_pending = false;
+        output_replaced = replaced;
+    }
+};
 
 // Constant bank 0 offsets of their image handles (both B10G11R11).
 constexpr u32 InputColorOffset = 0xa8;

@@ -1131,13 +1131,37 @@ bool KeplerCompute::ProcessOcarinaUpscale(u64 program_id, u64 native_key, u64 sh
     }
     // Without DLSS the game's own anti-aliasing runs: 14.8 ms a frame on an RX 580 at 1440p
     // (37% of the GPU's time in Ocarina of Time). EDEN_NX2_OOT_AA=0 (Performance > GPU) puts a
-    // bilinear copy of its input in its place.
+    // bilinear copy of its input in its place and skips the upstream AA network passes once
+    // output replacement is confirmed.
     const bool dlss = rasterizer->UsesNvidiaDlss();
     static const bool copy_aa = [] {
         const char* env = std::getenv("EDEN_NX2_OOT_AA");
         return env != nullptr && env[0] == '0';
     }();
-    if (program_id != ProgramId || (!input_pass && !output_pass) || (!dlss && !copy_aa)) {
+    if (program_id != ProgramId || (!dlss && !copy_aa)) {
+        return false;
+    }
+    struct SharedOcarinaState {
+        std::mutex mutex;
+        const VideoCore::RasterizerInterface* owner{};
+        BypassWindow window{};
+    };
+    static SharedOcarinaState shared_state;
+    std::unique_lock state_lock{shared_state.mutex};
+    if (shared_state.owner != rasterizer) {
+        shared_state.owner = rasterizer;
+        shared_state.window = {};
+    }
+    auto& window = shared_state.window;
+    if (!dlss && copy_aa) {
+        if (native_key == PrepassKey) {
+            return window.OnPrepass();
+        }
+        if (window.ShouldSkipUnusedDispatch(native_key)) {
+            return true;
+        }
+    }
+    if (!input_pass && !output_pass) {
         return false;
     }
     const auto& cbuf = launch_description.const_buffer_config[0];
@@ -1164,19 +1188,25 @@ bool KeplerCompute::ProcessOcarinaUpscale(u64 program_id, u64 native_key, u64 sh
         return tic;
     };
     if (input_pass) {
-        ocarina_input = image(InputColorOffset);
-        if (!ocarina_input) {
+        window.input = image(InputColorOffset);
+        if (!window.input) {
             for (const u32 read : NativeImageHandles(regs.code_loc.Address()).first) {
                 if (const auto candidate = image(read);
                     candidate && candidate->Width() >= 640 && candidate->Height() >= 360) {
-                    ocarina_input = candidate;
+                    window.input = candidate;
                     break;
                 }
             }
         }
-        return false;
+        ocarina_input = window.input;
+        return !dlss && copy_aa && window.ShouldSkipInputPass();
     }
-    const auto input = std::exchange(ocarina_input, std::nullopt);
+    auto input = std::exchange(window.input, std::nullopt);
+    if (!input) {
+        input = std::exchange(ocarina_input, std::nullopt);
+    } else {
+        ocarina_input.reset();
+    }
     auto output = image(OutputColorOffset);
     if (!output) {
         for (const u32 store : NativeImageHandles(regs.code_loc.Address()).second) {
@@ -1196,6 +1226,7 @@ bool KeplerCompute::ProcessOcarinaUpscale(u64 program_id, u64 native_key, u64 sh
     };
     if (!input || !output || input->Address() == output->Address() ||
         !valid_scale(*input, *output)) {
+        window.OnOutputResult(false);
         static bool reported{};
         if (!reported) {
             reported = true;
@@ -1220,6 +1251,7 @@ bool KeplerCompute::ProcessOcarinaUpscale(u64 program_id, u64 native_key, u64 sh
         result.addr_lower = static_cast<u32>(tic.Address());
         return result;
     };
+    state_lock.unlock();
     if (dlss) {
         return rasterizer->AccelerateCameraMotionUpscale(surface(*input), surface(*output));
     }
@@ -1237,6 +1269,11 @@ bool KeplerCompute::ProcessOcarinaUpscale(u64 program_id, u64 native_key, u64 sh
         .src_y1 = static_cast<s32>(input->Height()),
     };
     const bool copied = rasterizer->AccelerateSurfaceCopy(surface(*input), surface(*output), config);
+    state_lock.lock();
+    if (shared_state.owner == rasterizer) {
+        shared_state.window.OnOutputResult(copied);
+    }
+    state_lock.unlock();
     static bool reported{};
     if (!reported) {
         reported = true;
