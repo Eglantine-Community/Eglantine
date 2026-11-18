@@ -203,8 +203,11 @@ void BufferCache<P>::TickFrame() {
         // downloading the GPU-written ones, ~5% of the GPU thread) that were recreated later.
         // Collect when the buffers themselves are large. At 1 GiB it held geometry of scenes
         // long gone: title 1's title screen grew to ~0.9 GB of buffers in ten minutes.
-        if (buffer_bytes >= 512_MiB) {
-            RunGarbageCollector(buffer_bytes >= 1_GiB);
+        const bool small_vram = runtime.GetDeviceLocalMemory() <= 3_GiB;
+        const u64 gc_expected = small_vram ? 256_MiB : 512_MiB;
+        const u64 gc_critical = small_vram ? 512_MiB : 1_GiB;
+        if (buffer_bytes >= gc_expected) {
+            RunGarbageCollector(buffer_bytes >= gc_critical);
         }
     } else if (total_used_memory >= minimum_memory) {
         RunGarbageCollector(total_used_memory >= critical_memory);

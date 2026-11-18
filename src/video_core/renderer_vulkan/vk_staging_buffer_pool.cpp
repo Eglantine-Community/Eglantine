@@ -148,6 +148,18 @@ void StagingBufferPool::TickFrame() {
     ReleaseCache(MemoryUsage::DeviceLocal);
     ReleaseCache(MemoryUsage::Upload);
     ReleaseCache(MemoryUsage::Download);
+
+    // Reclaim finished >= 8 MiB staging allocations promptly instead of waiting up to 64 frames.
+    static constexpr size_t LargeLevelBegin = 23;
+    static constexpr size_t LargeLevelEnd = (std::min)(size_t{34}, NUM_LEVELS);
+    for (size_t log2 = LargeLevelBegin; log2 < LargeLevelEnd; ++log2) {
+        if (log2 == current_delete_level) {
+            continue;
+        }
+        ReleaseLevel(device_local_cache, log2);
+        ReleaseLevel(upload_cache, log2);
+        ReleaseLevel(download_cache, log2);
+    }
 }
 
 StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {

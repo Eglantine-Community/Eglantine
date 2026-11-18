@@ -855,7 +855,7 @@ bool ReadMemoryIsLow() {
     if (!GlobalMemoryStatusEx(&status)) {
         return false;
     }
-    const u64 floor = std::max<u64>(u64{1} << 30, status.ullTotalPhys / 10);
+    const u64 floor = std::max<u64>(u64{2} << 30, status.ullTotalPhys / 7);
     return status.ullAvailPhys < floor;
 #elif defined(__linux__)
     const auto read_file = [](const char* path) {

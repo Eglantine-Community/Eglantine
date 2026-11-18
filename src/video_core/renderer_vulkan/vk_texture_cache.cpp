@@ -289,8 +289,11 @@ enum class SparseTilesMode {
 // The most device memory one SparseLayers image binds: 768 MiB, 384 MiB on GPUs with less than
 // 7 GiB (title 1's BC6H arrays are 85 MB a layer).
 [[nodiscard]] VkDeviceSize SparseLayersCap(const Device& device) {
-    return device.GetDeviceLocalMemory() < (u64{7} << 30) ? (VkDeviceSize{384} << 20)
-                                                           : (VkDeviceSize{768} << 20);
+    const u64 local = device.GetDeviceLocalMemory();
+    if (local <= (u64{3} << 30)) {
+        return VkDeviceSize{192} << 20;
+    }
+    return local < (u64{7} << 30) ? (VkDeviceSize{384} << 20) : (VkDeviceSize{768} << 20);
 }
 
 // The host format of a huge ASTC array: the GPU decoder's RGBA8 (sRGB kept for sampling).
@@ -357,7 +360,11 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
     if (forced != 0) {
         return forced;
     }
-    return device.GetDeviceLocalMemory() < (u64{7} << 30) ? (u64{256} << 20) : (u64{512} << 20);
+    const u64 local = device.GetDeviceLocalMemory();
+    if (local <= (u64{3} << 30)) {
+        return u64{128} << 20;
+    }
+    return local < (u64{7} << 30) ? (u64{256} << 20) : (u64{512} << 20);
 }
 
 // The host shape of an image whose decoded copy would not fit in VRAM: a GPU-decoded ASTC array
@@ -5163,7 +5170,9 @@ u64 TextureCacheRuntime::TranscodeDecodeBytes(const PendingTranscode& t) {
 void TextureCacheRuntime::RecycleTranscodes() {
     // Finished decode images wait for the next texture of their shape, up to this much memory;
     // the rest are destroyed, which returns their video memory.
-    static constexpr u64 MaxFreeTranscodeBytes = u64{256} << 20;
+    const bool small_vram =
+        device.IsIntegrated() || device.GetDeviceLocalMemory() <= (u64{4} << 30);
+    const u64 max_free_bytes = small_vram ? (u64{32} << 20) : (u64{256} << 20);
     u64 free_bytes{};
     for (const PendingTranscode& t : free_transcodes) {
         free_bytes += TranscodeDecodeBytes(t);
@@ -5171,7 +5180,7 @@ void TextureCacheRuntime::RecycleTranscodes() {
     while (!pending_transcodes.empty() && scheduler.IsFree(pending_transcodes.front().tick)) {
         PendingTranscode& done = pending_transcodes.front();
         const u64 bytes = TranscodeDecodeBytes(done);
-        if (free_bytes + bytes <= MaxFreeTranscodeBytes) {
+        if (free_bytes + bytes <= max_free_bytes) {
             done.unused_frames = 0;
             free_bytes += bytes;
             free_transcodes.push_back(std::move(done));
@@ -5193,7 +5202,9 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     // shader builds in Ocarina of Time) every ASTC texture got a new one, up to 0.9 GB each for
     // 90-layer arrays, and 3.8 GB of them filled an 8 GB card. Recycle finished ones now, and
     // keep at most this much decode memory in flight, waiting for the GPU beyond it.
-    static constexpr u64 MaxInFlightTranscodeBytes = u64{512} << 20;
+    const bool small_vram =
+        device.IsIntegrated() || device.GetDeviceLocalMemory() <= (u64{4} << 30);
+    const u64 max_in_flight_bytes = small_vram ? (u64{128} << 20) : (u64{512} << 20);
     RecycleTranscodes();
     {
         u64 in_flight{};
@@ -5206,7 +5217,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
                 .tick = 0, .image{}, .views{}, .layer_views{}, .width = width, .height = height,
                 .levels = levels, .layers = layers, .unused_frames = 0}),
             u64{64} << 20);
-        if (!pending_transcodes.empty() && in_flight + needed > MaxInFlightTranscodeBytes) {
+        if (!pending_transcodes.empty() && in_flight + needed > max_in_flight_bytes) {
             scheduler.Wait(pending_transcodes.back().tick);
             RecycleTranscodes();
         }

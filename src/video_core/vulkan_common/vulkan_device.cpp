@@ -27,6 +27,7 @@
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/literals.h"
+#include "common/memory_detect.h"
 #include <ranges>
 #include "common/settings.h"
 #include "common/settings_enums.h"
@@ -1918,10 +1919,14 @@ void Device::CollectPhysicalMemoryInfo() {
     }
     if (is_integrated) {
         const s64 available_memory = static_cast<s64>(device_access_memory - device_initial_usage);
-        const u64 memory_size =
-            Settings::values.vram_usage_mode.GetValue() == Settings::VramUsageMode::Aggressive
-                ? 6_GiB
-                : 4_GiB;
+        const u64 host_ram = Common::GetMemInfo().TotalPhysicalMemory;
+        const bool low_host_ram = host_ram != 0 && host_ram <= 18_GiB;
+        const bool aggressive =
+            Settings::values.vram_usage_mode.GetValue() == Settings::VramUsageMode::Aggressive;
+        // On <= 16 GiB APUs, guest RAM, host heap, and UMA VRAM all share physical memory:
+        // capping the GPU share at 2.25-3 GiB keeps TextureCache from pushing the OS into swap.
+        const u64 memory_size = low_host_ram ? (aggressive ? 3_GiB : 2304_MiB)
+                                             : (aggressive ? 6_GiB : 4_GiB);
         // Linux RADV exposes full host RAM here (> 8 GiB on 16 GiB systems), while Windows WDDM
         // already halves host RAM into the shared GPU heap (~7.3 GiB on 16 GiB systems) alongside
         // a small BIOS UMA carveout (often 64-512 MiB). Subtracting 8 GiB again on Windows went
