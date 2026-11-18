@@ -523,15 +523,24 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         if (patch.title_id != title_id || patch.module != name) {
             continue;
         }
-        if (patch.name == "Max Resolution (built-in)" && Settings::values.nvidia_dlss.GetValue()) {
-            if (Settings::values.nvidia_dlss_quality.GetValue() != Settings::DlssQuality::DLAA) {
+        if (patch.name == "Max Resolution (built-in)") {
+            if (const char* const max_res = std::getenv("EDEN_NX2_OOT_MAX_RES");
+                max_res != nullptr && max_res[0] == '0') {
+                LOG_INFO(Loader,
+                         "    - Skipping \"{}\": EDEN_NX2_OOT_MAX_RES=0 keeps dynamic resolution",
+                         patch.name);
+                continue;
+            }
+            if (Settings::values.nvidia_dlss.GetValue() &&
+                Settings::values.nvidia_dlss_quality.GetValue() != Settings::DlssQuality::DLAA) {
                 LOG_INFO(Loader,
                          "    - Skipping \"{}\": NVIDIA DLSS quality is set to Super Resolution "
                          "(use DLAA for native 1440p)",
                          patch.name);
                 continue;
             }
-        } else if (std::find(disabled.cbegin(), disabled.cend(), patch.name) != disabled.cend()) {
+        }
+        if (std::find(disabled.cbegin(), disabled.cend(), patch.name) != disabled.cend()) {
             LOG_INFO(Loader, "    - Skipping \"{}\": disabled in Add-Ons", patch.name);
             continue;
         }

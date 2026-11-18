@@ -782,23 +782,26 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
             const auto dest = surface(*replacement_output);
             if (source && dest) {
                 // Does the program decode sRGB itself? (Ocarina's movie network does.)
-                const bool decodes_srgb = [&] {
-                    const GPUVAddr program = regs.code_loc.Address();
+                static std::unordered_map<GPUVAddr, bool> srgb_cache;
+                const GPUVAddr code_addr = regs.code_loc.Address();
+                auto [known, inserted] = srgb_cache.try_emplace(code_addr, false);
+                if (inserted) {
                     std::array<u32, 0x400> block{};
                     bool threshold = false, exponent = false;
                     for (u64 offset = 0; offset < 0x20000 && !(threshold && exponent);
                          offset += sizeof(block)) {
-                        if (!memory_manager.IsFullyMappedRange(program + offset, sizeof(block)))
+                        if (!memory_manager.IsFullyMappedRange(code_addr + offset, sizeof(block)))
                             break;
-                        memory_manager.ReadBlock(program + offset, block.data(), sizeof(block));
+                        memory_manager.ReadBlock(code_addr + offset, block.data(), sizeof(block));
                         for (size_t word = 0; word < block.size(); word += 4) {
                             const u32 opcode = block[word] & 0xfff;
                             threshold |= opcode == 0x434 && block[word + 1] == 0x292d292d;
                             exponent |= opcode == 0x832 && block[word + 1] == 0x40cc40cc;
                         }
                     }
-                    return threshold && exponent;
-                }();
+                    known->second = threshold && exponent;
+                }
+                const bool decodes_srgb = known->second;
                 const Fermi2D::Config config{
                     .operation = decodes_srgb ? Fermi2D::Operation::SrcCopySrgbToLinear
                                               : Fermi2D::Operation::SrcCopy,
@@ -814,10 +817,17 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
                     .src_y1 = static_cast<s32>(replacement_input->Height()),
                 };
                 const bool done = rasterizer->AccelerateSurfaceCopy(*source, *dest, config);
-                LOG_INFO(HW_GPU,
-                         "Native network pass {:#x} replaced by input copy {}->{} ({}): {}",
-                         regs.code_loc.Address(), replacement_input->Address(),
-                         replacement_output->Address(), decodes_srgb ? "sRGB" : "plain", done);
+                static std::set<std::tuple<GPUVAddr, GPUVAddr, GPUVAddr>> logged_copies;
+                if (logged_copies.size() < 64 &&
+                    logged_copies
+                        .emplace(code_addr, replacement_input->Address(),
+                                 replacement_output->Address())
+                        .second) {
+                    LOG_INFO(HW_GPU,
+                             "Native network pass {:#x} replaced by input copy {}->{} ({}): {}",
+                             code_addr, replacement_input->Address(),
+                             replacement_output->Address(), decodes_srgb ? "sRGB" : "plain", done);
+                }
                 native_upscale_input.reset();
                 network_skip_remaining = 0;
                 return true;

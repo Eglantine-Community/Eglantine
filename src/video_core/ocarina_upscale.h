@@ -41,9 +41,15 @@ constexpr u64 InputPassKey = 0x42593194bb0b2b32ULL;
 //     hash 0x9dfd3ff9ed9cb72a
 constexpr u64 OutputPassHash = 0x6bd913e1f34e83ebULL;
 constexpr u64 OutputPassUpscaleHash = 0xcf806c2846075a1fULL;
+constexpr u64 OutputPassUpscaleV111Hash = 0xe40f5efb5480e692ULL;
 constexpr u64 OutputPassUpscaleKey = 0x6f9367bd41dc0b58ULL;
 constexpr u64 OutputPassDockedHash = 0x9dfd3ff9ed9cb72aULL;
 constexpr u64 OutputPassDockedKey = 0xda6df3e54c716df2ULL;
+constexpr u64 OutputPassScaledFieldKey = 0xe4cda162ff6009e2ULL;
+constexpr u64 OutputPassScaledFieldHash = 0x9302bc0d6d1d9bc1ULL;
+constexpr u64 OutputPassScaledHandheldKey = 0xd8efd9f0c95abd80ULL;
+constexpr u64 OutputPassScaledHandheldHash = 0x03bf0ffc7d2d0bedULL;
+constexpr u64 OutputPassScaledMenuHash = 0x4c1ae2fe58f30a97ULL;
 
 [[nodiscard]] constexpr bool IsInputPass(u64 native_key, u64 shader_hash) noexcept {
     return shader_hash == InputPassHash || native_key == InputPassKey ||
@@ -52,8 +58,12 @@ constexpr u64 OutputPassDockedKey = 0xda6df3e54c716df2ULL;
 
 [[nodiscard]] constexpr bool IsOutputPass(u64 native_key, u64 shader_hash) noexcept {
     return shader_hash == OutputPassHash || shader_hash == OutputPassUpscaleHash ||
-           shader_hash == OutputPassDockedHash || native_key == OutputPassUpscaleKey ||
-           native_key == OutputPassDockedKey || native_key == OutputPassHash;
+           shader_hash == OutputPassUpscaleV111Hash || shader_hash == OutputPassDockedHash ||
+           shader_hash == OutputPassScaledFieldHash ||
+           shader_hash == OutputPassScaledHandheldHash ||
+           shader_hash == OutputPassScaledMenuHash || native_key == OutputPassUpscaleKey ||
+           native_key == OutputPassDockedKey || native_key == OutputPassScaledFieldKey ||
+           native_key == OutputPassScaledHandheldKey || native_key == OutputPassHash;
 }
 
 /// Shared across compute channels on one rasterizer: tracks the input image and whether the

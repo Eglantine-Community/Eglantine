@@ -143,17 +143,23 @@ TEST_CASE("Game preset overrides saved settings for the session", "[game_presets
     CheckPreset(*settings, program_id);
 }
 
-TEST_CASE("Donkey Kong Bananza preset uses real GPU time and no memory operation sync",
+TEST_CASE("Donkey Kong Bananza and Ocarina of Time presets use real GPU time and no memory sync",
           "[game_presets]") {
+    const u64 program_id =
+        GENERATE(Settings::DonkeyKongBananzaProgramId, Settings::OcarinaOfTimeProgramId);
     auto settings = std::make_unique<Settings::Values>();
     settings->gpu_clock.SetGlobal(true);
     settings->gpu_clock.SetValue(Settings::GpuClock::Boost);
     settings->sync_memory_operations.SetGlobal(true);
     settings->sync_memory_operations.SetValue(true);
-    REQUIRE(Settings::ApplyGamePreset(*settings, Settings::DonkeyKongBananzaProgramId, true));
+    REQUIRE(Settings::ApplyGamePreset(*settings, program_id, true));
     CHECK(settings->gpu_clock.GetValue() == Settings::GpuClock::Normal);
     CHECK_FALSE(settings->sync_memory_operations.GetValue());
-    CHECK(settings->vsync_mode.GetValue() == Settings::VSyncMode::Mailbox);
+    if (program_id == Settings::DonkeyKongBananzaProgramId) {
+        CHECK(settings->vsync_mode.GetValue() == Settings::VSyncMode::Mailbox);
+    } else {
+        CHECK(settings->vsync_mode.GetValue() == Settings::VSyncMode::FifoRelaxed);
+    }
     CHECK(settings->use_reactive_flushing.GetValue());
     // The global preferences stay as they were.
     CHECK(settings->gpu_clock.GetValue(true) == Settings::GpuClock::Boost);

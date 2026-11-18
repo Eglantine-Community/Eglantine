@@ -475,10 +475,13 @@ Id DescType(EmitContext& ctx, Id sampled_type, Id pointer_type, u32 count) {
 // of two consecutive loads in Ocarina's tree task program returned 0 on NVIDIA, so every tree
 // cell drew its 256-record cap (a wall of trees in Hyrule Field). EDEN_NX2_LEAN_SSBO=0/1 forces
 // inlined/calls for every stage.
-bool LeanGlobalMemory(Stage stage) {
+bool LeanGlobalMemory(const Profile& profile, Stage stage) {
     static const char* const forced = std::getenv("EDEN_NX2_LEAN_SSBO");
     if (forced != nullptr) {
         return forced[0] != '0';
+    }
+    if (!profile.has_broken_mesh_global_memory_calls) {
+        return true;
     }
     return stage != Stage::Task && stage != Stage::Mesh;
 }
@@ -1000,8 +1003,8 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
                                  runtime_info.mesh_as_compute &&
                                  (stage == Stage::Task || stage == Stage::Mesh)};
     const spv::FunctionControlMask helper_control{
-        LeanGlobalMemory(stage) ? spv::FunctionControlMask::DontInline
-                           : spv::FunctionControlMask::MaskNone};
+        LeanGlobalMemory(profile, stage) ? spv::FunctionControlMask::DontInline
+                                         : spv::FunctionControlMask::MaskNone};
     const spv::FunctionControlMask load_control{
         inline_mesh_loads ? spv::FunctionControlMask::Inline : helper_control};
     const auto define_body{[&](DefPtr ssbo_member, Id addr, Id element_pointer, u32 shift,
@@ -1068,7 +1071,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
                 best_distance = OpSelect(U64, better, distance, best_distance);
                 best_index = OpSelect(U32[1], better, Const(static_cast<u32>(index)), best_index);
             }
-            if (LeanGlobalMemory(stage)) {
+            if (LeanGlobalMemory(profile, stage)) {
                 std::vector<Sirit::Literal> literals;
                 std::vector<Id> labels;
                 for (size_t index = 0; index < num_buffers; ++index) {

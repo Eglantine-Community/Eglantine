@@ -89,7 +89,13 @@ TEST_CASE("Ocarina upscale matches input and output passes across modes", "[ocar
     REQUIRE(Ocarina::IsInputPass(0, Ocarina::InputPassHash));
     REQUIRE(Ocarina::IsOutputPass(0, Ocarina::OutputPassHash));
     REQUIRE(Ocarina::IsOutputPass(Ocarina::OutputPassUpscaleKey, Ocarina::OutputPassUpscaleHash));
+    REQUIRE(Ocarina::IsOutputPass(0, Ocarina::OutputPassUpscaleV111Hash));
     REQUIRE(Ocarina::IsOutputPass(Ocarina::OutputPassDockedKey, Ocarina::OutputPassDockedHash));
+    REQUIRE(Ocarina::IsOutputPass(Ocarina::OutputPassScaledFieldKey, 0));
+    REQUIRE(Ocarina::IsOutputPass(0, Ocarina::OutputPassScaledFieldHash));
+    REQUIRE(Ocarina::IsOutputPass(Ocarina::OutputPassScaledHandheldKey, 0));
+    REQUIRE(Ocarina::IsOutputPass(0, Ocarina::OutputPassScaledHandheldHash));
+    REQUIRE(Ocarina::IsOutputPass(0, Ocarina::OutputPassScaledMenuHash));
     REQUIRE_FALSE(Ocarina::IsOutputPass(Ocarina::InputPassKey, Ocarina::InputPassHash));
 }
 

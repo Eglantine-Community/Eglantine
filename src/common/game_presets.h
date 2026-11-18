@@ -70,7 +70,9 @@ inline const std::map<u64, GamePreset> game_presets{
        {"use_vsync", VSyncMode::FifoRelaxed},
        {"use_docked_mode", ConsoleMode::Docked},
        {"scaling_filter", ScalingFilter::ScaleForce},
-       {"anti_aliasing", AntiAliasing::Fxaa}}}},
+       {"anti_aliasing", AntiAliasing::Fxaa},
+       {"fast_gpu_time", GpuClock::Normal},
+       {"sync_memory_operations", false}}}},
     // Its dynamic resolution follows the GPU time it measures: with Boost it reads ~4x too little
     // and keeps 2096x1179 in busy areas (host GPU at 99%); with Normal it steps down to 1440x810
     // there, as the console does. Sync memory operations waited for a GPU fence 7-8 times a frame.
