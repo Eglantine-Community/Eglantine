@@ -1256,8 +1256,11 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
 
     if (use_vulkan_pipeline_cache) {
         vulkan_pipeline_cache_filename = cache_path("vulkan_pipelines");
+        // LoadVulkanPipelineCache deletes a file it can't use.
+        const bool existed = Common::FS::Exists(vulkan_pipeline_cache_filename);
         vulkan_pipeline_cache =
             LoadVulkanPipelineCache(vulkan_pipeline_cache_filename, CACHE_VERSION);
+        vulkan_pipeline_cache_found = existed && Common::FS::Exists(vulkan_pipeline_cache_filename);
     }
 
     struct {
@@ -2237,7 +2240,10 @@ void PipelineCache::StartShaderPrecache(u64 title_id) {
     const u32 device_id = device.GetDeviceID();
     const auto marker = ShaderWarm::ReadWarmMarker(warm_file);
     const auto current = ShaderWarm::CurrentWarmStamp(warm_file, 0, driver, device_id, CACHE_VERSION);
-    const bool done = current && marker && marker->Matches(*current);
+    // Where our own Vulkan pipeline cache holds the builds (Mesa, Intel), one that boot didn't
+    // find (deleted, or dropped for another version) lost them.
+    const bool done = current && marker && marker->Matches(*current) &&
+                      (!use_vulkan_pipeline_cache || vulkan_pipeline_cache_found);
 
     std::vector<std::pair<ComputePipelineCacheKey, FileEnvironment>> programs;
     size_t entries = 0;

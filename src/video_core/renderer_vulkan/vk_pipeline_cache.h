@@ -294,6 +294,7 @@ private:
     VideoCore::ShaderNotify& shader_notify;
     bool use_asynchronous_shaders{};
     bool use_vulkan_pipeline_cache{};
+    bool vulkan_pipeline_cache_found{}; ///< Boot loaded an existing driver cache file
 
     GraphicsPipelineCacheKey graphics_key{};
     GraphicsPipeline* current_pipeline{};

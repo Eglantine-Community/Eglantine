@@ -194,6 +194,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "video_core/gpu.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
+#include "video_core/shader_warm/shader_warm_builder.h"
 
 #include <SDL3/SDL.h>
 
@@ -3148,9 +3149,15 @@ void MainWindow::OnGameListRemoveFile(u64 program_id, QtCommon::Game::GameListRe
     }
 
     switch (target) {
-    case QtCommon::Game::GameListRemoveTarget::VkShaderCache:
+    case QtCommon::Game::GameListRemoveTarget::VkShaderCache: {
         QtCommon::Game::RemoveVulkanDriverPipelineCache(program_id);
+        // The precache's builds were in the removed driver cache: run it again at the next boot.
+        namespace ShaderWarm = VideoCommon::ShaderWarm;
+        std::error_code ec;
+        std::filesystem::remove(ShaderWarm::WarmMarkerPath(ShaderWarm::ComputeWarmPath(program_id)),
+                                ec);
         [[fallthrough]];
+    }
     case QtCommon::Game::GameListRemoveTarget::GlShaderCache:
         QtCommon::Game::RemoveTransferableShaderCache(program_id, target);
         break;
