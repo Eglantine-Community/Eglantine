@@ -406,6 +406,9 @@ private:
     /// it on the GPU thread. EDEN_NX2_BACKGROUND_PIPELINES=0 turns it off.
     std::unique_ptr<GraphicsPipeline> TakeBackgroundPipeline(const GraphicsPipelineCacheKey& key);
     void StopBackgroundPipelines();
+    /// Ends the background and precache builds and waits for every other pipeline build, for
+    /// drivers that can't read the Vulkan pipeline cache while one runs.
+    void EndPipelineBuildsForCacheRead();
     std::mutex background_mutex;
     /// Built and not yet asked for by a draw.
     std::unordered_map<GraphicsPipelineCacheKey, std::unique_ptr<GraphicsPipeline>> background_ready;

@@ -835,6 +835,8 @@ PipelineCache::~PipelineCache() {
     if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
         if (!device.CanReadPipelineCacheDuringBuilds()) {
             // Drop queued builds, as destroying the workers would; running ones must end first.
+            disk_replay_workers.ClearRequests();
+            disk_replay_workers.WaitForRequests();
             workers.ClearRequests();
             workers.WaitForRequests();
         }
@@ -1199,6 +1201,11 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     if (!pipeline_cache_filename.empty()) {
         serialization_thread.WaitForRequests();
         if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
+            // A reload: the previous load's builds may still run. Background and precache builds
+            // start again below.
+            if (!device.CanReadPipelineCacheDuringBuilds()) {
+                EndPipelineBuildsForCacheRead();
+            }
             SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
                                          CACHE_VERSION);
         }
@@ -1533,6 +1540,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         background_left.store(deferred_graphics.size(), std::memory_order_relaxed);
         background_start = std::chrono::steady_clock::now();
         background_active.store(true, std::memory_order_release);
+        background_stop.store(false, std::memory_order_relaxed);
         background_workers.reset(new Common::ThreadWorker(threads, "VkPipelinePrebuild", {},
                                                           Common::ThreadPlacement::Background));
         for (auto& deferred : deferred_graphics) {
@@ -2206,6 +2214,17 @@ void PipelineCache::StopBackgroundPipelines() {
     background_workers.reset();
 }
 
+void PipelineCache::EndPipelineBuildsForCacheRead() {
+    StopShaderPrecache();
+    StopBackgroundPipelines();
+    // Translations queue driver compiles on workers, so they finish first.
+    if (translation_workers) {
+        translation_workers->WaitForRequests();
+    }
+    disk_replay_workers.WaitForRequests();
+    workers.WaitForRequests();
+}
+
 void PipelineCache::StartShaderPrecache(u64 title_id) {
     namespace ShaderWarm = VideoCommon::ShaderWarm;
     const std::filesystem::path warm_file = ShaderWarm::ComputeWarmPath(title_id);
@@ -2297,6 +2316,7 @@ void PipelineCache::StartShaderPrecache(u64 title_id) {
     for (const auto& [key, env] : programs) {
         precache_states.try_emplace(key, PrecacheState::Queued);
     }
+    precache_stop.store(false, std::memory_order_relaxed);
     precache_workers.reset(new Common::ThreadWorker(threads, "VkShaderPrecache", {},
                                                     Common::ThreadPlacement::Background));
     for (auto& [key, env] : programs) {
