@@ -1716,16 +1716,16 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                 if constexpr (requires { runtime.HostImportChunkSize(); }) {
                     const uintptr_t chunk_size = runtime.HostImportChunkSize();
                     if (chunk_size != 0) {
-                        const uintptr_t offset =
+                        const uintptr_t chunk_offset =
                             reinterpret_cast<uintptr_t>(host_ptr) & (chunk_size - 1);
-                        if (device_addr < offset || size > chunk_size - offset) {
+                        if (device_addr < chunk_offset || size > chunk_size - chunk_offset) {
                             return false;
                         }
                         const u8* const chunk =
-                            device_memory.GetSpan(device_addr - offset, chunk_size);
+                            device_memory.GetSpan(device_addr - chunk_offset, chunk_size);
                         if (chunk == nullptr ||
                             reinterpret_cast<uintptr_t>(chunk) !=
-                                reinterpret_cast<uintptr_t>(host_ptr) - offset) {
+                                reinterpret_cast<uintptr_t>(host_ptr) - chunk_offset) {
                             return false;
                         }
                         return runtime.TryBindImportedUniformBuffer(

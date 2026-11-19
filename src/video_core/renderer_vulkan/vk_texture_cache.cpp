@@ -5048,24 +5048,11 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     // shader builds in Ocarina of Time) every ASTC texture got a new one, up to 0.9 GB each for
     // 90-layer arrays, and 3.8 GB of them filled an 8 GB card. Recycle finished ones now, and
     // keep at most this much decode memory in flight, waiting for the GPU beyond it.
+    // The wait comes after this texture's decode is recorded (end of the function): waiting
+    // here finished the submission that `map` belongs to, so the staging pool handed it to the
+    // next upload before the decode read it (another texture's data in this one, #905).
     static constexpr u64 MaxInFlightTranscodeBytes = u64{512} << 20;
     RecycleTranscodes();
-    {
-        u64 in_flight{};
-        for (const PendingTranscode& t : pending_transcodes) {
-            in_flight += TranscodeDecodeBytes(t);
-        }
-        // Large arrays are decoded in chunks of about 64 MiB (below).
-        const u64 needed = (std::min)(
-            TranscodeDecodeBytes(PendingTranscode{
-                .tick = 0, .image{}, .views{}, .layer_views{}, .width = width, .height = height,
-                .levels = levels, .layers = layers, .unused_frames = 0}),
-            u64{64} << 20);
-        if (!pending_transcodes.empty() && in_flight + needed > MaxInFlightTranscodeBytes) {
-            scheduler.Wait(pending_transcodes.back().tick);
-            RecycleTranscodes();
-        }
-    }
     // A decode image of the same shape the GPU is done with: title 1's title screen decodes
     // dozens of textures a frame, mostly of a few shapes. Making one took 263 us; from VMA's
     // shared blocks 90 us, but freeing them there left ~1 GB of those blocks unused.
@@ -5217,6 +5204,15 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     }
     pending.tick = scheduler.CurrentTick();
     pending_transcodes.push_back(std::move(pending));
+
+    u64 in_flight{};
+    for (const PendingTranscode& t : pending_transcodes) {
+        in_flight += TranscodeDecodeBytes(t);
+    }
+    if (pending_transcodes.size() > 1 && in_flight > MaxInFlightTranscodeBytes) {
+        scheduler.Wait(pending_transcodes.back().tick);
+        RecycleTranscodes();
+    }
 }
 
 void TextureCacheRuntime::TransitionImageLayout(Image& image) {
