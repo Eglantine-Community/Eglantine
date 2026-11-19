@@ -225,3 +225,50 @@ TEST_CASE("ShaderPrecache: programs that cannot be lowered are refused", "[video
     REQUIRE(ShaderWarm::LowerProgram(no_exit, lowered).has_value());
     REQUIRE(lowered.code.empty());
 }
+
+TEST_CASE("PipelineCacheFile: a damaged last record keeps the records before it",
+          "[video_core]") {
+    ShaderWarm::LoweredCode lowered;
+    lowered.code.resize(16 * sizeof(u64));
+    const ShaderWarm::ComputeControl control{{64, 1, 1}, 0, 0};
+    std::string records;
+    for (u8 i = 0; i < 3; ++i) {
+        lowered.code[0] = i;
+        ShaderWarm::ComputeKey key_bytes{};
+        const auto entry = ShaderWarm::ComputeEntry(lowered, control, key_bytes);
+        records.append(reinterpret_cast<const char*>(entry.data()), entry.size());
+    }
+    constexpr u32 version = 7;
+    std::string header{"yuzucach"};
+    header.append(reinterpret_cast<const char*>(&version), sizeof(version));
+    const size_t record_size = records.size() / 3;
+
+    TempDir dir;
+    const auto file = dir.path / "vulkan.bin";
+    // A crash in the middle of an append leaves half of the third record.
+    WriteBytes(file, header + records.substr(0, record_size * 2 + record_size / 2));
+
+    size_t loaded = 0;
+    VideoCommon::LoadPipelines(
+        {}, file, version,
+        [&](std::ifstream& in, VideoCommon::FileEnvironment) {
+            Vulkan::ComputePipelineCacheKey key{};
+            in.read(reinterpret_cast<char*>(&key), sizeof(key));
+            ++loaded;
+        },
+        [](std::ifstream&, std::vector<VideoCommon::FileEnvironment>) {});
+    REQUIRE(loaded == 2);
+    REQUIRE(std::filesystem::exists(file));
+    REQUIRE(std::filesystem::file_size(file) == header.size() + record_size * 2);
+
+    loaded = 0;
+    VideoCommon::LoadPipelines(
+        {}, file, version,
+        [&](std::ifstream& in, VideoCommon::FileEnvironment) {
+            Vulkan::ComputePipelineCacheKey key{};
+            in.read(reinterpret_cast<char*>(&key), sizeof(key));
+            ++loaded;
+        },
+        [](std::ifstream&, std::vector<VideoCommon::FileEnvironment>) {});
+    REQUIRE(loaded == 2);
+}
