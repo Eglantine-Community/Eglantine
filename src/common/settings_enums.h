@@ -169,6 +169,7 @@ ENUM(FrameGenType, Lsfg, Fsr3);
 ENUM(ColdHintMode, Off, WhenRamIsLow, Always);
 ENUM(MeshShaderMode, Auto, Native, ComputeFallback);
 ENUM(UpdateChannel, Unset, Stable, ReleaseCandidate, Daily);
+ENUM(UpdateVariant, Auto, Standard, Pgo);
 
 template <typename Type>
 inline std::string_view CanonicalizeEnum(Type id) {
