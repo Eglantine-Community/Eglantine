@@ -11,6 +11,7 @@
 
 #include <array>
 #include <atomic>
+#include <thread>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -311,6 +312,7 @@ private:
     /// Destroys graphics pipelines unused for a while, once the GPU is done with them.
     void EvictUnusedPipelines();
     u64 frame_count{};
+    std::atomic<std::thread::id> draw_thread{}; ///< Thread of the first draw that looked up a pipeline
     std::deque<std::pair<u64, std::unique_ptr<GraphicsPipeline>>> evicted_pipelines; ///< (tick, pipeline)
     std::unordered_set<u64> used_and_evicted; ///< Key hashes of pipelines used this session, evicted since
     std::unordered_set<u64> evicted_keys; ///< Key hashes of every evicted pipeline, to count rebuilds

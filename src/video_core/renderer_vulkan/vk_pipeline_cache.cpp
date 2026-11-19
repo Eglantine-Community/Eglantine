@@ -2022,6 +2022,9 @@ bool PipelineCache::CanSkipForDiskReplay() const noexcept {
 }
 
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath(bool is_indexed) {
+    if (draw_thread.load(std::memory_order_relaxed) == std::thread::id{}) {
+        draw_thread.store(std::this_thread::get_id(), std::memory_order_relaxed);
+    }
     if (num_translated.load(std::memory_order_acquire) != 0) {
         AdoptTranslatedGraphicsPipelines();
     }
@@ -2089,6 +2092,16 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath(bool is_indexed
 }
 
 void PipelineCache::TickFrame() {
+    // TickFrame changes graphics_cache and the frame state draws read without a lock. Report it
+    // once if it runs on another thread than the draws (a composite run by a syncpoint action).
+    if (const auto thread = draw_thread.load(std::memory_order_relaxed);
+        thread != std::thread::id{} && thread != std::this_thread::get_id()) {
+        static std::atomic_bool reported{};
+        if (!reported.exchange(true, std::memory_order_relaxed)) {
+            LOG_WARNING(Render_Vulkan,
+                        "Pipeline cache: TickFrame runs on another thread than the draws");
+        }
+    }
     DrainReadyDiskPipelines();
     if (deferred_candidate_count != 0) {
         const auto span = std::span{deferred_candidates.data(), deferred_candidate_count};
