@@ -1005,6 +1005,24 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         if (!before_pass) {
             scheduler.RequestOutsideRenderPassOperationContext();
         }
+        if (!IsBuilt()) {
+            // The dispatches need the compute pipelines; the draw's own build wait comes after
+            // them (and after the whole pass's hoisted work).
+            const auto wait_built = [this](vk::CommandBuffer) {
+                RunBuild();
+                std::unique_lock lock{build_mutex};
+                build_condvar.wait(lock,
+                                   [this] { return is_built.load(std::memory_order::relaxed); });
+            };
+            if (before_pass) {
+                scheduler.RecordBeforeRenderPass(mesh_emulation->has_task
+                                                     ? Scheduler::PrePassStage::Task
+                                                     : Scheduler::PrePassStage::Mesh,
+                                                 wait_built);
+            } else {
+                scheduler.Record(wait_built);
+            }
+        }
         if (before_pass) {
             // Before the pass: the same programs, one command per stage, without barriers of
             // their own (the scheduler puts one between stages for all the pass's draws).
