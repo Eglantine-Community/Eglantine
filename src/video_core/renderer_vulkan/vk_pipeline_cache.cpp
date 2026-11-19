@@ -866,13 +866,34 @@ void PipelineCache::SaveUsedPipelines() {
             next.try_emplace(hash, static_cast<u8>(age + 1));
         }
     }
-    std::ofstream file{used_pipelines_filename, std::ios::binary | std::ios::trunc};
-    const u32 count = static_cast<u32>(next.size());
-    file.write(reinterpret_cast<const char*>(&UsedPipelinesMagic), sizeof(UsedPipelinesMagic));
-    file.write(reinterpret_cast<const char*>(&count), sizeof(count));
-    for (const auto& [hash, age] : next) {
-        file.write(reinterpret_cast<const char*>(&hash), sizeof(hash));
-        file.write(reinterpret_cast<const char*>(&age), sizeof(age));
+    // Written next to the old list and renamed over it: a crash while writing keeps the old one.
+    auto temporary{used_pipelines_filename};
+    temporary += ".tmp";
+    {
+        std::ofstream file{temporary, std::ios::binary | std::ios::trunc};
+        const u32 count = static_cast<u32>(next.size());
+        file.write(reinterpret_cast<const char*>(&UsedPipelinesMagic), sizeof(UsedPipelinesMagic));
+        file.write(reinterpret_cast<const char*>(&count), sizeof(count));
+        for (const auto& [hash, age] : next) {
+            file.write(reinterpret_cast<const char*>(&hash), sizeof(hash));
+            file.write(reinterpret_cast<const char*>(&age), sizeof(age));
+        }
+        file.flush();
+        if (!file) {
+            LOG_ERROR(Render_Vulkan, "Failed to write {}",
+                      Common::FS::PathToUTF8String(temporary));
+            file.close();
+            std::error_code error;
+            std::filesystem::remove(temporary, error);
+            return;
+        }
+    }
+    std::error_code error;
+    std::filesystem::rename(temporary, used_pipelines_filename, error);
+    if (error) {
+        LOG_ERROR(Render_Vulkan, "Failed to replace {}: {}",
+                  Common::FS::PathToUTF8String(used_pipelines_filename), error.message());
+        std::filesystem::remove(temporary, error);
     }
 }
 
