@@ -38,6 +38,7 @@
 #include "shader_recompiler/frontend/ampere/program_address_map.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/memory_manager.h"
+#include "video_core/pipeline_cache_backups.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_diag.h"
 #include "video_core/mkw_wave_workaround.h"
@@ -1329,6 +1330,60 @@ void SerializePipeline(std::span<const char> key, std::span<const GenericEnviron
     }
 }
 
+namespace {
+// A build that finds a cache of another version (switching branches or builds) sets it aside as
+// "<file>.v<version>" instead of deleting it. The build of that version takes it back.
+std::filesystem::path VersionBackupPath(const std::filesystem::path& file, u32 version) {
+    auto backup{file};
+    backup += fmt::format(".v{}", version);
+    return backup;
+}
+
+bool RestoreVersionBackup(const std::filesystem::path& file, u32 version) {
+    const auto backup{VersionBackupPath(file, version)};
+    std::error_code ec;
+    if (!std::filesystem::exists(backup, ec)) {
+        return false;
+    }
+    std::filesystem::rename(backup, file, ec);
+    if (ec) {
+        return false;
+    }
+    LOG_INFO(Common_Filesystem, "Restored pipeline cache {} from {}",
+             Common::FS::PathToUTF8String(file), Common::FS::PathToUTF8String(backup));
+    return true;
+}
+
+// Keeps the most recently written backups; each is a whole pipeline cache.
+void TrimVersionBackups(const std::filesystem::path& file, size_t keep) {
+    const std::string prefix{file.filename().string() + ".v"};
+    std::vector<std::pair<std::filesystem::file_time_type, std::filesystem::path>> backups;
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(file.parent_path(), ec)) {
+        const std::string name{entry.path().filename().string()};
+        if (name.size() > prefix.size() && name.starts_with(prefix) &&
+            std::all_of(name.begin() + prefix.size(), name.end(),
+                        [](unsigned char c) { return std::isdigit(c) != 0; })) {
+            backups.emplace_back(entry.last_write_time(ec), entry.path());
+        }
+    }
+    if (backups.size() <= keep) {
+        return;
+    }
+    std::ranges::sort(backups, std::greater{});
+    for (size_t i = keep; i < backups.size(); ++i) {
+        if (std::filesystem::remove(backups[i].second, ec)) {
+            LOG_INFO(Common_Filesystem, "Deleted old pipeline cache {}",
+                     Common::FS::PathToUTF8String(backups[i].second));
+        }
+    }
+}
+} // Anonymous namespace
+
+void RemovePipelineCacheVersionBackups(const std::filesystem::path& file) {
+    TrimVersionBackups(file, 0);
+}
+
 void LoadPipelines(
     std::stop_token stop_loading, const std::filesystem::path& filename, u32 expected_cache_version,
     Common::UniqueFunction<void, std::ifstream&, FileEnvironment> load_compute,
@@ -1338,6 +1393,9 @@ void LoadPipelines(
     // record that fails to read after it is cut off instead of deleting the whole file.
     std::streamoff good_end{-1};
     try {
+        if (std::error_code ec; !std::filesystem::exists(filename, ec)) {
+            RestoreVersionBackup(filename, expected_cache_version);
+        }
         std::ifstream file(filename, std::ios::binary | std::ios::ate);
         if (!file.is_open()) {
             return;
@@ -1350,9 +1408,15 @@ void LoadPipelines(
         u32 cache_version;
         file.read(magic_number.data(), magic_number.size())
             .read(reinterpret_cast<char*>(&cache_version), sizeof(cache_version));
+        // Switching back to a build: its own cache, set aside earlier, beats translating the other
+        // build's cache again.
+        std::error_code backup_ec;
+        const bool own_backup =
+            cache_version != expected_cache_version &&
+            std::filesystem::exists(VersionBackupPath(filename, expected_cache_version), backup_ec);
         const bool upgrading = upgrade != nullptr && magic_number == MAGIC_NUMBER &&
                                cache_version >= min_compatible_version &&
-                               cache_version < expected_cache_version;
+                               cache_version < expected_cache_version && !own_backup;
         if (upgrading) {
             upgrade->from_version = cache_version;
         }
@@ -1360,13 +1424,20 @@ void LoadPipelines(
             (magic_number != MAGIC_NUMBER || cache_version != expected_cache_version)) {
             file.close();
             if (cache_version != expected_cache_version && magic_number == MAGIC_NUMBER) {
-                std::filesystem::path backup = filename;
-                backup += fmt::format(".v{}", cache_version);
+                const auto backup{VersionBackupPath(filename, cache_version)};
                 std::error_code ec;
                 std::filesystem::rename(filename, backup, ec);
                 if (!ec) {
                     LOG_INFO(Common_Filesystem, "Renamed old pipeline cache (v{}) to {}",
                              cache_version, Common::FS::PathToUTF8String(backup));
+                    TrimVersionBackups(filename, 2);
+                    // This version's own cache may be waiting from an earlier switch. Its name
+                    // says it is, so this runs once: a file that isn't is set aside above.
+                    if (RestoreVersionBackup(filename, expected_cache_version)) {
+                        LoadPipelines(stop_loading, filename, expected_cache_version,
+                                      std::move(load_compute), std::move(load_graphics),
+                                      with_mesh_state, min_compatible_version, upgrade);
+                    }
                     return;
                 }
             }

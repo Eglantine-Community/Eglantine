@@ -407,8 +407,9 @@ struct CacheUpgrade {
 };
 
 /// Loads the records of a pipeline cache file. A file from min_compatible_version up to the
-/// expected version is loaded too when `upgrade` is given (its records are kept there); older or
-/// broken files are deleted.
+/// expected version is loaded too when `upgrade` is given (its records are kept there); broken
+/// files are deleted. A file of another version is set aside as <name>.v<version> (the two newest
+/// are kept), and one this version set aside earlier takes its place.
 void LoadPipelines(
     std::stop_token stop_loading, const std::filesystem::path& filename, u32 expected_cache_version,
     Common::UniqueFunction<void, std::ifstream&, FileEnvironment> load_compute,

@@ -271,6 +271,7 @@ add_library(video_core STATIC
 
     shader_cache.cpp
     shader_cache.h
+    pipeline_cache_backups.h
     shader_environment.cpp
     shader_environment.h
     stage_cache.cpp
