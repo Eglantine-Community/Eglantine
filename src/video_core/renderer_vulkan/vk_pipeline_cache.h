@@ -392,6 +392,7 @@ private:
     std::atomic<size_t> last_cache_size{};
     std::atomic_bool flush_in_flight{};
 
+    /// Under background_mutex once the boot is done (background builds take from it).
     ::Common::unordered_map<GraphicsPipelineCacheKey, std::vector<VideoCommon::FileEnvironment>>
         skipped_disk_envs;
     std::unordered_set<u64> in_flight_disk_replays;
@@ -410,6 +411,10 @@ private:
     /// threads once the game runs, so a draw that needs one finds it built instead of translating
     /// it on the GPU thread. EDEN_NX2_BACKGROUND_PIPELINES=0 turns it off.
     std::unique_ptr<GraphicsPipeline> TakeBackgroundPipeline(const GraphicsPipelineCacheKey& key);
+    /// Runs on a background thread once runtime builds are idle. Without envs it takes them from
+    /// skipped_disk_envs (disk replay on), unless a draw replayed the pipeline first.
+    void BuildBackgroundPipeline(const GraphicsPipelineCacheKey& key,
+                                 std::optional<std::vector<VideoCommon::FileEnvironment>> envs);
     void StopBackgroundPipelines();
     /// Ends the background and precache builds and waits for every other pipeline build, for
     /// drivers that can't read the Vulkan pipeline cache while one runs.
@@ -419,6 +424,9 @@ private:
     std::unordered_map<GraphicsPipelineCacheKey, std::unique_ptr<GraphicsPipeline>> background_ready;
     /// Keys the GPU thread built itself meanwhile: their background build is skipped or dropped.
     std::unordered_set<GraphicsPipelineCacheKey> background_claimed;
+    /// Taken from skipped_disk_envs and building: a draw that may be skipped waits for them.
+    std::unordered_set<GraphicsPipelineCacheKey> background_building;
+    std::atomic<s64> background_paused_us{};
     std::atomic_bool background_active{};
     std::atomic_bool background_stop{};
     std::atomic<size_t> background_left{};
@@ -434,10 +442,14 @@ private:
     /// A marker skips it after it ran to the end for this driver and device.
     void StartShaderPrecache(u64 title_id);
     void StopShaderPrecache();
-    /// Precache builds wait while the game builds pipelines (queued translations or driver
-    /// compiles, or a pipeline built in the last moments): they share the CPU and the driver.
-    bool RuntimeBuildsBusy() const;
-    void WaitForIdleRuntimeBuilds();
+    /// Background builds take turns: run-time translations and driver compiles (or a pipeline
+    /// built in the last moments), then disk replays, then the background pipelines, then the
+    /// precache. Whether a build of the lowest kinds should wait (count_background: for the
+    /// precache, the background pipelines count too).
+    bool RuntimeBuildsBusy(bool count_background) const;
+    /// Waits until RuntimeBuildsBusy is false or stop is set; adds the time waited to paused_us.
+    void WaitForIdleRuntimeBuilds(const std::atomic_bool& stop, bool count_background,
+                                  std::atomic<s64>& paused_us) const;
     /// A dispatch needs `key` (GPU thread): a precache build not started yet is dropped, one in
     /// progress is waited for, briefly, so the dispatch's build finds it in the driver's cache.
     void ClaimPrecacheProgram(const ComputePipelineCacheKey& key);

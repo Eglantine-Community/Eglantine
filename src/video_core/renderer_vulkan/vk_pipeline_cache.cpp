@@ -1304,6 +1304,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     std::unordered_set<u64> boot_graphics; ///< Graphics keys built at boot (loading thread)
     std::vector<std::pair<GraphicsPipelineCacheKey, std::vector<FileEnvironment>>>
         deferred_graphics;
+    /// Disk replay on: the skipped keys, in file order; their envs stay in skipped_disk_envs.
+    std::vector<GraphicsPipelineCacheKey> deferred_replay_keys;
 
     if (use_vulkan_pipeline_cache) {
         vulkan_pipeline_cache_filename = cache_path("vulkan_pipelines");
@@ -1451,7 +1453,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             ++skipped_pipelines;
             if (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::ReplayDiskRecordings)) {
                 std::scoped_lock lock{state.mutex};
-                skipped_disk_envs.insert_or_assign(key, std::move(envs));
+                if (skipped_disk_envs.insert_or_assign(key, std::move(envs)).second &&
+                    BackgroundPipelinesEnabled()) {
+                    deferred_replay_keys.push_back(key);
+                }
             } else if (BackgroundPipelinesEnabled()) {
                 deferred_graphics.emplace_back(key, std::move(envs));
             }
@@ -1586,55 +1591,29 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         last_flush = std::chrono::steady_clock::now();
     }
 
-    if (!deferred_graphics.empty() && !stop_loading.stop_requested()) {
+    const size_t background_count = deferred_graphics.size() + deferred_replay_keys.size();
+    if (background_count != 0 && !stop_loading.stop_requested()) {
         const size_t threads = BackgroundPipelineThreads();
         LOG_INFO(Render_Vulkan,
-                 "Building {} cached graphics pipelines in the background ({} threads)",
-                 deferred_graphics.size(), threads);
-        background_left.store(deferred_graphics.size(), std::memory_order_relaxed);
+                 "Building {} cached graphics pipelines in the background ({} threads) once "
+                 "run-time builds are idle",
+                 background_count, threads);
+        background_left.store(background_count, std::memory_order_relaxed);
         background_start = std::chrono::steady_clock::now();
         background_active.store(true, std::memory_order_release);
         background_stop.store(false, std::memory_order_relaxed);
         background_workers.reset(new Common::ThreadWorker(threads, "VkPipelinePrebuild", {},
                                                           Common::ThreadPlacement::Background));
         for (auto& deferred : deferred_graphics) {
-            background_workers->QueueWork([this, key = deferred.first,
-                                           envs_ = std::move(deferred.second)]() mutable {
-                bool build = !background_stop.load(std::memory_order_relaxed);
-                if (build) {
-                    std::scoped_lock lock{background_mutex};
-                    build = !background_claimed.contains(key);
-                }
-                std::unique_ptr<GraphicsPipeline> pipeline;
-                if (build) {
-                    ShaderPools pools;
-                    boost::container::static_vector<Shader::Environment*, 5> env_ptrs;
-                    for (auto& env : envs_) {
-                        env_ptrs.push_back(&env);
-                    }
-                    pipeline =
-                        CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs), nullptr, false);
-                }
-                std::unique_lock lock{background_mutex};
-                if (pipeline && !background_claimed.contains(key)) {
-                    background_ready.emplace(key, std::move(pipeline));
-                }
-                if (background_left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                    const auto seconds = std::chrono::duration<double>(
-                                             std::chrono::steady_clock::now() - background_start)
-                                             .count();
-                    LOG_INFO(Render_Vulkan,
-                             "Background pipelines done in {:.1f} s: {} ready, {} taken by draws, "
-                             "{} built by the GPU thread first",
-                             seconds, background_ready.size() + background_taken, background_taken,
-                             background_claimed.size());
-                    background_claimed.clear();
-                    background_active.store(false, std::memory_order_release);
-                }
-                lock.unlock();
-                // A pipeline dropped here was never bound, so no GPU work can still use it.
-                pipeline.reset();
-            });
+            background_workers->QueueWork(
+                [this, key = deferred.first, envs = std::move(deferred.second)]() mutable {
+                    BuildBackgroundPipeline(key, std::move(envs));
+                });
+        }
+        // Newest records first: the file appends, so the oldest pipelines come last.
+        for (auto it = deferred_replay_keys.rbegin(); it != deferred_replay_keys.rend(); ++it) {
+            background_workers->QueueWork(
+                [this, key = *it] { BuildBackgroundPipeline(key, std::nullopt); });
         }
     }
 
@@ -2089,11 +2068,19 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath(bool is_indexed
     auto it{graphics_cache.find(graphics_key)};
     if (it == graphics_cache.end()) {
         if (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::ReplayDiskRecordings)) {
+            std::unique_lock background_lock{background_mutex};
+            if (background_building.contains(graphics_key) && CanSkipForDiskReplay()) {
+                background_lock.unlock();
+                RecordSkippedGeometry(is_indexed, nullptr);
+                graphics_miss = "background-build";
+                return nullptr;
+            }
             if (const auto disk_it = skipped_disk_envs.find(graphics_key);
                 disk_it != skipped_disk_envs.end() && CanSkipForDiskReplay() &&
                 !translating_graphics.contains(graphics_key)) {
                 auto envs = std::move(disk_it->second);
                 skipped_disk_envs.erase(disk_it);
+                background_lock.unlock();
                 in_flight_disk_replays.insert(key_hash);
                 const bool native_turing =
                     maxwell3d != nullptr && maxwell3d->GetNativeMacroEngine().native_turing;
@@ -2275,6 +2262,56 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::TakeBackgroundPipeline(
     return nullptr;
 }
 
+void PipelineCache::BuildBackgroundPipeline(
+    const GraphicsPipelineCacheKey& key, std::optional<std::vector<FileEnvironment>> envs) {
+    WaitForIdleRuntimeBuilds(background_stop, false, background_paused_us);
+    bool build = !background_stop.load(std::memory_order_relaxed);
+    if (build) {
+        std::scoped_lock lock{background_mutex};
+        build = !background_claimed.contains(key);
+        if (build && !envs) {
+            // Gone when a draw replayed or built it first.
+            const auto it = skipped_disk_envs.find(key);
+            build = it != skipped_disk_envs.end();
+            if (build) {
+                envs = std::move(it->second);
+                skipped_disk_envs.erase(it);
+                background_building.insert(key);
+            }
+        }
+    }
+    std::unique_ptr<GraphicsPipeline> pipeline;
+    if (build) {
+        ShaderPools pools;
+        boost::container::static_vector<Shader::Environment*, 5> env_ptrs;
+        for (auto& env : *envs) {
+            env_ptrs.push_back(&env);
+        }
+        pipeline = CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs), nullptr, false);
+    }
+    std::unique_lock lock{background_mutex};
+    background_building.erase(key);
+    if (pipeline && !background_claimed.contains(key)) {
+        background_ready.emplace(key, std::move(pipeline));
+    }
+    if (background_left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        const auto seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - background_start)
+                .count();
+        LOG_INFO(Render_Vulkan,
+                 "Background pipelines done in {:.1f} s ({:.1f} s waiting for run-time builds): "
+                 "{} ready, {} taken by draws, {} built by the GPU thread first",
+                 seconds, background_paused_us.load(std::memory_order_relaxed) / 1e6,
+                 background_ready.size() + background_taken, background_taken,
+                 background_claimed.size());
+        background_claimed.clear();
+        background_active.store(false, std::memory_order_release);
+    }
+    lock.unlock();
+    // A pipeline dropped here was never bound, so no GPU work can still use it.
+    pipeline.reset();
+}
+
 void PipelineCache::StopBackgroundPipelines() {
     background_stop.store(true, std::memory_order_relaxed);
     // Joins the threads: a build in progress finishes, queued ones are dropped.
@@ -2395,7 +2432,7 @@ void PipelineCache::StartShaderPrecache(u64 title_id) {
                                                     Common::ThreadPlacement::Background));
     for (auto& [key, env] : programs) {
         precache_workers->QueueWork([this, key, env = std::move(env), write_marker]() mutable {
-            WaitForIdleRuntimeBuilds();
+            WaitForIdleRuntimeBuilds(precache_stop, true, precache_paused_us);
             if (precache_stop.load(std::memory_order_relaxed)) {
                 return;
             }
@@ -2439,27 +2476,30 @@ void PipelineCache::StartShaderPrecache(u64 title_id) {
     }
 }
 
-bool PipelineCache::RuntimeBuildsBusy() const {
+bool PipelineCache::RuntimeBuildsBusy(bool count_background) const {
     // Long enough to cover the gaps between a loading burst's pipelines.
     constexpr std::chrono::milliseconds Quiet{250};
     const auto last = std::chrono::steady_clock::time_point{
         std::chrono::steady_clock::duration{last_runtime_build.load(std::memory_order_relaxed)}};
     return (translation_workers && translation_workers->PendingWork() != 0) ||
-           workers.PendingWork() != 0 || std::chrono::steady_clock::now() - last < Quiet;
+           workers.PendingWork() != 0 || disk_replay_workers.PendingWork() != 0 ||
+           (count_background && background_active.load(std::memory_order_acquire)) ||
+           std::chrono::steady_clock::now() - last < Quiet;
 }
 
-void PipelineCache::WaitForIdleRuntimeBuilds() {
+void PipelineCache::WaitForIdleRuntimeBuilds(const std::atomic_bool& stop, bool count_background,
+                                             std::atomic<s64>& paused_us) const {
     const auto begin = std::chrono::steady_clock::now();
     bool paused = false;
-    while (!precache_stop.load(std::memory_order_relaxed) && RuntimeBuildsBusy()) {
+    while (!stop.load(std::memory_order_relaxed) && RuntimeBuildsBusy(count_background)) {
         paused = true;
         std::this_thread::sleep_for(std::chrono::milliseconds{20});
     }
     if (paused) {
-        precache_paused_us.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(
-                                         std::chrono::steady_clock::now() - begin)
-                                         .count(),
-                                     std::memory_order_relaxed);
+        paused_us.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - begin)
+                                .count(),
+                            std::memory_order_relaxed);
     }
 }
 
@@ -3284,25 +3324,28 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     };
     const bool native_turing =
         maxwell3d != nullptr && maxwell3d->GetNativeMacroEngine().native_turing;
-    if (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::ReplayDiskRecordings)) {
+    std::optional<std::vector<FileEnvironment>> disk_envs;
+    {
+        std::scoped_lock lock{background_mutex};
         if (const auto disk_it = skipped_disk_envs.find(graphics_key);
             disk_it != skipped_disk_envs.end()) {
-            auto envs = std::move(disk_it->second);
+            disk_envs = std::move(disk_it->second);
             skipped_disk_envs.erase(disk_it);
-            boost::container::static_vector<Shader::Environment*, 5> env_ptrs;
-            for (auto& env : envs) {
-                env_ptrs.push_back(&env);
-            }
-            main_pools.ReleaseContents();
-            auto pipeline{CreateGraphicsPipeline(main_pools, graphics_key, MakeSpan(env_ptrs),
-                                                 nullptr, true, native_turing)};
-            if (pipeline && !pipeline_cache_filename.empty()) {
-                QueueVulkanPipelineCacheFlush();
-            }
-            return pipeline;
         }
     }
-    skipped_disk_envs.erase(graphics_key);
+    if (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::ReplayDiskRecordings) && disk_envs) {
+        boost::container::static_vector<Shader::Environment*, 5> env_ptrs;
+        for (auto& env : *disk_envs) {
+            env_ptrs.push_back(&env);
+        }
+        main_pools.ReleaseContents();
+        auto pipeline{CreateGraphicsPipeline(main_pools, graphics_key, MakeSpan(env_ptrs), nullptr,
+                                             true, native_turing)};
+        if (pipeline && !pipeline_cache_filename.empty()) {
+            QueueVulkanPipelineCacheFlush();
+        }
+        return pipeline;
+    }
     GraphicsEnvironments environments;
     {
         PhaseTimer env_timer{BuildPhase::Environments, true};
