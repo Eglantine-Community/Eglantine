@@ -273,6 +273,11 @@ buildEdenEmulator (
       # is the manifest's `package` field, or the entry key when absent. With
       # force_system set, a find_package miss is a FATAL_ERROR naming the
       # package, and a hit logs "Using system package <name>@<version>".
+      # Ships dist/72-eglantine-input.rules into $out/lib/udev/rules.d, so a NixOS host can add
+      # the package to services.udev.packages and get raw pad access (HD Rumble over Bluetooth
+      # needs it; the kernel drivers keep the hidraw nodes root-only otherwise).
+      "-DYUZU_INSTALL_UDEV_RULES=ON"
+
       "-DSDL3_FORCE_SYSTEM=ON"
       "-Denet_FORCE_SYSTEM=ON"
       "-Dnlohmann_json_FORCE_SYSTEM=ON"
