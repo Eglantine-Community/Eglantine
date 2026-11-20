@@ -205,8 +205,10 @@ public:
     /// Copies the 3D engine state translation reads and stops using the engine, so the program
     /// can be translated on a worker thread while the GPU thread moves on. Returns false, leaving
     /// the environment unchanged, when the texture pool isn't one contiguous device range or the
-    /// GPU has written it.
-    [[nodiscard]] bool Detach(Tegra::MaxwellDeviceMemoryManager& device_memory);
+    /// GPU has written it. pool_checked: another stage of the same pipeline (same engine state)
+    /// passed those checks already.
+    [[nodiscard]] bool Detach(Tegra::MaxwellDeviceMemoryManager& device_memory,
+                              bool pool_checked = false);
 
     /// Bytes of constant buffer contents copied by Detach (0 if not detached).
     [[nodiscard]] size_t SnapshotSizeBytes() const noexcept;

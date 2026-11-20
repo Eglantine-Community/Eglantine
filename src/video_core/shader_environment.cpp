@@ -914,7 +914,8 @@ Tegra::Texture::TICEntry GraphicsEnvironment::ReadSnapshotDescriptor(u32 handle)
 //   rewrites meanwhile gives the newer descriptor, an accepted risk as pools hold long-lived
 //   descriptors.
 // - The viewport transform flag and the HLE replacements are copied.
-bool GraphicsEnvironment::Detach(Tegra::MaxwellDeviceMemoryManager& device_memory) {
+bool GraphicsEnvironment::Detach(Tegra::MaxwellDeviceMemoryManager& device_memory,
+                                 bool pool_checked) {
     // A handle indexes at most 2^20 descriptors; a larger limit is not a real pool and would make
     // the checks below walk gigabytes of page table.
     constexpr u32 MaxTexturePoolLimit = (1U << 20) - 1;
@@ -925,8 +926,9 @@ bool GraphicsEnvironment::Detach(Tegra::MaxwellDeviceMemoryManager& device_memor
     const GPUVAddr pool_address{regs.tex_header.Address()};
     const size_t pool_size{(size_t{regs.tex_header.limit} + 1) * sizeof(Tegra::Texture::TICEntry)};
     const std::optional<DAddr> pool_device_address{gpu_memory->GpuToCpuAddress(pool_address)};
-    if (!pool_device_address || !gpu_memory->IsContinuousRange(pool_address, pool_size) ||
-        gpu_memory->IsMemoryDirty(pool_address, pool_size)) {
+    if (!pool_device_address ||
+        (!pool_checked && (!gpu_memory->IsContinuousRange(pool_address, pool_size) ||
+                           gpu_memory->IsMemoryDirty(pool_address, pool_size)))) {
         return false;
     }
     EngineSnapshot copy;

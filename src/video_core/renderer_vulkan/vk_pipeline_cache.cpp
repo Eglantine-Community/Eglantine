@@ -3537,16 +3537,19 @@ std::optional<std::shared_future<void>> PipelineCache::QueueGraphicsTranslation(
     GraphicsEnvironments environments;
     GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
     size_t copied{};
+    bool pool_checked{};
     for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
         if (graphics_key.unique_hashes[index] == 0) {
             continue;
         }
-        if (!environments.envs[index].Detach(device_memory)) {
+        // Every stage reads the same texture pool: its range is walked once.
+        if (!environments.envs[index].Detach(device_memory, pool_checked)) {
             ++report.not_detached;
             report.Log();
             return std::nullopt;
         }
         copied += environments.envs[index].SnapshotSizeBytes();
+        pool_checked = true;
     }
     {
         // Every stage of a pipeline has the same pool: count it once.
@@ -3675,16 +3678,24 @@ void PipelineCache::AdoptTranslatedGraphicsPipelines() {
         report.worker += translated.time;
         report.latency += translated.latency;
         report.max_latency = std::max(report.max_latency, translated.latency);
-        u32 changed{};
-        for (const auto& env : translated.envs) {
-            const auto check{env.CheckTextureReads(*gpu_memory)};
-            report.pool_reads += check.reads;
-            changed += check.changed;
-            report.pool_remapped += check.remapped ? 1 : 0;
-            report.pool_dirty += check.dirty ? 1 : 0;
+        // EDEN_NX2_CHECK_TEXTURE_READS=1: read every texture handle again on the GPU thread to
+        // tell whether the worker's late pool read gave another answer (diagnostic).
+        static const bool check_reads = [] {
+            const char* const value = std::getenv("EDEN_NX2_CHECK_TEXTURE_READS");
+            return value != nullptr && value[0] == '1';
+        }();
+        if (check_reads) {
+            u32 changed{};
+            for (const auto& env : translated.envs) {
+                const auto check{env.CheckTextureReads(*gpu_memory)};
+                report.pool_reads += check.reads;
+                changed += check.changed;
+                report.pool_remapped += check.remapped ? 1 : 0;
+                report.pool_dirty += check.dirty ? 1 : 0;
+            }
+            report.pool_changed += changed;
+            report.pool_pipelines_changed += changed != 0 ? 1 : 0;
         }
-        report.pool_changed += changed;
-        report.pool_pipelines_changed += changed != 0 ? 1 : 0;
         const bool is_mesh{translated.pipeline && translated.pipeline->IsMeshPipeline()};
         const bool built{static_cast<bool>(translated.pipeline)};
         const auto [it, inserted]{graphics_cache.try_emplace(translated.key)};
