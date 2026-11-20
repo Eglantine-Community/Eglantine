@@ -23,7 +23,7 @@ rustPlatform.buildRustPackage rec {
     owner = "trzz1214";
     repo = "RenHDrum";
     tag = "v${version}";
-    hash = "sha256-TpIv+2rBXLqF3Wvyknfe99qqKEWcbiaQ4E31jElZTPc=";
+    hash = "sha256-y8dofENZu0OKYG/+ff14rMm931s8OVbBdY0ZIzuW/34=";
   };
 
   # No runtime dependencies, still: 0.5.0 builds in Opus as vendored C, which adds
