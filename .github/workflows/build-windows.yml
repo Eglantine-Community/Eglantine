@@ -50,7 +50,7 @@ permissions:
 # lying around. Users can still drop a different renhdrum.dll next to eglantine.exe, or point
 # RENHDRUM_LIBRARY at one.
 env:
-  RENHDRUM_VERSION: v0.4.0
+  RENHDRUM_VERSION: v0.5.0
 
 jobs:
   msvc:

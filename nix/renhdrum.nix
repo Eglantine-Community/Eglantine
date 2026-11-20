@@ -17,16 +17,18 @@
 
 rustPlatform.buildRustPackage rec {
   pname = "renhdrum";
-  version = "0.4.0";
+  version = "0.5.0";
 
   src = fetchFromGitHub {
     owner = "trzz1214";
     repo = "RenHDrum";
     tag = "v${version}";
-    hash = "sha256-+VytHpeG7VtwAEe2zuUERpG6vgtPCM1v9jYTVqPXq6c=";
+    hash = "sha256-TpIv+2rBXLqF3Wvyknfe99qqKEWcbiaQ4E31jElZTPc=";
   };
 
-  # The crate has no dependencies at all, so the lock file pins nothing and nothing is vendored.
+  # No runtime dependencies, still: 0.5.0 builds in Opus as vendored C, which adds
+  # build-dependencies (cc, and what cc itself needs) to the lock file, but nothing is vendored
+  # into the store output and the emulator only loads the cdylib.
   cargoLock.lockFile = "${src}/Cargo.lock";
 
   # The crate builds a cdylib, a staticlib and an rlib; the emulator only uses the cdylib.
