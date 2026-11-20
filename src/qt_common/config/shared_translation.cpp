@@ -310,9 +310,9 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "hundreds of milliseconds each time."));
 #if defined(__linux__)
     INSERT(Settings, driver_shader_cache_size, tr("Separate driver shader cache (Linux only)"),
-           tr("Keeps the NVIDIA driver's shader cache for this emulator in its own folder, up to "
-              "this size, so other applications can't evict it.\nTurn it off to use the "
-              "driver's shared cache instead.\nTakes effect at the next start."));
+           tr("Keeps the NVIDIA or Mesa driver's shader cache for this emulator in its own "
+              "folder, up to this size, so other applications can't evict it.\nTurn it off to "
+              "use the driver's shared cache instead.\nTakes effect at the next start."));
 #else
     INSERT(Settings, driver_shader_cache_size, QString(), QString());
 #endif

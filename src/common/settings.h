@@ -638,7 +638,8 @@ struct Values {
                                                        "mesh_shader_mode",
                                                        Category::RendererAdvanced};
 
-    // Linux: the GPU driver's shader cache in a folder of our own (ConfigureDriverShaderCache),
+    // Linux: the NVIDIA or Mesa driver's shader cache in a folder of our own
+    // (ConfigureDriverShaderCache),
     // with its size limit in GiB. Applied at startup, before anything loads a driver.
     Setting<bool> private_driver_shader_cache{linkage, true, "private_driver_shader_cache",
                                               Category::RendererAdvanced, Specialization::Paired};
