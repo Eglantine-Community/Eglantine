@@ -2598,6 +2598,12 @@ bool PipelineCache::BuildNewGraphicsPipeline(bool is_indexed) {
     }
     std::unique_ptr<GraphicsPipeline> pipeline{TakeBackgroundPipeline(graphics_key)};
     if (!pipeline && DeferRuntimeBuild()) {
+        // Skipped either way; a worker can translate it meanwhile.
+        if (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::QueueDeferredTranslation) &&
+            CanQueueGraphicsTranslation()) {
+            ReportNewPipelineKey(graphics_key);
+            static_cast<void>(QueueGraphicsTranslation());
+        }
         RecordSkippedGeometry(is_indexed, nullptr);
         graphics_miss = "build-deferred";
         return false;
@@ -3315,8 +3321,11 @@ void PipelineCache::StoreGraphicsPipeline(const GraphicsPipelineCacheKey& key,
 // wait for a translation already queued. Compute pipelines and Switch 1 programs, whose code is
 // read from guest memory while translating, stay on the GPU thread.
 bool PipelineCache::CanTranslateAsynchronously() {
-    if (!translation_workers || !maxwell3d->GetNativeMacroEngine().native_turing ||
-        !CanSkipDraw()) {
+    return CanSkipDraw() && CanQueueGraphicsTranslation();
+}
+
+bool PipelineCache::CanQueueGraphicsTranslation() {
+    if (!translation_workers || !maxwell3d->GetNativeMacroEngine().native_turing) {
         return false;
     }
     for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {

@@ -229,6 +229,8 @@ private:
     };
 
     [[nodiscard]] bool CanTranslateAsynchronously();
+    /// Whether graphics_key's stages can be translated on a worker, whatever the draw.
+    [[nodiscard]] bool CanQueueGraphicsTranslation();
 
     /// Queues graphics_key's translation on a worker. Nothing when an environment can't be
     /// detached from the 3D engine.

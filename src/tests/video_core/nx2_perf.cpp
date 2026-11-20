@@ -84,3 +84,8 @@ TEST_CASE("geometry_consistency and build_order_priority: on by default", "[nx2_
     REQUIRE(!IsOff(DefaultOffMask(), Index(Opt::BuildOrderPriority)));
     REQUIRE(!IsOff(DefaultOffMask(), Index(Opt::ReplayDiskRecordings)));
 }
+
+TEST_CASE("queue_deferred_translation: on by default", "[nx2_perf]") {
+    REQUIRE(opt_names[Index(Opt::QueueDeferredTranslation)] == "queue_deferred_translation");
+    REQUIRE(!IsOff(DefaultOffMask(), Index(Opt::QueueDeferredTranslation)));
+}
