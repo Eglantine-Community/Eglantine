@@ -715,7 +715,7 @@ FN_MAX_LIMIT_LIST
 
     /// Returns true if graphics pipelines can be fast-linked from VK_EXT_graphics_pipeline_library
     /// libraries: the extension, fast linking and independent interpolation decorations are all
-    /// supported, and EDEN_NX2_GPL=1 asked for it.
+    /// supported, and the graphics_pipeline_library setting (or EDEN_NX2_GPL=1) asked for it.
     bool IsExtGraphicsPipelineLibrarySupported() const {
         return extensions.graphics_pipeline_library;
     }

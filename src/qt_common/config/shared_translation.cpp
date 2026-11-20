@@ -296,6 +296,14 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "shaders, and the GPU's own stages elsewhere.\n"
               "GPUs without VK_EXT_mesh_shader always use the compute fallback.\n"
               "Takes effect when a game starts."));
+    INSERT(Settings, graphics_pipeline_library, tr("Link pipelines from shared parts (experimental)"),
+           tr("Uses VK_EXT_graphics_pipeline_library: pipelines that share shaders compile them "
+              "once and link the rest, instead of compiling each pipeline whole.\n"
+              "Experimental. Measured on Ocarina of Time's first load with an empty driver cache: "
+              "43% of the new pipelines linked from parts already compiled, but driver time only "
+              "fell about 9% and skipped draws did not change, since pipelines needing new parts "
+              "compile them one after another. Shader modules are kept in memory for reuse.\n"
+              "Needs fast linking support from the driver. Takes effect when a game starts."));
     INSERT(Settings, use_vulkan_driver_pipeline_cache, tr("Use Vulkan pipeline cache"),
            tr("Enables GPU vendor-specific pipeline cache.\nThis option can improve shader loading "
               "time significantly in cases where the Vulkan driver does not store pipeline cache "

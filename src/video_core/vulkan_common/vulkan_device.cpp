@@ -1653,13 +1653,15 @@ void Device::RemoveUnsuitableExtensions() {
                                        VK_EXT_MESH_SHADER_EXTENSION_NAME);
 
     // VK_EXT_graphics_pipeline_library, which needs VK_KHR_pipeline_library: fast-linked
-    // pipelines (EDEN_NX2_GPL=1 while it is measured), only when linking is fast (otherwise it
+    // pipelines (the graphics_pipeline_library setting), only when linking is fast (otherwise it
     // saves nothing over a monolithic compile) and the vertex and fragment shaders may disagree
     // on interpolation decorations (libraries are compiled separately). Shared library parts
     // outlive the pipeline layout they were compiled with, which VK_KHR_maintenance4 allows.
     {
-        const char* const gpl_setting = std::getenv("EDEN_NX2_GPL");
-        const bool gpl_allowed = gpl_setting != nullptr && gpl_setting[0] == '1';
+        const char* const gpl_override = std::getenv("EDEN_NX2_GPL");
+        const bool gpl_allowed = gpl_override != nullptr
+                                     ? gpl_override[0] == '1'
+                                     : Settings::values.graphics_pipeline_library.GetValue();
         const auto& gpl_properties = properties.graphics_pipeline_library;
         const bool gpl_usable =
             features.graphics_pipeline_library.graphicsPipelineLibrary &&
