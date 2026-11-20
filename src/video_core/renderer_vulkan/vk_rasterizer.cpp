@@ -883,6 +883,22 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
         // Say why, and keep the expected asynchronous-shader skips from using up the line budget.
         const std::string_view miss = reason == "no pipeline" ? diag_outcome : reason;
+        {
+            // Every skipped draw by reason, every 10 s: the lines below are capped.
+            static std::map<std::string_view, u64> skipped;
+            static auto window = std::chrono::steady_clock::now();
+            ++skipped[miss];
+            if (const auto now = std::chrono::steady_clock::now();
+                now - window >= std::chrono::seconds{10}) {
+                std::string counts;
+                for (const auto& [name, count] : skipped) {
+                    counts += fmt::format(" {}={}", name, count);
+                }
+                LOG_INFO(HW_GPU, "Skipped draws in the last 10 s:{}", counts);
+                skipped.clear();
+                window = now;
+            }
+        }
         const bool async_miss = miss == "async-build";
         if ((async_miss ? async_logged < 8 : seen.size() < 64) && seen.emplace(vs, ps, miss).second) {
             async_logged += async_miss ? 1 : 0;
