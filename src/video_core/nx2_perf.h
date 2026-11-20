@@ -104,6 +104,9 @@ enum class Opt : unsigned {
     /// Async shaders: a draw the build budget defers still queues its pipeline's translation,
     /// so a later frame finds it translating or done instead of starting it then
     QueueDeferredTranslation,
+    /// Native stages: a stage another thread is translating is waited for and reused instead of
+    /// translated a second time (threads that hold no such stage themselves)
+    StageInFlight,
     Count,
 };
 
@@ -118,7 +121,7 @@ inline constexpr std::array<std::string_view, static_cast<size_t>(Opt::Count)> o
     "handle_page_cache", "dma_forward", "draw_begin_coalesce", "pending_wake", "diag_draw_lite",
     "shader_build_budget", "compute_rebuild_async", "compute_preload_variants", "stale_target_skip",
     "geometry_consistency", "build_order_priority", "replay_disk_recordings",
-    "queue_deferred_translation",
+    "queue_deferred_translation", "stage_in_flight",
 };
 
 static_assert(static_cast<size_t>(Opt::Count) <= 64, "the off-mask is 64 bits");

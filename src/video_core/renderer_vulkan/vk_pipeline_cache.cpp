@@ -2670,16 +2670,27 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                           std::shared_ptr<const StageCache::Emitted>>>
         new_translations;
 
-    // Detached environments (asynchronous translation): the stages the stage cache lacks are
-    // translated at once, each with its own pools, the extra ones on translation workers.
+    // Every native stage is looked up first. A stage another thread is translating is waited for
+    // and looked up again, so a burst of pipelines sharing a stage translates it once; the rest
+    // are claimed until they are inserted. The GPU thread doesn't wait: it translates its own.
     std::array<std::vector<u8>, Maxwell::MaxShaderProgram> signatures;
-    std::array<bool, Maxwell::MaxShaderProgram> looked_up{};
     std::array<bool, Maxwell::MaxShaderProgram> translated_ahead{};
     std::array<std::unique_ptr<ShaderPools>, Maxwell::MaxShaderProgram> stage_pools;
-    if (parallel_stages && cache_stages && translation_workers && ParallelStagesEnabled()) {
+    StageCache::InFlight in_flight;
+    std::optional<PhaseTimer> translate_timer{std::in_place, BuildPhase::Translate,
+                                              build_in_parallel};
+    if (cache_stages) {
         boost::container::static_vector<size_t, Maxwell::MaxShaderProgram> missing;
         std::array<Shader::Environment*, Maxwell::MaxShaderProgram> ahead_envs{};
         size_t ahead_env_index{};
+        const auto find = [&](size_t index) {
+            Shader::Environment& env{*ahead_envs[index]};
+            reused[index] = stage_cache.Find(signatures[index], env);
+            // A layer emulation source is needed with its IR (GenerateGeometryPassthrough).
+            if (reused[index] && reused[index]->program.info.requires_layer_emulation) {
+                reused[index] = nullptr;
+            }
+        };
         for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
             if (key.unique_hashes[index] == 0) {
                 continue;
@@ -2689,17 +2700,52 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 continue;
             }
             signatures[index] = StageCache::Signature(env, key.unique_hashes[index], index);
-            reused[index] = stage_cache.Find(signatures[index], env);
-            if (reused[index] && reused[index]->program.info.requires_layer_emulation) {
-                reused[index] = nullptr;
-            }
-            looked_up[index] = true;
+            ahead_envs[index] = &env;
+            find(index);
             if (!reused[index]) {
                 missing.push_back(index);
-                ahead_envs[index] = &env;
             }
         }
-        if (missing.size() >= 2) {
+        if (!missing.empty() &&
+            VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::StageInFlight)) {
+            // Pruned geometry and emulated mesh stages are never inserted: nobody waits for them.
+            const auto inserted = [&](size_t index) {
+                const Shader::Stage stage{ahead_envs[index]->ShaderStage()};
+                return index != static_cast<size_t>(Maxwell::ShaderType::Geometry) &&
+                       ((stage != Shader::Stage::Task && stage != Shader::Stage::Mesh) ||
+                        device.IsExtMeshShaderSupported());
+            };
+            boost::container::static_vector<u64, Maxwell::MaxShaderProgram> hashes;
+            for (const size_t index : missing) {
+                if (inserted(index)) {
+                    hashes.push_back(StageCache::SignatureHash(signatures[index]));
+                }
+            }
+            const bool on_gpu_thread{std::this_thread::get_id() ==
+                                     draw_thread.load(std::memory_order_relaxed)};
+            if (!on_gpu_thread &&
+                stage_cache.WaitForInFlight(hashes, std::chrono::milliseconds{500})) {
+                const size_t waited{missing.size()};
+                boost::container::static_vector<size_t, Maxwell::MaxShaderProgram> still_missing;
+                hashes.clear();
+                for (const size_t index : missing) {
+                    find(index);
+                    if (!reused[index]) {
+                        still_missing.push_back(index);
+                        if (inserted(index)) {
+                            hashes.push_back(StageCache::SignatureHash(signatures[index]));
+                        }
+                    }
+                }
+                stage_cache.CountInFlightWait(waited, waited - still_missing.size());
+                missing = still_missing;
+            }
+            in_flight = stage_cache.ClaimInFlight(hashes);
+        }
+        // Detached environments (asynchronous translation): the missing stages are translated at
+        // once, each with its own pools, the extra ones on translation workers.
+        if (parallel_stages && translation_workers && ParallelStagesEnabled() &&
+            missing.size() >= 2) {
             RunInParallel(missing.size(), [&](size_t task) {
                 const size_t index{missing[task]};
                 Shader::Environment& env{*ahead_envs[index]};
@@ -2727,8 +2773,6 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     Shader::IR::Program* layer_source_program{};
     bool mesh_unsupported{};
 
-    std::optional<PhaseTimer> translate_timer{std::in_place, BuildPhase::Translate,
-                                              build_in_parallel};
     for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
         const bool is_emulated_stage = layer_source_program != nullptr &&
                                        index == static_cast<u32>(Maxwell::ShaderType::Geometry);
@@ -2776,15 +2820,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         stage_envs[index] = &env;
         const bool cacheable{cache_stages && env.IsNativeProgram()};
         std::vector<u8> signature;
-        if (cacheable && looked_up[index]) {
+        if (cacheable) {
             signature = std::move(signatures[index]);
-        } else if (cacheable) {
-            signature = StageCache::Signature(env, key.unique_hashes[index], index);
-            reused[index] = stage_cache.Find(signature, env);
-            // A layer emulation source is needed with its IR (GenerateGeometryPassthrough).
-            if (reused[index] && reused[index]->program.info.requires_layer_emulation) {
-                reused[index] = nullptr;
-            }
         }
         if (reused[index]) {
             programs[index] = reused[index]->program;
@@ -3147,6 +3184,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     for (auto& [new_translation, entry] : new_translations) {
         stage_cache.Insert(std::move(new_translation), std::move(entry));
     }
+    in_flight.Release();
     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
     PhaseTimer object_timer{BuildPhase::Object, build_in_parallel};
     return std::make_unique<GraphicsPipeline>(
