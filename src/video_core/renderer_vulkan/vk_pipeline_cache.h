@@ -45,6 +45,7 @@
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+#include "video_core/renderer_vulkan/vk_pipeline_library.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/shader_cache.h"
 #include "video_core/stage_cache.h"
@@ -255,6 +256,10 @@ private:
     void StoreGraphicsPipeline(const GraphicsPipelineCacheKey& key, GraphicsEnvironmentArray envs,
                                bool is_mesh);
 
+    /// The shared modules of these stages' SPIR-V, built if no pipeline holds them.
+    std::shared_ptr<const GraphicsShaderSet> FindOrMakeShaderSet(
+        const std::array<std::vector<u32>, Maxwell::MaxShaderStage>& code);
+
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline(
         ShaderPools& pools, const GraphicsPipelineCacheKey& key,
         std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
@@ -343,6 +348,17 @@ private:
     Shader::Profile profile;
     Shader::HostTranslateInfo host_info;
     VideoCommon::StageCache stage_cache;
+
+    /// Pipeline library parts (VK_EXT_graphics_pipeline_library, EDEN_NX2_GPL=1), and the
+    /// shader module sets they are keyed by: pipelines whose stages are the same SPIR-V share one.
+    std::unique_ptr<GraphicsPipelineLibraryCache> library_cache;
+    struct ShaderSetEntry {
+        std::array<u64, Maxwell::MaxShaderStage> hashes{};
+        std::array<size_t, Maxwell::MaxShaderStage> sizes{};
+        std::weak_ptr<GraphicsShaderSet> set;
+    };
+    std::mutex shader_sets_mutex;
+    std::unordered_map<u64, ShaderSetEntry> shader_sets;
 
     std::filesystem::path pipeline_cache_filename;
     /// Task and mesh pipelines, with the mesh state they are translated with.

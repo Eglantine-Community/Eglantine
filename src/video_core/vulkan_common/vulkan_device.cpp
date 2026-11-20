@@ -1348,6 +1348,11 @@ bool Device::GetSuitability(bool requires_swapchain) {
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_PROPERTIES_KHR;
         SetNext(next, properties.maintenance5);
     }
+    if (extensions.graphics_pipeline_library) {
+        properties.graphics_pipeline_library.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT;
+        SetNext(next, properties.graphics_pipeline_library);
+    }
     if (extensions.custom_border_color) {
         properties.custom_border_color.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_PROPERTIES_EXT;
@@ -1646,6 +1651,39 @@ void Device::RemoveUnsuitableExtensions() {
     }
     RemoveExtensionFeatureIfUnsuitable(extensions.mesh_shader, features.mesh_shader,
                                        VK_EXT_MESH_SHADER_EXTENSION_NAME);
+
+    // VK_EXT_graphics_pipeline_library, which needs VK_KHR_pipeline_library: fast-linked
+    // pipelines (EDEN_NX2_GPL=1 while it is measured), only when linking is fast (otherwise it
+    // saves nothing over a monolithic compile) and the vertex and fragment shaders may disagree
+    // on interpolation decorations (libraries are compiled separately). Shared library parts
+    // outlive the pipeline layout they were compiled with, which VK_KHR_maintenance4 allows.
+    {
+        const char* const gpl_setting = std::getenv("EDEN_NX2_GPL");
+        const bool gpl_allowed = gpl_setting != nullptr && gpl_setting[0] == '1';
+        const auto& gpl_properties = properties.graphics_pipeline_library;
+        const bool gpl_usable =
+            features.graphics_pipeline_library.graphicsPipelineLibrary &&
+            extensions.pipeline_library &&
+            gpl_properties.graphicsPipelineLibraryFastLinking &&
+            gpl_properties.graphicsPipelineLibraryIndependentInterpolationDecoration &&
+            features.maintenance4.maintenance4;
+        if (gpl_allowed) {
+            LOG_INFO(Render_Vulkan,
+                     "VK_EXT_graphics_pipeline_library: fast linking {}, independent "
+                     "interpolation {}, {}",
+                     gpl_properties.graphicsPipelineLibraryFastLinking == VK_TRUE,
+                     gpl_properties.graphicsPipelineLibraryIndependentInterpolationDecoration ==
+                         VK_TRUE,
+                     gpl_usable ? "used" : "not used");
+        }
+        extensions.graphics_pipeline_library = gpl_allowed && gpl_usable;
+        RemoveExtensionFeatureIfUnsuitable(extensions.graphics_pipeline_library,
+                                           features.graphics_pipeline_library,
+                                           VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+        extensions.pipeline_library = extensions.graphics_pipeline_library;
+        RemoveExtensionIfUnsuitable(extensions.pipeline_library,
+                                    VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+    }
 
     // VK_KHR_shader_quad_control
     extensions.shader_quad_control = features.shader_quad_control.shaderQuadControl;

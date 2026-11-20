@@ -30,6 +30,7 @@
 #include "video_core/renderer_vulkan/vk_frame_dump.h"
 #include "video_core/nx2_draw_stats.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+#include "video_core/renderer_vulkan/vk_pipeline_library.h"
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -200,7 +201,7 @@ size_t NumAttachments(const FixedPipelineState& state) {
 }
 
 template <typename Spec>
-bool Passes(const std::array<vk::ShaderModule, NUM_STAGES>& modules,
+bool Passes(const std::array<VkShaderModule, NUM_STAGES>& modules,
             const std::array<Shader::Info, NUM_STAGES>& stage_infos) {
     for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
         if (!Spec::enabled_stages[stage] && modules[stage]) {
@@ -234,7 +235,7 @@ bool Passes(const std::array<vk::ShaderModule, NUM_STAGES>& modules,
 using ConfigureFuncPtr = bool (*)(GraphicsPipeline*, bool);
 
 template <typename Spec, typename... Specs>
-ConfigureFuncPtr FindSpec(const std::array<vk::ShaderModule, NUM_STAGES>& modules,
+ConfigureFuncPtr FindSpec(const std::array<VkShaderModule, NUM_STAGES>& modules,
                           const std::array<Shader::Info, NUM_STAGES>& stage_infos) {
     if constexpr (sizeof...(Specs) > 0) {
         if (!Passes<Spec>(modules, stage_infos)) {
@@ -284,7 +285,39 @@ struct DefaultSpec {
     static constexpr bool has_images = true;
 };
 
-ConfigureFuncPtr ConfigureFunc(const std::array<vk::ShaderModule, NUM_STAGES>& modules,
+// With VK_EXT_graphics_pipeline_library: how many pipelines were linked from library parts and
+// how long the driver took, against the ones compiled whole, every 10 s.
+void ReportLibraryBuild(bool linked, std::chrono::steady_clock::duration time) {
+    static std::mutex mutex;
+    static std::array<u32, 2> count{};
+    static std::array<std::chrono::steady_clock::duration, 2> total{};
+    static u32 fast_links{};
+    static auto window = std::chrono::steady_clock::now();
+    std::scoped_lock lock{mutex};
+    ++count[linked];
+    total[linked] += time;
+    // Under 5 ms, every part was compiled already: only the link ran.
+    fast_links += linked && time < std::chrono::milliseconds{5} ? 1 : 0;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - window < std::chrono::seconds{10}) {
+        return;
+    }
+    const auto mean = [&](size_t index) {
+        return count[index] ? std::chrono::duration<double, std::milli>(total[index]).count() /
+                                  count[index]
+                            : 0.0;
+    };
+    LOG_INFO(Render_Vulkan,
+             "Graphics pipeline library in the last 10 s: {} linked from parts ({:.1f} ms mean, "
+             "parts compiled included; {} under 5 ms), {} compiled whole ({:.1f} ms mean)",
+             count[1], mean(1), fast_links, count[0], mean(0));
+    count = {};
+    total = {};
+    fast_links = 0;
+    window = now;
+}
+
+ConfigureFuncPtr ConfigureFunc(const std::array<VkShaderModule, NUM_STAGES>& modules,
                                const std::array<Shader::Info, NUM_STAGES>& infos) {
     return FindSpec<SimpleVertexSpec, SimpleVertexFragmentSpec, SimpleStorageSpec, SimpleImageSpec,
                     DefaultSpec>(modules, infos);
@@ -302,12 +335,18 @@ GraphicsPipeline::GraphicsPipeline(
     const GraphicsPipelineCacheKey& key_, std::array<vk::ShaderModule, NUM_STAGES> stages,
     const std::array<const Shader::Info*, NUM_STAGES>& infos,
     std::function<std::array<vk::ShaderModule, NUM_STAGES>()> emit_stages,
-    std::optional<MeshEmulationSetup> mesh_emulation_)
+    std::optional<MeshEmulationSetup> mesh_emulation_,
+    std::shared_ptr<const GraphicsShaderSet> shader_set_,
+    GraphicsPipelineLibraryCache* library_cache_)
     : key{key_}, device{device_}, texture_cache{texture_cache_}, buffer_cache{buffer_cache_},
       pipeline_cache(pipeline_cache_), scheduler{scheduler_},
       guest_descriptor_queue{guest_descriptor_queue_},
       descriptor_buffer_ring{descriptor_buffer_ring_}, spv_modules{std::move(stages)},
+      shader_set{std::move(shader_set_)}, library_cache{library_cache_},
       mesh_emulation{std::move(mesh_emulation_)} {
+    for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+        modules[stage] = shader_set ? *shader_set->modules[stage] : *spv_modules[stage];
+    }
     if (shader_notify) {
         shader_notify->MarkShaderBuilding();
     }
@@ -446,8 +485,8 @@ GraphicsPipeline::GraphicsPipeline(
             LOG_CRITICAL(Render_Vulkan,
                          "Graphics pipeline build failed: {} (stages: tcs={} tes={} geom={}, "
                          "patch control points {}, device max patch size {})",
-                         exception.what(), spv_modules[1] ? 1 : 0, spv_modules[2] ? 1 : 0,
-                         spv_modules[3] ? 1 : 0, key.state.patch_control_points_minus_one.Value() + 1,
+                         exception.what(), modules[1] ? 1 : 0, modules[2] ? 1 : 0,
+                         modules[3] ? 1 : 0, key.state.patch_control_points_minus_one.Value() + 1,
                          device.GetMaxTessellationPatchSize());
             std::scoped_lock lock{build_mutex};
             is_built = true;
@@ -462,9 +501,11 @@ GraphicsPipeline::GraphicsPipeline(
         }
         // Nothing reads the shader modules once the pipeline exists, and the driver keeps a copy
         // of each one's SPIR-V while it lives (title 1: ~1,500 pipelines, 2-5 modules each).
+        // A shared set keeps its modules: other pipelines and library parts use them.
         for (vk::ShaderModule& module : spv_modules) {
             module.reset();
         }
+        modules = {};
         ReportPipelineBuild("Graphics", key.Hash(), queued_at, started_at);
 
         std::scoped_lock lock{build_mutex};
@@ -475,7 +516,7 @@ GraphicsPipeline::GraphicsPipeline(
         }
     }};
     // Before the build: it frees the modules this looks at.
-    configure_func = ConfigureFunc(spv_modules, stage_infos);
+    configure_func = ConfigureFunc(modules, stage_infos);
     build_task = std::move(func);
     if (worker_thread) {
         worker_thread->QueueWork([this] { RunBuild(); });
@@ -1522,12 +1563,12 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
                 *pipeline_cache);
         };
         mesh_vertex_module = BuildShader(device, mesh_emulation->vertex_spirv);
-        mesh_compute_pipeline = make_compute(*spv_modules[mesh_emulation->mesh_stage],
+        mesh_compute_pipeline = make_compute(modules[mesh_emulation->mesh_stage],
                                              *pipeline_layout,
                                              &stage_infos[mesh_emulation->mesh_stage]);
         if (mesh_emulation->has_task) {
             task_compute_pipeline =
-                make_compute(*spv_modules[0], *pipeline_layout, &stage_infos[0]);
+                make_compute(modules[0], *pipeline_layout, &stage_infos[0]);
             distribution_module = BuildShader(device, mesh_emulation->distribution_spirv);
             distribution_pipeline =
                 make_compute(*distribution_module, *distribution_layout, nullptr);
@@ -1594,7 +1635,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
     if (!vertex_binding_divisors.empty()) {
         vertex_input_ci.pNext = &input_divisor_ci;
     }
-    const bool has_tess_stages = !IsMeshPipeline() && (spv_modules[1] || spv_modules[2]);
+    const bool has_tess_stages = !IsMeshPipeline() && (modules[1] || modules[2]);
     auto input_assembly_topology = MaxwellToVK::PrimitiveTopology(device, key.state.topology);
     if (input_assembly_topology == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST) {
         if (!has_tess_stages) {
@@ -1917,7 +1958,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
     };
     static_vector<VkPipelineShaderStageCreateInfo, 5> shader_stages;
     for (size_t stage = 0; stage < Maxwell::MaxShaderStage; ++stage) {
-        if (!spv_modules[stage]) {
+        if (!modules[stage]) {
             continue;
         }
         if (mesh_emulation && mesh_emulation->has_task && stage == mesh_emulation->mesh_stage) {
@@ -1940,7 +1981,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
             .pNext = force_warp_size ? &subgroup_size_ci : nullptr,
             .flags = 0,
             .stage = stage_flag,
-            .module = emulated_vertex ? *mesh_vertex_module : *spv_modules[stage],
+            .module = emulated_vertex ? *mesh_vertex_module : modules[stage],
             .pName = "main",
             .pSpecializationInfo = nullptr,
         });
@@ -1974,7 +2015,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
     }
 
     const auto build_begin = std::chrono::steady_clock::now();
-    pipeline = device.GetLogical().CreateGraphicsPipeline({
+    const VkGraphicsPipelineCreateInfo pipeline_ci{
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .pNext = nullptr,
         .flags = flags,
@@ -1998,9 +2039,26 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         .subpass = 0,
         .basePipelineHandle = nullptr,
         .basePipelineIndex = 0,
-    }, *pipeline_cache);
-    DriverBuildReport::Record(DriverBuildReport::Kind::Graphics,
-                              std::chrono::steady_clock::now() - build_begin);
+    };
+    // Pipelines sharing a shader set link library parts compiled once (null when the create
+    // info holds something the parts can't express); the others compile whole.
+    if (library_cache && shader_set && !mesh_emulation) {
+        try {
+            pipeline = library_cache->Link(pipeline_ci, *pipeline_cache, shader_set, false);
+        } catch (const vk::Exception& exception) {
+            LOG_WARNING(Render_Vulkan, "Graphics pipeline library link failed ({}), compiling whole",
+                        exception.what());
+        }
+    }
+    const bool linked = static_cast<bool>(pipeline);
+    if (!linked) {
+        pipeline = device.GetLogical().CreateGraphicsPipeline(pipeline_ci, *pipeline_cache);
+    }
+    const auto build_time = std::chrono::steady_clock::now() - build_begin;
+    DriverBuildReport::Record(DriverBuildReport::Kind::Graphics, build_time);
+    if (library_cache) {
+        ReportLibraryBuild(linked, build_time);
+    }
 
     // Log graphics pipeline creation
     if (GPU::Logging::IsActive()) {

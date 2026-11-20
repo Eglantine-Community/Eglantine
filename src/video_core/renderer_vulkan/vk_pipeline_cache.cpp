@@ -532,6 +532,10 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     if (Settings::values.use_vulkan_driver_pipeline_cache.GetValue() && !use_vulkan_pipeline_cache) {
         LOG_INFO(Render_Vulkan, "Driver keeps its own pipeline cache, not saving a Vulkan one");
     }
+    if (device.IsExtGraphicsPipelineLibrarySupported()) {
+        library_cache = std::make_unique<GraphicsPipelineLibraryCache>(device);
+        LOG_INFO(Render_Vulkan, "Graphics pipelines that share shaders link library parts");
+    }
     build_budget = std::chrono::milliseconds{[] {
         const char* const value = std::getenv("EDEN_NX2_SHADER_BUDGET_MS");
         return value != nullptr ? std::max(1, std::atoi(value)) : 24;
@@ -3079,6 +3083,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     }
     std::array<const Shader::Info*, Maxwell::MaxShaderStage> infos{};
     std::array<vk::ShaderModule, Maxwell::MaxShaderStage> modules;
+    // With pipeline libraries, pipelines whose stages are the same SPIR-V share their modules
+    // (and so the library parts compiled from them): built after every stage is emitted.
+    const bool share_modules = library_cache && !mesh_emulation;
+    std::array<std::vector<u32>, Maxwell::MaxShaderStage> stage_code;
 
     const Shader::IR::Program* previous_stage{};
     Shader::Backend::Bindings binding;
@@ -3188,7 +3196,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         device.SaveShader(code);
         emit_timer.reset();
-        {
+        if (share_modules) {
+            stage_code[stage_index] = code;
+        } else {
             PhaseTimer module_timer{BuildPhase::Module, build_in_parallel};
             modules[stage_index] = BuildShader(device, code);
         }
@@ -3215,7 +3225,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             }
         }
 
-        if (device.HasDebuggingToolAttached()) {
+        if (device.HasDebuggingToolAttached() && modules[stage_index]) {
             const std::string name{fmt::format("Shader {:016x}", key.unique_hashes[index])};
             modules[stage_index].SetObjectNameEXT(name.c_str());
         }
@@ -3225,6 +3235,11 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         stage_cache.Insert(std::move(new_translation), std::move(entry));
     }
     in_flight.Release();
+    std::shared_ptr<const GraphicsShaderSet> shader_set;
+    if (share_modules) {
+        PhaseTimer module_timer{BuildPhase::Module, build_in_parallel};
+        shader_set = FindOrMakeShaderSet(stage_code);
+    }
     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
     PhaseTimer object_timer{BuildPhase::Object, build_in_parallel};
     return std::make_unique<GraphicsPipeline>(
@@ -3233,7 +3248,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         render_pass_cache, key, std::move(modules), infos,
         std::function<
             std::array<vk::ShaderModule, Tegra::Engines::Maxwell3D::Regs::MaxShaderStage>()>{},
-        std::move(mesh_emulation));
+        std::move(mesh_emulation), std::move(shader_set), library_cache.get());
 
 } catch (const Shader::Exception& exception) {
     auto hash = key.Hash();
@@ -3256,6 +3271,42 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     }
     LOG_ERROR(Render_Vulkan, "{}", exception.what());
     return nullptr;
+}
+
+std::shared_ptr<const GraphicsShaderSet> PipelineCache::FindOrMakeShaderSet(
+    const std::array<std::vector<u32>, Maxwell::MaxShaderStage>& code) {
+    ShaderSetEntry entry;
+    u64 key = 0;
+    for (size_t stage = 0; stage < code.size(); ++stage) {
+        entry.sizes[stage] = code[stage].size();
+        entry.hashes[stage] = code[stage].empty()
+                                  ? 0
+                                  : Common::CityHash64(
+                                        reinterpret_cast<const char*>(code[stage].data()),
+                                        code[stage].size() * sizeof(u32));
+        key = (key * 0x9E3779B97F4A7C15ULL) ^ entry.hashes[stage] ^ entry.sizes[stage];
+    }
+    {
+        std::scoped_lock lock{shader_sets_mutex};
+        const auto it = shader_sets.find(key);
+        if (it != shader_sets.end() && it->second.hashes == entry.hashes &&
+            it->second.sizes == entry.sizes) {
+            if (auto set = it->second.set.lock()) {
+                return set;
+            }
+        }
+    }
+    // Built without the lock; two threads building the same set at once each keep their own.
+    auto set = std::make_shared<GraphicsShaderSet>();
+    for (size_t stage = 0; stage < code.size(); ++stage) {
+        if (!code[stage].empty()) {
+            set->modules[stage] = BuildShader(device, code[stage]);
+        }
+    }
+    entry.set = set;
+    std::scoped_lock lock{shader_sets_mutex};
+    shader_sets.insert_or_assign(key, std::move(entry));
+    return set;
 }
 
 namespace {
