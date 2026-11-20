@@ -284,6 +284,8 @@ std::atomic<int> xbox_official_no_triggers{};
 struct RenHDrumPad::Impl {
     bool is_bluetooth{};
     int kind{-1};
+    // Rate limit for the refused-packet warning; only Tick writes it, but from two threads
+    std::atomic<std::int64_t> next_effect_error_us{0};
 
     mutable std::mutex mutex;
     SDL_Joystick* joystick{};
@@ -822,6 +824,18 @@ std::shared_ptr<RenHDrumPad> RenHDrumPad::Create(SDL_Joystick* joystick, SDL_Gam
         }
         LOG_INFO(Input, "RenHDrum: HD Rumble for {:04X}:{:04X} (Bluetooth: {})", vid, pid,
                  state->is_bluetooth);
+        // Wired and wireless are the only answers SDL can give when it owns the pad through
+        // hidapi. Anything else means the pad came in through evdev -- on Linux that is the
+        // kernel's hid-nintendo driver -- and evdev answers every raw rumble packet with
+        // SDL_Unsupported, so the engine's packets never leave the host.
+        const SDL_JoystickConnectionState connection = SDL_GetJoystickConnectionState(joystick);
+        if (connection != SDL_JOYSTICK_CONNECTION_WIRED &&
+            connection != SDL_JOYSTICK_CONNECTION_WIRELESS) {
+            LOG_WARNING(Input,
+                        "RenHDrum: SDL reports neither wired nor wireless for this pad, so it "
+                        "likely arrived through the kernel's driver and will refuse raw rumble "
+                        "packets");
+        }
         state->ConfigureEngine();
     } else {
         state->dsp = api.dsp_create(state->user.dualsense_volume, state->user.dualsense_crisp_notes);
@@ -1147,7 +1161,16 @@ void RenHDrumPad::Tick(std::int64_t now_us) {
         impl->OpenDualSenseAudio();
     }
     if (send) {
-        SDL_SendJoystickEffect(joystick, packet.data(), static_cast<int>(packet.size()));
+        if (!SDL_SendJoystickEffect(joystick, packet.data(), static_cast<int>(packet.size())) &&
+            now_us >= impl->next_effect_error_us.load(std::memory_order_relaxed)) {
+            // Stock SDL's evdev backend answers every raw packet with SDL_Unsupported; a pad that
+            // the kernel's hid-nintendo driver owns lands there, and Bluetooth is the usual way
+            // that happens. Silence here reads as "the engine does nothing", so say it once in
+            // a while instead.
+            impl->next_effect_error_us.store(now_us + 10'000'000, std::memory_order_relaxed);
+            LOG_WARNING(Input, "RenHDrum: the controller refused the rumble packet: {}",
+                        SDL_GetError());
+        }
     }
 }
 
