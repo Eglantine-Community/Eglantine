@@ -87,6 +87,8 @@ public:
     [[nodiscard]] u32 TranslateProgramAddress(u32 address) const override;
 
     [[nodiscard]] bool IsNativeProgram() const override;
+    [[nodiscard]] std::span<const Shader::Ampere::NativeRegisterRemap> NativeRegisterRemaps()
+        const override;
 
     [[nodiscard]] bool IsCbufStorageBufferPointer(u32 index, u32 offset) override;
 
@@ -155,6 +157,8 @@ protected:
     GPUVAddr program_base{};
 
     std::vector<u64> code;
+    /// Parsed from `code` when first asked for.
+    mutable std::optional<std::vector<Shader::Ampere::NativeRegisterRemap>> register_remaps;
     ::Common::unordered_map<u32, Shader::TextureType> texture_types;
     ::Common::unordered_map<u32, Shader::TexturePixelFormat> texture_pixel_formats;
     ::Common::unordered_map<u64, u32> cbuf_values;
@@ -336,6 +340,8 @@ public:
     [[nodiscard]] u32 TranslateProgramAddress(u32 address) const override;
 
     [[nodiscard]] bool IsNativeProgram() const override;
+    [[nodiscard]] std::span<const Shader::Ampere::NativeRegisterRemap> NativeRegisterRemaps()
+        const override;
 
     [[nodiscard]] bool IsCbufStorageBufferPointer(u32 index, u32 offset) override;
 
@@ -375,6 +381,8 @@ public:
 
 private:
     std::vector<u64> code;
+    /// Parsed from `code` when first asked for.
+    mutable std::optional<std::vector<Shader::Ampere::NativeRegisterRemap>> register_remaps;
     ::Common::unordered_map<u32, Shader::TextureType> texture_types;
     ::Common::unordered_map<u32, Shader::TexturePixelFormat> texture_pixel_formats;
     ::Common::unordered_map<u64, u32> cbuf_values;

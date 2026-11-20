@@ -87,6 +87,11 @@ bool StageCache::Recorder::IsNativeProgram() const {
     return inner.IsNativeProgram();
 }
 
+std::span<const Shader::Ampere::NativeRegisterRemap> StageCache::Recorder::NativeRegisterRemaps()
+    const {
+    return inner.NativeRegisterRemaps();
+}
+
 bool StageCache::Recorder::IsCbufStorageBufferPointer(u32 index, u32 offset) {
     return Log(StoragePointer, index, offset, 0, inner.IsCbufStorageBufferPointer(index, offset)) != 0;
 }

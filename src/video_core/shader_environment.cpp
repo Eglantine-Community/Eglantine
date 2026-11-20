@@ -75,6 +75,7 @@ std::vector<u64> LayOutLoweredNativeCode(std::span<const u64> header,
     // Keep the original padding ABI, then retain the native address map as
     // unreachable data. Existing disk-cache serialization carries it with code.
     code.push_back(0);
+    Shader::Ampere::AppendNativeRegisterRemaps(code, lowered.register_remaps);
     Shader::Ampere::AppendNativeAddressMap(code, lowered.source_instruction_offsets);
     return code;
 }
@@ -247,6 +248,14 @@ u32 GenericEnvironment::TranslateProgramAddress(u32 address) const {
 
 bool GenericEnvironment::IsNativeProgram() const {
     return native_source_size != 0 || Shader::Ampere::HasNativeAddressMap(code);
+}
+
+std::span<const Shader::Ampere::NativeRegisterRemap> GenericEnvironment::NativeRegisterRemaps()
+    const {
+    if (!register_remaps) {
+        register_remaps = Shader::Ampere::NativeRegisterRemaps(code);
+    }
+    return *register_remaps;
 }
 
 bool GenericEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {
@@ -1188,6 +1197,13 @@ u32 FileEnvironment::TranslateProgramAddress(u32 address) const {
 
 bool FileEnvironment::IsNativeProgram() const {
     return Shader::Ampere::HasNativeAddressMap(code);
+}
+
+std::span<const Shader::Ampere::NativeRegisterRemap> FileEnvironment::NativeRegisterRemaps() const {
+    if (!register_remaps) {
+        register_remaps = Shader::Ampere::NativeRegisterRemaps(code);
+    }
+    return *register_remaps;
 }
 
 std::vector<std::pair<u32, u32>> FileEnvironment::NullStoragePointerSlots() const {

@@ -25,8 +25,8 @@ constexpr u32 WarmCacheVersion = 35;
 
 /// What the builder finds in the game files, recorded in the precache's count file. A file built by
 /// an older builder is rebuilt at boot (RefreshWarmFiles). 2: Mario Kart World's .esetb effects.
-/// 3: .ptcl particle effects (Fire Emblem).
-constexpr u32 WarmBuilderVersion = 3;
+/// 3: .ptcl particle effects (Fire Emblem). 4: lowered code with register remaps (other hashes).
+constexpr u32 WarmBuilderVersion = 4;
 
 using ComputeKey = std::array<u8, 24>;
 

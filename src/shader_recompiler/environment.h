@@ -14,7 +14,10 @@
 #include <vector>
 #include "common/container/unordered_map.h"
 
+#include <span>
+
 #include "common/common_types.h"
+#include "shader_recompiler/frontend/ampere/program_address_map.h"
 #include "shader_recompiler/program_header.h"
 #include "shader_recompiler/shader_info.h"
 #include "shader_recompiler/stage.h"
@@ -91,6 +94,13 @@ public:
     /// A Switch 2 native program lowered to Maxwell instructions. Its storage buffer pointers are
     /// raw 8-byte arguments in constant buffers, without the NVN descriptor layout.
     [[nodiscard]] virtual bool IsNativeProgram() const { return false; }
+
+    /// Native programs: the register remaps of the lowered code (Ampere::NativeRegisterRemap),
+    /// ordered by address. An environment holding lowered code must return them, or the
+    /// translator reads the low quartets themselves.
+    [[nodiscard]] virtual std::span<const Ampere::NativeRegisterRemap> NativeRegisterRemaps() const {
+        return {};
+    }
 
     /// Native programs: whether the 8-byte constant at (index, offset) is a mapped GPU address.
     /// Native argument tables mix pointers with scalars (sizes, strides).
