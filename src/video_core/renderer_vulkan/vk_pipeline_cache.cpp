@@ -24,6 +24,7 @@
 #include <numeric>
 #include <optional>
 #include <span>
+#include <ranges>
 #include <string_view>
 #include <thread>
 #include <unordered_set>
@@ -471,6 +472,23 @@ bool EnvFlagSet(const char* name) {
     return false;
 }
 
+bool RadvSkipsDiskCache() {
+    if (const char* aco_debug = std::getenv("ACO_DEBUG"); aco_debug != nullptr && *aco_debug) {
+        return true;
+    }
+    const char* radv_debug = std::getenv("RADV_DEBUG");
+    if (radv_debug == nullptr) {
+        return false;
+    }
+    // A comma-separated list of flags.
+    for (const auto flag : std::views::split(std::string_view{radv_debug}, ',')) {
+        if (std::string_view{flag.begin(), flag.end()} == "nocache") {
+            return true;
+        }
+    }
+    return false;
+}
+
 // NVIDIA's and AMD's drivers keep a disk cache of built pipelines of their own. Eden's copy on top
 // only kept every pipeline the title ever built in host memory (title 1: a 245 MB file, ~0.35 GB
 // of RAM for the session) and copied it whole at each save, which stalled frames; pipelines built
@@ -481,8 +499,11 @@ bool DriverCachesPipelines(const Device& device) {
     case VK_DRIVER_ID_AMD_PROPRIETARY:
         return true;
     case VK_DRIVER_ID_MESA_RADV:
-        // RADV uses Mesa's on-disk shader cache unless the user turns it off.
-        return !EnvFlagSet("MESA_SHADER_CACHE_DISABLE") && !EnvFlagSet("MESA_GLSL_CACHE_DISABLE");
+        // RADV uses Mesa's on-disk shader cache unless the user turns it off, or RADV skips it:
+        // RADV_DEBUG=nocache, and ACO_DEBUG flags that change code generation
+        // (radv_device.c, disable_internal_cache).
+        return !EnvFlagSet("MESA_SHADER_CACHE_DISABLE") &&
+               !EnvFlagSet("MESA_GLSL_CACHE_DISABLE") && !RadvSkipsDiskCache();
     default:
         return false;
     }
