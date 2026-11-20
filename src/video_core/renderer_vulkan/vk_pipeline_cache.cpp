@@ -97,6 +97,11 @@ constexpr u32 MIN_COMPATIBLE_CACHE_VERSION = 20;
 constexpr size_t VULKAN_CACHE_FLUSH_PIPELINES = 128;
 constexpr size_t VULKAN_CACHE_FLUSH_MIN_SECONDS = 30;
 constexpr std::array<char, 8> VULKAN_CACHE_MAGIC_NUMBER{'y', 'u', 'z', 'u', 'v', 'k', 'c', 'h'};
+// Version of the driver pipeline cache file (vulkan_pipelines.bin), separate from CACHE_VERSION: the
+// driver checks its own header (vendor, device, driver UUID) and finds pipelines by their SPIR-V,
+// so a translation change doesn't make the file stale. Bump it only when this file's layout
+// changes. 35 is the CACHE_VERSION the existing files were written with.
+constexpr u32 DRIVER_CACHE_VERSION = 35;
 
 template <typename Container>
 auto MakeSpan(Container& container) {
@@ -841,7 +846,7 @@ PipelineCache::~PipelineCache() {
             workers.WaitForRequests();
         }
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
-                                     CACHE_VERSION);
+                                     DRIVER_CACHE_VERSION);
     }
 }
 
@@ -1207,7 +1212,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                 EndPipelineBuildsForCacheRead();
             }
             SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
-                                         CACHE_VERSION);
+                                         DRIVER_CACHE_VERSION);
         }
     }
 
@@ -1259,7 +1264,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         // LoadVulkanPipelineCache deletes a file it can't use.
         const bool existed = Common::FS::Exists(vulkan_pipeline_cache_filename);
         vulkan_pipeline_cache =
-            LoadVulkanPipelineCache(vulkan_pipeline_cache_filename, CACHE_VERSION);
+            LoadVulkanPipelineCache(vulkan_pipeline_cache_filename, DRIVER_CACHE_VERSION);
         vulkan_pipeline_cache_found = existed && Common::FS::Exists(vulkan_pipeline_cache_filename);
     }
 
@@ -1528,7 +1533,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     // a build runs (CanReadPipelineCacheDuringBuilds).
     if (use_vulkan_pipeline_cache) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
-                                     CACHE_VERSION);
+                                     DRIVER_CACHE_VERSION);
         size_t size = 0;
         vulkan_pipeline_cache.Read(&size, nullptr);
         last_cache_size.store(size, std::memory_order_relaxed);
@@ -1617,7 +1622,7 @@ void PipelineCache::QueueVulkanPipelineCacheFlush() {
     last_flush = now;
     serialization_thread.QueueWork([this] {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
-                                     CACHE_VERSION);
+                                     DRIVER_CACHE_VERSION);
         size_t size = 0;
         vulkan_pipeline_cache.Read(&size, nullptr);
         last_cache_size.store(size, std::memory_order_relaxed);
