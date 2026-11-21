@@ -517,8 +517,8 @@ public:
         std::ranges::sort(effects.methods);
         effects.methods.erase(std::unique(effects.methods.begin(), effects.methods.end()),
                               effects.methods.end());
-        for (const auto& entry : states) {
-            effects.instructions.push_back(entry.first / 2);
+        for (const auto& state_entry : states) {
+            effects.instructions.push_back(state_entry.first / 2);
         }
         std::ranges::sort(effects.instructions);
         effects.instructions.erase(

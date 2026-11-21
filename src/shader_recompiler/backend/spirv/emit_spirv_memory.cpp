@@ -36,7 +36,14 @@ Id StoragePointer(EmitContext& ctx, const IR::Value& binding, const IR::Value& o
     if (!binding.IsImmediate()) {
         throw NotImplementedException("Dynamic storage buffer indexing");
     }
-    const Id ssbo{ctx.ssbos[binding.U32()].*member_ptr};
+    const u32 ssbo_index{binding.U32()};
+    if (ssbo_index >= ctx.ssbos.size()) {
+        return Id{};
+    }
+    const Id ssbo{ctx.ssbos[ssbo_index].*member_ptr};
+    if (!Sirit::ValidId(ssbo)) {
+        return Id{};
+    }
     const Id index{StorageIndex(ctx, offset, element_size, index_offset)};
     return ctx.OpAccessChain(type_def.element, ssbo, ctx.u32_zero_value, index);
 }
@@ -46,6 +53,9 @@ Id LoadStorage(EmitContext& ctx, const IR::Value& binding, const IR::Value& offs
                Id StorageDefinitions::*member_ptr, u32 index_offset = 0) {
     const Id pointer{
         StoragePointer(ctx, binding, offset, type_def, element_size, member_ptr, index_offset)};
+    if (!Sirit::ValidId(pointer)) {
+        return ctx.ConstantNull(result_type);
+    }
     return ctx.OpLoad(result_type, pointer);
 }
 
@@ -60,6 +70,9 @@ void WriteStorage(EmitContext& ctx, const IR::Value& binding, const IR::Value& o
                   Id StorageDefinitions::*member_ptr, u32 index_offset = 0) {
     const Id pointer{
         StoragePointer(ctx, binding, offset, type_def, element_size, member_ptr, index_offset)};
+    if (!Sirit::ValidId(pointer)) {
+        return;
+    }
     ctx.OpStore(pointer, value);
 }
 
@@ -73,6 +86,9 @@ void WriteStorageByCasLoop(EmitContext& ctx, const IR::Value& binding, const IR:
                            Id value, Id bit_offset, Id bit_count) {
     const Id pointer{StoragePointer(ctx, binding, offset, ctx.storage_types.U32, sizeof(u32),
                                     &StorageDefinitions::U32)};
+    if (!Sirit::ValidId(pointer)) {
+        return;
+    }
     ctx.OpFunctionCall(ctx.TypeVoid(), ctx.write_storage_cas_loop_func, pointer, value, bit_offset,
                        bit_count);
 }

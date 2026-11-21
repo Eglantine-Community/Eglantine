@@ -212,12 +212,16 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
         return;
     }
 
-    if (!shaders->IsValid() && Settings::values.frame_gen_type.GetValue() != Settings::FrameGenType::Fsr3) {
-        unavailable = true;
-        state.store(shaders->IsDeviceSupported() ? VideoCore::FrameGenState::MissingLosslessDll
-                                                 : VideoCore::FrameGenState::UnsupportedGpu,
-                    std::memory_order_relaxed);
-        return;
+    const bool requested_fsr3 =
+        Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::Fsr3;
+    const bool use_fsr3 = requested_fsr3 || !shaders->IsValid();
+
+    if (!shaders->IsValid() && !requested_fsr3) {
+        static bool logged_fallback = false;
+        if (!logged_fallback) {
+            LOG_INFO(Render_Vulkan, "LSFG shaders unavailable, falling back to FSR 3 Frame Generation");
+            logged_fallback = true;
+        }
     }
 
     if (!frame->storage_view) {
@@ -245,8 +249,6 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
     warm_streak = warm ? warm_streak + 1 : 0;
     generated = warm && warm_streak >= LSFG_RECURRENCE_FRAMES && plan.generations > 0;
     generated_frames.fetch_add(GeneratedFrameCount(), std::memory_order_relaxed);
-
-    const bool use_fsr3 = Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::Fsr3;
 
     if (use_fsr3 && fsr3_chain) {
         scheduler.RequestOutsideRenderPassOperationContext();
@@ -295,8 +297,9 @@ size_t FrameGen::GeneratedFrameCount() const {
 }
 
 void FrameGen::GenerateInto(const Device& device, Frame* destination, size_t generation) {
-    const bool use_fsr3 = Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::Fsr3;
-
+    const bool use_fsr3 =
+        Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::Fsr3 ||
+        (shaders && !shaders->IsValid());
     if (use_fsr3 && fsr3_chain) {
         const f32 blend = static_cast<f32>(generation + 1) / static_cast<f32>(last_generations + 1);
         const f32 flow_scale = ConfiguredFlowScale(peak_guest_extent, built_extent);
@@ -327,7 +330,11 @@ void FrameGen::Rebuild(const Device& device, VkExtent2D extent, VkFormat format,
 
     built_flow_scale = flow_scale;
 
-    if (Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::Fsr3) {
+    const bool use_fsr3 =
+        Settings::values.frame_gen_type.GetValue() == Settings::FrameGenType::Fsr3 ||
+        (shaders && !shaders->IsValid());
+
+    if (use_fsr3) {
         fsr3_chain.emplace(device, memory_allocator, extent, format);
     } else {
         chain.emplace(device, memory_allocator, *shaders, extent, format, built_flow_scale);

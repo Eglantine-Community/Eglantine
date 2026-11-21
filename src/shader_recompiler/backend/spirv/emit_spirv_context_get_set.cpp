@@ -135,6 +135,10 @@ Id GetCbuf(EmitContext& ctx, Id result_type, Id UniformDefinitions::*member_ptr,
         return ctx.OpFunctionCall(result_type, indirect_func, ctx.Def(binding), buffer_offset);
     }
 
+    if (binding.U32() >= ctx.cbufs.size()) {
+        return ctx.ConstantNull(result_type);
+    }
+
     const Id cbuf{ctx.cbufs[binding.U32()].*member_ptr};
     const Id access_chain{ctx.OpAccessChain(uniform_type, cbuf, ctx.u32_zero_value, buffer_offset)};
     const Id val = ctx.OpLoad(result_type, access_chain);

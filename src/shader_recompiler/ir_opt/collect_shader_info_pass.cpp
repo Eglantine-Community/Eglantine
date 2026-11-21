@@ -18,6 +18,9 @@ void AddConstantBufferDescriptor(Info& info, u32 index, u32 count) {
     if (count != 1) {
         throw NotImplementedException("Constant buffer descriptor indexing");
     }
+    if (index >= Info::MAX_CBUFS) {
+        return;
+    }
     if ((info.constant_buffer_mask & (1U << index)) != 0) {
         return;
     }
@@ -547,13 +550,15 @@ void VisitUsages(Info& info, IR::Inst& inst) {
         const IR::Value index{inst.Arg(0)};
         const IR::Value offset{inst.Arg(1)};
         if (index.IsImmediate()) {
-            AddConstantBufferDescriptor(info, index.U32(), 1);
-            u32 element_size = GetElementSize(info.used_constant_buffer_types, inst.GetOpcode());
-            u32& size{info.constant_buffer_used_sizes[index.U32()]};
-            if (offset.IsImmediate()) {
-                size = Common::AlignUp((std::max)(size, offset.U32() + element_size), 16u);
-            } else {
-                size = 0x10'000;
+            if (index.U32() < Info::MAX_CBUFS) {
+                AddConstantBufferDescriptor(info, index.U32(), 1);
+                u32 element_size = GetElementSize(info.used_constant_buffer_types, inst.GetOpcode());
+                u32& size{info.constant_buffer_used_sizes[index.U32()]};
+                if (offset.IsImmediate()) {
+                    size = Common::AlignUp((std::max)(size, offset.U32() + element_size), 16u);
+                } else {
+                    size = 0x10'000;
+                }
             }
         } else {
             AddRegisterIndexedLdc(info);

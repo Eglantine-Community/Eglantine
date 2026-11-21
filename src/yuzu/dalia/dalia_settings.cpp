@@ -529,8 +529,8 @@ void DaliaSettingsDialog::LoadSettings() {
     m_check_disk_shaders->setChecked(Settings::values.use_disk_shader_cache.GetValue());
     m_check_driver_cache->setChecked(Settings::values.use_vulkan_driver_pipeline_cache.GetValue());
     m_check_reactive_flushing->setChecked(Settings::values.use_reactive_flushing.GetValue());
-    m_check_gpl->setChecked(Settings::values.use_graphics_pipeline_library.GetValue());
-    m_check_precompile_shaders->setChecked(Settings::values.precompile_shaders.GetValue());
+    m_check_gpl->setChecked(true);
+    m_check_precompile_shaders->setChecked(Settings::values.precache_shaders.GetValue() != Settings::PrecacheShaders::Off);
 
     const auto cpu_acc = Settings::values.cpu_accuracy.GetValue();
     for (int i = 0; i < m_combo_cpu_accuracy->count(); ++i) {
@@ -579,8 +579,8 @@ void DaliaSettingsDialog::SaveSettings() {
     Settings::values.use_disk_shader_cache.SetValue(m_check_disk_shaders->isChecked());
     Settings::values.use_vulkan_driver_pipeline_cache.SetValue(m_check_driver_cache->isChecked());
     Settings::values.use_reactive_flushing.SetValue(m_check_reactive_flushing->isChecked());
-    Settings::values.use_graphics_pipeline_library.SetValue(m_check_gpl->isChecked());
-    Settings::values.precompile_shaders.SetValue(m_check_precompile_shaders->isChecked());
+    Settings::values.precache_shaders.SetValue(
+        m_check_precompile_shaders->isChecked() ? Settings::PrecacheShaders::Always : Settings::PrecacheShaders::Off);
 
     Settings::values.cpu_accuracy.SetValue(
         static_cast<Settings::CpuAccuracy>(m_combo_cpu_accuracy->currentData().toUInt()));

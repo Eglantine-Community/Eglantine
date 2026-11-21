@@ -27,8 +27,7 @@ void EmuThread::run() {
     gpu.ObtainContext();
 
     emit LoadProgress(VideoCore::LoadCallbackStage::Prepare, 0, 0);
-    if (Settings::values.use_disk_shader_cache.GetValue() ||
-        Settings::values.precompile_shaders.GetValue()) {
+    if (Settings::values.use_disk_shader_cache.GetValue()) {
         QtCommon::system->Renderer().ReadRasterizer()->LoadDiskResources(
             QtCommon::system->GetApplicationProcessProgramID(), stop_token,
             [this](VideoCore::LoadCallbackStage stage, std::size_t value, std::size_t total) {
@@ -80,8 +79,7 @@ void EmuThread::run() {
 }
 
 void EmuThread::ReloadDiskShaderCache(u64 program_id) {
-    if (!Settings::values.use_disk_shader_cache.GetValue() &&
-        !Settings::values.precompile_shaders.GetValue()) {
+    if (!Settings::values.use_disk_shader_cache.GetValue()) {
         return;
     }
 

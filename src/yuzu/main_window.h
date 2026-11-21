@@ -64,6 +64,17 @@ class QSlider;
 class QHBoxLayout;
 class WaitTreeWidget;
 class PerformanceOverlay;
+class DaliaGameDetailsDialog;
+class DaliaGameplayOverlay;
+class DaliaSettingsDialog;
+class DaliaDiagnosticsDialog;
+class DaliaMainContainer;
+class DaliaSidebar;
+class DaliaHomePage;
+class DaliaLibraryPage;
+class DaliaControllersPage;
+class DaliaSettingsPage;
+class DaliaSystemPage;
 #ifdef HAS_RESHADE
 class ConfigurePostProcessing;
 #endif
@@ -171,6 +182,19 @@ private:
 class MainWindow : public QMainWindow {
     Q_OBJECT
 
+    friend class SwitchActionBar;
+    friend class DaliaGameDetailsDialog;
+    friend class DaliaGameplayOverlay;
+    friend class DaliaSettingsDialog;
+    friend class DaliaDiagnosticsDialog;
+    friend class DaliaMainContainer;
+    friend class DaliaSidebar;
+    friend class DaliaHomePage;
+    friend class DaliaLibraryPage;
+    friend class DaliaControllersPage;
+    friend class DaliaSettingsPage;
+    friend class DaliaSystemPage;
+
     /// Max number of recently loaded items to keep track of
     static const int max_recent_files_item = 10;
 
@@ -184,6 +208,7 @@ public:
     void AcceptDropEvent(QDropEvent* event);
 
     std::filesystem::path GetShortcutPath(QtCommon::Game::ShortcutTarget target);
+    void ShowApplicationMenu(const QPoint& global_pos);
 
     /// Frames per second frame generation added since the last status bar update.
     [[nodiscard]] double FrameGenFps() const {
@@ -425,6 +450,7 @@ private slots:
     void OnToggleFilterBar();
     void OnToggleStatusBar();
     void OnTogglePerfOverlay();
+    void OnToggleGameplayOverlay();
 #ifdef HAS_RESHADE
     void OnPostProcessingShaders();
 #endif
@@ -536,6 +562,7 @@ private:
 
     GRenderWindow* render_window = nullptr;
     GameList* game_list = nullptr;
+    DaliaMainContainer* dalia_main_container = nullptr;
     LoadingScreen* loading_screen = nullptr;
     QTimer shutdown_timer;
     QTimer emu_terminate_timer;
@@ -543,6 +570,7 @@ private:
     QFutureWatcher<bool> nextendo_session_watcher;
     OverlayDialog* shutdown_dialog{};
     PerformanceOverlay* perf_overlay = nullptr;
+    DaliaGameplayOverlay* dalia_gameplay_overlay = nullptr;
 #ifdef HAS_RESHADE
     ConfigurePostProcessing* post_processing_dialog = nullptr;
 #endif

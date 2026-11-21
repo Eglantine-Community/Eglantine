@@ -15,6 +15,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QKeyEvent>
 #include <QList>
 #include <QListView>
 #include <QMenu>
@@ -42,6 +43,7 @@
 #include "yuzu/game/carousel.h"
 #include "yuzu/game/game_grid.h"
 #include "yuzu/game/game_list.h"
+#include "yuzu/dalia/dalia_game_details.h"
 #include "yuzu/game/game_tree.h"
 #include "yuzu/game/search_field.h"
 #include "yuzu/main_window.h"
@@ -897,6 +899,39 @@ bool GameList::eventFilter(QObject* obj, QEvent* event) {
     }
 
     return QWidget::eventFilter(obj, event);
+}
+
+void GameList::keyPressEvent(QKeyEvent* event) {
+    if (event->key() == Qt::Key_Minus || event->key() == Qt::Key_Plus || event->key() == Qt::Key_X) {
+        OpenGameDetails();
+        event->accept();
+        return;
+    }
+    QWidget::keyPressEvent(event);
+}
+
+void GameList::OpenGameDetails() {
+    if (!m_currentView) return;
+    const QModelIndex cur = m_currentView->currentIndex();
+    if (!cur.isValid()) return;
+    const auto selected = cur.sibling(cur.row(), 0);
+    if (selected.data(GameListItem::TypeRole).value<GameListItemType>() != GameListItemType::Game) {
+        return;
+    }
+    const QString title = selected.data(GameListItemPath::TitleRole).toString();
+    const u64 program_id = selected.data(GameListItemPath::ProgramIdRole).toULongLong();
+    const QString file_path = selected.data(GameListItemPath::FullPathRole).toString();
+    const QPixmap icon = selected.data(Qt::DecorationRole).value<QPixmap>();
+    const QString version = cur.sibling(cur.row(), 2).data(Qt::DisplayRole).toString();
+    const QString file_size = cur.sibling(cur.row(), 4).data(Qt::DisplayRole).toString();
+    const QString play_time = selected.data(Qt::ToolTipRole).toString();
+
+    auto* dialog = new DaliaGameDetailsDialog(main_window, title, program_id, file_path, icon,
+                                             QStringLiteral("Nintendo / Verified"), version, play_time, file_size);
+    connect(dialog, &DaliaGameDetailsDialog::LaunchRequested, this, [this](const QString& path) {
+        emit GameChosen(path);
+    });
+    dialog->exec();
 }
 
 GameListPlaceholder::GameListPlaceholder(MainWindow* parent) : QWidget{parent} {

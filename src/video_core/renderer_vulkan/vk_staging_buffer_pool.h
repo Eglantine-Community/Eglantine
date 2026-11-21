@@ -40,7 +40,9 @@ public:
     StagingBufferRef Request(size_t size, MemoryUsage usage, bool deferred = false);
     void FreeDeferred(StagingBufferRef& ref);
     /// GPU access and the CPU consumer must both have finished before this call.
-    void FreeCompletedDeferred(StagingBufferRef& ref);
+    void FreeCompletedDeferred(StagingBufferRef& ref) {
+        FreeDeferred(ref);
+    }
 
     [[nodiscard]] VkBuffer StreamBuf() const noexcept {
         return *stream_buffer;

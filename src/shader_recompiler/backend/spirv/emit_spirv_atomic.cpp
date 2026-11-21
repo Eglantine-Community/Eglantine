@@ -43,7 +43,14 @@ Id StoragePointer(EmitContext& ctx, const StorageTypeDefinition& type_def,
     if (!binding.IsImmediate()) {
         throw NotImplementedException("Dynamic storage buffer indexing");
     }
-    const Id ssbo{ctx.ssbos[binding.U32()].*member_ptr};
+    const u32 ssbo_index{binding.U32()};
+    if (ssbo_index >= ctx.ssbos.size()) {
+        return Id{};
+    }
+    const Id ssbo{ctx.ssbos[ssbo_index].*member_ptr};
+    if (!Sirit::ValidId(ssbo)) {
+        return Id{};
+    }
     const Id index{StorageIndex(ctx, offset, element_size)};
     return ctx.OpAccessChain(type_def.element, ssbo, ctx.u32_zero_value, index);
 }
@@ -65,6 +72,9 @@ Id StorageAtomicU32(EmitContext& ctx, const IR::Value& binding, const IR::Value&
                     Id (Sirit::Module::*atomic_func)(Id, Id, Id, Id, Id)) {
     const Id pointer{StoragePointer(ctx, ctx.storage_types.U32, &StorageDefinitions::U32, binding,
                                     offset, sizeof(u32))};
+    if (!Sirit::ValidId(pointer)) {
+        return ctx.ConstantNull(ctx.U32[1]);
+    }
     const auto [scope, semantics]{AtomicArgs(ctx)};
     return (ctx.*atomic_func)(ctx.U32[1], pointer, scope, semantics, value);
 }
@@ -80,12 +90,18 @@ Id StorageAtomicU64(EmitContext& ctx, const IR::Value& binding, const IR::Value&
     if (ctx.profile.support_int64_atomics) {
         const Id pointer{StoragePointer(ctx, ctx.storage_types.U64, &StorageDefinitions::U64,
                                         binding, offset, sizeof(u64))};
+        if (!Sirit::ValidId(pointer)) {
+            return ctx.ConstantNull(ctx.U64);
+        }
         const auto [scope, semantics]{AtomicArgs(ctx)};
         return (ctx.*atomic_func)(ctx.U64, pointer, scope, semantics, value);
     }
     LOG_WARNING(Shader_SPIRV, "Int64 atomics not supported, fallback to non-atomic");
     const Id pointer{StoragePointer(ctx, ctx.storage_types.U32x2, &StorageDefinitions::U32x2,
                                     binding, offset, sizeof(u32[2]))};
+    if (!Sirit::ValidId(pointer)) {
+        return ctx.ConstantNull(ctx.U64);
+    }
     const Id original_value{ctx.OpBitcast(ctx.U64, ctx.OpLoad(ctx.U32[2], pointer))};
     const Id result{(ctx.*non_atomic_func)(ctx.U64, value, original_value)};
     ctx.OpStore(pointer, ctx.OpBitcast(ctx.U32[2], result));
@@ -102,6 +118,9 @@ Id StorageAtomicU32x2(EmitContext& ctx, const IR::Value& binding, const IR::Valu
     LOG_WARNING(Shader_SPIRV, "Int64 atomics not supported, fallback to non-atomic");
     const Id pointer{StoragePointer(ctx, ctx.storage_types.U32x2, &StorageDefinitions::U32x2,
                                     binding, offset, sizeof(u32[2]))};
+    if (!Sirit::ValidId(pointer)) {
+        return ctx.ConstantNull(ctx.U32[2]);
+    }
     const Id original_value{ctx.OpLoad(ctx.U32[2], pointer)};
     const Id result{(ctx.*non_atomic_func)(ctx.U32[2], value, original_value)};
     ctx.OpStore(pointer, result);
@@ -253,6 +272,9 @@ Id EmitStorageAtomicCompareExchange32(EmitContext& ctx, const IR::Value& binding
                                       const IR::Value& offset, Id comparator, Id value) {
     const Id pointer{StoragePointer(ctx, ctx.storage_types.U32, &StorageDefinitions::U32, binding,
                                     offset, sizeof(u32))};
+    if (!Sirit::ValidId(pointer)) {
+        return ctx.ConstantNull(ctx.U32[1]);
+    }
     const auto [scope, semantics]{AtomicArgs(ctx)};
     return ctx.OpAtomicCompareExchange(ctx.U32[1], pointer, scope, semantics, semantics, value,
                                        comparator);
@@ -311,12 +333,18 @@ Id EmitStorageAtomicExchange64(EmitContext& ctx, const IR::Value& binding, const
     if (ctx.profile.support_int64_atomics) {
         const Id pointer{StoragePointer(ctx, ctx.storage_types.U64, &StorageDefinitions::U64,
                                         binding, offset, sizeof(u64))};
+        if (!Sirit::ValidId(pointer)) {
+            return ctx.ConstantNull(ctx.U64);
+        }
         const auto [scope, semantics]{AtomicArgs(ctx)};
         return ctx.OpAtomicExchange(ctx.U64, pointer, scope, semantics, value);
     }
     LOG_WARNING(Shader_SPIRV, "Int64 atomics not supported, fallback to non-atomic");
     const Id pointer{StoragePointer(ctx, ctx.storage_types.U32x2, &StorageDefinitions::U32x2,
                                     binding, offset, sizeof(u32[2]))};
+    if (!Sirit::ValidId(pointer)) {
+        return ctx.ConstantNull(ctx.U64);
+    }
     const Id original{ctx.OpBitcast(ctx.U64, ctx.OpLoad(ctx.U32[2], pointer))};
     ctx.OpStore(pointer, value);
     return original;
@@ -367,6 +395,9 @@ Id EmitStorageAtomicExchange32x2(EmitContext& ctx, const IR::Value& binding,
     LOG_WARNING(Shader_SPIRV, "Int64 atomics not supported, fallback to non-atomic");
     const Id pointer{StoragePointer(ctx, ctx.storage_types.U32x2, &StorageDefinitions::U32x2,
                                     binding, offset, sizeof(u32[2]))};
+    if (!Sirit::ValidId(pointer)) {
+        return ctx.ConstantNull(ctx.U32[2]);
+    }
     const Id original{ctx.OpLoad(ctx.U32[2], pointer)};
     ctx.OpStore(pointer, value);
     return original;
@@ -374,14 +405,22 @@ Id EmitStorageAtomicExchange32x2(EmitContext& ctx, const IR::Value& binding,
 
 Id EmitStorageAtomicAddF32(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
                            Id value) {
-    const Id ssbo{ctx.ssbos[binding.U32()].U32};
+    const u32 ssbo_index{binding.U32()};
+    if (ssbo_index >= ctx.ssbos.size() || !Sirit::ValidId(ctx.ssbos[ssbo_index].U32)) {
+        return ctx.ConstantNull(ctx.F32[1]);
+    }
+    const Id ssbo{ctx.ssbos[ssbo_index].U32};
     const Id base_index{StorageIndex(ctx, offset, sizeof(u32))};
     return ctx.OpFunctionCall(ctx.F32[1], ctx.f32_add_cas, base_index, value, ssbo);
 }
 
 Id EmitStorageAtomicAddF16x2(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
                              Id value) {
-    const Id ssbo{ctx.ssbos[binding.U32()].U32};
+    const u32 ssbo_index{binding.U32()};
+    if (ssbo_index >= ctx.ssbos.size() || !Sirit::ValidId(ctx.ssbos[ssbo_index].U32)) {
+        return ctx.ConstantNull(ctx.U32[1]);
+    }
+    const Id ssbo{ctx.ssbos[ssbo_index].U32};
     const Id base_index{StorageIndex(ctx, offset, sizeof(u32))};
     const Id result{ctx.OpFunctionCall(ctx.F16[2], ctx.f16x2_add_cas, base_index, value, ssbo)};
     return ctx.OpBitcast(ctx.U32[1], result);
@@ -389,7 +428,11 @@ Id EmitStorageAtomicAddF16x2(EmitContext& ctx, const IR::Value& binding, const I
 
 Id EmitStorageAtomicAddF32x2(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
                              Id value) {
-    const Id ssbo{ctx.ssbos[binding.U32()].U32};
+    const u32 ssbo_index{binding.U32()};
+    if (ssbo_index >= ctx.ssbos.size() || !Sirit::ValidId(ctx.ssbos[ssbo_index].U32)) {
+        return ctx.ConstantNull(ctx.U32[1]);
+    }
+    const Id ssbo{ctx.ssbos[ssbo_index].U32};
     const Id base_index{StorageIndex(ctx, offset, sizeof(u32))};
     const Id result{ctx.OpFunctionCall(ctx.F32[2], ctx.f32x2_add_cas, base_index, value, ssbo)};
     return ctx.OpPackHalf2x16(ctx.U32[1], result);
@@ -397,7 +440,11 @@ Id EmitStorageAtomicAddF32x2(EmitContext& ctx, const IR::Value& binding, const I
 
 Id EmitStorageAtomicMinF16x2(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
                              Id value) {
-    const Id ssbo{ctx.ssbos[binding.U32()].U32};
+    const u32 ssbo_index{binding.U32()};
+    if (ssbo_index >= ctx.ssbos.size() || !Sirit::ValidId(ctx.ssbos[ssbo_index].U32)) {
+        return ctx.ConstantNull(ctx.U32[1]);
+    }
+    const Id ssbo{ctx.ssbos[ssbo_index].U32};
     const Id base_index{StorageIndex(ctx, offset, sizeof(u32))};
     const Id result{ctx.OpFunctionCall(ctx.F16[2], ctx.f16x2_min_cas, base_index, value, ssbo)};
     return ctx.OpBitcast(ctx.U32[1], result);
@@ -405,7 +452,11 @@ Id EmitStorageAtomicMinF16x2(EmitContext& ctx, const IR::Value& binding, const I
 
 Id EmitStorageAtomicMinF32x2(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
                              Id value) {
-    const Id ssbo{ctx.ssbos[binding.U32()].U32};
+    const u32 ssbo_index{binding.U32()};
+    if (ssbo_index >= ctx.ssbos.size() || !Sirit::ValidId(ctx.ssbos[ssbo_index].U32)) {
+        return ctx.ConstantNull(ctx.U32[1]);
+    }
+    const Id ssbo{ctx.ssbos[ssbo_index].U32};
     const Id base_index{StorageIndex(ctx, offset, sizeof(u32))};
     const Id result{ctx.OpFunctionCall(ctx.F32[2], ctx.f32x2_min_cas, base_index, value, ssbo)};
     return ctx.OpPackHalf2x16(ctx.U32[1], result);
@@ -413,7 +464,11 @@ Id EmitStorageAtomicMinF32x2(EmitContext& ctx, const IR::Value& binding, const I
 
 Id EmitStorageAtomicMaxF16x2(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
                              Id value) {
-    const Id ssbo{ctx.ssbos[binding.U32()].U32};
+    const u32 ssbo_index{binding.U32()};
+    if (ssbo_index >= ctx.ssbos.size() || !Sirit::ValidId(ctx.ssbos[ssbo_index].U32)) {
+        return ctx.ConstantNull(ctx.U32[1]);
+    }
+    const Id ssbo{ctx.ssbos[ssbo_index].U32};
     const Id base_index{StorageIndex(ctx, offset, sizeof(u32))};
     const Id result{ctx.OpFunctionCall(ctx.F16[2], ctx.f16x2_max_cas, base_index, value, ssbo)};
     return ctx.OpBitcast(ctx.U32[1], result);
@@ -421,7 +476,11 @@ Id EmitStorageAtomicMaxF16x2(EmitContext& ctx, const IR::Value& binding, const I
 
 Id EmitStorageAtomicMaxF32x2(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
                              Id value) {
-    const Id ssbo{ctx.ssbos[binding.U32()].U32};
+    const u32 ssbo_index{binding.U32()};
+    if (ssbo_index >= ctx.ssbos.size() || !Sirit::ValidId(ctx.ssbos[ssbo_index].U32)) {
+        return ctx.ConstantNull(ctx.U32[1]);
+    }
+    const Id ssbo{ctx.ssbos[ssbo_index].U32};
     const Id base_index{StorageIndex(ctx, offset, sizeof(u32))};
     const Id result{ctx.OpFunctionCall(ctx.F32[2], ctx.f32x2_max_cas, base_index, value, ssbo)};
     return ctx.OpPackHalf2x16(ctx.U32[1], result);

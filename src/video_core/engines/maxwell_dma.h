@@ -28,10 +28,6 @@ namespace VideoCore {
 class RasterizerInterface;
 }
 
-namespace VideoCommon {
-class GpuSplit;
-}
-
 namespace Tegra {
 namespace DMA {
 
@@ -257,11 +253,6 @@ public:
     /// Write multiple values to the register identified by method.
     void CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) override;
 
-    void FrontCallMethod(VideoCommon::GpuSplit& split, u32 method, u32 method_argument,
-                         bool is_last_call, const GPUVAddr* segment);
-    void FrontCallMultiMethod(VideoCommon::GpuSplit& split, u32 method, const u32* base_start,
-                              u32 amount, u32 methods_pending, const GPUVAddr* segment);
-
 private:
     /// Performs the copy from the source buffer to the destination buffer as configured in the
     /// registers.
@@ -276,7 +267,6 @@ private:
     void ReleaseSemaphore();
 
     void ConsumeSinkImpl(Core::System& system) override;
-    void FrontNoteLaunchDma(VideoCommon::GpuSplit& split);
 
     MemoryManager& memory_manager;
     VideoCore::RasterizerInterface* rasterizer = nullptr;
@@ -319,7 +309,7 @@ private:
             };
             std::array<u32, NUM_REGS> reg_array;
         };
-    } regs{}, front_regs{};
+    } regs{};
     static_assert(sizeof(Regs) == NUM_REGS * 4);
 
 #define ASSERT_REG_POSITION(field_name, position)                                                  \

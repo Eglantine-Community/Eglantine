@@ -15,6 +15,9 @@
 #include "common/settings_enums.h"
 #include "frontend_common/settings_generator.h"
 #include "render/performance_overlay.h"
+#include "yuzu/dalia/dalia_gameplay_overlay.h"
+#include "yuzu/dalia/dalia_library_page.h"
+#include "yuzu/dalia/dalia_main_container.h"
 #ifdef HAS_RESHADE
 #include "configuration/configure_post_processing.h"
 #include "video_core/post_processing/fx_preset.h"
@@ -443,6 +446,10 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     QtCommon::SetupHID();
     controller_dialog->refreshConfiguration();
 
+    setWindowIcon(QIcon(QStringLiteral(":/img/dalia.png")));
+    auto* dalia_overlay_shortcut = new QShortcut(QKeySequence(Qt::Key_F10), this);
+    connect(dalia_overlay_shortcut, &QShortcut::activated, this, &MainWindow::OnToggleGameplayOverlay);
+
     UpdateWindowTitle();
 
     show();
@@ -524,6 +531,9 @@ MainWindow::MainWindow(bool has_broken_vulkan)
         renderer_status_button->setChecked(false);
     } else {
         VkDeviceInfo::PopulateRecords(vk_device_records, this->window()->windowHandle());
+        if (dalia_main_container) {
+            dalia_main_container->RefreshVkRecords(vk_device_records);
+        }
     }
 
     // On macOS, SDL video would pump AppKit events alongside Qt and disrupt native menus.
@@ -963,7 +973,9 @@ void MainWindow::InitializeWidgets() {
 
     game_list = new GameList(QtCommon::vfs, QtCommon::provider.get(), *play_time_manager,
                              *QtCommon::system, this);
-    ui->horizontalLayout->addWidget(game_list);
+
+    dalia_main_container = new DaliaMainContainer(this, game_list, vk_device_records);
+    ui->horizontalLayout->addWidget(dalia_main_container);
 
     game_list_placeholder = new GameListPlaceholder(this);
     ui->horizontalLayout->addWidget(game_list_placeholder);
@@ -2381,6 +2393,9 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     // Update the GUI
     UpdateStatusButtons();
     if (ui->action_Single_Window_Mode->isChecked()) {
+        if (dalia_main_container) {
+            dalia_main_container->hide();
+        }
         game_list->hide();
         game_list_placeholder->hide();
     }
@@ -2480,6 +2495,12 @@ bool MainWindow::OnShutdownBegin() {
         perf_overlay->hide();
         perf_overlay->deleteLater();
         perf_overlay = nullptr;
+    }
+
+    if (dalia_gameplay_overlay) {
+        dalia_gameplay_overlay->hide();
+        dalia_gameplay_overlay->deleteLater();
+        dalia_gameplay_overlay = nullptr;
     }
 
     QtCommon::system->SetShuttingDown(true);
@@ -2585,10 +2606,15 @@ void MainWindow::OnEmulationStopped() {
     render_window->hide();
     loading_screen->hide();
     loading_screen->Clear();
-    if (game_list->IsEmpty()) {
-        game_list_placeholder->show();
+    if (dalia_main_container) {
+        dalia_main_container->show();
+        ui->menubar->hide();
     } else {
-        game_list->show();
+        if (game_list->IsEmpty()) {
+            game_list_placeholder->show();
+        } else {
+            game_list->show();
+        }
     }
     game_list->SetFilterFocus();
     tas_label->clear();
@@ -3541,6 +3567,14 @@ void MainWindow::OnLoadComplete() {
     perf_overlay = new PerformanceOverlay(this);
     perf_overlay->setVisible(ui->action_Show_Performance_Overlay->isChecked());
 
+    dalia_gameplay_overlay = new DaliaGameplayOverlay(this);
+    std::string game_title_str;
+    QtCommon::system->GetAppLoader().ReadTitle(game_title_str);
+    const QString game_title = QString::fromStdString(game_title_str);
+    const u64 prog_id = QtCommon::system->GetApplicationProcessProgramID();
+    dalia_gameplay_overlay->SetGameTitle(game_title, prog_id);
+    dalia_gameplay_overlay->setVisible(ui->action_Show_Performance_Overlay->isChecked());
+
     connect(perf_overlay, &PerformanceOverlay::closed, perf_overlay,
             [this]() { ui->action_Show_Performance_Overlay->setChecked(false); });
 }
@@ -3753,7 +3787,11 @@ void MainWindow::ToggleWindowMode() {
         if (emulation_running) {
             render_window->setVisible(true);
             render_window->setFocus();
-            game_list->hide();
+            if (dalia_main_container) {
+                dalia_main_container->hide();
+            } else {
+                game_list->hide();
+            }
         }
 
     } else {
@@ -3764,7 +3802,11 @@ void MainWindow::ToggleWindowMode() {
         if (emulation_running) {
             render_window->setVisible(true);
             render_window->RestoreGeometry();
-            game_list->show();
+            if (dalia_main_container) {
+                dalia_main_container->show();
+            } else {
+                game_list->show();
+            }
         }
     }
 }
@@ -3838,6 +3880,55 @@ void MainWindow::SetGameListMode(Settings::GameListMode mode) {
 
     CheckIconSize();
     game_list->ResetViewMode();
+    if (dalia_main_container && dalia_main_container->GetLibraryPage()) {
+        dalia_main_container->GetLibraryPage()->SyncViewModeButtons();
+    }
+}
+
+void MainWindow::ShowApplicationMenu(const QPoint& global_pos) {
+    QMenu menu(this);
+    menu.setStyleSheet(QStringLiteral(
+        "QMenu {"
+        "  background-color: #1B2029;"
+        "  color: #FFFFFF;"
+        "  border: 1px solid #282C37;"
+        "  border-radius: 8px;"
+        "  padding: 6px;"
+        "}"
+        "QMenu::item {"
+        "  padding: 8px 24px 8px 16px;"
+        "  border-radius: 6px;"
+        "}"
+        "QMenu::item:selected {"
+        "  background-color: #242A35;"
+        "  color: #48BDEB;"
+        "}"
+        "QMenu::separator {"
+        "  height: 1px;"
+        "  background-color: #242A35;"
+        "  margin: 4px 8px;"
+        "}"));
+
+    menu.addAction(ui->action_Load_File);
+    menu.addAction(ui->action_Load_Folder);
+    menu.addAction(ui->action_Install_File_NAND);
+    menu.addSeparator();
+    menu.addAction(ui->action_Root_Data_Folder);
+    menu.addAction(ui->action_Mod_Folder);
+    menu.addSeparator();
+
+    auto* toggle_menu_bar = menu.addAction(tr("Mostrar Barra de Menú Clásica"), [this] {
+        ui->menubar->setVisible(!ui->menubar->isVisible());
+    });
+    toggle_menu_bar->setCheckable(true);
+    toggle_menu_bar->setChecked(ui->menubar->isVisible());
+
+    menu.addAction(ui->action_Configure);
+    menu.addAction(ui->action_About);
+    menu.addSeparator();
+    menu.addAction(ui->action_Exit);
+
+    menu.exec(global_pos);
 }
 
 void MainWindow::SetGridView() {
@@ -4414,6 +4505,14 @@ void MainWindow::OnToggleStatusBar() {
 void MainWindow::OnTogglePerfOverlay() {
     if (perf_overlay)
         perf_overlay->setVisible(ui->action_Show_Performance_Overlay->isChecked());
+    if (dalia_gameplay_overlay)
+        dalia_gameplay_overlay->setVisible(ui->action_Show_Performance_Overlay->isChecked());
+}
+
+void MainWindow::OnToggleGameplayOverlay() {
+    if (dalia_gameplay_overlay) {
+        dalia_gameplay_overlay->ToggleVisibility();
+    }
 }
 
 #ifdef HAS_RESHADE
@@ -5154,23 +5253,14 @@ void MainWindow::OnApplicationChanged(u64 program_id) {
 
 void MainWindow::UpdateWindowTitle(std::string_view title_name, std::string_view title_version,
                                    std::string_view gpu_vendor) {
-    static const std::string build_id = std::string{Common::g_build_id};
-    static const std::string yuzu_title =
-        fmt::format("{} | {} | {}", std::string{Common::g_build_name},
-                    std::string{Common::g_build_version}, std::string{Common::g_compiler_id});
-
-    const auto override_title =
-        fmt::format(fmt::runtime(std::string(Common::g_title_bar_format_idle)), build_id);
-    const auto window_title = override_title.empty() ? yuzu_title : override_title;
-
     if (title_name.empty()) {
-        setWindowTitle(QString::fromStdString(window_title));
+        setWindowTitle(QStringLiteral("DALIA"));
     } else {
-        const auto run_title = [window_title, title_name, title_version, gpu_vendor]() {
+        const auto run_title = [title_name, title_version, gpu_vendor]() {
             if (title_version.empty()) {
-                return fmt::format("{} | {} | {}", window_title, title_name, gpu_vendor);
+                return fmt::format("DALIA | {} | {}", title_name, gpu_vendor);
             }
-            return fmt::format("{} | {} | {} | {}", window_title, title_name, title_version,
+            return fmt::format("DALIA | {} | {} | {}", title_name, title_version,
                                gpu_vendor);
         }();
         setWindowTitle(QString::fromStdString(run_title));
