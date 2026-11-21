@@ -906,6 +906,7 @@ PipelineCache::~PipelineCache() {
     }
     StopBackgroundPipelines();
     SaveUsedPipelines();
+    SavePipelineLayouts();
     if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
         if (!device.CanReadPipelineCacheDuringBuilds()) {
             // Drop queued builds, as destroying the workers would; running ones must end first.
@@ -1319,6 +1320,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     used_pipelines_filename = cache_path("vulkan_used");
     mesh_pipeline_cache_filename = cache_path("vulkan_mesh");
     used_pipelines = LoadUsedPipelines(used_pipelines_filename, MaxUsedPipelineAge(device));
+    layouts_filename = base_dir / "layouts.mythos.bin";
+    LoadPipelineLayouts();
     used_pipelines_saved = std::chrono::steady_clock::now();
     size_t skipped_pipelines = 0;
     size_t queued_graphics = 0;
@@ -3293,6 +3296,82 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     }
     LOG_ERROR(Render_Vulkan, "{}", exception.what());
     return nullptr;
+}
+
+namespace {
+constexpr u32 PipelineLayoutsMagic = 0x31594c50; // "PLY1"
+} // Anonymous namespace
+
+void PipelineCache::LoadPipelineLayouts() {
+    using VideoCommon::Nx2Perf::Opt;
+    if (layouts_filename.empty() || !VideoCommon::Nx2Perf::On(Opt::SharedPipelineLayouts) ||
+        !VideoCommon::Nx2Perf::On(Opt::SavedPipelineLayouts)) {
+        return;
+    }
+    std::ifstream file{layouts_filename, std::ios::binary};
+    u32 magic{}, count{};
+    if (!file.read(reinterpret_cast<char*>(&magic), sizeof(magic)) ||
+        magic != PipelineLayoutsMagic ||
+        !file.read(reinterpret_cast<char*>(&count), sizeof(count)) || count > 65536) {
+        return;
+    }
+    const auto begin = std::chrono::steady_clock::now();
+    size_t made{};
+    for (u32 index = 0; index < count; ++index) {
+        u32 size{};
+        if (!file.read(reinterpret_cast<char*>(&size), sizeof(size)) || size > 4096) {
+            break;
+        }
+        std::vector<u32> key(size);
+        if (!file.read(reinterpret_cast<char*>(key.data()), size * sizeof(u32))) {
+            break;
+        }
+        auto from_key = DescriptorLayoutBuilder::FromKey(device, key);
+        if (!from_key) {
+            continue;
+        }
+        try {
+            layout_cache.Insert(std::move(key), from_key->builder.CreateLayouts(
+                                                    from_key->use_push_descriptor,
+                                                    from_key->use_descriptor_buffer));
+            ++made;
+        } catch (const vk::Exception& exception) {
+            LOG_WARNING(Render_Vulkan, "Saved pipeline layout not created: {}", exception.what());
+        }
+    }
+    LOG_INFO(Render_Vulkan, "Pipeline layouts: {} of {} saved ones created at boot in {:.1f} ms",
+             made, count,
+             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin)
+                 .count());
+}
+
+void PipelineCache::SavePipelineLayouts() {
+    if (layouts_filename.empty() ||
+        !VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::SavedPipelineLayouts)) {
+        return;
+    }
+    const std::vector<std::vector<u32>> keys = layout_cache.Keys();
+    if (keys.empty()) {
+        return;
+    }
+    auto temporary{layouts_filename};
+    temporary += ".tmp";
+    {
+        std::ofstream file{temporary, std::ios::binary | std::ios::trunc};
+        const u32 count = static_cast<u32>(keys.size());
+        file.write(reinterpret_cast<const char*>(&PipelineLayoutsMagic), sizeof(PipelineLayoutsMagic));
+        file.write(reinterpret_cast<const char*>(&count), sizeof(count));
+        for (const std::vector<u32>& key : keys) {
+            const u32 size = static_cast<u32>(key.size());
+            file.write(reinterpret_cast<const char*>(&size), sizeof(size));
+            file.write(reinterpret_cast<const char*>(key.data()), size * sizeof(u32));
+        }
+        if (!file) {
+            return;
+        }
+    }
+    std::error_code error;
+    std::filesystem::rename(temporary, layouts_filename, error);
 }
 
 std::shared_ptr<const GraphicsShaderSet> PipelineCache::FindOrMakeShaderSet(

@@ -355,6 +355,10 @@ private:
     /// Layouts shared by graphics pipelines with the same descriptor layout (each pipeline holds
     /// its own by shared pointer, so they outlive this map).
     PipelineLayoutCache layout_cache;
+    /// <title>/layouts.mythos.bin: the shared layouts' keys, created at boot.
+    std::filesystem::path layouts_filename;
+    void LoadPipelineLayouts();
+    void SavePipelineLayouts();
     /// Compiles the parts a link still misses, beside the thread that links (never `workers`,
     /// whose threads wait for these). Declared after library_cache and before `workers`, so it
     /// stops after the builds that wait for it and before the parts it compiles go away.

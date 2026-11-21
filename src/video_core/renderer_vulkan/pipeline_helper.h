@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -16,6 +17,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <vector>
 
 #include <boost/container/small_vector.hpp>
@@ -351,6 +353,12 @@ public:
         });
     }
 
+    /// The builder a LayoutKey describes, with the descriptor choices it was made with: for
+    /// creating saved layouts at boot. Nothing for keys this device can't create.
+    struct FromKeyResult;
+    [[nodiscard]] static std::optional<FromKeyResult> FromKey(const Device& device,
+                                                              std::span<const u32> key);
+
     /// Everything the layouts it creates depend on (CreateLayouts), for sharing them.
     [[nodiscard]] std::vector<u32> LayoutKey(bool use_push_descriptor,
                                              bool use_descriptor_buffer) const {
@@ -477,6 +485,54 @@ private:
     size_t offset{};
 };
 
+struct DescriptorLayoutBuilder::FromKeyResult {
+    DescriptorLayoutBuilder builder;
+    bool use_push_descriptor;
+    bool use_descriptor_buffer;
+};
+
+inline std::optional<DescriptorLayoutBuilder::FromKeyResult> DescriptorLayoutBuilder::FromKey(
+    const Device& device, std::span<const u32> key) {
+    if (key.empty() || (key.size() - 1) % 4 != 0) {
+        return std::nullopt;
+    }
+    const u32 flags = key[0];
+    FromKeyResult result{DescriptorLayoutBuilder{device}, (flags & 1) != 0, (flags & 2) != 0};
+    DescriptorLayoutBuilder& builder = result.builder;
+    builder.is_compute = (flags & 4) != 0;
+    builder.uses_mesh = (flags & 8) != 0;
+    if ((flags & 16) != 0 || (flags & ~31U) != 0 || builder.is_compute ||
+        (builder.uses_mesh && !device.IsExtMeshShaderSupported())) {
+        return std::nullopt;
+    }
+    for (size_t index = 1; index < key.size(); index += 4) {
+        const u32 count = key[index + 2];
+        builder.bindings.push_back({
+            .binding = key[index],
+            .descriptorType = static_cast<VkDescriptorType>(key[index + 1]),
+            .descriptorCount = count,
+            .stageFlags = key[index + 3],
+            .pImmutableSamplers = nullptr,
+        });
+        builder.entries.push_back({
+            .dstBinding = key[index],
+            .dstArrayElement = 0,
+            .descriptorCount = count,
+            .descriptorType = static_cast<VkDescriptorType>(key[index + 1]),
+            .offset = builder.offset,
+            .stride = sizeof(DescriptorUpdateEntry),
+        });
+        builder.binding = (std::max)(builder.binding, key[index] + 1);
+        builder.num_descriptors += count;
+        builder.offset += sizeof(DescriptorUpdateEntry) * count;
+    }
+    if ((result.use_push_descriptor && !builder.CanUsePushDescriptor()) ||
+        (result.use_descriptor_buffer && !builder.CanUseDescriptorBuffer())) {
+        return std::nullopt;
+    }
+    return result;
+}
+
 inline std::shared_ptr<PipelineLayouts> DescriptorLayoutBuilder::CreateLayouts(
     bool use_push_descriptor, bool use_descriptor_buffer) const {
     auto layouts = std::make_shared<PipelineLayouts>();
@@ -519,6 +575,23 @@ public:
     [[nodiscard]] std::pair<u64, u64> Counts() {
         std::scoped_lock lock{mutex};
         return {created, shared};
+    }
+
+    /// Adds layouts made ahead of time (saved ones, at boot).
+    void Insert(std::vector<u32> key, std::shared_ptr<const PipelineLayouts> made) {
+        std::scoped_lock lock{mutex};
+        layouts.try_emplace(std::move(key), std::move(made));
+    }
+
+    /// The keys of every layout, for saving them.
+    [[nodiscard]] std::vector<std::vector<u32>> Keys() {
+        std::scoped_lock lock{mutex};
+        std::vector<std::vector<u32>> keys;
+        keys.reserve(layouts.size());
+        for (const auto& [key, made] : layouts) {
+            keys.push_back(key);
+        }
+        return keys;
     }
 
 private:

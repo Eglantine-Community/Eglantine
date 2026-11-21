@@ -114,6 +114,8 @@ enum class Opt : unsigned {
     /// Translation threads run at normal priority, above the driver compile workers (both stay
     /// below the emulation's threads): every skipped draw waits for its translation first
     TranslationPriority,
+    /// Shared layouts are saved per title and created at boot, before anything compiles
+    SavedPipelineLayouts,
     Count,
 };
 
@@ -129,7 +131,7 @@ inline constexpr std::array<std::string_view, static_cast<size_t>(Opt::Count)> o
     "shader_build_budget", "compute_rebuild_async", "compute_preload_variants", "stale_target_skip",
     "geometry_consistency", "build_order_priority", "replay_disk_recordings",
     "queue_deferred_translation", "stage_in_flight", "shared_pipeline_layouts",
-    "translation_priority",
+    "translation_priority", "saved_pipeline_layouts",
 };
 
 static_assert(static_cast<size_t>(Opt::Count) <= 64, "the off-mask is 64 bits");
