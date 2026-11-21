@@ -121,8 +121,8 @@ ConfigureHdRumble::ConfigureHdRumble(QWidget* parent) : QDialog(parent) {
 
     // Body: the controller in use first, the others and the advanced rows behind disclosures
     const int connected = InputCommon::GetRenHDrumConnectedKind();
-    const unsigned active =
-        (connected >= 0 && connected <= 2) ? (1u << connected) : 1u; // 1 Switch, 2 DualSense
+    // 0 Switch, 1 DualSense, 2 Xbox; none connected means no active card at all
+    const unsigned active = (connected >= 0 && connected <= 2) ? (1u << connected) : 0u;
     body = new QWidget;
     auto* body_col = new QVBoxLayout(body);
     body_col->setContentsMargins(0, 0, 0, 0);
@@ -134,10 +134,18 @@ ConfigureHdRumble::ConfigureHdRumble(QWidget* parent) : QDialog(parent) {
     const bool per_game = !Settings::values.hd_rumble_gain.UsingGlobal();
     body_col->addWidget(MakeNote(
         per_game ? tr("Intensity: this game has its own value, and changes here apply to it.")
-                 : tr("Intensity multiplies the game's rumble. Some Switch 2 games (Ocarina of "
-                      "Time) send very weak values that the Joy-Con 2 still plays strongly: "
-                      "try 400-600% for them.")));
-    body_col->addWidget(CreateDeviceCard(active, connected >= 0));
+                 : tr("Intensity multiplies the game's rumble.")));
+    body_col->addWidget(MakeNote(
+        tr("Eglantine bundles RenHDrum on its own. You can supply your own build: point the "
+           "RENHDRUM_LIBRARY environment variable at it, or on Windows replace renhdrum.dll "
+           "next to the emulator. Use a build from the same release, or the settings may not "
+           "line up.")));
+    if (active != 0u) {
+        body_col->addWidget(CreateDeviceCard(active, true));
+    } else {
+        body_col->addWidget(MakeNote(tr("No compatible controller detected: these settings "
+                                        "apply once one connects.")));
+    }
 
     // Every other controller family stays one disclosure away, one card each
     auto* others_host = new QWidget;
@@ -150,7 +158,7 @@ ConfigureHdRumble::ConfigureHdRumble(QWidget* parent) : QDialog(parent) {
         }
     }
     body_col->addWidget(MakeCollapsible(tr("Other controllers"), others_host, false));
-    body_col->addWidget(MakeCollapsible(tr("Advanced"), CreateAdvancedCard(active), false));
+    body_col->addWidget(MakeCollapsible(tr("Advanced"), CreateAdvancedCard(), false));
     body_col->addWidget(MakeNote(
         tr("Changes reach connected controllers on their next vibration. To feel them now, "
            "open the Vibration settings and hold a button on the controller.")));
@@ -165,7 +173,9 @@ ConfigureHdRumble::ConfigureHdRumble(QWidget* parent) : QDialog(parent) {
     // Footer: credit left, dialog buttons right
     root->addWidget(MakeDivider());
     auto* footer = new QHBoxLayout;
-    auto* credit = MakeNote(tr("Powered by RenHDrum"));
+    auto* credit =
+        new QLabel(tr("<a href=\"https://github.com/trzz1214/RenHDrum\">Powered by RenHDrum</a>"));
+    credit->setOpenExternalLinks(true);
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel |
                                          QDialogButtonBox::RestoreDefaults);
     connect(buttons, &QDialogButtonBox::accepted, this, &QDialog::accept);
@@ -536,35 +546,45 @@ QWidget* ConfigureHdRumble::CreateDeviceCard(unsigned device, bool connected) {
     return card;
 }
 
-QWidget* ConfigureHdRumble::CreateAdvancedCard(unsigned device) {
-    // The tier-1 rows of the active device, behind the Advanced disclosure
+QWidget* ConfigureHdRumble::CreateAdvancedCard() {
+    // The tier-1 rows of every family behind one disclosure, each group under its device
+    // title: a Gamesir in Direct mode is configured the same way with or without it plugged in
     auto* card = new QFrame;
     card->setFrameShape(QFrame::StyledPanel);
     auto* col = new QVBoxLayout(card);
     col->setContentsMargins(14, 10, 14, 12);
     col->setSpacing(6);
-    bool first = true;
     const auto& options = Options();
-    for (int i = 0; i < static_cast<int>(options.size()); ++i) {
-        const auto& opt = options[i];
-        if (opt.key == "enable_hd_rumble") {
-            continue;
+    bool first_group = true;
+    for (unsigned bit : {1u, 2u, 4u}) {
+        if (!first_group) {
+            col->addWidget(MakeDivider());
         }
-        if (opt.tier != 1 || (opt.devices & device) == 0) {
-            continue;
+        first_group = false;
+        auto* group_title = new QLabel(DeviceTitle(bit));
+        QFont bold = group_title->font();
+        bold.setWeight(QFont::DemiBold);
+        group_title->setFont(bold);
+        col->addWidget(group_title);
+        bool first = true;
+        for (int i = 0; i < static_cast<int>(options.size()); ++i) {
+            const auto& opt = options[i];
+            if (opt.key == "enable_hd_rumble" || opt.tier != 1 || (opt.devices & bit) == 0) {
+                continue;
+            }
+            AddRow(col, first, opt, i, opt.def);
         }
-        AddRow(col, first, opt, i, opt.def);
-    }
-    // A setting the engine's table does not carry, a long-standing Eglantine row
-    if (device == 1u) {
-        InputCommon::RenHDrumOption extra{};
-        extra.key = "bluetooth_level";
-        extra.label = "Bluetooth pacing";
-        extra.help = "Lower levels send less often, which keeps input lag down on a busy "
-                     "Bluetooth link. (Bluetooth only)";
-        extra.choices = {"1 - Stable (60 ms)", "2 - Balanced (45 ms)", "3 - Quality (35 ms)"};
-        extra.kind = 2;
-        AddRow(col, first, extra, -1, 3);
+        // A setting the engine's table does not carry, a long-standing Eglantine row
+        if (bit == 1u) {
+            InputCommon::RenHDrumOption extra{};
+            extra.key = "bluetooth_level";
+            extra.label = "Bluetooth pacing";
+            extra.help = "Lower levels send less often, which keeps input lag down on a busy "
+                         "Bluetooth link. (Bluetooth only)";
+            extra.choices = {"1 - Stable (60 ms)", "2 - Balanced (45 ms)", "3 - Quality (35 ms)"};
+            extra.kind = 2;
+            AddRow(col, first, extra, -1, 3);
+        }
     }
     return card;
 }
