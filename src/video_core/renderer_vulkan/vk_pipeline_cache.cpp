@@ -387,6 +387,18 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
     return info;
 }
 
+// Called by every task on translation_workers (Opt::TranslationPriority): the workers start at
+// low priority like the driver compile workers, and the first task raises its thread once.
+void PrioritizeTranslationThread() {
+    thread_local bool raised = false;
+    if (!raised) {
+        raised = true;
+        if (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::TranslationPriority)) {
+            Common::SetCurrentThreadPriority(Common::ThreadPriority::Normal);
+        }
+    }
+}
+
 size_t GetTotalPipelineWorkers() {
     const size_t max_core_threads =
         std::max<size_t>(static_cast<size_t>(std::thread::hardware_concurrency()), 2ULL) - 1ULL;
@@ -3512,7 +3524,10 @@ void PipelineCache::RunInParallel(size_t count, const std::function<void(size_t)
         }
     };
     for (size_t helper = 1; helper < count; ++helper) {
-        translation_workers->QueueWork([state, run] { run(*state); });
+        translation_workers->QueueWork([state, run] {
+            PrioritizeTranslationThread();
+            run(*state);
+        });
     }
     run(*state);
     {
@@ -3630,6 +3645,7 @@ std::optional<std::shared_future<void>> PipelineCache::QueueGraphicsTranslation(
     report.peak_queued = std::max(report.peak_queued, translating_graphics.size());
     last_runtime_build.store(begin.time_since_epoch().count(), std::memory_order_relaxed);
     translation_workers->QueueWork([this, key = graphics_key, task] {
+        PrioritizeTranslationThread();
         if (!task->claimed.exchange(true)) {
             TranslateGraphicsPipeline(key, std::move(task->envs), std::move(task->done),
                                       task->queued_at);
