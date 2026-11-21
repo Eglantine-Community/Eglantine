@@ -621,6 +621,28 @@ void ConfigureHdRumble::RestoreDefaults() {
 void ConfigureHdRumble::UpdateEnabledState() {
     const bool on = hd_enabled->isChecked();
     body->setEnabled(on);
+    // The gate reads the row widgets, not the settings store: the store only catches up on OK,
+    // and the rows below a mode switch must react while the dialog is open
+    auto row_value = [this](const std::string& key) -> int {
+        if (key == "enable_hd_rumble") {
+            return hd_enabled->isChecked() ? 1 : 0;
+        }
+        for (const auto& row : rows) {
+            if (row.key != key) {
+                continue;
+            }
+            if (row.check != nullptr) {
+                return row.check->isChecked() ? 1 : 0;
+            }
+            if (row.combo != nullptr) {
+                return row.combo->currentIndex();
+            }
+            if (row.spin != nullptr) {
+                return row.spin->value();
+            }
+        }
+        return OptionValue(key); // no widget for it: the stored value stands in
+    };
     for (auto& row : rows) {
         bool parent_on = true;
         if (row.table_index >= 0) {
@@ -628,8 +650,8 @@ void ConfigureHdRumble::UpdateEnabledState() {
             const auto& options = Options();
             const int parent_index = options[row.table_index].requires_row;
             if (parent_index >= 0 && parent_index < static_cast<int>(options.size())) {
-                const auto& parent_key = options[parent_index].key;
-                parent_on = OptionValue(parent_key) != 0;
+                const std::string& parent_key = options[parent_index].key;
+                parent_on = row_value(parent_key) != 0;
             }
         }
         const bool triggers_ok = row.key != "xbox_trigger_mix" || xbox_triggers_state != 0;
