@@ -118,11 +118,14 @@ TEST_CASE("NX: catalog-only queries", "[core][nx]") {
     CHECK(Loader::IsBootableGameContainer(file, Loader::FileType::NX));
     CHECK(Loader::AppLoader_NX::ReadPlatform(file, 0) == 2);
     CHECK(Loader::AppLoader_NX::ReadPlatform(file, ApplicationId) == 2);
+    CHECK(Loader::IsSwitch2Program(file));
+    CHECK(Loader::IsSwitch2Program(file, ApplicationId));
     // Header and Catalog only: Manifest damage is found when the loader mounts the archive.
     for (const auto name :
          {"damaged_both_slots.nx", "truncated_header_area.nx", "invalid_offsets.nx"}) {
         INFO(name);
         CHECK_FALSE(Loader::AppLoader_NX::IsBootable(OpenFixture(name)));
+        CHECK_FALSE(Loader::IsSwitch2Program(OpenFixture(name)));
     }
 }
 
@@ -381,7 +384,7 @@ TEST_CASE("NX: registering an archive preserves an external NSP add-on", "[core]
             loader.RegisterContent(provider);
             const auto entries = provider.ListEntriesFilter(
                 FileSys::TitleType::AOC, FileSys::ContentRecordType::Data, std::nullopt);
-            REQUIRE(entries.size() == (std::string_view(archive) == "lichii_synthetic.nx" ? 2 : 1));
+            REQUIRE(entries.size() == (std::string_view(archive) == "lichii_synthetic.nx" ? 2U : 1U));
             const auto dlc =
                 provider.GetEntry(ApplicationId + 0x1002, FileSys::ContentRecordType::Data);
             REQUIRE(dlc != nullptr);
