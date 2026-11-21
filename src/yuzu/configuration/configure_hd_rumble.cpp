@@ -158,7 +158,6 @@ ConfigureHdRumble::ConfigureHdRumble(QWidget* parent) : QDialog(parent) {
         }
     }
     body_col->addWidget(MakeCollapsible(tr("Other controllers"), others_host, false));
-    body_col->addWidget(MakeCollapsible(tr("Advanced"), CreateAdvancedCard(), false));
     body_col->addWidget(MakeNote(
         tr("Changes reach connected controllers on their next vibration. To feel them now, "
            "open the Vibration settings and hold a button on the controller.")));
@@ -541,50 +540,41 @@ QWidget* ConfigureHdRumble::CreateDeviceCard(unsigned device, bool connected) {
                                    "controllers. Most wireless receivers drive just the "
                                    "grip motors.")));
     }
+
+    // The family's own advanced rows, behind a disclosure at the bottom of its card
+    col->addWidget(MakeDivider());
+    col->addWidget(MakeCollapsible(tr("Advanced"), CreateAdvancedRows(device), false));
     return card;
 }
 
-QWidget* ConfigureHdRumble::CreateAdvancedCard() {
-    // The tier-1 rows of every family behind one disclosure, each group under its device
-    // title: a Gamesir in Direct mode is configured the same way with or without it plugged in
-    auto* card = new QFrame;
-    card->setFrameShape(QFrame::StyledPanel);
-    auto* col = new QVBoxLayout(card);
-    col->setContentsMargins(14, 10, 14, 12);
+QWidget* ConfigureHdRumble::CreateAdvancedRows(unsigned device) {
+    // The tier-1 rows of one family: the card that holds them is the section title, so the
+    // disclosure carries just the rows
+    auto* host = new QWidget;
+    auto* col = new QVBoxLayout(host);
+    col->setContentsMargins(0, 0, 0, 0);
     col->setSpacing(6);
     const auto& options = Options();
-    bool first_group = true;
-    for (unsigned bit : {1u, 2u, 4u}) {
-        if (!first_group) {
-            col->addWidget(MakeDivider());
+    bool first = true;
+    for (int i = 0; i < static_cast<int>(options.size()); ++i) {
+        const auto& opt = options[i];
+        if (opt.key == "enable_hd_rumble" || opt.tier != 1 || (opt.devices & device) == 0) {
+            continue;
         }
-        first_group = false;
-        auto* group_title = new QLabel(DeviceTitle(bit));
-        QFont bold = group_title->font();
-        bold.setWeight(QFont::DemiBold);
-        group_title->setFont(bold);
-        col->addWidget(group_title);
-        bool first = true;
-        for (int i = 0; i < static_cast<int>(options.size()); ++i) {
-            const auto& opt = options[i];
-            if (opt.key == "enable_hd_rumble" || opt.tier != 1 || (opt.devices & bit) == 0) {
-                continue;
-            }
-            AddRow(col, first, opt, i, opt.def);
-        }
-        // A setting the engine's table does not carry, a long-standing Eglantine row
-        if (bit == 1u) {
-            InputCommon::RenHDrumOption extra{};
-            extra.key = "bluetooth_level";
-            extra.label = "Bluetooth pacing";
-            extra.help = "Lower levels send less often, which keeps input lag down on a busy "
-                         "Bluetooth link. (Bluetooth only)";
-            extra.choices = {"1 - Stable (60 ms)", "2 - Balanced (45 ms)", "3 - Quality (35 ms)"};
-            extra.kind = 2;
-            AddRow(col, first, extra, -1, 3);
-        }
+        AddRow(col, first, opt, i, opt.def);
     }
-    return card;
+    // A setting the engine's table does not carry, a long-standing Eglantine row
+    if (device == 1u) {
+        InputCommon::RenHDrumOption extra{};
+        extra.key = "bluetooth_level";
+        extra.label = "Bluetooth pacing";
+        extra.help = "Lower levels send less often, which keeps input lag down on a busy "
+                     "Bluetooth link. (Bluetooth only)";
+        extra.choices = {"1 - Stable (60 ms)", "2 - Balanced (45 ms)", "3 - Quality (35 ms)"};
+        extra.kind = 2;
+        AddRow(col, first, extra, -1, 3);
+    }
+    return host;
 }
 
 void ConfigureHdRumble::LoadConfiguration() {

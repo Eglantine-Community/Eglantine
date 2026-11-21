@@ -54,9 +54,9 @@ private:
     /// One card per controller family: `device` is the bit RenHDrum's table marks rows with
     /// (1 Switch, 2 DualSense, 4 Xbox). A connected controller gets the status pill.
     QWidget* CreateDeviceCard(unsigned device, bool connected);
-    /// The tier-1 rows of every controller family, grouped under their device titles, behind
-    /// the Advanced disclosure.
-    QWidget* CreateAdvancedCard();
+    /// The tier-1 rows of one controller family, behind the Advanced disclosure at the
+    /// bottom of that family's card.
+    QWidget* CreateAdvancedRows(unsigned device);
     /// One row in the upstream anatomy: label with muted help on the left, control
     /// right-aligned and vertically centered, appended to `rows` for the binding layer.
     void AddRow(QVBoxLayout* col, bool& first, const InputCommon::RenHDrumOption& opt,
