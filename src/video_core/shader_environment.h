@@ -97,6 +97,8 @@ public:
 
     [[nodiscard]] std::vector<std::pair<u32, u32>> NullStoragePointerSlots() const override;
 
+    [[nodiscard]] std::vector<u64> UnmappedStoragePointerTableKeys() const override;
+
     [[nodiscard]] std::vector<u64> MappedStoragePointerKeys() const override;
 
     /// Answers the classification of these keys (see MappedStoragePointerKeys) as storage buffer
@@ -349,6 +351,8 @@ public:
                                                           u32 indirect) override;
 
     [[nodiscard]] std::vector<std::pair<u32, u32>> NullStoragePointerSlots() const override;
+
+    [[nodiscard]] std::vector<u64> UnmappedStoragePointerTableKeys() const override;
 
     [[nodiscard]] std::vector<u64> MappedStoragePointerKeys() const override;
 

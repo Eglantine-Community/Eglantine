@@ -1169,6 +1169,48 @@ bool PipelineCache::StaleNullPointerSlot(const ComputePipelineCacheEntry& entry)
             return true;
         }
     }
+    // Pages can be mapped without backing while the game tears a table down: read through the
+    // host pointer and treat a page without one as unmapped.
+    const auto read_pointer = [this](GPUVAddr address) -> GPUVAddr {
+        const u8* const host{gpu_memory->GetPointer(address)};
+        if (host == nullptr) {
+            return 0;
+        }
+        u64 value;
+        std::memcpy(&value, host, sizeof(value));
+        return value;
+    };
+    const auto is_mapped = [this](GPUVAddr address) {
+        return address != 0 && gpu_memory->IsWithinGPUAddressRange(address) &&
+               gpu_memory->IsFullyMappedRange(address, 1) &&
+               gpu_memory->GetPointer(address) != nullptr;
+    };
+    for (const u64 key : entry.null_table_slots) {
+        const u32 index{static_cast<u32>((key >> 32) & 0xff)};
+        const u32 offset{static_cast<u32>(key)};
+        const u32 indirect{static_cast<u32>((key >> 40) & 0x3fffff)};
+        if (index >= qmd.const_buffer_config.size() ||
+            ((qmd.const_buffer_enable_mask >> index) & 1) == 0) {
+            continue;
+        }
+        const auto& cbuf{qmd.const_buffer_config[index]};
+        if (offset + sizeof(u64) > cbuf.size) {
+            continue;
+        }
+        const GPUVAddr holder{read_pointer(cbuf.Address() + offset)};
+        if (!is_mapped(holder)) {
+            continue;
+        }
+        const GPUVAddr address{read_pointer(holder + indirect)};
+        if (is_mapped(address)) {
+            LOG_INFO(Render_Vulkan,
+                     "Rebuilding compute program {:#x}: c{}[{:#x}] table entry {:#x} was not "
+                     "mapped at translation and now points to {:#x}",
+                     kepler_compute->regs.code_loc.Address() + qmd.program_start, index, offset,
+                     indirect, address);
+            return true;
+        }
+    }
     return false;
 }
 
@@ -1218,17 +1260,20 @@ ComputePipeline* PipelineCache::CurrentComputePipeline(u64& native_key) {
             ClaimPrecacheProgram(key);
         }
         entry = CreateComputePipeline(key, shader);
-    } else if (!entry.pending && !entry.null_pointer_slots.empty() &&
+    } else if (!entry.pending &&
+               (!entry.null_pointer_slots.empty() || !entry.null_table_slots.empty()) &&
                entry.rebuilds < MaxComputeRebuilds && StaleNullPointerSlot(entry)) {
         bool swapped_alternate = false;
         if (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::ComputePreloadVariants)) {
             for (auto& alt : entry.alternates) {
                 ComputePipelineCacheEntry alt_check{
                     .null_pointer_slots = alt.null_pointer_slots,
+                    .null_table_slots = alt.null_table_slots,
                 };
                 if (alt.pipeline && alt.pipeline->IsBuilt() && !StaleNullPointerSlot(alt_check)) {
                     std::swap(entry.pipeline, alt.pipeline);
                     std::swap(entry.null_pointer_slots, alt.null_pointer_slots);
+                    std::swap(entry.null_table_slots, alt.null_table_slots);
                     std::swap(entry.mapped_pointers, alt.mapped_pointers);
                     ++entry.rebuilds;
                     swapped_alternate = true;
@@ -1245,6 +1290,7 @@ ComputePipeline* PipelineCache::CurrentComputePipeline(u64& native_key) {
                 if (rebuild_async && entry.pipeline && !rebuilt.pipeline->IsBuilt()) {
                     entry.pending = std::move(rebuilt.pipeline);
                     entry.null_pointer_slots = std::move(rebuilt.null_pointer_slots);
+                    entry.null_table_slots = std::move(rebuilt.null_table_slots);
                     entry.mapped_pointers = std::move(rebuilt.mapped_pointers);
                     ++entry.rebuilds;
                 } else {
@@ -1266,7 +1312,8 @@ ComputePipeline* PipelineCache::CurrentComputePipeline(u64& native_key) {
         }
     }
     if (entry.pipeline && !entry.pending &&
-        (entry.null_pointer_slots.empty() || entry.rebuilds >= MaxComputeRebuilds)) {
+        ((entry.null_pointer_slots.empty() && entry.null_table_slots.empty()) ||
+         entry.rebuilds >= MaxComputeRebuilds)) {
         fast_entry.key = key;
         fast_entry.pipeline = entry.pipeline.get();
     }
@@ -1403,6 +1450,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                         entry.alternates.push_back(ComputePipelineVariant{
                             .pipeline = std::move(candidate.pipeline),
                             .null_pointer_slots = std::move(candidate.null_pointer_slots),
+                            .null_table_slots = std::move(candidate.null_table_slots),
                             .mapped_pointers = std::move(candidate.mapped_pointers),
                         });
                     }
@@ -3985,6 +4033,8 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(ShaderPools& pool
                 std::move(spv_module), key.unique_hash),
             .null_pointer_slots = env.IsNativeProgram() ? env.NullStoragePointerSlots()
                                                         : std::vector<std::pair<u32, u32>>{},
+            .null_table_slots = env.IsNativeProgram() ? env.UnmappedStoragePointerTableKeys()
+                                                      : std::vector<u64>{},
             .mapped_pointers =
                 env.IsNativeProgram() ? env.MappedStoragePointerKeys() : std::vector<u64>{}};
 

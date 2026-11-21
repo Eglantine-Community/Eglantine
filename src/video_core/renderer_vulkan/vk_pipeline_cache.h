@@ -122,6 +122,7 @@ struct ShaderPools {
 struct ComputePipelineVariant {
     std::unique_ptr<ComputePipeline> pipeline;
     std::vector<std::pair<u32, u32>> null_pointer_slots;
+    std::vector<u64> null_table_slots;
     std::vector<u64> mapped_pointers;
 };
 
@@ -134,6 +135,8 @@ struct ComputePipelineCacheEntry {
     std::string failure;
     /// Constant buffer slots that were null pointers at translation (see NullStoragePointerSlots)
     std::vector<std::pair<u32, u32>> null_pointer_slots;
+    /// Pointer-table entries that were not mapped at translation (UnmappedStoragePointerTableKeys)
+    std::vector<u64> null_table_slots;
     /// Constant buffer slots bound as storage buffer pointers (see MappedStoragePointerKeys)
     std::vector<u64> mapped_pointers;
     u32 rebuilds{};

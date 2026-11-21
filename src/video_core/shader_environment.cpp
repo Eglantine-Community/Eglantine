@@ -110,6 +110,20 @@ static std::vector<std::pair<u32, u32>> NullStoragePointerSlots(
     return slots;
 }
 
+// Pointer-table entries that were not mapped when the program was translated. NullStoragePointerSlots
+// leaves them out; the table can fill later, which makes the translation stale too.
+static std::vector<u64> UnmappedStoragePointerTableKeys(
+    const ::Common::unordered_map<u64, u8>& storage_pointer_types) {
+    std::vector<u64> keys;
+    for (const auto& [key, type] : storage_pointer_types) {
+        if (type == 0 && (key >> 63) != 0) {
+            keys.push_back(key);
+        }
+    }
+    std::ranges::sort(keys);
+    return keys;
+}
+
 static std::vector<u64> MappedStoragePointerKeys(
     const ::Common::unordered_map<u64, u8>& storage_pointer_types) {
     std::vector<u64> keys;
@@ -292,6 +306,10 @@ bool GenericEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 offse
 
 std::vector<std::pair<u32, u32>> GenericEnvironment::NullStoragePointerSlots() const {
     return VideoCommon::NullStoragePointerSlots(cbuf_values, storage_pointer_types);
+}
+
+std::vector<u64> GenericEnvironment::UnmappedStoragePointerTableKeys() const {
+    return VideoCommon::UnmappedStoragePointerTableKeys(storage_pointer_types);
 }
 
 std::vector<u64> GenericEnvironment::MappedStoragePointerKeys() const {
@@ -1208,6 +1226,10 @@ std::span<const Shader::Ampere::NativeRegisterRemap> FileEnvironment::NativeRegi
 
 std::vector<std::pair<u32, u32>> FileEnvironment::NullStoragePointerSlots() const {
     return VideoCommon::NullStoragePointerSlots(cbuf_values, storage_pointer_types);
+}
+
+std::vector<u64> FileEnvironment::UnmappedStoragePointerTableKeys() const {
+    return VideoCommon::UnmappedStoragePointerTableKeys(storage_pointer_types);
 }
 
 std::vector<u64> FileEnvironment::MappedStoragePointerKeys() const {

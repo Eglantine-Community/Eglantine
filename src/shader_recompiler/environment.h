@@ -117,6 +117,12 @@ public:
         return {};
     }
 
+    /// Native programs: pointer-table entries classified as non-pointers because they were not
+    /// mapped, as the keys of their classification.
+    [[nodiscard]] virtual std::vector<u64> UnmappedStoragePointerTableKeys() const {
+        return {};
+    }
+
     /// Native programs: the classified slots bound as storage buffer pointers, as the sorted keys
     /// of their classification (direct and pointer-table slots).
     [[nodiscard]] virtual std::vector<u64> MappedStoragePointerKeys() const {
