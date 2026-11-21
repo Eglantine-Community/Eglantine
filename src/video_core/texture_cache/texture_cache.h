@@ -804,7 +804,6 @@ void TextureCache<P>::MemoizeTextures(SampledTextureMemo& memo,
     for (size_t i = 0; i < reads.size(); ++i) {
         const auto [view_index, sampler_index] = Tegra::Texture::TexturePair(reads[i].raw, via_header_index);
         const u32 tic_index =
-        const u32 tic_index =
             Tegra::Texture::TextureHeaderIndex(view_index, image_table.current_limit,
                                                byte_offset_handles);
         if (!views[i].id || !samplers[i] || tic_index > image_table.current_limit ||

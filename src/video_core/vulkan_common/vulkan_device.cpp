@@ -1071,7 +1071,6 @@ void Device::ReportUnresponsive() const {
     ClaimDeviceReport();
     LOG_CRITICAL(Render_Vulkan,
                  "Closing Dalia: the GPU stopped making progress (EDEN_NX2_GPU_WATCHDOG)");
-    Common::Log::Flush();
 #ifdef _WIN32
     TerminateProcess(GetCurrentProcess(), EXIT_FAILURE);
 #endif

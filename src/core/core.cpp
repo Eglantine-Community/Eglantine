@@ -48,6 +48,7 @@
 #include "core/hle/kernel/k_resource_limit.h"
 #include "core/hle/kernel/k_scheduler.h"
 #include "core/hle/kernel/k_system_control.h"
+#include "core/hle/kernel/nx2_thread_stats.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/physical_core.h"
 #include "core/hle/service/acc/profile_manager.h"
@@ -386,12 +387,10 @@ struct System::Impl {
             LOG_CRITICAL(Core, "Not enough host memory to start the guest kernel");
             return SystemResultStatus::ErrorMemoryAllocation;
         }
-        Kernel::Nx2ThreadStats::ReadSwitch();
 #if defined(ARCHITECTURE_x86_64)
         core_timing.ConfigureInlineCntpct(!Kernel::Nx2ThreadStats::g_enabled &&
                                          !system.DebuggerEnabled());
 #endif
-        Service::FileSystem::ReadTraceScope::ReadSwitch();
         kernel.Initialize();
         return SystemResultStatus::Success;
     }
