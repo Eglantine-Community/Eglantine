@@ -21,6 +21,7 @@
 #include "hid_core/resources/keyboard/keyboard.h"
 #include "hid_core/resources/mouse/debug_mouse.h"
 #include "hid_core/resources/mouse/mouse.h"
+#include "hid_core/resources/mouse/nmouse.h"
 #include "hid_core/resources/npad/npad.h"
 #include "hid_core/resources/palma/palma.h"
 #include "hid_core/resources/shared_memory_format.h"
@@ -164,6 +165,10 @@ std::shared_ptr<SevenSixAxis> ResourceManager::GetSevenSixAxis() const {
     return seven_six_axis;
 }
 
+std::shared_ptr<Nmouse> ResourceManager::GetNmouse() const {
+    return nmouse;
+}
+
 std::shared_ptr<SixAxis> ResourceManager::GetSixAxis() const {
     return six_axis;
 }
@@ -285,6 +290,7 @@ void ResourceManager::InitializeTouchScreenSampler() {
 void ResourceManager::InitializeConsoleSixAxisSampler() {
     console_six_axis = std::make_shared<ConsoleSixAxis>(system.HIDCore());
     seven_six_axis = std::make_shared<SevenSixAxis>(system);
+    nmouse = std::make_shared<Nmouse>(system);
 
     console_six_axis->SetAppletResource(applet_resource, &shared_mutex);
 }

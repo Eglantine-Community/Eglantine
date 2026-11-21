@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <mutex>
 
 #include "common/common_types.h"
@@ -32,6 +33,7 @@
 #include "hid_core/resources/debug_pad/debug_pad.h"
 #include "hid_core/resources/keyboard/keyboard.h"
 #include "hid_core/resources/mouse/mouse.h"
+#include "hid_core/resources/mouse/nmouse.h"
 #include "hid_core/resources/npad/npad.h"
 #include "hid_core/resources/npad/npad_types.h"
 #include "hid_core/resources/npad/npad_vibration.h"
@@ -265,7 +267,7 @@ IHidServer::IHidServer(Core::System& system_, std::shared_ptr<ResourceManager> r
         {3113, &IHidServer::StubReplyZeroed, "StopJcms"},
         {3114, &IHidServer::StubReplyZeroed, "Unknown3114"},
         {3130, &IHidServer::StubReplyZeroed, "InitializeNmouse"},
-        {3131, &IHidServer::StubReplyZeroed, "FinalizeNmouse"},
+        {3131, C<&IHidServer::FinalizeNmouse>, "FinalizeNmouse"},
         {3132, C<&IHidServer::SetNmousePointerRanges>, "SetNmousePointerRanges"},
         {3133, C<&IHidServer::GetNmousePointerRanges>, "GetNmousePointerRanges"},
         {3134, &IHidServer::StubReplyZeroed, "Unknown3134"},
@@ -1197,6 +1199,27 @@ Result IHidServer::InitializeNmouse2(u32 pointer_type, s32 width, s32 height, u3
                 "applet_resource_user_id={}, t_mem_size={:#x}",
                 pointer_type, width, height, unknown, aruid.pid, t_mem_size);
     nmouse_pointer_ranges[aruid.pid] = {width, height};
+
+    // EDEN_NX2_MOUSE_FIX opts into writing the Switch 2 mouse state layout into the transfer
+    // memory titles hand over here. Mario Kart World dereferences a null object during boot when
+    // that memory is left untouched; the layout is the NmouseTransferMemoryAccessor format,
+    // reverse-engineered by the PokeDinner project (PR #83).
+    static const bool env_nmouse_fix = std::getenv("EDEN_NX2_MOUSE_FIX") != nullptr;
+    if (env_nmouse_fix) {
+        GetResourceManager()->GetNmouse()->Initialize(
+            t_mem->GetSourceAddress(),
+            std::min(t_mem_size, static_cast<u64>(t_mem->GetSize())), t_mem->GetOwner());
+    }
+    R_SUCCEED();
+}
+
+Result IHidServer::FinalizeNmouse(ClientAppletResourceUserId aruid) {
+    LOG_DEBUG(Service_HID, "called, applet_resource_user_id={}", aruid.pid);
+
+    static const bool env_nmouse_fix = std::getenv("EDEN_NX2_MOUSE_FIX") != nullptr;
+    if (env_nmouse_fix) {
+        GetResourceManager()->GetNmouse()->Finalize();
+    }
     R_SUCCEED();
 }
 

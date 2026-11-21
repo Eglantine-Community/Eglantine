@@ -214,12 +214,17 @@ private:
     Result GetSceneIdForPrivateApp(Out<u64> out_scene_id, ClientAppletResourceUserId aruid);
     // Switch 2 mouse mode (Nmouse). The pointer ranges (the screen size the pointer moves in) an
     // application sets with InitializeNmouse2 or SetNmousePointerRanges are what
-    // GetNmousePointerRanges reads back. No mouse is ever attached, so the shared memory the title
-    // hands over stays as it is. InitializeNmouse (3130) stays a placeholder: no title has been
-    // seen calling it, so its layout is unconfirmed.
+    // GetNmousePointerRanges reads back. InitializeNmouse (3130) stays a placeholder: no title
+    // has been seen calling it, so its layout is unconfirmed.
+    //
+    // No host mouse is fed, but with EDEN_NX2_MOUSE_FIX set InitializeNmouse2 writes the state
+    // layout the SDK's NmouseTransferMemoryAccessor reads into the title's transfer memory
+    // (reverse-engineered by the PokeDinner project, PR #83): Mario Kart World walks a null
+    // object during boot when that memory is left untouched.
     Result InitializeNmouse2(u32 pointer_type, s32 width, s32 height, u32 unknown,
                              ClientAppletResourceUserId aruid, u64 t_mem_size,
                              InCopyHandle<Kernel::KTransferMemory> t_mem);
+    Result FinalizeNmouse(ClientAppletResourceUserId aruid);
     Result SetNmousePointerRanges(s32 width, s32 height, ClientAppletResourceUserId aruid);
     Result GetNmousePointerRanges(Out<s32> out_width, Out<s32> out_height,
                                   ClientAppletResourceUserId aruid);

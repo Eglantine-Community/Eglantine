@@ -40,6 +40,7 @@ class HomeButton;
 class Keyboard;
 class Mouse;
 class NPad;
+class Nmouse;
 class Palma;
 class SevenSixAxis;
 class SixAxis;
@@ -73,6 +74,7 @@ public:
     std::shared_ptr<Keyboard> GetKeyboard() const;
     std::shared_ptr<Mouse> GetMouse() const;
     std::shared_ptr<NPad> GetNpad() const;
+    std::shared_ptr<Nmouse> GetNmouse() const;
     std::shared_ptr<Palma> GetPalma() const;
     std::shared_ptr<SevenSixAxis> GetSevenSixAxis() const;
     std::shared_ptr<SixAxis> GetSixAxis() const;
@@ -142,6 +144,7 @@ private:
     std::shared_ptr<Keyboard> keyboard{nullptr};
     std::shared_ptr<Mouse> mouse{nullptr};
     std::shared_ptr<NPad> npad{nullptr};
+    std::shared_ptr<Nmouse> nmouse{nullptr};
     std::shared_ptr<Palma> palma{nullptr};
     std::shared_ptr<SevenSixAxis> seven_six_axis{nullptr};
     std::shared_ptr<SixAxis> six_axis{nullptr};
