@@ -8,6 +8,7 @@
 
 #include <memory>
 #include <mutex>
+#include <vector>
 #include "common/common_types.h"
 #include "core/file_sys/fs_directory.h"
 #include "core/file_sys/fs_filesystem.h"
@@ -77,6 +78,12 @@ public:
                        std::shared_ptr<RomFsController>* out_romfs_controller,
                        ProcessId process_id);
     void SetPackedUpdate(ProcessId process_id, FileSys::VirtualFile update_raw);
+
+    /// Add-on content title ids the process was booted with (NUP containers only; a container
+    /// holds its own add-ons, so no installed content lists them). Empty for other loaders.
+    /// `program_id` is the caller's program id, used when `process_id` is not a registered one.
+    [[nodiscard]] std::vector<u64> GetAddOnContentTitleIds(ProcessId process_id,
+                                                           ProgramId program_id);
 
     std::shared_ptr<SaveDataController> OpenSaveDataController();
 

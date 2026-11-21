@@ -208,10 +208,12 @@ AppLoader_NUP::AppLoader_NUP(FileSys::VirtualFile file_)
         nup->GetPackages().begin(), nup->GetPackages().end(),
         [](const auto& package) { return package.kind == NupContainer::PackageKind::Addon; });
     if (addon_count > 0) {
-        LOG_WARNING(Loader,
-                    "NUP container has {} add-on content package(s); AoC mounting is not "
-                    "supported yet",
-                    addon_count);
+        LOG_INFO(Loader, "NUP container has {} add-on content package(s)", addon_count);
+        for (const auto& package : nup->GetPackages()) {
+            if (package.kind == NupContainer::PackageKind::Addon) {
+                addon_title_ids.push_back(package.title_id);
+            }
+        }
     }
 }
 
@@ -237,10 +239,28 @@ AppLoader::LoadResult AppLoader_NUP::Load(Kernel::KProcess& process, Core::Syste
         return result;
     }
 
-    system.GetFileSystemController().RegisterProcess(
-        process.GetProcessId(), base_title_id,
-        std::make_shared<FileSys::RomFSFactory>(*this, system.GetContentProvider(),
-                                                system.GetFileSystemController()));
+    auto romfs_factory = std::make_shared<FileSys::RomFSFactory>(*this, system.GetContentProvider(),
+                                                                 system.GetFileSystemController());
+
+    // Add-on content travels in the container: expose each package's RomFS as a data storage of
+    // its own title id, so aoc:u can list it and nn::fs can mount it.
+    const auto& packages = nup->GetPackages();
+    for (std::size_t i = 0; i < packages.size(); ++i) {
+        if (packages[i].kind != NupContainer::PackageKind::Addon) {
+            continue;
+        }
+        const auto romfs = nup->GetRomFSDir(i);
+        if (romfs == nullptr) {
+            LOG_WARNING(Loader, "NUP add-on content {:016X} has no RomFS", packages[i].title_id);
+            continue;
+        }
+        LOG_INFO(Loader, "NUP add-on content {:016X} (v{}) registered", packages[i].title_id,
+                 packages[i].version);
+        romfs_factory->AddAddOnContent(packages[i].title_id, romfs);
+    }
+
+    system.GetFileSystemController().RegisterProcess(process.GetProcessId(), base_title_id,
+                                                     std::move(romfs_factory));
 
     is_loaded = true;
     return result;

@@ -19,9 +19,11 @@
 #include <fmt/format.h>
 #include <openssl/evp.h>
 
+#include "core/file_sys/common_funcs.h"
 #include "core/file_sys/nup_container.h"
 #include "core/file_sys/nup_writer.h"
 #include "core/file_sys/control_metadata.h"
+#include "core/file_sys/romfs.h"
 #include "core/file_sys/vfs/vfs_real.h"
 #include "core/file_sys/vfs/vfs_vector.h"
 #include "core/loader/nup.h"
@@ -877,4 +879,40 @@ TEST_CASE("NUP edits localized titles and keeps the rest", "[nup]") {
     FileSys::NupContainer nup{real.OpenFile(archive.string(), FileSys::OpenMode::Read)};
     REQUIRE(nup.GetPackages()[0].localized_titles.empty());
     REQUIRE(nup.GetPackages()[0].title_name == "Renamed");
+}
+
+TEST_CASE("NUP add-on content is exposed to the loader", "[nup]") {
+    TempDir t;
+    const auto root = t.path / "Game";
+    MakeDump(root);
+    Put(root / "dlc/0400ABCD00011002/0/romfs/more.bin", "more addon data");
+    const auto archive = t.path / "Game.nup";
+    REQUIRE(FileSys::Nup::PackDump(root, archive) == FileSys::Nup::PackResult::Success);
+
+    FileSys::RealVfsFilesystem real;
+    Loader::AppLoader_NUP loader{real.OpenFile(archive.string(), FileSys::OpenMode::Read)};
+
+    // Both add-ons are listed, in title id order, and each carries a complete RomFS.
+    const auto& addon_ids = loader.GetAddOnContentTitleIds();
+    REQUIRE(addon_ids == std::vector<u64>{0x0400ABCD00011001ULL, 0x0400ABCD00011002ULL});
+
+    FileSys::NupContainer nup{real.OpenFile(archive.string(), FileSys::OpenMode::Read)};
+    REQUIRE(nup.GetStatus() == Loader::ResultStatus::Success);
+    for (const auto index : {std::size_t{3}, std::size_t{4}}) {
+        REQUIRE(nup.GetPackages()[index].kind == NupContainer::PackageKind::Addon);
+        REQUIRE(nup.GetPackages()[index].title_id == addon_ids[index - 3]);
+        const auto romfs = FileSys::CreateRomFS(nup.GetRomFSDir(index));
+        REQUIRE(romfs != nullptr);
+        REQUIRE(FileSys::ExtractRomFS(romfs) != nullptr);
+    }
+}
+
+TEST_CASE("Add-on content data ids match across the title type byte", "[nup]") {
+    // Kirby and the Forgotten Land: a 0x04 program ships 0x01 add-on content.
+    constexpr u64 addon = 0x01004D300C5AF001ULL;
+    REQUIRE(FileSys::IsMatchingAddOnContentTitle(addon, addon));
+    REQUIRE(FileSys::IsMatchingAddOnContentTitle(0x04004D300C5AF001ULL, addon));
+    // Another add-on index, and the program id itself, are not the same content.
+    REQUIRE_FALSE(FileSys::IsMatchingAddOnContentTitle(0x04004D300C5AF002ULL, addon));
+    REQUIRE_FALSE(FileSys::IsMatchingAddOnContentTitle(0x04004D300C5AE001ULL, addon));
 }

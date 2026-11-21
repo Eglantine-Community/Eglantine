@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <utility>
 
 #include "common/assert.h"
@@ -14,6 +15,7 @@
 #include "core/core.h"
 #include "core/file_sys/bis_factory.h"
 #include "core/file_sys/card_image.h"
+#include "core/file_sys/common_funcs.h"
 #include "core/file_sys/control_metadata.h"
 #include "core/file_sys/errors.h"
 #include "core/file_sys/patch_manager.h"
@@ -375,6 +377,25 @@ void FileSystemController::SetPackedUpdate(ProcessId process_id, FileSys::Virtua
     }
 
     it->second.romfs_factory->SetPackedUpdate(std::move(update_raw));
+}
+
+std::vector<u64> FileSystemController::GetAddOnContentTitleIds(ProcessId process_id,
+                                                               ProgramId program_id) {
+    std::scoped_lock lk{registration_lock};
+
+    auto it = registrations.find(process_id);
+    if (it == registrations.end()) {
+        // aoc:u may be called on behalf of the application from another process.
+        const auto base_title_id = FileSys::GetBaseTitleID(program_id);
+        it = std::find_if(
+            registrations.begin(), registrations.end(), [base_title_id](const auto& entry) {
+                return FileSys::GetBaseTitleID(entry.second.program_id) == base_title_id;
+            });
+    }
+    if (it == registrations.end() || it->second.romfs_factory == nullptr) {
+        return {};
+    }
+    return it->second.romfs_factory->GetAddOnContentTitleIds();
 }
 
 std::shared_ptr<SaveDataController> FileSystemController::OpenSaveDataController() {

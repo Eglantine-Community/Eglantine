@@ -43,6 +43,10 @@ public:
         OutInterface<IPurchaseEventManager> out_interface);
 
 private:
+    /// Every add-on content title id the caller can see: installed content plus whatever the
+    /// loader's container carries. Sorted, so add-on indices stay stable between calls.
+    [[nodiscard]] std::vector<u64> GetAddOnContentTitleIds(const ClientProcessId& process_id) const;
+
     std::vector<u64> add_on_content;
     KernelHelpers::ServiceContext service_context;
 

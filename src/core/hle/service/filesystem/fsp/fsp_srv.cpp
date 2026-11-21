@@ -56,7 +56,7 @@ FSP_SRV::FSP_SRV(Core::System& system_)
         {1, D<&FSP_SRV::SetCurrentProcess>, "SetCurrentProcess"},
         {2, D<&FSP_SRV::OpenDataFileSystemByCurrentProcess>, "OpenDataFileSystemByCurrentProcess"},
         {7, D<&FSP_SRV::OpenFileSystemWithPatch>, "OpenFileSystemWithPatch"},
-        {8, nullptr, "OpenFileSystemWithId"},
+        {8, D<&FSP_SRV::OpenFileSystemWithId>, "OpenFileSystemWithId"},
         {9, nullptr, "OpenDataFileSystemByApplicationId"},
         {11, nullptr, "OpenBisFileSystem"},
         {12, nullptr, "OpenBisStorage"},
@@ -217,6 +217,30 @@ Result FSP_SRV::OpenFileSystemWithPatch(OutInterface<IFileSystem> out_interface,
 
     *out_interface = std::make_shared<IFileSystem>(
         system, extracted_romfs, SizeGetter::FromStorageId(fsc, FileSys::StorageId::NandUser));
+
+    R_SUCCEED();
+}
+
+Result FSP_SRV::OpenFileSystemWithId(OutInterface<IFileSystem> out_interface,
+                                     FileSys::StorageId storage_id,
+                                     FileSys::ContentRecordType content_type, u64 title_id) {
+    LOG_DEBUG(Service_FS, "called with storage_id={:02X}, content_type={:02X}, title_id={:016X}",
+              storage_id, content_type, title_id);
+
+    auto data = romfs_controller->OpenRomFS(title_id, storage_id, content_type);
+    if (!data) {
+        LOG_ERROR(Service_FS, "Could not open file system with title_id={:016X}", title_id);
+        R_RETURN(FileSys::ResultTargetNotFound);
+    }
+
+    auto extracted = FileSys::ExtractRomFS(data);
+    if (!extracted) {
+        LOG_ERROR(Service_FS, "Could not extract the RomFS of title_id={:016X}", title_id);
+        R_RETURN(FileSys::ResultTargetNotFound);
+    }
+
+    *out_interface = std::make_shared<IFileSystem>(
+        system, extracted, SizeGetter::FromStorageId(fsc, FileSys::StorageId::NandUser));
 
     R_SUCCEED();
 }

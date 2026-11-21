@@ -7,6 +7,7 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <memory>
 #include "common/assert.h"
 #include "common/common_types.h"
@@ -16,6 +17,7 @@
 #include "core/file_sys/nca_metadata.h"
 #include "core/file_sys/patch_manager.h"
 #include "core/file_sys/registered_cache.h"
+#include "core/file_sys/romfs.h"
 #include "core/file_sys/romfs_factory.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/service/filesystem/filesystem.h"
@@ -38,6 +40,51 @@ RomFSFactory::~RomFSFactory() = default;
 
 void RomFSFactory::SetPackedUpdate(VirtualFile update_raw_file) {
     packed_update_raw = std::move(update_raw_file);
+}
+
+void RomFSFactory::AddAddOnContent(u64 title_id, VirtualDir romfs_dir) {
+    std::scoped_lock lock{addon_mutex};
+    add_on_contents.insert_or_assign(title_id, AddOnContent{std::move(romfs_dir), nullptr});
+}
+
+std::vector<u64> RomFSFactory::GetAddOnContentTitleIds() const {
+    std::scoped_lock lock{addon_mutex};
+
+    std::vector<u64> title_ids;
+    title_ids.reserve(add_on_contents.size());
+    for (const auto& [title_id, entry] : add_on_contents) {
+        title_ids.push_back(title_id);
+    }
+    // aoc:u indexes add-ons, so the order has to be stable between calls.
+    std::sort(title_ids.begin(), title_ids.end());
+    return title_ids;
+}
+
+VirtualFile RomFSFactory::OpenAddOnContent(u64 title_id) const {
+    std::scoped_lock lock{addon_mutex};
+
+    auto it = add_on_contents.find(title_id);
+    if (it == add_on_contents.end()) {
+        it = std::find_if(add_on_contents.begin(), add_on_contents.end(),
+                          [title_id](const auto& entry) {
+                              return IsMatchingAddOnContentTitle(title_id, entry.first);
+                          });
+    }
+    if (it == add_on_contents.end()) {
+        return nullptr;
+    }
+    if (it->second.romfs == nullptr) {
+        it->second.romfs = CreateRomFS(it->second.dir);
+        if (it->second.romfs != nullptr) {
+            LOG_INFO(Service_FS, "Built add-on content RomFS for title_id={:016X}", it->first);
+        }
+    }
+    if (it->first != title_id) {
+        LOG_DEBUG(Service_FS,
+                  "Data id {:016X} resolved to add-on content {:016X} (title type differs)",
+                  title_id, it->first);
+    }
+    return it->second.romfs;
 }
 
 VirtualFile RomFSFactory::OpenCurrentProcess(u64 current_process_title_id) const {
@@ -85,6 +132,11 @@ VirtualFile RomFSFactory::OpenPatchedRomFSWithProgramIndex(u64 title_id, u8 prog
 }
 
 VirtualFile RomFSFactory::Open(u64 title_id, StorageId storage, ContentRecordType type) const {
+    // Add-on content packaged in the loader's container is a data storage of its own.
+    if (const auto addon = OpenAddOnContent(title_id); addon != nullptr) {
+        return addon;
+    }
+
     const std::shared_ptr<NCA> res = GetEntry(title_id, storage, type);
     if (res == nullptr) {
         return nullptr;

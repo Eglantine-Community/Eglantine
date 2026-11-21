@@ -52,4 +52,19 @@ constexpr u64 BASE_TITLE_ID_MASK = 0xFFFFFFFFFFFFE000;
     return aoc_title_id & AOC_TITLE_ID_MASK;
 }
 
+/**
+ * Whether `requested`, a data id nn::fs was asked to open, names the add-on content stored as
+ * `addon_title_id`. The title type byte is ignored: a Switch 2 edition program carries 0x04 where
+ * the add-on content it ships keeps 0x01, and the data id may be derived from either side.
+ *
+ * @param requested The title id being opened.
+ * @param addon_title_id The add-on content title id the loader provides.
+ * @returns True when both are the same add-on content title id.
+ */
+[[nodiscard]] constexpr bool IsMatchingAddOnContentTitle(u64 requested, u64 addon_title_id) {
+    constexpr u64 title_type_mask = 0xFF00000000000000ULL;
+    return (requested & AOC_TITLE_ID_OFFSET) != 0 && (addon_title_id & AOC_TITLE_ID_OFFSET) != 0 &&
+           (requested & ~title_type_mask) == (addon_title_id & ~title_type_mask);
+}
+
 } // namespace FileSys

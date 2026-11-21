@@ -9,6 +9,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "core/file_sys/nup_container.h"
 #include "core/loader/loader.h"
@@ -21,8 +22,9 @@ class NupContainer;
 namespace Loader {
 
 /// Loads a NUP (NX Package) container: loose ExeFS/RomFS trees for a base
-/// program plus its updates in one file. The newest update package is layered
-/// over the base; add-on content packages are recognized but not yet mounted.
+/// program plus its updates and add-on content in one file. The newest update
+/// package is layered over the base; each add-on package is mounted as a data
+/// storage of its own title id.
 class AppLoader_NUP final : public AppLoader {
 public:
     explicit AppLoader_NUP(FileSys::VirtualFile file_);
@@ -54,12 +56,19 @@ public:
     ResultStatus ReadControlData(FileSys::NACP& control) override;
     ResultStatus ReadNSOModules(Modules& modules) override;
 
+    /// Add-on content title ids packaged in this container. These are not installed content, so
+    /// only the container itself can report them.
+    [[nodiscard]] const std::vector<u64>& GetAddOnContentTitleIds() const {
+        return addon_title_ids;
+    }
+
 private:
     std::unique_ptr<FileSys::NupContainer> nup;
     std::unique_ptr<AppLoader> secondary_loader;
 
     std::unique_ptr<FileSys::NACP> nacp_file;
     FileSys::VirtualFile icon_file;
+    std::vector<u64> addon_title_ids;
     u64 base_title_id{};
     std::string display_version;
     bool has_program{};

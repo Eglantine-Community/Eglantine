@@ -8,6 +8,8 @@
 
 #include <mutex>
 #include <memory>
+#include <unordered_map>
+#include <vector>
 
 #include "common/common_types.h"
 #include "core/file_sys/vfs/vfs_types.h"
@@ -53,7 +55,19 @@ public:
     [[nodiscard]] std::shared_ptr<NCA> GetEntry(u64 title_id, StorageId storage,
                                                 ContentRecordType type) const;
 
+    /// Add-on content carried by the loader's container (NUP only): the RomFS tree is exposed as
+    /// a data storage under its own title id, built on first use.
+    void AddAddOnContent(u64 title_id, VirtualDir romfs_dir);
+    [[nodiscard]] std::vector<u64> GetAddOnContentTitleIds() const;
+
 private:
+    [[nodiscard]] VirtualFile OpenAddOnContent(u64 title_id) const;
+
+    struct AddOnContent {
+        VirtualDir dir;
+        mutable VirtualFile romfs;
+    };
+
     VirtualFile file;
     VirtualFile packed_update_raw;
 
@@ -63,6 +77,10 @@ private:
     /// The merged RomFS with LayeredFS mods applied (not updatable: NUP containers).
     mutable VirtualFile layered_file;
     mutable std::mutex layered_mutex;
+
+    /// Add-on content packaged in the loader's container, by title id.
+    mutable std::mutex addon_mutex;
+    std::unordered_map<u64, AddOnContent> add_on_contents;
 
     ContentProvider& content_provider;
     Service::FileSystem::FileSystemController& filesystem_controller;
