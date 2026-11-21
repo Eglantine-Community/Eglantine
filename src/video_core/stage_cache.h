@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <functional>
 #include <optional>
 #include <span>
 #include <unordered_map>
@@ -139,7 +140,10 @@ public:
 
     /// Waits up to `limit` until no other thread is translating any of `hashes`. The caller must
     /// hold no InFlight itself, or two threads could wait for each other. True when it waited.
-    bool WaitForInFlight(std::span<const u64> hashes, std::chrono::milliseconds limit);
+    /// `help`, when given, runs other work while the stages are busy and returns false when it
+    /// found none (the wait then sleeps as without it).
+    bool WaitForInFlight(std::span<const u64> hashes, std::chrono::milliseconds limit,
+                         const std::function<bool()>& help = {});
 
     /// Marks the `hashes` no other thread is translating as translated by the caller.
     [[nodiscard]] InFlight ClaimInFlight(std::span<const u64> hashes);
@@ -195,6 +199,7 @@ private:
     std::atomic<u64> in_flight_waits{};
     std::atomic<u64> in_flight_waited_stages{};
     std::atomic<u64> in_flight_reused{};
+    std::atomic<u64> in_flight_helped{};
 
     std::mutex in_flight_mutex;
     std::condition_variable in_flight_cv;

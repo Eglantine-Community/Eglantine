@@ -235,7 +235,8 @@ u64 StageCache::SignatureHash(const std::vector<u8>& signature) {
     return Common::CityHash64(reinterpret_cast<const char*>(signature.data()), signature.size());
 }
 
-bool StageCache::WaitForInFlight(std::span<const u64> hashes, std::chrono::milliseconds limit) {
+bool StageCache::WaitForInFlight(std::span<const u64> hashes, std::chrono::milliseconds limit,
+                                 const std::function<bool()>& help) {
     const auto busy = [&] {
         for (const u64 hash : hashes) {
             if (in_flight.contains(hash)) {
@@ -248,7 +249,17 @@ bool StageCache::WaitForInFlight(std::span<const u64> hashes, std::chrono::milli
     if (!busy()) {
         return false;
     }
-    in_flight_cv.wait_for(lock, limit, [&] { return !busy(); });
+    const auto deadline = std::chrono::steady_clock::now() + limit;
+    while (help && busy() && std::chrono::steady_clock::now() < deadline) {
+        lock.unlock();
+        const bool helped = help();
+        lock.lock();
+        if (!helped) {
+            break;
+        }
+        in_flight_helped.fetch_add(1, std::memory_order_relaxed);
+    }
+    in_flight_cv.wait_until(lock, deadline, [&] { return !busy(); });
     return true;
 }
 
@@ -542,9 +553,10 @@ void StageCache::Log() {
     LOG_INFO(Render_Vulkan,
              "Stage cache: {} stages reused whole, {} translations reused, {} translated; "
              "{} pipelines waited for {} stages another thread was translating, {} of them "
-             "reused; {} duplicates merged, {} evicted{}",
+             "reused, {} translations run while waiting; {} duplicates merged, {} evicted{}",
              reused_emitted.load(), reused_translation.load(), translated.load(),
              in_flight_waits.load(), in_flight_waited_stages.load(), in_flight_reused.load(),
+             in_flight_helped.load(),
              deduplicated.load(), evicted.load(),
              verify ? fmt::format(", {} verify mismatches", verify_mismatches.load())
                     : std::string{});

@@ -95,5 +95,7 @@ TEST_CASE("shader compile scheduling switches: on by default", "[nx2_perf]") {
     REQUIRE(opt_names[Index(Opt::TranslationPriority)] == "translation_priority");
     REQUIRE(!IsOff(DefaultOffMask(), Index(Opt::TranslationPriority)));
     REQUIRE(opt_names[Index(Opt::SavedPipelineLayouts)] == "saved_pipeline_layouts");
+    REQUIRE(opt_names[Index(Opt::HelpWhileInFlight)] == "help_while_in_flight");
     REQUIRE(!IsOff(DefaultOffMask(), Index(Opt::SavedPipelineLayouts)));
+    REQUIRE(!IsOff(DefaultOffMask(), Index(Opt::HelpWhileInFlight)));
 }

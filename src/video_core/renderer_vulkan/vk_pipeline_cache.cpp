@@ -387,12 +387,16 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
     return info;
 }
 
+// Set on translation_workers' threads by their first task.
+thread_local bool on_translation_thread = false;
+// Set while a translation thread runs another queued translation inside an in-flight wait.
+thread_local bool helping_in_flight = false;
+
 // Called by every task on translation_workers (Opt::TranslationPriority): the workers start at
 // low priority like the driver compile workers, and the first task raises its thread once.
 void PrioritizeTranslationThread() {
-    thread_local bool raised = false;
-    if (!raised) {
-        raised = true;
+    if (!on_translation_thread) {
+        on_translation_thread = true;
         if (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::TranslationPriority)) {
             Common::SetCurrentThreadPriority(Common::ThreadPriority::Normal);
         }
@@ -2789,8 +2793,23 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             }
             const bool on_gpu_thread{std::this_thread::get_id() ==
                                      draw_thread.load(std::memory_order_relaxed)};
+            // A translation thread runs other queued translations meanwhile (one level deep:
+            // the ones it runs wait without helping).
+            const std::function<bool()> help = [this] {
+                if (helping_in_flight) {
+                    return false;
+                }
+                helping_in_flight = true;
+                const bool ran = translation_workers->TryRunOne();
+                helping_in_flight = false;
+                return ran;
+            };
+            const bool may_help =
+                on_translation_thread && !helping_in_flight && translation_workers &&
+                VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::HelpWhileInFlight);
             if (!on_gpu_thread &&
-                stage_cache.WaitForInFlight(hashes, std::chrono::milliseconds{500})) {
+                stage_cache.WaitForInFlight(hashes, std::chrono::milliseconds{500},
+                                            may_help ? help : std::function<bool()>{})) {
                 const size_t waited{missing.size()};
                 boost::container::static_vector<size_t, Maxwell::MaxShaderProgram> still_missing;
                 hashes.clear();

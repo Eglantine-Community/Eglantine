@@ -116,6 +116,9 @@ enum class Opt : unsigned {
     TranslationPriority,
     /// Shared layouts are saved per title and created at boot, before anything compiles
     SavedPipelineLayouts,
+    /// A translation thread waiting for a stage another thread translates runs other queued
+    /// translations meanwhile instead of idling
+    HelpWhileInFlight,
     Count,
 };
 
@@ -132,6 +135,7 @@ inline constexpr std::array<std::string_view, static_cast<size_t>(Opt::Count)> o
     "geometry_consistency", "build_order_priority", "replay_disk_recordings",
     "queue_deferred_translation", "stage_in_flight", "shared_pipeline_layouts",
     "translation_priority", "saved_pipeline_layouts",
+    "help_while_in_flight",
 };
 
 static_assert(static_cast<size_t>(Opt::Count) <= 64, "the off-mask is 64 bits");
