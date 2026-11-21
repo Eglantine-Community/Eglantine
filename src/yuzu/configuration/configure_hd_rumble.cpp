@@ -18,6 +18,7 @@
 #include <QPushButton>
 #include <QSlider>
 #include <QSpinBox>
+#include <QFrame>
 #include <QStackedWidget>
 #include <QToolButton>
 #include <QVBoxLayout>
@@ -300,15 +301,28 @@ QWidget* ConfigureHdRumble::CreateOptionPage(unsigned device, const QString& not
     auto* page = new QWidget;
     auto* layout = new QVBoxLayout(page);
     layout->setContentsMargins(0, 0, 0, 0);
+    layout->setSpacing(10);
     layout->addWidget(MakeNote(note));
 
-    auto* basic = new QFormLayout;
-    QFormLayout* advanced = nullptr;
+    // One card per page for the basic rows, the anatomy of the upstream panel translated to
+    // native Qt: every row is a label stack on the left (title, muted help under it) with its
+    // control vertically centered on the right, and a thin divider between rows.
+    auto* basic_card = new QGroupBox(device == 1   ? tr("Rumble")
+                                     : device == 2 ? tr("Haptics")
+                                                   : tr("Motors"));
+    auto* basic_col = new QVBoxLayout(basic_card);
+    basic_col->setContentsMargins(14, 12, 14, 12);
+    basic_col->setSpacing(6);
     QWidget* advanced_box = nullptr;
+    QVBoxLayout* advanced_col = nullptr;
     QToolButton* advanced_button = nullptr;
 
     const auto& options = Options();
-    auto add_row = [&](const InputCommon::RenHDrumOption& opt, int table_index, int def) {
+    bool first_basic = true;
+    bool first_advanced = true;
+
+    auto add_row = [&](QVBoxLayout* col, bool& first, const InputCommon::RenHDrumOption& opt,
+                       int table_index, int def) {
         OptionRow row;
         row.key = opt.key;
         row.table_index = table_index;
@@ -323,52 +337,62 @@ QWidget* ConfigureHdRumble::CreateOptionPage(unsigned device, const QString& not
                                    : QStringLiteral(" (Bluetooth only)");
         }
 
-        QFormLayout* form = basic;
-        if (opt.tier == 1) {
-            if (!advanced) {
-                // Collapsible Advanced section, the way the upstream dialog groups its
-                // second-tier rows; native Qt widgets only.
-                advanced_button = new QToolButton;
-                advanced_button->setText(tr("Advanced"));
-                advanced_button->setCheckable(true);
-                advanced_button->setToolButtonStyle(Qt::ToolButtonTextOnly);
-                advanced_button->setArrowType(Qt::DownArrow);
-                advanced_box = new QWidget;
-                advanced = new QFormLayout(advanced_box);
-                advanced->setContentsMargins(0, 0, 0, 0);
-                layout->addWidget(advanced_button);
-                layout->addWidget(advanced_box);
-                advanced_box->setVisible(false);
-                connect(advanced_button, &QToolButton::toggled, advanced_box, &QWidget::setVisible);
-                connect(advanced_button, &QToolButton::toggled, this, [advanced_button](bool on) {
-                    advanced_button->setArrowType(on ? Qt::UpArrow : Qt::DownArrow);
-                });
-            }
-            form = advanced;
+        if (!first) {
+            auto* divider = new QFrame;
+            divider->setFrameShape(QFrame::HLine);
+            divider->setFrameShadow(QFrame::Sunken);
+            col->addWidget(divider);
         }
+        first = false;
+
+        auto* row_box = new QWidget;
+        auto* row_layout = new QHBoxLayout(row_box);
+        row_layout->setContentsMargins(0, 4, 0, 4);
+        row_layout->setSpacing(12);
+        auto* left = new QVBoxLayout;
+        left->setSpacing(2);
+        auto* title_label = new QLabel(QString::fromStdString(opt.label));
+        title_label->setWordWrap(true);
+        left->addWidget(title_label);
+        if (!help.isEmpty()) {
+            left->addWidget(MakeNote(help));
+        }
+        row_layout->addLayout(left, 1);
 
         if (opt.kind == 0) {
-            row.check = new QCheckBox(QString::fromStdString(opt.label));
+            // The label lives on the left stack; the checkbox is the control on the right
+            row.check = new QCheckBox;
+            row.check->setChecked(def != 0);
+            row.check->setAccessibleName(QString::fromStdString(opt.label));
             if (!help.isEmpty()) {
                 row.check->setToolTip(help);
             }
-            form->addRow(row.check);
+            row_layout->addWidget(row.check, 0, Qt::AlignVCenter);
         } else if (opt.kind == 2) {
             row.combo = new QComboBox;
             for (const std::string& choice : opt.choices) {
                 row.combo->addItem(QString::fromStdString(choice));
             }
+            row.combo->setCurrentIndex(std::clamp(def, 0, row.combo->count() - 1));
             if (!help.isEmpty()) {
                 row.combo->setToolTip(help);
             }
-            form->addRow(QString::fromStdString(opt.label), row.combo);
+            row_layout->addWidget(row.combo, 0, Qt::AlignVCenter);
         } else {
+            auto* controls = new QHBoxLayout;
+            controls->setContentsMargins(0, 0, 0, 0);
+            controls->setSpacing(8);
             row.slider = new QSlider(Qt::Horizontal);
+            row.slider->setMinimumWidth(120);
             row.slider->setRange(opt.min, opt.max);
-            row.slider->setSingleStep(opt.step);
+            row.slider->setSingleStep(std::max(1, opt.step));
+            row.slider->setPageStep(std::max(1, opt.step) * 4);
+            row.slider->setValue(std::clamp(def, opt.min, opt.max));
             row.spin = new QSpinBox;
             row.spin->setRange(opt.min, opt.max);
-            row.spin->setSingleStep(opt.step);
+            row.spin->setSingleStep(std::max(1, opt.step));
+            row.spin->setSuffix(QStringLiteral(" %"));
+            row.spin->setValue(std::clamp(def, opt.min, opt.max));
             if (!help.isEmpty()) {
                 row.spin->setToolTip(help);
                 row.slider->setToolTip(help);
@@ -376,14 +400,11 @@ QWidget* ConfigureHdRumble::CreateOptionPage(unsigned device, const QString& not
             connect(row.slider, &QSlider::valueChanged, row.spin, &QSpinBox::setValue);
             connect(row.spin, qOverload<int>(&QSpinBox::valueChanged), row.slider,
                     &QSlider::setValue);
-            auto* spin_row = new QHBoxLayout;
-            spin_row->addWidget(row.slider, 1);
-            spin_row->addWidget(row.spin);
-            form->addRow(QString::fromStdString(opt.label), spin_row);
+            controls->addWidget(row.slider);
+            controls->addWidget(row.spin);
+            row_layout->addLayout(controls, 0);
         }
-        if (!help.isEmpty() && opt.kind != 0) {
-            form->addRow(QString{}, MakeNote(help));
-        }
+        col->addWidget(row_box);
         rows.push_back(row);
     };
 
@@ -396,7 +417,30 @@ QWidget* ConfigureHdRumble::CreateOptionPage(unsigned device, const QString& not
         if ((opt.devices & device) == 0) {
             continue;
         }
-        add_row(opt, i, opt.def);
+        if (opt.tier == 1) {
+            if (!advanced_box) {
+                advanced_button = new QToolButton;
+                advanced_button->setText(tr("Advanced"));
+                advanced_button->setCheckable(true);
+                advanced_button->setAutoRaise(true);
+                advanced_button->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+                advanced_button->setArrowType(Qt::RightArrow);
+                advanced_button->setCursor(Qt::PointingHandCursor);
+                advanced_box = new QWidget;
+                advanced_col = new QVBoxLayout(advanced_box);
+                advanced_col->setContentsMargins(14, 4, 14, 4);
+                advanced_col->setSpacing(6);
+                advanced_box->setVisible(false);
+                connect(advanced_button, &QToolButton::toggled, advanced_button,
+                        [advanced_button, advanced_box](bool open) {
+                            advanced_button->setArrowType(open ? Qt::DownArrow : Qt::RightArrow);
+                            advanced_box->setVisible(open);
+                        });
+            }
+            add_row(advanced_col, first_advanced, opt, i, opt.def);
+        } else {
+            add_row(basic_col, first_basic, opt, i, opt.def);
+        }
     }
 
     // Two settings the engine's table does not carry, both long-standing Eglantine rows
@@ -405,11 +449,30 @@ QWidget* ConfigureHdRumble::CreateOptionPage(unsigned device, const QString& not
         extra.key = "bluetooth_level";
         extra.label = "Bluetooth pacing";
         extra.help = "Lower levels send less often, which keeps input lag down on a busy "
-                     "Bluetooth link.";
+                     "Bluetooth link. (Bluetooth only)";
         extra.choices = {"1 - Stable (60 ms)", "2 - Balanced (45 ms)", "3 - Quality (35 ms)"};
         extra.kind = 2;
-        extra.def = 3;
-        add_row(extra, -1, 3);
+        if (!advanced_box) {
+            // Only advanced-tier rows exist for this device so far; make the section anyway
+            advanced_button = new QToolButton;
+            advanced_button->setText(tr("Advanced"));
+            advanced_button->setCheckable(true);
+            advanced_button->setAutoRaise(true);
+            advanced_button->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+            advanced_button->setArrowType(Qt::RightArrow);
+            advanced_button->setCursor(Qt::PointingHandCursor);
+            advanced_box = new QWidget;
+            advanced_col = new QVBoxLayout(advanced_box);
+            advanced_col->setContentsMargins(14, 4, 14, 4);
+            advanced_col->setSpacing(6);
+            advanced_box->setVisible(false);
+            connect(advanced_button, &QToolButton::toggled, advanced_button,
+                    [advanced_button, advanced_box](bool open) {
+                        advanced_button->setArrowType(open ? Qt::DownArrow : Qt::RightArrow);
+                        advanced_box->setVisible(open);
+                    });
+        }
+        add_row(advanced_col, first_advanced, extra, -1, 3);
     }
     if (device == 2) {
         InputCommon::RenHDrumOption extra;
@@ -420,11 +483,14 @@ QWidget* ConfigureHdRumble::CreateOptionPage(unsigned device, const QString& not
         extra.min = 0;
         extra.max = 100;
         extra.step = 5;
-        extra.def = 60;
-        add_row(extra, -1, 60);
+        add_row(basic_col, first_basic, extra, -1, 60);
     }
 
-    layout->addLayout(basic);
+    layout->addWidget(basic_card);
+    if (advanced_box) {
+        layout->addWidget(advanced_button);
+        layout->addWidget(advanced_box);
+    }
 
     if (device == 4) {
         // Whether the controller in use has trigger motors, known when the dialog opens
