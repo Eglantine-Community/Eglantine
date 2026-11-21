@@ -913,6 +913,11 @@ struct Values {
     Setting<bool> hd_rumble_bt_fast{linkage, true, "hd_rumble_bt_fast", Category::Controls};
     Setting<bool> hd_rumble_bt_crisp_notes{linkage, true, "hd_rumble_bt_crisp_notes",
                                            Category::Controls};
+    // RenHDrum 0.5.0 HD Haptics: the controller speaker and the L2/R2 trigger kick react to the
+    // rumble. Host-side only: the speaker and trigger blocks are sent by the pad driver.
+    Setting<bool> dualsense_hd_haptics{linkage, true, "dualsense_hd_haptics", Category::Controls};
+    Setting<int> dualsense_speaker_volume{linkage, 60, "dualsense_speaker_volume",
+                                          Category::Controls};
     Setting<bool> dualsense_haptics_enabled{linkage, true, "dualsense_haptics_enabled",
                                             Category::Controls};
     Setting<int> dualsense_haptics_volume{linkage, 100, "dualsense_haptics_volume", Category::Controls};

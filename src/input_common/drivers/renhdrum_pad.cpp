@@ -61,6 +61,23 @@ struct RenHDrumApi {
     decltype(&renhdrum_dualsense_dsp_fill_f32) dsp_fill_f32{};
     // Optional (RenHDrum 0.2.1+): DualSense haptics over Bluetooth
     decltype(&renhdrum_dualsense_dsp_build_bt_report) dsp_build_bt_report{};
+    // Optional (RenHDrum 0.5.0+): DualSense HD Haptics -- the speaker and the trigger kick
+    decltype(&renhdrum_dualsense_dsp_set_speaker) dsp_set_speaker{};
+    decltype(&renhdrum_hd_haptics_speaker_block) hd_speaker_block{};
+    decltype(&renhdrum_hd_haptics_trigger_block) hd_trigger_block{};
+    decltype(&renhdrum_tri_trigger_create) tri_create{};
+    decltype(&renhdrum_tri_trigger_destroy) tri_destroy{};
+    decltype(&renhdrum_tri_trigger_update) tri_update{};
+    // Strictly optional even when the rest is there: a hint the core works without
+    decltype(&renhdrum_tri_trigger_note_action) tri_note_action{};
+    // Optional (RenHDrum 0.5.0+): the combined rumble + trigger + speaker report 0x36
+    decltype(&renhdrum_dualsense_dsp_build_bt36_report) dsp_build_bt36_report{};
+    bool HasTriTrigger() const {
+        return tri_create && tri_destroy && tri_update;
+    }
+    bool HasHdHaptics() const {
+        return HasTriTrigger() && dsp_set_speaker && hd_speaker_block && hd_trigger_block;
+    }
     // Optional (RenHDrum 0.2.0+): Xbox-style controllers
     decltype(&renhdrum_xbox_rumble_create) xbox_create{};
     decltype(&renhdrum_xbox_rumble_destroy) xbox_destroy{};
@@ -135,6 +152,15 @@ const RenHDrumApi& Api() {
             (void)a.library.GetSymbol("renhdrum_set_nx2_mode", &a.set_nx2_mode);
             (void)a.library.GetSymbol("renhdrum_dualsense_dsp_build_bt_report",
                                       &a.dsp_build_bt_report);
+            (void)a.library.GetSymbol("renhdrum_dualsense_dsp_set_speaker", &a.dsp_set_speaker);
+            (void)a.library.GetSymbol("renhdrum_hd_haptics_speaker_block", &a.hd_speaker_block);
+            (void)a.library.GetSymbol("renhdrum_hd_haptics_trigger_block", &a.hd_trigger_block);
+            (void)a.library.GetSymbol("renhdrum_tri_trigger_create", &a.tri_create);
+            (void)a.library.GetSymbol("renhdrum_tri_trigger_destroy", &a.tri_destroy);
+            (void)a.library.GetSymbol("renhdrum_tri_trigger_update", &a.tri_update);
+            (void)a.library.GetSymbol("renhdrum_tri_trigger_note_action", &a.tri_note_action);
+            (void)a.library.GetSymbol("renhdrum_dualsense_dsp_build_bt36_report",
+                                      &a.dsp_build_bt36_report);
             (void)a.library.GetSymbol("renhdrum_xbox_rumble_create", &a.xbox_create);
             (void)a.library.GetSymbol("renhdrum_xbox_rumble_destroy", &a.xbox_destroy);
             (void)a.library.GetSymbol("renhdrum_xbox_rumble_push_half_sample",
@@ -158,6 +184,23 @@ constexpr std::array<Uint8, 10> NeutralPacket{0x10, 0, 0x00, 0x01, 0x40, 0x40, 0
 constexpr int DualSenseAudioMaxAttempts = 10;
 // SDL no-queue gap while the 5 ms envelope runs (Ryuhdr AmFmNoQueueGapMs)
 [[maybe_unused]] constexpr int NoQueueEnvelopeGapMs = 10;
+
+// HD Haptics (RenHDrum 0.5.0): the 47-byte DualSense effects blocks come from the core, ready to
+// hand to SDL_SendJoystickEffect. Only used once Api().HasHdHaptics() is true.
+using Ds5Block = std::array<Uint8, RENHDRUM_DS5_EFFECTS_SIZE>;
+
+Ds5Block HdSpeakerBlock(bool on) {
+    Ds5Block block{};
+    Api().hd_speaker_block(on ? 1 : 0, block.data());
+    return block;
+}
+
+/// `effect` null = trigger off.
+Ds5Block HdTriggerBlock(bool is_right, const std::array<Uint8, 11>* effect) {
+    Ds5Block block{};
+    Api().hd_trigger_block(is_right ? 1 : 0, effect ? effect->data() : nullptr, block.data());
+    return block;
+}
 
 bool IsSwitchHdController(Uint16 vid, Uint16 pid) {
     return vid == NintendoVendorId && (pid == 0x2009 || pid == 0x2006 || pid == 0x2007);
@@ -203,6 +246,8 @@ struct UserSettings {
     bool dualsense_enabled{true};
     int dualsense_volume{100};
     bool dualsense_crisp_notes{true};
+    bool dualsense_hd_haptics{true};
+    int dualsense_speaker_volume{60};
     bool xbox_enabled{true};
     int xbox_strength{100};
     bool xbox_direct{false};
@@ -229,6 +274,8 @@ UserSettings ReadUserSettings() {
         .dualsense_enabled = s.dualsense_haptics_enabled.GetValue(),
         .dualsense_volume = std::clamp(s.dualsense_haptics_volume.GetValue(), 0, 100),
         .dualsense_crisp_notes = s.dualsense_crisp_notes.GetValue(),
+        .dualsense_hd_haptics = s.dualsense_hd_haptics.GetValue(),
+        .dualsense_speaker_volume = std::clamp(s.dualsense_speaker_volume.GetValue(), 0, 100),
         .xbox_enabled = s.xbox_rumble_enabled.GetValue(),
         .xbox_strength = std::clamp(s.xbox_motor_strength.GetValue(), 0, 1000),
         .xbox_direct = s.xbox_rumble_mode.GetValue() == 1,
@@ -315,10 +362,29 @@ struct RenHDrumPad::Impl {
     std::array<std::uint16_t, 2> trigger_target{};
     std::array<std::uint16_t, 2> trigger_sent{};
 
-    std::mutex bt_dsp_mutex;
+    mutable std::mutex bt_dsp_mutex;
     SDL_hid_device* bt_hid{};
     std::thread bt_thread;
     std::atomic<bool> bt_running{};
+    // HD Haptics (RenHDrum 0.5.0): one trigger-kick handle per side, the latest raw sample and
+    // fresh flag for it, and the speaker state. `tri_mutex` guards the trigger step; lock order is
+    // `tri_mutex`, then `mutex`.
+    std::array<RenHdcTriTrigger*, 2> tri{};
+    std::mutex tri_mutex;
+    std::array<std::array<float, 4>, 2> tri_sample{};
+    std::array<bool, 2> tri_fresh{};
+    bool speaker_on{};
+    int speaker_volume_applied{};
+    bool speaker_logged{};
+    bool speaker_off_logged{};
+    // The combined Bluetooth report 0x36 carries the triggers; the sender thread reads both
+    // sides' latest effects, written under `bt_dsp_mutex`.
+    std::array<std::array<Uint8, 11>, 2> bt_effect{};
+    std::array<bool, 2> bt_effect_set{};
+    std::atomic<bool> bt_report36{};
+    // Set by Release() when the pad leaves, so Shutdown() can turn the extras off over HID
+    bool restore_speaker{};
+    bool restore_trigger{};
 
     /// Engine settings from the user's choices (Ryuhdr 0.2.6's recommended mode by default).
     /// Caller holds the mutex.
@@ -336,6 +402,9 @@ struct RenHDrumPad::Impl {
         config.hd_rumble_experimental_bt_after_input = user.bt_after_input;
         config.hd_rumble_experimental_bt_fast = user.bt_fast;
         config.hd_rumble_experimental_bt_crisp_notes = user.bt_crisp_notes;
+        // HD Haptics is on by default in 0.5.0; this is the single switch the core knows. The
+        // speaker and trigger wiring below is what actually makes it happen on the pad.
+        config.dualsense_hd_haptics_off = !user.dualsense_hd_haptics;
         const auto& api = Api();
         const auto resolve = api.settings_resolve_pure ? api.settings_resolve_pure
                                                        : api.settings_resolve;
@@ -413,6 +482,7 @@ struct RenHDrumPad::Impl {
     struct SettingsChange {
         bool reconfigure_engine{};
         bool stop_engine{};
+        bool sync_hd_haptics{};
     };
 
     /// Picks up changes made in the HD Rumble dialog. Caller holds the mutex; the returned SDL
@@ -444,7 +514,184 @@ struct RenHDrumPad::Impl {
         return {
             .reconfigure_engine = engine != nullptr,
             .stop_engine = engine != nullptr && old.hd_enabled && !now.hd_enabled,
+            // The volume and crisp-notes rows recreate the DSP, which forgets the speaker, so a
+            // recreate also re-syncs. Everything else just flips what SyncHdHaptics applies.
+            .sync_hd_haptics = dsp != nullptr &&
+                               (old.hd_enabled != now.hd_enabled ||
+                                old.dualsense_enabled != now.dualsense_enabled ||
+                                old.dualsense_hd_haptics != now.dualsense_hd_haptics ||
+                                old.dualsense_speaker_volume != now.dualsense_speaker_volume ||
+                                old.dualsense_volume != now.dualsense_volume ||
+                                old.dualsense_crisp_notes != now.dualsense_crisp_notes),
         };
+    }
+
+    /// Brings HD Haptics in line with the settings: on = the speaker (wired, once its audio
+    /// stream is open) and a trigger-kick handle per side, plus report 0x36 on Bluetooth; off =
+    /// both triggers off and the speaker released. Called without the mutex.
+    void SyncHdHaptics() {
+        const auto& api = Api();
+        SDL_Joystick* js = nullptr;
+        bool open_speaker = false;
+        bool close_speaker = false;
+        bool off_triggers = false;
+        bool log_trigger = false;
+        {
+            std::scoped_lock lock{mutex};
+            if (!dsp || !joystick) {
+                return;
+            }
+            js = joystick;
+            const bool want = api.HasHdHaptics() && user.hd_enabled && user.dualsense_enabled &&
+                              user.dualsense_hd_haptics;
+            const bool bt36 = want && is_bluetooth && api.dsp_build_bt36_report != nullptr;
+            bt_report36.store(bt36);
+            if (want && gamepad) {
+                for (auto& handle : tri) {
+                    if (!handle) {
+                        handle = api.tri_create();
+                        log_trigger |= handle && !std::exchange(speaker_logged, true);
+                    }
+                }
+            } else {
+                for (auto& handle : tri) {
+                    if (handle) {
+                        api.tri_destroy(handle);
+                        handle = nullptr;
+                        off_triggers = true;
+                    }
+                }
+            }
+            if (!is_bluetooth) {
+                if (want && audio_stream && !speaker_on) {
+                    api.dsp_set_speaker(dsp, user.dualsense_speaker_volume);
+                    speaker_on = true;
+                    open_speaker = true;
+                } else if (want && speaker_on &&
+                           speaker_volume_applied != user.dualsense_speaker_volume) {
+                    api.dsp_set_speaker(dsp, user.dualsense_speaker_volume);
+                } else if (!want && speaker_on) {
+                    api.dsp_set_speaker(dsp, 0);
+                    speaker_on = false;
+                    close_speaker = true;
+                }
+                speaker_volume_applied = want ? user.dualsense_speaker_volume : 0;
+            } else if (api.dsp_set_speaker) {
+                std::scoped_lock bt_lock{bt_dsp_mutex};
+                api.dsp_set_speaker(dsp, bt36 ? user.dualsense_speaker_volume : 0);
+                speaker_volume_applied = bt36 ? user.dualsense_speaker_volume : 0;
+            }
+        }
+        if (open_speaker) {
+            const auto block = HdSpeakerBlock(true);
+            SDL_SendJoystickEffect(js, block.data(), static_cast<int>(block.size()));
+            LOG_INFO(Input, "RenHDrum: DualSense speaker on ({}%)", speaker_volume_applied);
+        }
+        if (log_trigger) {
+            LOG_INFO(Input, "RenHDrum: DualSense trigger kick on");
+        }
+        if (off_triggers) {
+            {
+                std::scoped_lock bt_lock{bt_dsp_mutex};
+                bt_effect_set = {};
+            }
+            for (const bool is_right : {false, true}) {
+                const auto block = HdTriggerBlock(is_right, nullptr);
+                SDL_SendJoystickEffect(js, block.data(), static_cast<int>(block.size()));
+            }
+        }
+        if (close_speaker) {
+            const auto block = HdSpeakerBlock(false);
+            SDL_SendJoystickEffect(js, block.data(), static_cast<int>(block.size()));
+        }
+    }
+
+    /// Caller holds `bt_dsp_mutex`. The 47-byte trigger state for report 0x36 (both sides' latest
+    /// effects), or false while no trigger effect exists yet.
+    bool BuildBtTriggerState(Ds5Block& out) const {
+        if (!bt_effect_set[0] && !bt_effect_set[1]) {
+            return false;
+        }
+        out = {};
+        for (const bool is_right : {false, true}) {
+            const std::size_t side = is_right ? 1 : 0;
+            if (!bt_effect_set[side]) {
+                continue;
+            }
+            const auto one = HdTriggerBlock(is_right, &bt_effect[side]);
+            for (std::size_t i = 0; i < out.size(); ++i) {
+                out[i] |= one[i];
+            }
+        }
+        return true;
+    }
+
+    /// One step of the trigger kick for one side; Tick calls it every ~1 ms. Vibrate only stores
+    /// the newest raw sample and the fresh flag. Lock order: `tri_mutex`, then `mutex`. Called
+    /// without `mutex`.
+    void TriggerStep(std::int64_t now_us, bool is_right) {
+        std::scoped_lock tri_lock{tri_mutex};
+        const std::size_t side = is_right ? 1 : 0;
+        SDL_Joystick* js = nullptr;
+        SDL_Gamepad* gp = nullptr;
+        {
+            std::scoped_lock lock{mutex};
+            if (!tri[side] || !joystick || !gamepad) {
+                return;
+            }
+            js = joystick;
+            gp = gamepad;
+        }
+        const int axis =
+            std::clamp<int>(SDL_GetGamepadAxis(gp, is_right ? SDL_GAMEPAD_AXIS_RIGHT_TRIGGER
+                                                            : SDL_GAMEPAD_AXIS_LEFT_TRIGGER),
+                            0, 32767);
+        const auto depth = static_cast<Uint8>(axis * 255 / 32767);
+        // Another action button (or the other trigger) held means the rumble belongs to that
+        // action, so this trigger must not follow it. START/BACK/GUIDE/TOUCHPAD/MISC/paddles do
+        // not count.
+        static constexpr std::array<SDL_GamepadButton, 12> action_buttons{
+            SDL_GAMEPAD_BUTTON_SOUTH,         SDL_GAMEPAD_BUTTON_EAST,
+            SDL_GAMEPAD_BUTTON_WEST,          SDL_GAMEPAD_BUTTON_NORTH,
+            SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER,
+            SDL_GAMEPAD_BUTTON_LEFT_STICK,    SDL_GAMEPAD_BUTTON_RIGHT_STICK,
+            SDL_GAMEPAD_BUTTON_DPAD_UP,       SDL_GAMEPAD_BUTTON_DPAD_DOWN,
+            SDL_GAMEPAD_BUTTON_DPAD_LEFT,     SDL_GAMEPAD_BUTTON_DPAD_RIGHT};
+        bool other_action =
+            SDL_GetGamepadAxis(gp, is_right ? SDL_GAMEPAD_AXIS_LEFT_TRIGGER
+                                            : SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) *
+                255 / 32767 >
+            12;
+        for (std::size_t i = 0; !other_action && i < action_buttons.size(); ++i) {
+            other_action = SDL_GetGamepadButton(gp, action_buttons[i]);
+        }
+        std::array<Uint8, 11> effect{};
+        int changed = 0;
+        {
+            std::scoped_lock lock{mutex};
+            if (!tri[side]) {
+                return;
+            }
+            const bool fresh = std::exchange(tri_fresh[side], false);
+            const auto& s = tri_sample[side];
+            const auto now_ms = static_cast<std::uint32_t>(now_us / 1000);
+            if (other_action && Api().tri_note_action) {
+                Api().tri_note_action(tri[side], now_ms);
+            }
+            changed = Api().tri_update(tri[side], now_ms, depth, s[0], s[1], s[2], s[3], fresh,
+                                       effect.data());
+        }
+        if (changed == 1) {
+            if (bt_report36.load()) {
+                // Bluetooth: the sender thread carries it in the next report 0x36
+                std::scoped_lock bt_lock{bt_dsp_mutex};
+                bt_effect[side] = effect;
+                bt_effect_set[side] = true;
+            } else {
+                const auto block = HdTriggerBlock(is_right, &effect);
+                SDL_SendJoystickEffect(js, block.data(), static_cast<int>(block.size()));
+            }
+        }
     }
 
     /// The DualSense exposes its voice coils as a 4-channel USB audio device that Windows may
@@ -518,6 +765,8 @@ struct RenHDrumPad::Impl {
             } else {
                 SDL_RumbleJoystick(js, 0, 0, 0);
             }
+            // The speaker can only open now that its audio stream exists
+            SyncHdHaptics();
         }
     }
 
@@ -574,25 +823,42 @@ struct RenHDrumPad::Impl {
         constexpr int MaxFailsInRow = 50;
         const auto& api = Api();
         std::array<std::uint8_t, RENHDRUM_DS5_BT_REPORT_SIZE> report{};
+        std::array<std::uint8_t, RENHDRUM_DS5_BT36_REPORT_SIZE> report36{};
         Uint64 next = SDL_GetTicksNS();
         Uint64 last_signal = 0;
         int fails_in_row = 0;
         while (bt_running.load()) {
             next += RENHDRUM_DS5_BT_PERIOD_NS;
+            // HD Haptics on: the combined report 0x36 (rumble + triggers + speaker), which the
+            // core stops by itself after 2 s of silence. Off: the plain 0x32 as before.
+            const bool combined = bt_report36.load();
             int built = -1;
             {
                 std::scoped_lock lock{bt_dsp_mutex};
                 if (dsp) {
-                    built = api.dsp_build_bt_report(dsp, RENHDRUM_DS5_BT_BUFFER_LENGTH_DEFAULT,
-                                                    report.data());
+                    if (combined) {
+                        Ds5Block state{};
+                        const bool have_state = BuildBtTriggerState(state);
+                        built = api.dsp_build_bt36_report(dsp, have_state ? state.data() : nullptr,
+                                                          0, report36.data());
+                    } else {
+                        built = api.dsp_build_bt_report(dsp, RENHDRUM_DS5_BT_BUFFER_LENGTH_DEFAULT,
+                                                        report.data());
+                    }
                 }
             }
             const Uint64 now = SDL_GetTicksNS();
             if (built == 1) {
                 last_signal = now;
             }
-            if (built >= 0 && last_signal != 0 && now - last_signal < KeepSendingNs) {
-                if (SDL_hid_write(bt_hid, report.data(), report.size()) < 0) {
+            const bool send = combined ? built == 1
+                                       : built >= 0 && last_signal != 0 &&
+                                             now - last_signal < KeepSendingNs;
+            if (send) {
+                const int written =
+                    combined ? SDL_hid_write(bt_hid, report36.data(), report36.size())
+                             : SDL_hid_write(bt_hid, report.data(), report.size());
+                if (written < 0) {
                     ++fails_in_row;
                 } else {
                     fails_in_row = 0;
@@ -758,6 +1024,20 @@ struct RenHDrumPad::Impl {
             api.engine_destroy(engine);
             engine = nullptr;
         }
+        // HD Haptics: the handles die with the DSP; the pad-side state does not, so remember
+        // what Shutdown() has to turn off over HID while the joystick is still there.
+        if (speaker_on && dsp && api.dsp_set_speaker) {
+            api.dsp_set_speaker(dsp, 0);
+        }
+        restore_speaker = std::exchange(speaker_on, false);
+        for (auto& handle : tri) {
+            if (handle) {
+                api.tri_destroy(handle);
+                handle = nullptr;
+                restore_trigger = true;
+            }
+        }
+        bt_effect_set = {};
         if (dsp) {
             api.dsp_destroy(dsp);
             dsp = nullptr;
@@ -843,6 +1123,9 @@ std::shared_ptr<RenHDrumPad> RenHDrumPad::Create(SDL_Joystick* joystick, SDL_Gam
             return nullptr;
         }
         LOG_INFO(Input, "RenHDrum: DualSense haptics for {:04X}:{:04X}", vid, pid);
+        // HD Haptics: the trigger kick (and report 0x36 on Bluetooth) now; the speaker once its
+        // audio stream is open
+        state->SyncHdHaptics();
         state->OpenDualSenseAudio();
     }
     state->kind = xbox_pad ? 2 : switch_pad ? 0 : 1;
@@ -921,6 +1204,18 @@ void RenHDrumPad::Shutdown() {
     }
     if (had_engine) {
         SendNeutralPacket(joystick);
+    }
+    if (impl->restore_trigger) {
+        impl->restore_trigger = false;
+        for (const bool is_right : {false, true}) {
+            const auto block = HdTriggerBlock(is_right, nullptr);
+            SDL_SendJoystickEffect(joystick, block.data(), static_cast<int>(block.size()));
+        }
+    }
+    if (impl->restore_speaker) {
+        impl->restore_speaker = false;
+        const auto block = HdSpeakerBlock(false);
+        SDL_SendJoystickEffect(joystick, block.data(), static_cast<int>(block.size()));
     }
     if (had_xbox) {
         SDL_RumbleJoystick(joystick, 0, 0, 0);
@@ -1057,11 +1352,17 @@ bool RenHDrumPad::Vibrate(std::int64_t now_us, bool is_right,
         } else if (impl->dsp) {
             if (u.hd_enabled && u.dualsense_enabled) {
                 api.dsp_set_half_target(impl->dsp, is_right,
-                                        ShapeAmplitude(status.low_amplitude, u),
-                                        status.low_frequency,
-                                        ShapeAmplitude(status.high_amplitude, u),
-                                        status.high_frequency);
+                                         ShapeAmplitude(status.low_amplitude, u),
+                                         status.low_frequency,
+                                         ShapeAmplitude(status.high_amplitude, u),
+                                         status.high_frequency);
                 handled = impl->audio_stream != nullptr || impl->bt_running.load();
+                const std::size_t side = is_right ? 1 : 0;
+                if (impl->tri[side]) {
+                    impl->tri_sample[side] = {status.low_amplitude, status.low_frequency,
+                                              status.high_amplitude, status.high_frequency};
+                    impl->tri_fresh[side] = true;
+                }
             } else {
                 // Haptics off: silence the voice coils, the standard rumble takes over
                 api.dsp_set_half_target(impl->dsp, is_right, 0.0f, status.low_frequency, 0.0f,
@@ -1081,6 +1382,9 @@ bool RenHDrumPad::Vibrate(std::int64_t now_us, bool is_right,
     }
     if (change.reconfigure_engine) {
         impl->ConfigureEngine();
+    }
+    if (change.sync_hd_haptics) {
+        impl->SyncHdHaptics();
     }
     if (engine_sample) {
         Tick(now_us);
@@ -1160,6 +1464,9 @@ void RenHDrumPad::Tick(std::int64_t now_us) {
     if (open_audio) {
         impl->OpenDualSenseAudio();
     }
+    // HD Haptics: one trigger-kick step per side; with no fresh sample the core falls back to off
+    impl->TriggerStep(now_us, false);
+    impl->TriggerStep(now_us, true);
     if (send) {
         if (!SDL_SendJoystickEffect(joystick, packet.data(), static_cast<int>(packet.size())) &&
             now_us >= impl->next_effect_error_us.load(std::memory_order_relaxed)) {

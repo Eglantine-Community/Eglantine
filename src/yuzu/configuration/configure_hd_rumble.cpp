@@ -227,9 +227,31 @@ QWidget* ConfigureHdRumble::CreateDualSensePage() {
     volume_row->addWidget(ds_volume);
     volume_row->addWidget(new QLabel(QStringLiteral("%")));
     ds_crisp_notes = new QCheckBox(tr("Crisp notes"));
+    // RenHDrum 0.5.0 HD Haptics: the rumble drives the controller speaker and the L2/R2
+    // trigger kick as well. Wiring (speaker volume, speaker + trigger blocks, report 0x36 on
+    // Bluetooth) lives in the pad driver; nothing happens without the 0.5.0 library.
+    ds_hd_haptics = new QCheckBox(tr("HD Haptics (speaker + trigger kick)"));
+    ds_hd_haptics->setToolTip(tr("HD Rumble upgraded for DualSense. The controller speaker and "
+                                 "the L2/R2 triggers react to the rumble. Off = standard HD "
+                                 "Rumble."));
+    ds_speaker_slider = new QSlider(Qt::Horizontal);
+    ds_speaker_slider->setRange(0, 100);
+    ds_speaker = new QSpinBox;
+    ds_speaker->setRange(0, 100);
+    ds_speaker->setSingleStep(5);
+    ds_speaker->setToolTip(tr("How loud the controller speaker taps. 0 = off."));
+    connect(ds_speaker_slider, &QSlider::valueChanged, ds_speaker, &QSpinBox::setValue);
+    connect(ds_speaker, qOverload<int>(&QSpinBox::valueChanged), ds_speaker_slider,
+            &QSlider::setValue);
+    auto* speaker_row = new QHBoxLayout;
+    speaker_row->addWidget(ds_speaker_slider, 1);
+    speaker_row->addWidget(ds_speaker);
+    speaker_row->addWidget(new QLabel(QStringLiteral("%")));
     form->addRow(ds_enabled);
     form->addRow(tr("Volume"), volume_row);
     form->addRow(ds_crisp_notes);
+    form->addRow(ds_hd_haptics);
+    form->addRow(tr("Speaker volume"), speaker_row);
     layout->addWidget(group);
 
     layout->addStretch();
@@ -356,6 +378,8 @@ void ConfigureHdRumble::LoadConfiguration() {
     ds_enabled->setChecked(s.dualsense_haptics_enabled.GetValue());
     ds_volume->setValue(std::clamp(s.dualsense_haptics_volume.GetValue(), 0, 100));
     ds_crisp_notes->setChecked(s.dualsense_crisp_notes.GetValue());
+    ds_hd_haptics->setChecked(s.dualsense_hd_haptics.GetValue());
+    ds_speaker->setValue(std::clamp(s.dualsense_speaker_volume.GetValue(), 0, 100));
     xbox_enabled->setChecked(s.xbox_rumble_enabled.GetValue());
     // Stored as 0-1000 (100 = as sent), shown as 0-100%
     xbox_strength->setValue(s.xbox_motor_strength.GetValue() / 10);
@@ -430,6 +454,8 @@ void ConfigureHdRumble::ApplyConfiguration() {
     s.dualsense_haptics_enabled.SetValue(ds_enabled->isChecked());
     s.dualsense_haptics_volume.SetValue(ds_volume->value());
     s.dualsense_crisp_notes.SetValue(ds_crisp_notes->isChecked());
+    s.dualsense_hd_haptics.SetValue(ds_hd_haptics->isChecked());
+    s.dualsense_speaker_volume.SetValue(ds_speaker->value());
     s.xbox_rumble_enabled.SetValue(xbox_enabled->isChecked());
     s.xbox_motor_strength.SetValue(xbox_strength->value() * 10);
     s.xbox_rumble_mode.SetValue(xbox_mode->currentData().toInt());

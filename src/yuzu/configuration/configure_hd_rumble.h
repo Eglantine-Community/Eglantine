@@ -57,6 +57,9 @@ private:
     QSlider* ds_volume_slider{};
     QSpinBox* ds_volume{};
     QCheckBox* ds_crisp_notes{};
+    QCheckBox* ds_hd_haptics{};
+    QSlider* ds_speaker_slider{};
+    QSpinBox* ds_speaker{};
 
     QCheckBox* xbox_enabled{};
     QComboBox* xbox_mode{};
