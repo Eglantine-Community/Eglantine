@@ -357,7 +357,11 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
             *target = (std::min)(static_cast<u64>(std::strtoull(value, nullptr, 10)) << 20, limit);
         }
     }
-    expected_memory = (std::min)(expected_memory, critical_memory);
+    // Keep a working band between the two thresholds. An override pair that closes the gap makes
+    // the collector evict every frame instead of at the expected threshold (measured on an 8 GB
+    // card: expected 6000 / critical 6011 MiB ran 19 fps against 29 fps with a 500 MiB band).
+    const u64 band = (std::min)(critical_memory, u64{512_MiB});
+    expected_memory = (std::min)(expected_memory, critical_memory - band);
     if (log) {
         LogThresholds();
     }
@@ -800,6 +804,10 @@ void TextureCache<P>::MemoizeTextures(SampledTextureMemo& memo,
             Tegra::Texture::TextureHeaderIndex(view_index, image_table.current_limit, native_tiling);
         if (!views[i].id || !samplers[i] || tic_index > image_table.current_limit ||
             sampler_index > sampler_table.current_limit) {
+            return;
+        }
+        const ImageId image_id = slot_image_views[views[i].id].image_id;
+        if (native_tiling && image_id && slot_images[image_id].info.maxwell_gob_layout) {
             return;
         }
         SampledTextureMemo::Entry entry{
@@ -2491,6 +2499,9 @@ void TextureCache<P>::UploadLayers(Image& image, std::span<const u32> layers) {
         }
         // Each layer's mip chain from the first level the host keeps on (as UploadImageContents).
         auto uploads = FullUploadSwizzles(image.info);
+        if (image.host_level_offset >= uploads.size()) {
+            return;
+        }
         const size_t level_offset = uploads[image.host_level_offset].buffer_offset;
         const size_t tail = image.info.layer_stride - level_offset;
         auto staging = runtime.UploadStagingBuffer(tail * layers.size());
@@ -2521,19 +2532,21 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) 
         // Only levels >= host_level_offset exist on the host: read each layer's tail of the mip
         // chain into a compact buffer (layer stride = that tail's size) and decode those levels.
         auto uploads = FullUploadSwizzles(image.info);
-        const size_t level_offset = uploads[image.host_level_offset].buffer_offset;
-        const size_t tail = image.info.layer_stride - level_offset;
-        for (s32 layer = 0; layer < image.info.resources.layers; ++layer) {
-            gpu_memory->ReadBlock(gpu_addr + layer * image.info.layer_stride + level_offset,
-                                  mapped_span.data() + layer * tail, tail,
-                                  VideoCommon::CacheType::NoTextureCache);
+        if (image.host_level_offset < uploads.size()) {
+            const size_t level_offset = uploads[image.host_level_offset].buffer_offset;
+            const size_t tail = image.info.layer_stride - level_offset;
+            for (s32 layer = 0; layer < image.info.resources.layers; ++layer) {
+                gpu_memory->ReadBlock(gpu_addr + layer * image.info.layer_stride + level_offset,
+                                      mapped_span.data() + layer * tail, tail,
+                                      VideoCommon::CacheType::NoTextureCache);
+            }
+            uploads.erase(uploads.begin(), uploads.begin() + image.host_level_offset);
+            for (auto& upload : uploads) {
+                upload.buffer_offset -= level_offset;
+            }
+            runtime.AccelerateImageUpload(image, staging, uploads, 0, 0);
+            return;
         }
-        uploads.erase(uploads.begin(), uploads.begin() + image.host_level_offset);
-        for (auto& upload : uploads) {
-            upload.buffer_offset -= level_offset;
-        }
-        runtime.AccelerateImageUpload(image, staging, uploads, 0, 0);
-        return;
     }
     if (True(image.flags & ImageFlagBits::AcceleratedUpload)) {
         gpu_memory->ReadBlock(gpu_addr, mapped_span.data(), mapped_span.size_bytes(),
@@ -2625,6 +2638,7 @@ ImageId TextureCache<P>::FindImage(const ImageInfo& info, GPUVAddr gpu_addr,
     const bool broken_views =
         runtime.HasBrokenTextureViewFormats() || True(options & RelaxedOptions::ForceBrokenViews);
     const bool native_bgr = runtime.HasNativeBgr();
+    const bool native_tiling = gpu_memory->UsesNativeTiling() && !info.maxwell_gob_layout;
     const bool flexible_formats = True(options & RelaxedOptions::Format);
     ImageId image_id{};
     boost::container::small_vector<ImageId, 8> image_ids;
@@ -2645,7 +2659,8 @@ ImageId TextureCache<P>::FindImage(const ImageInfo& info, GPUVAddr gpu_addr,
                 image_ids.push_back(existing_image_id);
                 return !flexible_formats && existing.format == info.format;
             }
-        } else if (IsSubresource(info, existing_image, gpu_addr, options, broken_views,
+        } else if (existing_image.info.native_tiling == native_tiling &&
+                   IsSubresource(info, existing_image, gpu_addr, options, broken_views,
                                  native_bgr)) {
             image_id = existing_image_id;
             image_ids.push_back(existing_image_id);
@@ -3010,7 +3025,7 @@ ImageId TextureCache<P>::InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
     }
     ASSERT_MSG(cpu_addr, "Tried to insert an image to an invalid gpu_addr={:#x}", gpu_addr);
     ImageInfo storage_info = info;
-    storage_info.native_tiling = gpu_memory->UsesNativeTiling();
+    storage_info.native_tiling = gpu_memory->UsesNativeTiling() && !info.maxwell_gob_layout;
     if (storage_info.native_tiling && info.type == ImageType::e3D) {
         // Switch 2 3D images (lighting/fog volumes) are rare: log each one's shape.
         LOG_DEBUG(HW_GPU, "3D image at {:#x}: {}x{}x{} levels {} format {} block {}x{}x{}",
@@ -3064,6 +3079,10 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             return;
         }
         join_overlaps_found.insert(overlap_id);
+        if (new_info.native_tiling != overlap.info.native_tiling) {
+            join_bad_overlap_ids.push_back(overlap_id);
+            return;
+        }
         constexpr bool strict_size = true;
         const std::optional<OverlapResult> solution = ResolveOverlap(
             new_info, gpu_addr, cpu_addr, overlap, strict_size, broken_views, native_bgr);
@@ -3096,7 +3115,8 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             if (True(overlap.flags & ImageFlagBits::Remapped)) {
                 join_ignore_textures.insert(overlap_id);
             }
-            if (overlap.gpu_addr == gpu_addr && overlap.guest_size_bytes == size_bytes) {
+            if (overlap.gpu_addr == gpu_addr && overlap.guest_size_bytes == size_bytes &&
+                new_info.native_tiling == overlap.info.native_tiling) {
                 join_ignore_textures.insert(overlap_id);
             }
         }

@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <bit>
@@ -36,14 +35,7 @@ Id StoragePointer(EmitContext& ctx, const IR::Value& binding, const IR::Value& o
     if (!binding.IsImmediate()) {
         throw NotImplementedException("Dynamic storage buffer indexing");
     }
-    const u32 ssbo_index{binding.U32()};
-    if (ssbo_index >= ctx.ssbos.size()) {
-        return Id{};
-    }
-    const Id ssbo{ctx.ssbos[ssbo_index].*member_ptr};
-    if (!Sirit::ValidId(ssbo)) {
-        return Id{};
-    }
+    const Id ssbo{ctx.ssbos[binding.U32()].*member_ptr};
     const Id index{StorageIndex(ctx, offset, element_size, index_offset)};
     return ctx.OpAccessChain(type_def.element, ssbo, ctx.u32_zero_value, index);
 }
@@ -53,9 +45,6 @@ Id LoadStorage(EmitContext& ctx, const IR::Value& binding, const IR::Value& offs
                Id StorageDefinitions::*member_ptr, u32 index_offset = 0) {
     const Id pointer{
         StoragePointer(ctx, binding, offset, type_def, element_size, member_ptr, index_offset)};
-    if (!Sirit::ValidId(pointer)) {
-        return ctx.ConstantNull(result_type);
-    }
     return ctx.OpLoad(result_type, pointer);
 }
 
@@ -70,9 +59,6 @@ void WriteStorage(EmitContext& ctx, const IR::Value& binding, const IR::Value& o
                   Id StorageDefinitions::*member_ptr, u32 index_offset = 0) {
     const Id pointer{
         StoragePointer(ctx, binding, offset, type_def, element_size, member_ptr, index_offset)};
-    if (!Sirit::ValidId(pointer)) {
-        return;
-    }
     ctx.OpStore(pointer, value);
 }
 
@@ -86,9 +72,6 @@ void WriteStorageByCasLoop(EmitContext& ctx, const IR::Value& binding, const IR:
                            Id value, Id bit_offset, Id bit_count) {
     const Id pointer{StoragePointer(ctx, binding, offset, ctx.storage_types.U32, sizeof(u32),
                                     &StorageDefinitions::U32)};
-    if (!Sirit::ValidId(pointer)) {
-        return;
-    }
     ctx.OpFunctionCall(ctx.TypeVoid(), ctx.write_storage_cas_loop_func, pointer, value, bit_offset,
                        bit_count);
 }
@@ -110,25 +93,27 @@ void EmitLoadGlobalS16(EmitContext&) {
     throw NotImplementedException("SPIR-V Instruction");
 }
 
-Id EmitLoadGlobal32(EmitContext& ctx, Id address) {
+Id EmitLoadGlobal32(EmitContext& ctx, IR::Inst* inst, Id address) {
     if (ctx.profile.support_int64) {
-        return ctx.OpFunctionCall(ctx.U32[1], ctx.load_global_func_u32, address);
+        return ctx.OpFunctionCall(ctx.U32[1], ctx.GlobalMemoryFunctionsOf(*inst).load_u32, address);
     }
     LOG_WARNING(Shader_SPIRV, "Int64 not supported, ignoring memory operation");
     return ctx.Const(0u);
 }
 
-Id EmitLoadGlobal64(EmitContext& ctx, Id address) {
+Id EmitLoadGlobal64(EmitContext& ctx, IR::Inst* inst, Id address) {
     if (ctx.profile.support_int64) {
-        return ctx.OpFunctionCall(ctx.U32[2], ctx.load_global_func_u32x2, address);
+        return ctx.OpFunctionCall(ctx.U32[2], ctx.GlobalMemoryFunctionsOf(*inst).load_u32x2,
+                                  address);
     }
     LOG_WARNING(Shader_SPIRV, "Int64 not supported, ignoring memory operation");
     return ctx.Const(0u, 0u);
 }
 
-Id EmitLoadGlobal128(EmitContext& ctx, Id address) {
+Id EmitLoadGlobal128(EmitContext& ctx, IR::Inst* inst, Id address) {
     if (ctx.profile.support_int64) {
-        return ctx.OpFunctionCall(ctx.U32[4], ctx.load_global_func_u32x4, address);
+        return ctx.OpFunctionCall(ctx.U32[4], ctx.GlobalMemoryFunctionsOf(*inst).load_u32x4,
+                                  address);
     }
     LOG_WARNING(Shader_SPIRV, "Int64 not supported, ignoring memory operation");
     return ctx.Const(0u, 0u, 0u, 0u);
@@ -150,25 +135,28 @@ void EmitWriteGlobalS16(EmitContext&) {
     throw NotImplementedException("SPIR-V Instruction");
 }
 
-void EmitWriteGlobal32(EmitContext& ctx, Id address, Id value) {
+void EmitWriteGlobal32(EmitContext& ctx, IR::Inst* inst, Id address, Id value) {
     if (ctx.profile.support_int64) {
-        ctx.OpFunctionCall(ctx.void_id, ctx.write_global_func_u32, address, value);
+        ctx.OpFunctionCall(ctx.void_id, ctx.GlobalMemoryFunctionsOf(*inst).write_u32, address,
+                           value);
         return;
     }
     LOG_WARNING(Shader_SPIRV, "Int64 not supported, ignoring memory operation");
 }
 
-void EmitWriteGlobal64(EmitContext& ctx, Id address, Id value) {
+void EmitWriteGlobal64(EmitContext& ctx, IR::Inst* inst, Id address, Id value) {
     if (ctx.profile.support_int64) {
-        ctx.OpFunctionCall(ctx.void_id, ctx.write_global_func_u32x2, address, value);
+        ctx.OpFunctionCall(ctx.void_id, ctx.GlobalMemoryFunctionsOf(*inst).write_u32x2, address,
+                           value);
         return;
     }
     LOG_WARNING(Shader_SPIRV, "Int64 not supported, ignoring memory operation");
 }
 
-void EmitWriteGlobal128(EmitContext& ctx, Id address, Id value) {
+void EmitWriteGlobal128(EmitContext& ctx, IR::Inst* inst, Id address, Id value) {
     if (ctx.profile.support_int64) {
-        ctx.OpFunctionCall(ctx.void_id, ctx.write_global_func_u32x4, address, value);
+        ctx.OpFunctionCall(ctx.void_id, ctx.GlobalMemoryFunctionsOf(*inst).write_u32x4, address,
+                           value);
         return;
     }
     LOG_WARNING(Shader_SPIRV, "Int64 not supported, ignoring memory operation");

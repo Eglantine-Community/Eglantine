@@ -91,6 +91,7 @@ struct UnswizzlePlan {
     size_t total_host_bytes{0};
     u32 bpp_log2{0};
     bool layout_valid{true};
+    bool native_tiling{false};
     bool maxwell_gobs{false};
 };
 

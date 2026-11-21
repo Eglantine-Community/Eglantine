@@ -85,6 +85,27 @@ public:
 
     void Sync(size_t start, size_t size) {
         const auto& dev = device.GetLogical();
+        // AMD's driver: read what is available without blocking; a result that has not landed
+        // counts as visible (1024 samples), as in the GPU-side resolve (SyncWrites).
+        if (device.GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY ||
+            device.GetDriverID() == VK_DRIVER_ID_AMD_OPEN_SOURCE) {
+            std::array<std::pair<u64, u64>, BANK_SIZE> values{};
+            const VkResult query_result = dev.GetQueryResults(
+                *query_pool, static_cast<u32>(start), static_cast<u32>(size),
+                sizeof(values[0]) * size, values.data(), sizeof(values[0]),
+                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+            if (query_result == VK_ERROR_DEVICE_LOST) {
+                device.ReportLoss();
+                throw vk::Exception(query_result);
+            }
+            if (query_result != VK_SUCCESS && query_result != VK_NOT_READY) {
+                throw vk::Exception(query_result);
+            }
+            for (size_t i = 0; i < size; ++i) {
+                host_results[start + i] = values[i].second != 0 ? values[i].first : 1024;
+            }
+            return;
+        }
         const VkResult query_result = dev.GetQueryResults(
             *query_pool, static_cast<u32>(start), static_cast<u32>(size), sizeof(u64) * size,
             &host_results[start], sizeof(u64), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);

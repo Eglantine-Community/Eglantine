@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/alignment.h"
@@ -17,9 +16,6 @@ namespace {
 void AddConstantBufferDescriptor(Info& info, u32 index, u32 count) {
     if (count != 1) {
         throw NotImplementedException("Constant buffer descriptor indexing");
-    }
-    if (index >= Info::MAX_CBUFS) {
-        return;
     }
     if ((info.constant_buffer_mask & (1U << index)) != 0) {
         return;
@@ -550,15 +546,13 @@ void VisitUsages(Info& info, IR::Inst& inst) {
         const IR::Value index{inst.Arg(0)};
         const IR::Value offset{inst.Arg(1)};
         if (index.IsImmediate()) {
-            if (index.U32() < Info::MAX_CBUFS) {
-                AddConstantBufferDescriptor(info, index.U32(), 1);
-                u32 element_size = GetElementSize(info.used_constant_buffer_types, inst.GetOpcode());
-                u32& size{info.constant_buffer_used_sizes[index.U32()]};
-                if (offset.IsImmediate()) {
-                    size = Common::AlignUp((std::max)(size, offset.U32() + element_size), 16u);
-                } else {
-                    size = 0x10'000;
-                }
+            AddConstantBufferDescriptor(info, index.U32(), 1);
+            u32 element_size = GetElementSize(info.used_constant_buffer_types, inst.GetOpcode());
+            u32& size{info.constant_buffer_used_sizes[index.U32()]};
+            if (offset.IsImmediate()) {
+                size = Common::AlignUp((std::max)(size, offset.U32() + element_size), 16u);
+            } else {
+                size = 0x10'000;
             }
         } else {
             AddRegisterIndexedLdc(info);
@@ -998,6 +992,40 @@ void GatherInfoFromHeader(Environment& env, Info& info) {
         // TODO: Legacy varyings
     }
 }
+
+/// True when position z and w are each stored once, in the same block, from the same value, and
+/// the program leaves the viewport at 0.
+bool PositionOnFarPlane(const IR::Program& program) {
+    const IR::Inst* z_store{};
+    const IR::Inst* w_store{};
+    const IR::Block* z_block{};
+    const IR::Block* w_block{};
+    for (IR::Block* const block : program.post_order_blocks) {
+        for (const IR::Inst& inst : block->Instructions()) {
+            if (inst.GetOpcode() == IR::Opcode::SetAttributeIndexed) {
+                return false;
+            }
+            if (inst.GetOpcode() != IR::Opcode::SetAttribute) {
+                continue;
+            }
+            const IR::Attribute attr{inst.Arg(0).Attribute()};
+            if (attr == IR::Attribute::ViewportIndex || attr == IR::Attribute::ViewportMask) {
+                return false;
+            }
+            if (attr != IR::Attribute::PositionZ && attr != IR::Attribute::PositionW) {
+                continue;
+            }
+            auto& store{attr == IR::Attribute::PositionZ ? z_store : w_store};
+            if (store) {
+                return false;
+            }
+            store = &inst;
+            (attr == IR::Attribute::PositionZ ? z_block : w_block) = block;
+        }
+    }
+    return z_store && w_store && z_block == w_block &&
+           z_store->Arg(1).Resolve() == w_store->Arg(1).Resolve();
+}
 } // Anonymous namespace
 
 void CollectShaderInfoPass(Environment& env, IR::Program& program) {
@@ -1035,6 +1063,7 @@ void CollectShaderInfoPass(Environment& env, IR::Program& program) {
         }
     }
     GatherInfoFromHeader(env, info);
+    info.position_on_far_plane = program.stage == Stage::VertexB && PositionOnFarPlane(program);
 }
 
 } // namespace Shader::Optimization

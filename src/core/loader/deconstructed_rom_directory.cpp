@@ -483,11 +483,13 @@ AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirect
 
     // Enable direct memory mapping in case of NCE.
     const u64 fastmem_base = [&]() -> size_t {
+#ifdef HAS_NCE
         if (is_application && Settings::IsNceEnabled()) {
             auto& buffer = system.DeviceMemory().buffer;
             buffer.EnableDirectMappedAddress();
             return reinterpret_cast<u64>(buffer.VirtualBasePointer());
         }
+#endif
         return 0;
     }();
 

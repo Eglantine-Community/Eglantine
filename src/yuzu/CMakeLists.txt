@@ -14,7 +14,8 @@ endif()
 
 find_package(Qt6 REQUIRED COMPONENTS Widgets)
 
-if(YUZU_TESTS)
+find_package(Qt6 QUIET COMPONENTS Test)
+if(YUZU_TESTS AND TARGET Qt6::Test)
     add_subdirectory(../tests/qt_compatibility ${CMAKE_BINARY_DIR}/qt_compatibility_tests)
 endif()
 

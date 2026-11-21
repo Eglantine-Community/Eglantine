@@ -41,7 +41,7 @@ public:
             entries.clear();
         }
         const size_t as_id = memory.GetID();
-        const u64 key = MakeKey(as_id, gpu_addr, size);
+        const u64 key = MakeKey(as_id, gpu_addr);
         const auto it = entries.find(key);
         if (it != entries.end() && it->second.as_id == as_id && it->second.gpu_addr == gpu_addr) {
             const Entry& cached = it->second;
@@ -129,9 +129,8 @@ private:
         u64 size;
     };
 
-    static u64 MakeKey(size_t as_id, GPUVAddr gpu_addr, u32 size) {
-        return (static_cast<u64>(as_id) << 48) ^ gpu_addr ^
-               (static_cast<u64>(size) * 0x9e3779b97f4a7c15ULL);
+    static u64 MakeKey(size_t as_id, GPUVAddr gpu_addr) {
+        return (static_cast<u64>(as_id) << 48) ^ gpu_addr;
     }
 
     void ApplyDeferred() {

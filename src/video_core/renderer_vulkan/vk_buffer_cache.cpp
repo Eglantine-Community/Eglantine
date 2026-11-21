@@ -433,7 +433,7 @@ void BufferCacheRuntime::FreeDeferredStagingBuffer(StagingBufferRef& ref) {
 }
 
 void BufferCacheRuntime::FreeCompletedDeferredStagingBuffer(StagingBufferRef& ref) {
-    staging_pool.FreeDeferred(ref);
+    staging_pool.FreeCompletedDeferred(ref);
 }
 
 u64 BufferCacheRuntime::GetDeviceLocalMemory() const {

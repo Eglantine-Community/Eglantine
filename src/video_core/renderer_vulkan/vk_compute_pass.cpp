@@ -705,10 +705,11 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
     });
     // With trimmed host levels the input holds each layer's mip chain from host_level_offset on
     // (see TextureCache::UploadImageContents), so its layer stride is that tail's size.
+    const auto uploads = VideoCommon::FullUploadSwizzles(info);
     const u32 input_layer_stride =
-        skip != 0 ? info.layer_stride -
-                        static_cast<u32>(VideoCommon::FullUploadSwizzles(info)[skip].buffer_offset)
-                  : info.layer_stride;
+        (skip != 0 && skip < uploads.size())
+            ? info.layer_stride - static_cast<u32>(uploads[skip].buffer_offset)
+            : info.layer_stride;
     const size_t input_size = skip != 0 ? size_t{input_layer_stride} * info.resources.layers
                                         : guest_size_bytes;
     // Only some layers: one dispatch per layer and level, into that layer's own view.

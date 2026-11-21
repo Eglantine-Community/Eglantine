@@ -103,6 +103,12 @@ void DaliaSidebar::SetupUI() {
         dalia_icon = QPixmap(QStringLiteral(":/img/dalia.png"));
     }
     if (dalia_icon.isNull()) {
+        dalia_icon = QPixmap(QStringLiteral(":/icons/default/256x256/lichii.png"));
+    }
+    if (dalia_icon.isNull()) {
+        dalia_icon = QPixmap(QCoreApplication::applicationDirPath() + QStringLiteral("/dist/dalia.png"));
+    }
+    if (dalia_icon.isNull()) {
         dalia_icon = QPixmap(QStringLiteral("dist/dalia.png"));
     }
     if (!dalia_icon.isNull()) {

@@ -659,10 +659,6 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
             device.GetDriverVersion() < VK_MAKE_VERSION(512, 672, 0),
         .has_broken_spirv_subgroup_shuffle = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY,
         .has_broken_spirv_fragment_shuffle = driver_id == VK_DRIVER_ID_AMD_PROPRIETARY,
-        .has_broken_spirv_demote_reorder =
-            driver_id == VK_DRIVER_ID_AMD_PROPRIETARY ||
-            driver_id == VK_DRIVER_ID_AMD_OPEN_SOURCE ||
-            driver_id == VK_DRIVER_ID_SAMSUNG_PROPRIETARY,
         .max_subgroup_size = device.GetMaxSubgroupSize(),
         .has_broken_robust =
             device.IsNvidia() && device.GetNvidiaArch() <= NvidiaArchitecture::Arch_Pascal,
@@ -693,9 +689,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .support_float64 = device.IsFloat64Supported(),
         .support_float16 = device.IsFloat16Supported(),
         .support_int64 = device.IsShaderInt64Supported(),
-        .needs_demote_reorder = driver_id == VK_DRIVER_ID_AMD_PROPRIETARY ||
-                                driver_id == VK_DRIVER_ID_AMD_OPEN_SOURCE ||
-                                driver_id == VK_DRIVER_ID_SAMSUNG_PROPRIETARY,
+        .needs_demote_reorder = false,
         .support_snorm_render_buffer = true,
         .support_viewport_index_layer = device.IsExtShaderViewportIndexLayerSupported(),
         .support_viewport_mask = device.IsNvViewportArray2Supported(),

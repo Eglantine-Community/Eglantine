@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <bit>
@@ -133,10 +132,6 @@ Id GetCbuf(EmitContext& ctx, Id result_type, Id UniformDefinitions::*member_ptr,
     }
     if (!binding.IsImmediate()) {
         return ctx.OpFunctionCall(result_type, indirect_func, ctx.Def(binding), buffer_offset);
-    }
-
-    if (binding.U32() >= ctx.cbufs.size()) {
-        return ctx.ConstantNull(result_type);
     }
 
     const Id cbuf{ctx.cbufs[binding.U32()].*member_ptr};

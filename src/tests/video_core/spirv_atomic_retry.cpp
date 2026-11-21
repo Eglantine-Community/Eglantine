@@ -92,9 +92,9 @@ TEST_CASE("SPIR-V CAS retries use the exchange result as the next expected word"
             const auto variables = Instructions(code, spv::Op::OpVariable);
             const auto integers = Instructions(code, spv::Op::OpTypeInt);
             const auto comparisons = Instructions(code, spv::Op::OpIEqual);
-            REQUIRE(exchanges.size() == (explicit_shared ? size_t{9} : size_t{11}));
+            REQUIRE(exchanges.size() == (explicit_shared ? 9 : 11));
             for (const auto& exchange : exchanges) {
-                REQUIRE(exchange.size() == size_t{8});
+                REQUIRE(exchange.size() == 8);
                 const u32 type = exchange[0];
                 const u32 result = exchange[1];
                 const u32 memory = exchange[2];
@@ -112,7 +112,7 @@ TEST_CASE("SPIR-V CAS retries use the exchange result as the next expected word"
                 CHECK((*variable)[2] == static_cast<u32>(spv::StorageClass::Function));
                 REQUIRE(std::ranges::count_if(stores, [=](const auto& store) {
                     return store[0] == retry;
-                }) == size_t{2});
+                }) == 2);
                 CHECK(std::ranges::find(stores, std::vector<u32>{retry, result}) != stores.end());
                 const auto initial = std::ranges::find_if(
                     loads, [=](const auto& load) { return load[2] == memory; });
@@ -120,7 +120,7 @@ TEST_CASE("SPIR-V CAS retries use the exchange result as the next expected word"
                 CHECK((*initial)[0] == type);
                 CHECK(std::ranges::count_if(loads, [=](const auto& load) {
                     return load[2] == memory;
-                }) == size_t{1});
+                }) == 1);
                 CHECK(std::ranges::find(stores, std::vector<u32>{retry, (*initial)[1]}) != stores.end());
                 CHECK(std::ranges::any_of(comparisons, [=](const auto& comparison) {
                     return (comparison[2] == result && comparison[3] == expected) ||

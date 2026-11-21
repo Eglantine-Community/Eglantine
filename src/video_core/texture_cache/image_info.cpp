@@ -50,6 +50,8 @@ ImageInfo::ImageInfo(const TICEntry& config) noexcept {
     }
     rescaleable = false;
     is_sparse = config.is_sparse != 0;
+    maxwell_gob_layout = config.load_store_hint != 0 &&
+                         config.texture_type != TextureType::Texture3D;
     maxwell_gobs = config.load_store_hint != 0;
     tile_width_spacing = config.tile_width_spacing;
     if (config.texture_type != TextureType::Texture2D &&
@@ -108,14 +110,13 @@ ImageInfo::ImageInfo(const TICEntry& config) noexcept {
         resources.layers = config.BaseLayer() + 6;
         break;
     case TextureType::TextureCubeArray:
-        UNIMPLEMENTED_IF(config.load_store_hint != 0);
+        UNIMPLEMENTED_IF(config.load_store_hint != 0 && !maxwell_gob_layout);
         type = ImageType::e2D;
         size.width = config.Width();
         size.height = config.Height();
         resources.layers = config.BaseLayer() + config.Depth() * 6;
         break;
     case TextureType::Texture3D: {
-        ASSERT(config.BaseLayer() == 0);
         type = ImageType::e3D;
         size.width = config.Width();
         size.height = config.Height();

@@ -6,12 +6,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 endif()
 
 set(CMAKE_AUTOMOC ON)
-find_package(Qt6 COMPONENTS Widgets Network)
-find_package(Qt6 OPTIONAL_COMPONENTS Test)
-if (NOT TARGET Qt6::Test)
-    message(STATUS "Qt6::Test not found, skipping compatibility_report_tests")
-    return()
-endif()
+find_package(Qt6 REQUIRED COMPONENTS Widgets Network Test)
 add_executable(compatibility_report_tests
     compatibility_report.cpp
     ../../yuzu/compatibility_report.cpp

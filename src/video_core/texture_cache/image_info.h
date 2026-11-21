@@ -17,7 +17,7 @@ using VideoCore::Surface::PixelFormat;
 // Native descriptors address the selected view directly. The legacy NVN
 // layer-base bookkeeping is not an additional array prefix for this ABI.
 inline TICEntry TextureViewHeader(TICEntry entry, bool native) {
-    if (native) {
+    if (native || entry.texture_type == Tegra::Texture::TextureType::Texture3D) {
         entry.layer_base_0_2.Assign(0);
         entry.layer_base_3_7.Assign(0);
         entry.layer_base_8_10.Assign(0);
@@ -49,6 +49,7 @@ struct ImageInfo {
     u32 num_samples = 1;
     u32 tile_width_spacing = 0;
     bool native_tiling = false;
+    bool maxwell_gob_layout = false;
     // Switch 2 texture header word 2 bit 24: the surface keeps the Maxwell GOB layout. Xenoblade
     // Chronicles' headers all set it (its LUTs, fonts and textures decode only that way); Mario
     // Tennis Fever's and Donkey Kong Bananza's never do.
