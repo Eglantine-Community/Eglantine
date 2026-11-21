@@ -337,7 +337,8 @@ GraphicsPipeline::GraphicsPipeline(
     std::function<std::array<vk::ShaderModule, NUM_STAGES>()> emit_stages,
     std::optional<MeshEmulationSetup> mesh_emulation_,
     std::shared_ptr<const GraphicsShaderSet> shader_set_,
-    GraphicsPipelineLibraryCache* library_cache_, Common::ThreadWorker* library_part_workers_)
+    GraphicsPipelineLibraryCache* library_cache_, Common::ThreadWorker* library_part_workers_,
+    PipelineLayoutCache* layout_cache)
     : key{key_}, device{device_}, texture_cache{texture_cache_}, buffer_cache{buffer_cache_},
       pipeline_cache(pipeline_cache_), scheduler{scheduler_},
       guest_descriptor_queue{guest_descriptor_queue_},
@@ -394,10 +395,16 @@ GraphicsPipeline::GraphicsPipeline(
     // offset and map buffers.
     const u32 emulation_buffers{mesh_emulation ? (mesh_emulation->has_task ? 4U : 1U) : 0U};
     num_descriptor_entries += emulation_buffers;
-    descriptor_set_layout =
-        builder.CreateDescriptorSetLayout(uses_push_descriptor, uses_descriptor_buffer);
+    // Mesh emulation's layouts hold its own buffers: not shared.
+    const auto make_layouts = [&](bool use_descriptor_buffer) {
+        return layout_cache && !mesh_emulation
+                   ? layout_cache->Get(builder, uses_push_descriptor, use_descriptor_buffer)
+                   : std::shared_ptr<const PipelineLayouts>{
+                         builder.CreateLayouts(uses_push_descriptor, use_descriptor_buffer)};
+    };
+    layouts = make_layouts(uses_descriptor_buffer);
     if (uses_descriptor_buffer) {
-        descriptor_buffer_layout = builder.MakeDescriptorBufferLayout(*descriptor_set_layout);
+        descriptor_buffer_layout = layouts->buffer_layout;
         if (!descriptor_buffer_ring.CanAllocate(descriptor_buffer_layout.size)) {
             LOG_WARNING(Render_Vulkan,
                         "Graphics pipeline {:016X} needs {} descriptor bytes per draw, falling back "
@@ -405,17 +412,17 @@ GraphicsPipeline::GraphicsPipeline(
                         key.Hash(), descriptor_buffer_layout.size);
             uses_descriptor_buffer = false;
             descriptor_buffer_layout = {};
-            descriptor_set_layout = builder.CreateDescriptorSetLayout(uses_push_descriptor);
+            layouts = make_layouts(false);
         } else {
             last_descriptor_payload.reserve(num_descriptor_entries);
         }
     }
+    descriptor_set_layout = *layouts->set_layout;
+    pipeline_layout = *layouts->pipeline_layout;
+    descriptor_update_template = *layouts->update_template;
 
-    const VkDescriptorSetLayout set_layout{*descriptor_set_layout};
-    pipeline_layout = builder.CreatePipelineLayout(set_layout);
+    const VkDescriptorSetLayout set_layout{descriptor_set_layout};
     if (!uses_descriptor_buffer) {
-        descriptor_update_template =
-            builder.CreateTemplate(set_layout, *pipeline_layout, uses_push_descriptor);
         if (!uses_push_descriptor && mesh_emulation) {
             // The set also holds the emulation's buffers.
             std::array<Shader::Info, NUM_STAGES + 1> bank_infos{};
@@ -1076,18 +1083,18 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                                            vk::CommandBuffer cmdbuf, VkDescriptorSet set) {
                 constexpr VkShaderStageFlags push_stages{VK_SHADER_STAGE_ALL_GRAPHICS |
                                                          VK_SHADER_STAGE_COMPUTE_BIT};
-                cmdbuf.PushConstants(*pipeline_layout, push_stages, RESCALING_LAYOUT_WORDS_OFFSET,
+                cmdbuf.PushConstants(pipeline_layout, push_stages, RESCALING_LAYOUT_WORDS_OFFSET,
                                      sizeof(rescaling_data), rescaling_data.data());
                 const f32 config_down_factor{Settings::values.resolution_info.down_factor};
                 const f32 down_factor{is_rescaling ? config_down_factor : 1.0f};
-                cmdbuf.PushConstants(*pipeline_layout, push_stages,
+                cmdbuf.PushConstants(pipeline_layout, push_stages,
                                      RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, sizeof(down_factor),
                                      &down_factor);
                 if (uses_render_area) {
-                    cmdbuf.PushConstants(*pipeline_layout, push_stages, RENDERAREA_LAYOUT_OFFSET,
+                    cmdbuf.PushConstants(pipeline_layout, push_stages, RENDERAREA_LAYOUT_OFFSET,
                                          sizeof(render_area_data), &render_area_data);
                 }
-                cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline_layout, 0, set,
+                cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout, 0, set,
                                           nullptr);
             };
             // The first stage commits the draw's set; the later ones skip when it did not.
@@ -1098,7 +1105,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                     return VK_NULL_HANDLE;
                 }
                 const VkDescriptorSet set{descriptor_allocator.Commit()};
-                device.GetLogical().UpdateDescriptorSet(set, *descriptor_update_template,
+                device.GetLogical().UpdateDescriptorSet(set, descriptor_update_template,
                                                         descriptor_data);
                 *set_slot = set;
                 return set;
@@ -1201,25 +1208,25 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                     return;
                 }
                 const VkDescriptorSet descriptor_set{descriptor_allocator.Commit()};
-                device.GetLogical().UpdateDescriptorSet(descriptor_set, *descriptor_update_template,
+                device.GetLogical().UpdateDescriptorSet(descriptor_set, descriptor_update_template,
                                                         descriptor_data);
                 *set_slot = descriptor_set;
                 // The task and mesh programs read the draw's push constants and descriptors.
                 const auto bind_program_state = [&] {
                     constexpr VkShaderStageFlags push_stages{VK_SHADER_STAGE_ALL_GRAPHICS |
                                                              VK_SHADER_STAGE_COMPUTE_BIT};
-                    cmdbuf.PushConstants(*pipeline_layout, push_stages, RESCALING_LAYOUT_WORDS_OFFSET,
+                    cmdbuf.PushConstants(pipeline_layout, push_stages, RESCALING_LAYOUT_WORDS_OFFSET,
                                          sizeof(rescaling_data), rescaling_data.data());
                     const f32 config_down_factor{Settings::values.resolution_info.down_factor};
                     const f32 down_factor{is_rescaling ? config_down_factor : 1.0f};
-                    cmdbuf.PushConstants(*pipeline_layout, push_stages,
+                    cmdbuf.PushConstants(pipeline_layout, push_stages,
                                          RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, sizeof(down_factor),
                                          &down_factor);
                     if (uses_render_area) {
-                        cmdbuf.PushConstants(*pipeline_layout, push_stages, RENDERAREA_LAYOUT_OFFSET,
+                        cmdbuf.PushConstants(pipeline_layout, push_stages, RENDERAREA_LAYOUT_OFFSET,
                                              sizeof(render_area_data), &render_area_data);
                     }
-                    cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline_layout, 0,
+                    cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout, 0,
                                               descriptor_set, nullptr);
                 };
                 const auto memory_barrier = [&](VkAccessFlags src_access, VkAccessFlags dst_access,
@@ -1465,21 +1472,21 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                           RESCALING_LAYOUT_WORDS_OFFSET + offsetof(ScalingConstants, down_factor));
             const ScalingConstants constants{
                 rescaling_data, is_rescaling ? Settings::values.resolution_info.down_factor : 1.0f};
-            cmdbuf.PushConstants(*pipeline_layout, push_stages, RESCALING_LAYOUT_WORDS_OFFSET,
+            cmdbuf.PushConstants(pipeline_layout, push_stages, RESCALING_LAYOUT_WORDS_OFFSET,
                                  sizeof(constants), &constants);
         } else if (push_rescaling) {
-            cmdbuf.PushConstants(*pipeline_layout, push_stages, RESCALING_LAYOUT_WORDS_OFFSET,
+            cmdbuf.PushConstants(pipeline_layout, push_stages, RESCALING_LAYOUT_WORDS_OFFSET,
                                  sizeof(rescaling_data), rescaling_data.data());
         }
         if (!combined_rescaling && (update_rescaling || mesh_emulation)) {
             const f32 config_down_factor{Settings::values.resolution_info.down_factor};
             const f32 scale_down_factor{is_rescaling ? config_down_factor : 1.0f};
-            cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
+            cmdbuf.PushConstants(pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
                                  RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, sizeof(scale_down_factor),
                                  &scale_down_factor);
         }
         if (uses_render_area && push_render_area) {
-            cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
+            cmdbuf.PushConstants(pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
                                  RENDERAREA_LAYOUT_OFFSET, sizeof(render_area_data),
                                  &render_area_data);
         }
@@ -1489,7 +1496,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         if (mesh_emulation) {
             // The set the emulation's dispatch committed (see above).
             if (mesh_set_slot && *mesh_set_slot) {
-                cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout, 0,
+                cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0,
                                           *mesh_set_slot, nullptr);
             }
             return;
@@ -1499,18 +1506,18 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                 return;
             }
             const u32 buffer_index{};
-            cmdbuf.SetDescriptorBufferOffsetsEXT(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout,
+            cmdbuf.SetDescriptorBufferOffsetsEXT(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout,
                                                  0, buffer_index, descriptor_buffer_offset);
         } else if (uses_push_descriptor) {
             if (update_descriptors) {
-                cmdbuf.PushDescriptorSetWithTemplateKHR(*descriptor_update_template, *pipeline_layout,
+                cmdbuf.PushDescriptorSetWithTemplateKHR(descriptor_update_template, pipeline_layout,
                                                          0, descriptor_data);
             }
         } else if (update_descriptors) {
             const VkDescriptorSet descriptor_set{descriptor_allocator.Commit()};
             const vk::Device& dev{device.GetLogical()};
-            dev.UpdateDescriptorSet(descriptor_set, *descriptor_update_template, descriptor_data);
-            cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout, 0,
+            dev.UpdateDescriptorSet(descriptor_set, descriptor_update_template, descriptor_data);
+            cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0,
                                       descriptor_set, nullptr);
         }
     });
@@ -1565,11 +1572,11 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         };
         mesh_vertex_module = BuildShader(device, mesh_emulation->vertex_spirv);
         mesh_compute_pipeline = make_compute(modules[mesh_emulation->mesh_stage],
-                                             *pipeline_layout,
+                                             pipeline_layout,
                                              &stage_infos[mesh_emulation->mesh_stage]);
         if (mesh_emulation->has_task) {
             task_compute_pipeline =
-                make_compute(modules[0], *pipeline_layout, &stage_infos[0]);
+                make_compute(modules[0], pipeline_layout, &stage_infos[0]);
             distribution_module = BuildShader(device, mesh_emulation->distribution_spirv);
             distribution_pipeline =
                 make_compute(*distribution_module, *distribution_layout, nullptr);
@@ -2035,7 +2042,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         .pDepthStencilState = &depth_stencil_ci,
         .pColorBlendState = &color_blend_ci,
         .pDynamicState = &dynamic_state_ci,
-        .layout = *pipeline_layout,
+        .layout = pipeline_layout,
         .renderPass = render_pass,
         .subpass = 0,
         .basePipelineHandle = nullptr,

@@ -870,6 +870,10 @@ bool PreloadAllPipelines() {
 
 PipelineCache::~PipelineCache() {
     StopShaderPrecache();
+    if (const auto [created, shared] = layout_cache.Counts(); created != 0) {
+        LOG_INFO(Render_Vulkan, "Pipeline layouts: {} created, {} pipelines shared one", created,
+                 shared);
+    }
     if (!precache_keys.empty()) {
         LOG_INFO(Render_Vulkan,
                  "Shader precache: {} of the {} compute pipelines new this session were in the "
@@ -3252,7 +3256,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         std::function<
             std::array<vk::ShaderModule, Tegra::Engines::Maxwell3D::Regs::MaxShaderStage>()>{},
         std::move(mesh_emulation), std::move(shader_set), library_cache.get(),
-        library_part_workers.get());
+        library_part_workers.get(),
+        VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::SharedPipelineLayouts) ? &layout_cache
+                                                                                  : nullptr);
 
 } catch (const Shader::Exception& exception) {
     auto hash = key.Hash();

@@ -130,7 +130,8 @@ public:
         std::optional<MeshEmulationSetup> mesh_emulation = std::nullopt,
         std::shared_ptr<const GraphicsShaderSet> shader_set = {},
         GraphicsPipelineLibraryCache* library_cache = nullptr,
-        Common::ThreadWorker* library_part_workers = nullptr);
+        Common::ThreadWorker* library_part_workers = nullptr,
+        PipelineLayoutCache* layout_cache = nullptr);
 
     bool HasDynamicVertexInput() const noexcept { return key.state.dynamic_vertex_input; }
     const std::array<u64, 6>& ShaderHashes() const noexcept {
@@ -334,10 +335,12 @@ private:
     bool writes_storage{};
     bool has_render_area_push_constants{};
 
-    vk::DescriptorSetLayout descriptor_set_layout;
+    /// Owns the three handles below, shared with pipelines of the same layout (PipelineLayoutCache).
+    std::shared_ptr<const PipelineLayouts> layouts;
+    VkDescriptorSetLayout descriptor_set_layout{};
     DescriptorAllocator descriptor_allocator;
-    vk::PipelineLayout pipeline_layout;
-    vk::DescriptorUpdateTemplate descriptor_update_template;
+    VkPipelineLayout pipeline_layout{};
+    VkDescriptorUpdateTemplate descriptor_update_template{};
     vk::Pipeline pipeline;
 
     DescriptorBufferLayout descriptor_buffer_layout;

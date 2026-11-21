@@ -107,6 +107,10 @@ enum class Opt : unsigned {
     /// Native stages: a stage another thread is translating is waited for and reused instead of
     /// translated a second time (threads that hold no such stage themselves)
     StageInFlight,
+    /// Graphics pipelines with the same descriptor layout share their set layout, pipeline layout
+    /// and update template (PipelineLayoutCache): creating them waits on a driver lock while
+    /// pipelines compile
+    SharedPipelineLayouts,
     Count,
 };
 
@@ -121,7 +125,7 @@ inline constexpr std::array<std::string_view, static_cast<size_t>(Opt::Count)> o
     "handle_page_cache", "dma_forward", "draw_begin_coalesce", "pending_wake", "diag_draw_lite",
     "shader_build_budget", "compute_rebuild_async", "compute_preload_variants", "stale_target_skip",
     "geometry_consistency", "build_order_priority", "replay_disk_recordings",
-    "queue_deferred_translation", "stage_in_flight",
+    "queue_deferred_translation", "stage_in_flight", "shared_pipeline_layouts",
 };
 
 static_assert(static_cast<size_t>(Opt::Count) <= 64, "the off-mask is 64 bits");

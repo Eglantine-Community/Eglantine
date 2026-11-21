@@ -12,7 +12,11 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <optional>
+#include <vector>
 
 #include <boost/container/small_vector.hpp>
 
@@ -238,6 +242,16 @@ inline void WriteDescriptorBuffer(const Device& device, const DescriptorBufferLa
            Shader::NumDescriptors(info.image_descriptors);
 }
 
+/// The layouts of a pipeline. Creating them waits on a driver lock while other pipelines
+/// compile (2.8 ms each in Ocarina of Time's load burst), so graphics pipelines with the same
+/// descriptor layout share one (PipelineLayoutCache).
+struct PipelineLayouts {
+    vk::DescriptorSetLayout set_layout;
+    DescriptorBufferLayout buffer_layout;
+    vk::PipelineLayout pipeline_layout;
+    vk::DescriptorUpdateTemplate update_template;
+};
+
 class DescriptorLayoutBuilder {
 public:
     DescriptorLayoutBuilder(const Device& device_) : device{&device_} {}
@@ -336,6 +350,27 @@ public:
             .set = 0,
         });
     }
+
+    /// Everything the layouts it creates depend on (CreateLayouts), for sharing them.
+    [[nodiscard]] std::vector<u32> LayoutKey(bool use_push_descriptor,
+                                             bool use_descriptor_buffer) const {
+        std::vector<u32> key;
+        key.reserve(1 + bindings.size() * 4);
+        key.push_back(u32{use_push_descriptor} | u32{use_descriptor_buffer} << 1 |
+                      u32{is_compute} << 2 | u32{uses_mesh} << 3 | u32{mesh_emulation} << 4);
+        for (const VkDescriptorSetLayoutBinding& entry : bindings) {
+            key.push_back(entry.binding);
+            key.push_back(static_cast<u32>(entry.descriptorType));
+            key.push_back(entry.descriptorCount);
+            key.push_back(entry.stageFlags);
+        }
+        return key;
+    }
+
+    /// The set layout, the descriptor buffer layout (with descriptor buffers), the pipeline
+    /// layout and the update template (without).
+    [[nodiscard]] std::shared_ptr<PipelineLayouts> CreateLayouts(bool use_push_descriptor,
+                                                                 bool use_descriptor_buffer) const;
 
     vk::PipelineLayout CreatePipelineLayout(VkDescriptorSetLayout descriptor_set_layout) const {
         using Shader::Backend::SPIRV::RenderAreaLayout;
@@ -440,6 +475,57 @@ private:
     u32 binding{};
     u32 num_descriptors{};
     size_t offset{};
+};
+
+inline std::shared_ptr<PipelineLayouts> DescriptorLayoutBuilder::CreateLayouts(
+    bool use_push_descriptor, bool use_descriptor_buffer) const {
+    auto layouts = std::make_shared<PipelineLayouts>();
+    layouts->set_layout = CreateDescriptorSetLayout(use_push_descriptor, use_descriptor_buffer);
+    if (use_descriptor_buffer) {
+        layouts->buffer_layout = MakeDescriptorBufferLayout(*layouts->set_layout);
+    }
+    layouts->pipeline_layout = CreatePipelineLayout(*layouts->set_layout);
+    if (!use_descriptor_buffer) {
+        layouts->update_template =
+            CreateTemplate(*layouts->set_layout, *layouts->pipeline_layout, use_push_descriptor);
+    }
+    return layouts;
+}
+
+/// Layouts shared by the graphics pipelines that describe the same ones (LayoutKey).
+class PipelineLayoutCache {
+public:
+    [[nodiscard]] std::shared_ptr<const PipelineLayouts> Get(const DescriptorLayoutBuilder& builder,
+                                                             bool use_push_descriptor,
+                                                             bool use_descriptor_buffer) {
+        std::vector<u32> key = builder.LayoutKey(use_push_descriptor, use_descriptor_buffer);
+        {
+            std::scoped_lock lock{mutex};
+            if (const auto it = layouts.find(key); it != layouts.end()) {
+                ++shared;
+                return it->second;
+            }
+        }
+        // Created without the lock; a thread that lost the race uses the first one.
+        std::shared_ptr<const PipelineLayouts> made =
+            builder.CreateLayouts(use_push_descriptor, use_descriptor_buffer);
+        std::scoped_lock lock{mutex};
+        const auto [it, inserted] = layouts.try_emplace(std::move(key), std::move(made));
+        ++(inserted ? created : shared);
+        return it->second;
+    }
+
+    /// Layouts created and pipelines that found theirs already there.
+    [[nodiscard]] std::pair<u64, u64> Counts() {
+        std::scoped_lock lock{mutex};
+        return {created, shared};
+    }
+
+private:
+    u64 created{};
+    u64 shared{};
+    std::mutex mutex;
+    std::map<std::vector<u32>, std::shared_ptr<const PipelineLayouts>> layouts;
 };
 
 class RescalingPushConstant {

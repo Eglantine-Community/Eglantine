@@ -352,6 +352,9 @@ private:
     /// Pipeline library parts (VK_EXT_graphics_pipeline_library, EDEN_NX2_GPL=1), and the
     /// shader module sets they are keyed by: pipelines whose stages are the same SPIR-V share one.
     std::unique_ptr<GraphicsPipelineLibraryCache> library_cache;
+    /// Layouts shared by graphics pipelines with the same descriptor layout (each pipeline holds
+    /// its own by shared pointer, so they outlive this map).
+    PipelineLayoutCache layout_cache;
     /// Compiles the parts a link still misses, beside the thread that links (never `workers`,
     /// whose threads wait for these). Declared after library_cache and before `workers`, so it
     /// stops after the builds that wait for it and before the parts it compiles go away.
