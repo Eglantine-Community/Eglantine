@@ -388,6 +388,8 @@ IApplicationManagerInterface::IApplicationManagerInterface(Core::System& system_
         {3050, nullptr, "ListAssignELicenseTaskResult"},
         {3104, nullptr, "GetApplicationNintendoLogo"}, //18.0.0+
         {3105, nullptr, "GetApplicationStartupMovie"}, //18.0.0+
+        {3250, D<&IApplicationManagerInterface::Unknown3250>, "Unknown3250"}, //23.0.0+
+        {3251, D<&IApplicationManagerInterface::Unknown3251>, "Unknown3251"}, //23.0.0+
         {4000, nullptr, "Unknown4000"}, //20.0.0+
         {4004, nullptr, "Unknown4004"}, //20.0.0+
         {4006, nullptr, "Unknown4006"}, //20.0.0+
@@ -859,6 +861,22 @@ Result IApplicationManagerInterface::Unknown4022(
     LOG_WARNING(Service_NS, "(STUBBED) called");
     unknown_event.Signal(system.Kernel());
     *out_event = unknown_event.GetHandle();
+    R_SUCCEED();
+}
+
+Result IApplicationManagerInterface::Unknown3250() {
+    // 23.0.0+, called by qlaunch during startup. Semantics unknown; succeed so the
+    // home menu does not throw a fatal error (2010-0212).
+    LOG_WARNING(Service_NS, "(STUBBED) called");
+    R_SUCCEED();
+}
+
+Result IApplicationManagerInterface::Unknown3251(
+    OutBuffer<BufferAttr_HipcMapAlias> out_buffer) {
+    // 23.0.0+, called by qlaunch during startup with one output buffer.
+    // Semantics unknown; return an empty (zeroed) buffer.
+    LOG_WARNING(Service_NS, "(STUBBED) called, buffer_size={:#x}", out_buffer.size());
+    std::memset(out_buffer.data(), 0, out_buffer.size());
     R_SUCCEED();
 }
 
