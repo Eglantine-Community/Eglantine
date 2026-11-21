@@ -31,7 +31,8 @@ IApplicationManagerInterface::IApplicationManagerInterface(Core::System& system_
       record_update_system_event{service_context}, sd_card_mount_status_event{service_context},
       gamecard_update_detection_event{service_context},
       gamecard_mount_status_event{service_context}, gamecard_mount_failure_event{service_context},
-      gamecard_waken_ready_event{service_context}, unknown_event{service_context} {
+      gamecard_waken_ready_event{service_context}, unknown_event{service_context},
+      unknown_3250_event{service_context} {
     // clang-format off
     static const FunctionInfo functions[] = {
         {0, D<&IApplicationManagerInterface::ListApplicationRecord>, "ListApplicationRecord"},
@@ -865,10 +866,13 @@ Result IApplicationManagerInterface::Unknown4022(
     R_SUCCEED();
 }
 
-Result IApplicationManagerInterface::Unknown3250() {
-    // 23.0.0+, called by qlaunch during startup. Semantics unknown; succeed so the
-    // home menu does not throw a fatal error (2010-0212).
+Result IApplicationManagerInterface::Unknown3250(
+    OutCopyHandle<Kernel::KReadableEvent> out_event) {
+    // 23.0.0+, called by qlaunch right after GetApplicationRecordUpdateSystemEvent and
+    // GetGameCardUpdateDetectionEvent, so it is most likely another event getter.
+    // Hand out an event that is never signaled.
     LOG_WARNING(Service_NS, "(STUBBED) called");
+    *out_event = unknown_3250_event.GetHandle();
     R_SUCCEED();
 }
 
@@ -882,11 +886,12 @@ Result IApplicationManagerInterface::Unknown3251(
 }
 
 Result IApplicationManagerInterface::Unknown3254(
-    OutBuffer<BufferAttr_HipcMapAlias> out_buffer) {
-    // 23.0.0+, called by qlaunch right after 3250 with one output buffer.
-    // Semantics unknown; return an empty (zeroed) buffer.
+    Out<s32> out_count, OutBuffer<BufferAttr_HipcMapAlias> out_buffer) {
+    // 23.0.0+, called by qlaunch right after 3250 with one output buffer. Looks like a
+    // list query; report zero entries and return an empty (zeroed) buffer.
     LOG_WARNING(Service_NS, "(STUBBED) called, buffer_size={:#x}", out_buffer.size());
     std::memset(out_buffer.data(), 0, out_buffer.size());
+    *out_count = 0;
     R_SUCCEED();
 }
 
