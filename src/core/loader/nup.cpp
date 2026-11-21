@@ -12,8 +12,8 @@
 #include "common/logging.h"
 #include "common/string_util.h"
 #include "core/core.h"
-#include "core/file_sys/nup_container.h"
 #include "core/file_sys/control_metadata.h"
+#include "core/file_sys/nup_container.h"
 #include "core/file_sys/patch_manager.h"
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/romfs_factory.h"
@@ -35,10 +35,24 @@ struct LanguageSlot {
 };
 
 constexpr std::array<LanguageSlot, 18> LanguageSlots{{
-    {"en-us", 0},   {"en-gb", 1},  {"ja", 2},     {"fr", 3},     {"de", 4},
-    {"es-419", 5},  {"es", 6},     {"it", 7},     {"nl", 8},     {"fr-ca", 9},
-    {"pt", 10},     {"ru", 11},    {"ko", 12},    {"zh-hant", 13}, {"zh-hans", 14},
-    {"pt-br", 15},  {"pl", 16},    {"th", 17},
+    {"en-us", 0},
+    {"en-gb", 1},
+    {"ja", 2},
+    {"fr", 3},
+    {"de", 4},
+    {"es-419", 5},
+    {"es", 6},
+    {"it", 7},
+    {"nl", 8},
+    {"fr-ca", 9},
+    {"pt", 10},
+    {"ru", 11},
+    {"ko", 12},
+    {"zh-hant", 13},
+    {"zh-hans", 14},
+    {"pt-br", 15},
+    {"pl", 16},
+    {"th", 17},
 }};
 
 void CopyNameToEntry(FileSys::LanguageEntry& entry, std::string_view name) {
@@ -55,43 +69,52 @@ void CopyDeveloperToEntry(FileSys::LanguageEntry& entry, std::string_view develo
 
 std::unique_ptr<FileSys::NACP> BuildNacp(const NupContainer::PackageInfo& base,
                                          const std::string& version) {
-    const std::string& effective_title =
-        !base.title_name.empty() ? base.title_name : base.source_dump;
-    if (effective_title.empty() && base.localized_titles.empty() && base.publisher.empty() &&
+    auto nacp = std::make_unique<FileSys::NACP>();
+    const bool has_raw_nacp = base.nacp.size() == sizeof(nacp->raw);
+    if (!base.nacp.empty() && !has_raw_nacp) {
+        LOG_WARNING(Loader, "NUP NACP TLV has unexpected size {}, ignoring it", base.nacp.size());
+    }
+
+    // source_dump is a last resort, and never overrides a real NACP name.
+    std::string title = base.title_name;
+    if (title.empty() && !has_raw_nacp) {
+        title = base.source_dump;
+    }
+
+    if (!has_raw_nacp && title.empty() && base.localized_titles.empty() && base.publisher.empty() &&
         version.empty()) {
         return nullptr;
     }
-    auto nacp = std::make_unique<FileSys::NACP>();
-    nacp->raw.supported_languages = static_cast<FileSys::SupportedLanguage>(0x3FFFF);
+
+    if (has_raw_nacp) {
+        std::memcpy(&nacp->raw, base.nacp.data(), sizeof(nacp->raw)); // verbatim NACP
+    } else {
+        nacp->raw.supported_languages = static_cast<FileSys::SupportedLanguage>(0x3FFFF);
+        nacp->raw.save_data_owner_id = base.title_id;
+    }
 
     for (const auto& [lang, name] : base.localized_titles) {
         for (const auto& slot : LanguageSlots) {
-            // The uncompressed RawNACP only stores 16 entries; Polish/Thai exist
-            // only in the compressed format, so they fall back to the default.
             if (slot.index < 16 && slot.tag == lang) {
                 CopyNameToEntry(nacp->raw.language_entries.language_entries[slot.index], name);
             }
         }
     }
-    if (!effective_title.empty()) {
-        CopyNameToEntry(nacp->raw.language_entries.language_entries[0], effective_title);
+    auto& default_entry = nacp->raw.language_entries.language_entries[0];
+    if (!title.empty()) {
+        CopyNameToEntry(default_entry, title);
     }
     if (!base.publisher.empty()) {
-        CopyDeveloperToEntry(nacp->raw.language_entries.language_entries[0], base.publisher);
-    }
-    if (!base.publisher.empty()) {
-        auto& entry = nacp->raw.language_entries.language_entries[0];
         const std::size_t length =
-            std::min(base.publisher.size(), entry.developer_name.size() - 1);
-        std::memcpy(entry.developer_name.data(), base.publisher.data(), length);
-        entry.developer_name[length] = '\0';
+            std::min(base.publisher.size(), default_entry.developer_name.size() - 1);
+        std::memcpy(default_entry.developer_name.data(), base.publisher.data(), length);
+        default_entry.developer_name[length] = '\0';
     }
     if (!version.empty()) {
         const std::size_t length = std::min(version.size(), nacp->raw.version_string.size() - 1);
         std::memcpy(nacp->raw.version_string.data(), version.data(), length);
         nacp->raw.version_string[length] = '\0';
     }
-    nacp->raw.save_data_owner_id = base.title_id;
 
     nacp->language_entries.resize(16);
     std::memcpy(nacp->language_entries.data(), nacp->raw.language_entries.language_entries.data(),
@@ -123,9 +146,8 @@ AppLoader_NUP::AppLoader_NUP(FileSys::VirtualFile file_)
     std::optional<std::size_t> exefs_index;
     if (base_index && nup->GetExeFSDir(*base_index) != nullptr) {
         program_index = base_index;
-        exefs_index = update_index && nup->GetExeFSDir(*update_index) != nullptr
-                          ? update_index
-                          : base_index;
+        exefs_index =
+            update_index && nup->GetExeFSDir(*update_index) != nullptr ? update_index : base_index;
     } else if (update_index && nup->GetExeFSDir(*update_index) != nullptr) {
         LOG_INFO(Loader,
                  "NUP container is a standalone update; booting the update program directly");
@@ -151,13 +173,23 @@ AppLoader_NUP::AppLoader_NUP(FileSys::VirtualFile file_)
 
     if (update_index) {
         const auto& update = nup->GetPackages()[*update_index];
-        display_version = update.display_version.empty() ? DecodeVersion(update.version)
-                                                         : update.display_version;
+        display_version =
+            update.display_version.empty() ? DecodeVersion(update.version) : update.display_version;
     } else {
         display_version = program.display_version.empty() ? DecodeVersion(program.version)
                                                           : program.display_version;
     }
-    nacp_file = BuildNacp(program, display_version);
+    auto meta_source = program; // copy
+    if (meta_source.title_name.empty() && meta_source.localized_titles.empty()) {
+        for (const auto& pkg : nup->GetPackages()) {
+            if (!pkg.title_name.empty() || !pkg.localized_titles.empty()) {
+                meta_source.title_name = pkg.title_name;
+                meta_source.localized_titles = pkg.localized_titles;
+                break;
+            }
+        }
+    }
+    nacp_file = BuildNacp(meta_source, display_version);
     if (!program.icon.empty()) {
         icon_file = std::make_shared<FileSys::VectorVfsFile>(program.icon, "icon.dat");
     } else {
@@ -172,11 +204,9 @@ AppLoader_NUP::AppLoader_NUP(FileSys::VirtualFile file_)
         }
     }
 
-    const auto addon_count = std::count_if(nup->GetPackages().begin(), nup->GetPackages().end(),
-                                           [](const auto& package) {
-                                               return package.kind ==
-                                                      NupContainer::PackageKind::Addon;
-                                           });
+    const auto addon_count = std::count_if(
+        nup->GetPackages().begin(), nup->GetPackages().end(),
+        [](const auto& package) { return package.kind == NupContainer::PackageKind::Addon; });
     if (addon_count > 0) {
         LOG_WARNING(Loader,
                     "NUP container has {} add-on content package(s); AoC mounting is not "
@@ -216,8 +246,7 @@ AppLoader::LoadResult AppLoader_NUP::Load(Kernel::KProcess& process, Core::Syste
     return result;
 }
 
-ResultStatus AppLoader_NUP::VerifyIntegrity(
-    std::function<bool(size_t, size_t)> progress_callback) {
+ResultStatus AppLoader_NUP::VerifyIntegrity(std::function<bool(size_t, size_t)> progress_callback) {
     if (nup->GetStatus() != ResultStatus::Success) {
         return nup->GetStatus();
     }

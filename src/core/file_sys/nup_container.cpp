@@ -71,17 +71,17 @@ struct TocHeader {
 static_assert(sizeof(TocHeader) == TocHeaderSize);
 
 struct PackageRecord {
-    u64_le title_id; // 0x00
-    u32_le root_dir; // 0x08
-    u32_le exefs_dir; // 0x0C
-    u32_le romfs_dir; // 0x10
-    u32_le version; // 0x14
-    u8 kind; // 0x18
-    u8 flags; // 0x19
-    u16_le reserved; // 0x1A
-    u32_le reserved2; // 0x1C
-    u64_le meta_offset; // 0x20
-    u32_le meta_size; // 0x28
+    u64_le title_id;              // 0x00
+    u32_le root_dir;              // 0x08
+    u32_le exefs_dir;             // 0x0C
+    u32_le romfs_dir;             // 0x10
+    u32_le version;               // 0x14
+    u8 kind;                      // 0x18
+    u8 flags;                     // 0x19
+    u16_le reserved;              // 0x1A
+    u32_le reserved2;             // 0x1C
+    u64_le meta_offset;           // 0x20
+    u32_le meta_size;             // 0x28
     std::array<u8, 20> reserved3; // 0x2C
 };
 static_assert(sizeof(PackageRecord) == PackageRecordSize);
@@ -107,15 +107,15 @@ struct DirRecord {
 static_assert(sizeof(DirRecord) == DirRecordSize);
 
 struct FileRecord {
-    u32_le name_offset; // 0x00
-    u32_le name_length; // 0x04
-    u64_le size; // 0x08
-    u64_le extent_offset; // 0x10
-    u64_le extent_size; // 0x18
-    std::array<u8, 0x20> sha256; // 0x20
-    u8 codec; // 0x40
-    u8 codec_flags; // 0x41
-    u16_le reserved2; // 0x42
+    u32_le name_offset;           // 0x00
+    u32_le name_length;           // 0x04
+    u64_le size;                  // 0x08
+    u64_le extent_offset;         // 0x10
+    u64_le extent_size;           // 0x18
+    std::array<u8, 0x20> sha256;  // 0x20
+    u8 codec;                     // 0x40
+    u8 codec_flags;               // 0x41
+    u16_le reserved2;             // 0x42
     std::array<u8, 12> reserved3; // 0x44
 };
 static_assert(sizeof(FileRecord) == FileRecordSize);
@@ -139,6 +139,7 @@ static_assert(sizeof(TlvHeader) == TlvHeaderSize);
 
 enum MetaType : u16 {
     MetaNpdm = 0x0001,
+    MetaNacp = 0x0002,
     MetaIcon = 0x0003,
     MetaDisplayVersion = 0x0004,
     MetaTitleName = 0x0005,
@@ -408,8 +409,8 @@ bool NupContainer::Parse() {
         return false;
     }
 
-    const auto toc = file->ReadBytes(static_cast<std::size_t>(toc_size),
-                                     static_cast<std::size_t>(toc_offset));
+    const auto toc =
+        file->ReadBytes(static_cast<std::size_t>(toc_size), static_cast<std::size_t>(toc_offset));
     if (toc.size() != toc_size) {
         status = Loader::ResultStatus::ErrorNUPBadFormat;
         return false;
@@ -621,6 +622,9 @@ bool NupContainer::ParseMeta(PackageInfo& package) {
         case MetaNpdm:
             package.npdm.assign(payload, payload + header.size);
             break;
+        case MetaNacp:
+            package.nacp.assign(payload, payload + header.size);
+            break;
         case MetaIcon:
             package.icon.assign(payload, payload + header.size);
             break;
@@ -661,8 +665,8 @@ bool NupContainer::ParseMeta(PackageInfo& package) {
                                           data_length));
                 } else {
                     package.localized_icons.emplace_back(
-                        lang, std::vector<u8>(payload + record_pos,
-                                              payload + record_pos + data_length));
+                        lang,
+                        std::vector<u8>(payload + record_pos, payload + record_pos + data_length));
                 }
                 record_pos += data_length;
             }
@@ -719,12 +723,11 @@ VirtualFile NupContainer::OpenFileAs(std::size_t file_index, const std::string& 
         return std::make_shared<VectorVfsFile>(std::vector<u8>{}, name);
     }
     if (node.codec == CodecRaw) {
-        return std::make_shared<OffsetVfsFile>(
-            file, static_cast<std::size_t>(node.extent_size),
-            static_cast<std::size_t>(node.extent_offset), name);
+        return std::make_shared<OffsetVfsFile>(file, static_cast<std::size_t>(node.extent_size),
+                                               static_cast<std::size_t>(node.extent_offset), name);
     }
-    return std::make_shared<NupVfsFile>(file, node.extent_offset, node.extent_size, node.size,
-                                        name, cache, file_index);
+    return std::make_shared<NupVfsFile>(file, node.extent_offset, node.extent_size, node.size, name,
+                                        cache, file_index);
 }
 
 std::optional<bool> NupContainer::HasZstdMagic(std::size_t file_index) const {
@@ -789,8 +792,8 @@ std::optional<std::size_t> NupContainer::FindStandIn(std::size_t damaged,
         const auto mismatch = std::ranges::mismatch(name, other);
         const auto prefix = static_cast<std::size_t>(mismatch.in1 - name.begin());
         const u64 size = files[candidate].size;
-        const u64 gap = size > files[damaged].size ? size - files[damaged].size
-                                                   : files[damaged].size - size;
+        const u64 gap =
+            size > files[damaged].size ? size - files[damaged].size : files[damaged].size - size;
         if (best && (prefix < best_prefix || (prefix == best_prefix && gap >= best_gap))) {
             continue;
         }
@@ -824,9 +827,8 @@ void NupContainer::BuildDirTree(u32 dir_index, VectorVfsDirectory& out, bool ser
                 out.AddFile(OpenFile(index));
             }
         } else {
-            auto sub = std::make_shared<VectorVfsDirectory>(std::vector<VirtualFile>{},
-                                                            std::vector<VirtualDir>{},
-                                                            dirs[child].name);
+            auto sub = std::make_shared<VectorVfsDirectory>(
+                std::vector<VirtualFile>{}, std::vector<VirtualDir>{}, dirs[child].name);
             BuildDirTree(child, *sub, serve_stand_ins);
             out.AddDirectory(sub);
         }
@@ -850,8 +852,8 @@ void NupContainer::BuildDirTree(u32 dir_index, VectorVfsDirectory& out, bool ser
 }
 
 VirtualDir NupContainer::BuildPackageDir(u32 dir_index, bool serve_stand_ins) {
-    auto out = std::make_shared<VectorVfsDirectory>(std::vector<VirtualFile>{},
-                                                    std::vector<VirtualDir>{}, dirs[dir_index].name);
+    auto out = std::make_shared<VectorVfsDirectory>(
+        std::vector<VirtualFile>{}, std::vector<VirtualDir>{}, dirs[dir_index].name);
     BuildDirTree(dir_index, *out, serve_stand_ins);
     return out;
 }
@@ -953,8 +955,8 @@ Loader::ResultStatus NupContainer::VerifyIntegrity(
         } else if (node.codec == CodecRaw) {
             content = ReadExtentRaw(node);
         } else {
-            NupVfsFile view(file, node.extent_offset, node.extent_size, node.size, node.name,
-                            cache, i);
+            NupVfsFile view(file, node.extent_offset, node.extent_size, node.size, node.name, cache,
+                            i);
             content = view.ReadAllBytes();
         }
         if (content.size() != node.size) {
