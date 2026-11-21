@@ -258,6 +258,10 @@ public:
     /// Reports a device loss.
     void ReportLoss() const;
 
+    /// Ends the process when submitted GPU work stopped making progress without the driver
+    /// reporting a loss (EDEN_NX2_GPU_WATCHDOG). Makes no Vulkan calls.
+    [[noreturn]] void ReportUnresponsive() const;
+
     /// Logs what VK_EXT_device_fault reports about a device loss.
     void ReportDeviceFault() const;
 
