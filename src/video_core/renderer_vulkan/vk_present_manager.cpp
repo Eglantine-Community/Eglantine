@@ -243,7 +243,18 @@ VkFormat PresentManager::GetFrameImageFormat(VkFormat image_view_format) const {
         return image_view_format;
     }
     // Render SDR through a UNORM view, but preserve the surface's transfer encoding for blits.
-    return swapchain.GetSdrImageFormat();
+    const VkFormat sdr_format = swapchain.GetSdrImageFormat();
+#ifdef HAS_LSFG
+    if (Settings::values.frame_gen.GetValue()) {
+        if (CanStoreToFrame(device.GetPhysical(), sdr_format)) {
+            return sdr_format;
+        }
+        if (CanStoreToFrame(device.GetPhysical(), VK_FORMAT_R8G8B8A8_UNORM)) {
+            return VK_FORMAT_R8G8B8A8_UNORM;
+        }
+    }
+#endif
+    return sdr_format;
 }
 
 void PresentManager::RecreateFrame(Frame* frame, u32 width, u32 height, VkFormat image_view_format,
@@ -427,14 +438,12 @@ bool PresentManager::RecreateSwapchain(Frame* frame) {
 void PresentManager::ConfigureTransfer(const Frame* frame) {
     transfer_source_format = frame->image_format;
     transfer_mode = TransferMode::Unsupported;
-    if (frame->image_format == GetFrameImageFormat(frame->format)) {
-        if (CanBlitToSwapchain(device.GetPhysical(), swapchain.GetImageFormat()) &&
-            (device.GetPhysical().GetFormatProperties(frame->image_format).optimalTilingFeatures &
-             VK_FORMAT_FEATURE_BLIT_SRC_BIT) != 0) {
-            transfer_mode = TransferMode::Blit;
-        } else if (frame->image_format == swapchain.GetImageFormat()) {
-            transfer_mode = TransferMode::Copy;
-        }
+    if (CanBlitToSwapchain(device.GetPhysical(), swapchain.GetImageFormat()) &&
+        (device.GetPhysical().GetFormatProperties(frame->image_format).optimalTilingFeatures &
+         VK_FORMAT_FEATURE_BLIT_SRC_BIT) != 0) {
+        transfer_mode = TransferMode::Blit;
+    } else if (frame->image_format == swapchain.GetImageFormat()) {
+        transfer_mode = TransferMode::Copy;
     }
 }
 

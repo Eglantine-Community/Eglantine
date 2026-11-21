@@ -23,13 +23,13 @@ AboutDialog::AboutDialog(QWidget* parent)
 
     ui->setupUi(this);
     // Try and request the icon from Qt theme (Linux?)
-    const QIcon yuzu_logo = QIcon::fromTheme(QStringLiteral("io.github.zortos293.lichii"),
-                                           QIcon(QStringLiteral(":/img/lichii.ico")));
+    const QIcon yuzu_logo = QIcon::fromTheme(QStringLiteral("io.github.dalia.dalia"),
+                                           QIcon(QStringLiteral(":/img/dalia.png")));
     if (!yuzu_logo.isNull()) {
         ui->labelLogo->setPixmap(yuzu_logo.pixmap(112));
     }
-    ui->labelYuzu->setPixmap(QIcon(QStringLiteral(":/img/lichii_wordmark.png")).pixmap(113, 48));
-    ui->labelYuzu->setAccessibleName(QStringLiteral("Lichii"));
+    ui->labelYuzu->setPixmap(QIcon(QStringLiteral(":/img/dalia.png")).pixmap(113, 48));
+    ui->labelYuzu->setAccessibleName(QStringLiteral("DALIA"));
     ui->verticalLayout_3->setContentsMargins(32, 28, 32, 20);
     ui->horizontalLayout->setSpacing(32);
     ui->verticalLayout->setSpacing(10);

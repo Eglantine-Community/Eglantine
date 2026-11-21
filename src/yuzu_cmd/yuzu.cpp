@@ -514,6 +514,15 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     Common::Log::Initialize();
     Common::Log::SetColorConsoleBackendEnabled(true);
     Common::Log::Start();
+
+    fmt::print(
+        "\n"
+        "  ____    _    _     ___    _    \n"
+        " |  _ \\  / \\  | |   |_ _|  / \\   \n"
+        " | | | |/ _ \\ | |    | |  / _ \\  \n"
+        " | |_| / ___ \\| |___ | | / ___ \\ \n"
+        " |____/_/   \\_\\_____|___/_/   \\_\\\n"
+        " DALIA Switch Emulator - CLI\n\n");
 #ifdef _WIN32
     // EDEN_NX2_CRASH_DUMP=<dir> puts the dump somewhere other than the log directory.
     const char* const crash_dump_dir = std::getenv("EDEN_NX2_CRASH_DUMP");

@@ -8,8 +8,8 @@
 
 // yuzu data directories
 
-#define EDEN_DIR "lichii"
-#define EDEN_LEGACY_DIR "eden"
+#define EDEN_DIR "dalia"
+#define EDEN_LEGACY_DIR "lichii"
 #define PORTABLE_DIR "user"
 
 // Sub-directories contained within a yuzu data directory

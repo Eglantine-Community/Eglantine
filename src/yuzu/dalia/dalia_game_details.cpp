@@ -59,6 +59,12 @@ void DaliaGameDetailsDialog::SetupUI() {
     if (scaled_icon.isNull()) {
         scaled_icon = QPixmap(QStringLiteral(":/icons/default/256x256/dalia.png"));
     }
+    if (scaled_icon.isNull()) {
+        scaled_icon = QPixmap(QStringLiteral(":/img/dalia.png"));
+    }
+    if (scaled_icon.isNull()) {
+        scaled_icon = QPixmap(QStringLiteral("dist/dalia.png"));
+    }
     if (!scaled_icon.isNull()) {
         QPixmap rounded_pixmap(220, 220);
         rounded_pixmap.fill(Qt::transparent);

@@ -99,6 +99,12 @@ void DaliaSidebar::SetupUI() {
     logo_badge->setAlignment(Qt::AlignCenter);
 
     QPixmap dalia_icon(QStringLiteral(":/icons/default/256x256/dalia.png"));
+    if (dalia_icon.isNull()) {
+        dalia_icon = QPixmap(QStringLiteral(":/img/dalia.png"));
+    }
+    if (dalia_icon.isNull()) {
+        dalia_icon = QPixmap(QStringLiteral("dist/dalia.png"));
+    }
     if (!dalia_icon.isNull()) {
         QPixmap scaled(28, 28);
         scaled.fill(Qt::transparent);

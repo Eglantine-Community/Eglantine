@@ -305,7 +305,7 @@ TEST_CASE("NX: an extracted add-on is listed as add-on content after Load", "[co
     const auto& content = system.GetContentProvider();
     const auto entries =
         content.ListEntriesFilter(FileSys::TitleType::AOC, FileSys::ContentRecordType::Data);
-    REQUIRE(entries.size() == 1);
+    REQUIRE(entries.size() == size_t{1});
     CHECK(entries[0].title_id == AddOnId);
     const auto nca = content.GetEntry(AddOnId, FileSys::ContentRecordType::Data);
     REQUIRE(nca != nullptr);
@@ -388,7 +388,7 @@ TEST_CASE("NX: registering an archive preserves an external NSP add-on", "[core]
             loader.RegisterContent(provider);
             const auto entries = provider.ListEntriesFilter(
                 FileSys::TitleType::AOC, FileSys::ContentRecordType::Data, std::nullopt);
-            REQUIRE(entries.size() == (std::string_view(archive) == "lichii_synthetic.nx" ? 2 : 1));
+            REQUIRE(entries.size() == (std::string_view(archive) == "lichii_synthetic.nx" ? size_t{2} : size_t{1}));
             const auto dlc =
                 provider.GetEntry(ApplicationId + 0x1002, FileSys::ContentRecordType::Data);
             REQUIRE(dlc != nullptr);

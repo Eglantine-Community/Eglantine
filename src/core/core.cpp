@@ -161,7 +161,15 @@ std::optional<u64> FindSwitch2Program(const FileSys::VirtualFile& file, u64 prog
         }
         const auto exefs = program ? nup.GetExeFSDir(*program) : nullptr;
         const auto npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
-        return Switch2ProgramId(metadata, npdm);
+        if (const auto id = Switch2ProgramId(metadata, npdm)) {
+            return id;
+        }
+        for (const auto& pkg : nup.GetPackages()) {
+            if ((pkg.title_id & 0xFF00000000000000ULL) == 0x0400000000000000ULL) {
+                return pkg.title_id;
+            }
+        }
+        return std::nullopt;
     }
     const auto type = file != nullptr ? Loader::IdentifyFile(file) : Loader::FileType::Unknown;
     if (type == Loader::FileType::NX) {
@@ -417,8 +425,11 @@ struct System::Impl {
                 ? FindSwitch2Program(GetGameFileFromPath(virtual_filesystem, filepath),
                                      params.program_id, params.program_index)
                 : std::nullopt;
-        const bool switch2_program = switch2_program_id.has_value();
-        Kernel::KSystemControl::SetApplicationProgramId(switch2_program_id.value_or(0));
+        const bool switch2_program = switch2_program_id.has_value() ||
+                                     ((params.program_id & 0xFF00000000000000ULL) == 0x0400000000000000ULL);
+        const u64 application_program_id = switch2_program_id.value_or(
+            ((params.program_id & 0xFF00000000000000ULL) == 0x0400000000000000ULL) ? params.program_id : 0ULL);
+        Kernel::KSystemControl::SetApplicationProgramId(application_program_id);
         Settings::SetCurrentProgramIsSwitch2(switch2_program);
         Settings::SetAstcRecompressionOverride(std::nullopt);
 

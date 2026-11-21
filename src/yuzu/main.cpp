@@ -116,8 +116,8 @@ int main(int argc, char* argv[]) {
 #endif
 
     // Init settings params
-    QCoreApplication::setOrganizationName(QStringLiteral("eden"));
-    QCoreApplication::setApplicationName(QStringLiteral("Lichii"));
+    QCoreApplication::setOrganizationName(QStringLiteral("dalia"));
+    QCoreApplication::setApplicationName(QStringLiteral("DALIA"));
 
     // Increases the maximum open file limit.
     // TODO: This should be common to all frontends.
@@ -169,7 +169,7 @@ int main(int argc, char* argv[]) {
 
     // Fix the Wayland appId. This needs to match the name of the .desktop file without the .desktop
     // suffix.
-    QGuiApplication::setDesktopFileName(QStringLiteral("io.github.zortos293.lichii"));
+    QGuiApplication::setDesktopFileName(QStringLiteral("io.github.dalia.dalia"));
 #endif
 
     auto rounding_policy = GetHighDpiRoundingPolicy();
@@ -215,7 +215,7 @@ int main(int argc, char* argv[]) {
                     &MainWindow::OnAppFocusStateChanged);
         return app.exec();
     } catch (const std::exception& exception) {
-        QMessageBox::critical(nullptr, QObject::tr("Lichii startup stopped"),
+        QMessageBox::critical(nullptr, QObject::tr("DALIA startup stopped"),
                               QString::fromUtf8(exception.what()));
         return EXIT_FAILURE;
     }
