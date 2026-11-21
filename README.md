@@ -1,104 +1,128 @@
 <!--
-# SPDX-FileCopyrightText: Copyright 2025 Eden Emulator Project
+# SPDX-FileCopyrightText: Copyright 2026 Dalia Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
-
-# SPDX-FileCopyrightText: 2018 yuzu Emulator Project
-# SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
-<h2 align="center">⚠️ Lichii has no official website ⚠️</h2>
-
-> [!CAUTION]
-> **Lichii has no official website.** The only site run by this project is the **game compatibility website, [lichii.zortos.me](https://lichii.zortos.me)**, for compatibility reports only. Download Lichii **only** from this repository's [releases page](https://github.com/zortos293/Lichii/releases). Any other "Lichii" website or download (such as lichii.org) is not ours and may contain malware ([#545](https://github.com/zortos293/Lichii/issues/545)).
-
 <p align="center">
-  <img src="dist/branding/lichii_icon_with_logo.png" alt="Lichii" width="600">
+  <img src="dist/dalia.png" alt="Dalia Emulator" width="200">
 </p>
 
-# Lichii
+<h1 align="center">Dalia</h1>
 
-Lichii is an experimental, open-source Nintendo Switch and Switch 2 emulator written in C++. It builds on Eglantine, Eden, yuzu and Sudachi, preserving their contributions while developing this fork's game compatibility and renderer fixes.
+<p align="center">
+  <strong>Emulador experimental y de código abierto para Nintendo Switch y Switch 2 escrito en C++.</strong>
+</p>
 
-This is an independent fork, not an official release of those upstream projects. Lichii is not affiliated with Nintendo.
+<p align="center">
+  <a href="https://github.com/azeselh/Eglantine_Aze/releases"><img src="https://img.shields.io/github/v/release/azeselh/Eglantine_Aze?style=flat-square&color=8A2BE2" alt="Releases"></a>
+  <a href="LICENSE.txt"><img src="https://img.shields.io/badge/license-GPLv3%2B-blue.svg?style=flat-square" alt="License"></a>
+  <img src="https://img.shields.io/badge/c%2B%2B-20-00599C.svg?style=flat-square&logo=c%2B%2B" alt="C++20">
+  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey.svg?style=flat-square" alt="Platform">
+</p>
 
-Visit the [Lichii game compatibility website](https://lichii.zortos.me) to find games and compare community compatibility reports.
+---
 
-## Downloads and setup
+## 🌸 Acerca de Dalia
 
-Download Lichii only from this repository's [releases page](https://github.com/zortos293/Lichii/releases). Lichii has no other download site: archives offered elsewhere, such as lichii.org, are not built by this project, and one has been reported to install malware ([#545](https://github.com/zortos293/Lichii/issues/545)).
+**Dalia** es un emulador experimental desarrollado en C++20 con foco en la precisión visual, el rendimiento optimizado y la compatibilidad con títulos de Nintendo Switch y Switch 2.
 
-On Windows, extract the entire build archive and run **lichii.exe**. Only use games and system files you have legally obtained. Games, keys and firmware are not included.
-
-### Existing saves and settings
-
-Lichii uses its own profile: `%APPDATA%\lichii` on Windows, and the `lichii` directories under `$XDG_DATA_HOME`, `$XDG_CONFIG_HOME` and `$XDG_CACHE_HOME` on Linux and macOS. Without XDG overrides, these are `~/.local/share/lichii`, `~/.config/lichii` and `~/.cache/lichii`. An existing portable `user/` directory still takes priority and is not imported or changed by the wizard.
-
-On the first non-portable GUI launch, Lichii offers to import Eden and other detected emulator profiles. Back up `%APPDATA%\eden` first on Windows, or the old data, config and cache directories on Unix, and close the source emulator. Choose **Keep Old Data** to copy without changing the source, then check your saves and relaunch. Existing destination data is retained in backup directories rather than merged. Move also retains a source backup until you remove it yourself; Link deliberately shares settings and saves. Paths outside the imported data root remain shared and unchanged. An interrupted import offers recovery on the next launch. `eden-cli`, including `--help` and `--version`, refuses to initialize configuration until you import or explicitly choose **Start fresh** in the GUI.
-
-## Compatibility and issue reports
-
-Compatibility and performance vary by game, hardware and driver. Rendering errors, stutters and crashes remain possible. Passing automated tests does not establish that a game renders correctly, and this project makes no universal frame-rate guarantee.
-
-Browse [community compatibility reports](https://lichii.zortos.me/reports) for results with each player's build and setup.
-
-Desktop reporting requires a build containing [PR #303](https://github.com/zortos293/Lichii/pull/303) and is not available in build 88. In builds that include it, play and stop a Switch 2 game, then right-click that game and choose **Submit compatibility report**. Only the latest session in the current Lichii process is eligible.
-
-Confirm the matching website catalog entry and review the editable machine, game, setup, and enabled add-on details prefilled where available. Check the public preview and give explicit consent before submitting. Nothing uploads automatically, and the native v1 reporter does not read or upload logs or files.
-
-When [reporting an issue](https://github.com/zortos293/Eglantine/issues), include:
-
-- The exact build, game version, CPU, GPU and driver version.
-- Relevant settings and steps to reproduce the problem.
-- A screenshot and the log from the affected session, after checking it for personal information.
-
-Do not upload game files, keys, firmware or private account information.
-
-## Building and contributing
-
-See the [build guide](docs/Build.md), [user documentation](docs/user/README.md) and [coding guidelines](docs/Coding.md). Some inherited documentation and internal build target names still use upstream names. The GUI build target remains `yuzu`; its output is `lichii.exe` on Windows and `lichii` on other desktop platforms.
-
-Keep changes focused and distinguish code-level checks from actual gameplay testing.
-
-## Artwork
-Art created by YOB (yobslab)
-The supplied Lichii logo, icon and library artwork are in [dist/branding](dist/branding). Windows, Linux and macOS icon resources are generated from that artwork by [Generate-LichiiIcons.ps1](tools/Generate-LichiiIcons.ps1).
-
-## Support Lichii
-
-Lichii is free and stays free. If you want to help, you can donate in crypto. Donations help pay for the AI tools and build machines used to develop this open-source project faster.
-
-**Solana (SOL)**
-```text
-JepEjfyWjGjhJvHSrqj52KtLjcbbbmUh1iGqerYBF4w
-```
-
-**Ethereum (ETH)**
-```text
-0x055ABa1b80Bc35C836Ce7E9F47c2b3d6C75b5534
-```
-
-**Bitcoin (BTC)**
-```text
-bc1qcvxdpf4qvdhqp8ee4s355cjmxrzsphsdwpl8w4
-```
-
-**BNB Smart Chain (BNB)**
-```text
-0x055ABa1b80Bc35C836Ce7E9F47c2b3d6C75b5534
-```
-
-**Polygon**
-```text
-0x055ABa1b80Bc35C836Ce7E9F47c2b3d6C75b5534
-```
-
-Send each coin on its matching network. Coins sent on the wrong network can't be recovered.
+Este proyecto se basa y continúa el trabajo de destacados emuladores de la comunidad de código abierto —incluyendo Eglantine, Eden, yuzu y Sudachi—, incorporando correcciones avanzadas en el renderizador, optimizaciones en el manejo de texturas y memoria, y sincronizaciones específicas para maximizar la estabilidad gráfica y la tasa de cuadros.
 
 > [!NOTE]
-> Donations are voluntary gifts and are non-refundable. A donation does not buy any product, service, perk, early access, exclusive build, priority support or say in the project. Every release stays free and public for everyone.
+> Dalia es un proyecto independiente de código abierto y no está afiliado, respaldado ni patrocinado por Nintendo. Para utilizar el emulador es necesario contar con volcados legales de tus propios juegos, claves criptográficas (`prod.keys`) y firmware.
 
-## Credits and license
+---
 
-Lichii inherits the work of the Eglantine, Eden, yuzu and Sudachi projects and their contributors, including Eglantine's original developer Camille LaVey. Original copyright notices and third-party licenses are retained.
+## 🚀 Características principales
 
-See [LICENSE.txt](LICENSE.txt) and the source files for applicable license terms.
+- **Renderizador Vulkan de alto rendimiento:** Pipeline gráfico optimizado con soporte para transcodificación ASTC por lotes, cache de pipelines de bajo retraso, corrección precisa de layouts Maxwell/GOB en subrecursos y texturas 2D, y sincronización adaptativa de ticks GPU.
+- **Compatibilidad con arquitectura Switch 2:** Soporte para instrucciones Ampere y macros Turing en el re-compilador de shaders, tiling nativo por bloques y soporte para llamadas de cómputo nativo.
+- **Emulación de CPU con Dynarmic:** Re-compilación dinámica JIT de 64 bits (A64) con soporte de reloj atómico sincronizado y optimizaciones de giro/polling en bucles de espera.
+- **Arquitectura GPU Split multihilo:** Separación del procesamiento frontal y trasero de comandos de GPU para eliminar cuellos de botella en la CPU y mejorar el frame pacing.
+- **Interfaz moderna en Qt6:** Interfaz gráfica limpia e intuitiva, gestión visual de biblioteca de juegos, configuración granular por título, soporte para mods (LayeredFS) y actualización de contenido.
+- **Audio Core & HLE robusto:** Emulación de servicios del sistema operativo de bajo impacto y reproducción de audio de latencia ultrabaja.
+
+---
+
+## 📦 Descarga y uso
+
+### Descargas
+Puedes descargar las versiones compiladas más recientes directamente desde la sección de **[Releases](https://github.com/azeselh/Eglantine_Aze/releases)** del repositorio.
+
+En Windows, extrae el archivo en una carpeta y ejecuta:
+- **`dalia.exe`**: Interfaz gráfica de usuario (GUI).
+- **`dalia-cli.exe`**: Interfaz de línea de comandos para automatización y depuración.
+
+### Directorios de datos y perfiles
+
+Dalia almacena configuraciones, estados guardados y shaders en su propio directorio:
+
+- **Windows:** `%APPDATA%\dalia`
+- **Linux:** `~/.local/share/dalia`, `~/.config/dalia`, `~/.cache/dalia`
+- **Modo portátil:** Crea una carpeta llamada `user` en el mismo directorio donde se encuentra `dalia.exe`. Dalia utilizará automáticamente esa carpeta para todos sus datos sin tocar el sistema.
+
+### Migración de datos
+En su primer inicio no portátil, Dalia permite importar automáticamente configuraciones y partidas guardadas desde perfiles previos detectados (`%APPDATA%\eden`, `%APPDATA%\lichii`, `%APPDATA%\yuzu`), manteniendo copias de respaldo de tus partidas intactas.
+
+---
+
+## 🛠️ Compilación desde el código fuente
+
+### Requisitos previos
+
+- **CMake:** Versión 3.31 o superior.
+- **Compilador C++20:**
+  - Windows: Visual Studio 2022 (MSVC v143+) o Clang-cl (LLVM 18+).
+  - Linux: GCC 13+ o Clang 18+.
+- **Generador:** Ninja (recomendado).
+- **Librerías externas:** Qt 6 (Widgets, Core, Gui), Vulkan SDK 1.3+.
+
+### Instrucciones de compilación (Windows / Linux)
+
+```bash
+# 1. Clonar el repositorio
+git clone https://github.com/azeselh/Eglantine_Aze.git
+cd Eglantine_Aze
+
+# 2. Configurar el proyecto con CMake
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+# 3. Compilar el emulador y la CLI
+cmake --build build --target yuzu yuzu-cmd --parallel
+```
+
+Los ejecutables resultantes se ubicarán en `build/bin/`:
+- `build/bin/dalia.exe` (o `dalia` en Linux)
+- `build/bin/dalia-cli.exe` (o `dalia-cli` en Linux)
+
+Para más detalles sobre dependencias de plataformas específicas, consulta la [Guía de compilación](docs/Build.md).
+
+---
+
+## 📋 Reporte de problemas
+
+Si encuentras algún fallo técnico o incompatibilidad gráfica:
+
+1. Comprueba si el problema ya ha sido reportado en la sección de **[Issues](https://github.com/azeselh/Eglantine_Aze/issues)**.
+2. Al abrir un nuevo reporte, incluye:
+   - Especificaciones completas de hardware (CPU, GPU, versión del controlador gráfico, SO).
+   - Título e ID del programa afectado.
+   - Archivo de registro del emulador (`eden_log.txt` ubicado en `%APPDATA%\dalia\log\`).
+   - Pasos claros para reproducir el comportamiento.
+
+> [!CAUTION]
+> Nunca compartas ni adjuntes volcados de juegos con derechos de autor, volcados de memoria que contengan claves privadas ni archivos `prod.keys` / firmware en los reportes de problemas.
+
+---
+
+## 📜 Licencia y agradecimientos
+
+Dalia se distribuye bajo los términos de la **GNU General Public License v3.0 o posterior** ([GPL-3.0-or-later](LICENSE.txt)).
+
+Dalia reconoce y agradece profundamente el trabajo de:
+- **Eglantine Project** y **Camille LaVey**
+- **Eden Emulator Project**
+- **yuzu Emulator Project**
+- **Sudachi Project**
+- **Dynarmic Team**
+- Todos los colaboradores de la comunidad de emulación de Nintendo Switch.
