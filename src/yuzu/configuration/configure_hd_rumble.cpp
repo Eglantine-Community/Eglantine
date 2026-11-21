@@ -5,21 +5,19 @@
 #include <array>
 #include <limits>
 
+#include <QApplication>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDialogButtonBox>
-#include <QFormLayout>
-#include <QGroupBox>
+#include <QFont>
+#include <QFrame>
 #include <QHBoxLayout>
 #include <QLabel>
-#include <QApplication>
-#include <QListWidget>
 #include <QMessageBox>
 #include <QPushButton>
+#include <QScrollArea>
 #include <QSlider>
 #include <QSpinBox>
-#include <QFrame>
-#include <QStackedWidget>
 #include <QToolButton>
 #include <QVBoxLayout>
 
@@ -32,25 +30,83 @@ namespace {
 QLabel* MakeNote(const QString& text) {
     auto* label = new QLabel(text);
     label->setWordWrap(true);
-    label->setStyleSheet(QStringLiteral("color: palette(mid);"));
+    // Muted but legible on every theme: window-text blended 75/25 toward the background
+    const QColor text_c = label->palette().color(QPalette::WindowText);
+    const QColor back_c = label->palette().color(QPalette::Window);
+    const QColor muted((text_c.red() * 3 + back_c.red()) / 4,
+                       (text_c.green() * 3 + back_c.green()) / 4,
+                       (text_c.blue() * 3 + back_c.blue()) / 4);
+    label->setStyleSheet(QStringLiteral("color: %1;").arg(muted.name(QColor::HexArgb)));
     return label;
 }
+
+QFrame* MakeDivider() {
+    auto* divider = new QFrame;
+    divider->setFrameShape(QFrame::HLine);
+    divider->setFrameShadow(QFrame::Sunken);
+    return divider;
+}
+
+// A disclosure row like the upstream panel's collapsibles: plain text, arrow beside it
+QWidget* MakeCollapsible(const QString& title, QWidget* content, bool open) {
+    auto* holder = new QWidget;
+    auto* col = new QVBoxLayout(holder);
+    col->setContentsMargins(0, 0, 0, 0);
+    col->setSpacing(6);
+    auto* head = new QToolButton;
+    head->setText(title);
+    head->setCheckable(true);
+    head->setChecked(open);
+    head->setAutoRaise(true);
+    head->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    head->setArrowType(open ? Qt::DownArrow : Qt::RightArrow);
+    head->setCursor(Qt::PointingHandCursor);
+    content->setVisible(open);
+    QObject::connect(head, &QToolButton::toggled, head, [head, content](bool on) {
+        head->setArrowType(on ? Qt::DownArrow : Qt::RightArrow);
+        content->setVisible(on);
+    });
+    col->addWidget(head);
+    col->addWidget(content);
+    return holder;
+}
+
+QString DeviceTitle(unsigned device) {
+    switch (device) {
+    case 1u:
+        return QObject::tr("Switch Controller");
+    case 2u:
+        return QObject::tr("DualSense Wireless Controller");
+    default:
+        return QObject::tr("Xbox Controller");
+    }
+}
+
 } // namespace
 
 ConfigureHdRumble::ConfigureHdRumble(QWidget* parent) : QDialog(parent) {
     setWindowTitle(tr("HD Rumble"));
-    setMinimumSize(640, 460);
+    setMinimumSize(560, 480);
 
     auto* root = new QVBoxLayout(this);
+    root->setContentsMargins(16, 12, 16, 12);
+    root->setSpacing(10);
 
-    // Header: master switch
+    // Header: the panel title with the master switch right-aligned, like the upstream panel
     auto* header = new QHBoxLayout;
-    auto* title = new QLabel(tr("<b>HD Rumble</b>"));
-    hd_enabled = new QCheckBox(tr("Enabled"));
+    header->setSpacing(10);
+    auto* title = new QLabel(tr("HD Rumble"));
+    QFont title_font = title->font();
+    title_font.setPointSizeF(title_font.pointSizeF() * 1.2);
+    title_font.setWeight(QFont::DemiBold);
+    title->setFont(title_font);
+    hd_enabled = new QCheckBox;
+    hd_enabled->setChecked(true);
+    hd_enabled->setAccessibleName(tr("HD Rumble"));
     hd_enabled->setToolTip(tr("Off: the controllers use the emulator's standard rumble."));
     header->addWidget(title);
-    header->addStretch();
-    header->addWidget(hd_enabled);
+    header->addStretch(1);
+    header->addWidget(hd_enabled, 0, Qt::AlignVCenter);
     root->addLayout(header);
     if (!InputCommon::IsRenHDrumLoaded()) {
         auto* missing = new QLabel(
@@ -61,55 +117,55 @@ ConfigureHdRumble::ConfigureHdRumble(QWidget* parent) : QDialog(parent) {
         missing->setOpenExternalLinks(true);
         root->addWidget(missing);
     }
-    root->addWidget(MakeNote(
+    root->addWidget(MakeDivider());
+
+    // Body: the controller in use first, the others and the advanced rows behind disclosures
+    const int connected = InputCommon::GetRenHDrumConnectedKind();
+    const unsigned active =
+        (connected >= 0 && connected <= 2) ? (1u << connected) : 1u; // 1 Switch, 2 DualSense
+    body = new QWidget;
+    auto* body_col = new QVBoxLayout(body);
+    body_col->setContentsMargins(0, 0, 0, 0);
+    body_col->setSpacing(10);
+    body_col->addWidget(MakeNote(
         tr("While HD Rumble is on, the \"Enable Accurate Vibration\" filter in the vibration "
            "dialog is bypassed: this engine paces the 5 ms packets itself, and the 15 ms filter "
            "would drop the short ticks Switch 2 games send.")));
-
-    // Intensity and Lift weak rumble are rows of the settings table ("all controllers"), so
-    // every device page below carries them; only the per-game note lives here.
     const bool per_game = !Settings::values.hd_rumble_gain.UsingGlobal();
-    root->addWidget(MakeNote(
+    body_col->addWidget(MakeNote(
         per_game ? tr("Intensity: this game has its own value, and changes here apply to it.")
                  : tr("Intensity multiplies the game's rumble. Some Switch 2 games (Ocarina of "
                       "Time) send very weak values that the Joy-Con 2 still plays strongly: "
                       "try 400-600% for them.")));
+    body_col->addWidget(CreateDeviceCard(active, connected >= 0));
 
-    // Body: controller list on the left, its settings on the right
-    auto* body = new QHBoxLayout;
-    page_list = new QListWidget;
-    page_list->addItem(tr("Switch Controller"));
-    page_list->addItem(tr("DualSense"));
-    page_list->addItem(tr("Xbox"));
-    page_list->setFixedWidth(170);
-    pages = new QStackedWidget;
-    // Device bits as RenHDrum's options table numbers them: 1 Switch, 2 DualSense, 4 Xbox
-    pages->addWidget(CreateOptionPage(
-        1, tr("Pro Controller and Joy-Con: the game's HD Rumble sent with full detail.")));
-    pages->addWidget(CreateOptionPage(
-        2, tr("Detailed rumble on the DualSense and DualSense Edge haptics, wired or on "
-              "Bluetooth.")));
-    pages->addWidget(CreateOptionPage(
-        4, tr("Xbox controllers and Xbox-style controllers from other brands.")));
-    connect(page_list, &QListWidget::currentRowChanged, pages, &QStackedWidget::setCurrentIndex);
-    // Open on the page of the controller in use, marked as connected
-    const int connected = InputCommon::GetRenHDrumConnectedKind();
-    if (connected >= 0 && connected < page_list->count()) {
-        auto* item = page_list->item(connected);
-        item->setText(tr("%1 (connected)").arg(item->text()));
+    // Every other controller family stays one disclosure away, one card each
+    auto* others_host = new QWidget;
+    auto* others = new QVBoxLayout(others_host);
+    others->setContentsMargins(0, 0, 0, 0);
+    others->setSpacing(10);
+    for (unsigned bit : {1u, 2u, 4u}) {
+        if (bit != active) {
+            others->addWidget(CreateDeviceCard(bit, false));
+        }
     }
-    page_list->setCurrentRow(connected >= 0 ? connected : 0);
-    body->addWidget(page_list);
-    body->addWidget(pages, 1);
-    root->addLayout(body, 1);
+    body_col->addWidget(MakeCollapsible(tr("Other controllers"), others_host, false));
+    body_col->addWidget(MakeCollapsible(tr("Advanced"), CreateAdvancedCard(active), false));
+    body_col->addWidget(MakeNote(
+        tr("Changes reach connected controllers on their next vibration. To feel them now, "
+           "open the Vibration settings and hold a button on the controller.")));
+    body_col->addStretch(1);
 
-    root->addWidget(MakeNote(
-        tr("Changes reach connected controllers on their next vibration. To feel them now, open "
-           "the Vibration settings and hold a button on the controller.")));
+    auto* scroll = new QScrollArea;
+    scroll->setWidget(body);
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+    root->addWidget(scroll, 1);
 
+    // Footer: credit left, dialog buttons right
+    root->addWidget(MakeDivider());
     auto* footer = new QHBoxLayout;
-    auto* credit = new QLabel(tr("Powered by RenHDrum"));
-    credit->setStyleSheet(QStringLiteral("color: palette(mid);"));
+    auto* credit = MakeNote(tr("Powered by RenHDrum"));
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel |
                                          QDialogButtonBox::RestoreDefaults);
     connect(buttons, &QDialogButtonBox::accepted, this, &QDialog::accept);
@@ -297,185 +353,137 @@ void SetOptionValue(const std::string& key, int value) {
 
 } // namespace
 
-QWidget* ConfigureHdRumble::CreateOptionPage(unsigned device, const QString& note) {
-    auto* page = new QWidget;
-    auto* layout = new QVBoxLayout(page);
-    layout->setContentsMargins(0, 0, 0, 0);
-    layout->setSpacing(10);
-    layout->addWidget(MakeNote(note));
+void ConfigureHdRumble::AddRow(QVBoxLayout* col, bool& first,
+                               const InputCommon::RenHDrumOption& opt, int table_index,
+                               int def) {
+    OptionRow row;
+    row.key = opt.key;
+    row.table_index = table_index;
+    row.def = def;
 
-    // One card per page for the basic rows, the anatomy of the upstream panel translated to
-    // native Qt: every row is a label stack on the left (title, muted help under it) with its
-    // control vertically centered on the right, and a thin divider between rows.
-    auto* basic_card = new QGroupBox(device == 1   ? tr("Rumble")
-                                     : device == 2 ? tr("Haptics")
-                                                   : tr("Motors"));
-    auto* basic_col = new QVBoxLayout(basic_card);
-    basic_col->setContentsMargins(14, 12, 14, 12);
-    basic_col->setSpacing(6);
-    QWidget* advanced_box = nullptr;
-    QVBoxLayout* advanced_col = nullptr;
-    QToolButton* advanced_button = nullptr;
+    QString help = QString::fromStdString(opt.help);
+    if (opt.link == 1) {
+        help += help.isEmpty() ? QStringLiteral("(wired only)")
+                               : QStringLiteral(" (wired only)");
+    } else if (opt.link == 2) {
+        help += help.isEmpty() ? QStringLiteral("(Bluetooth only)")
+                               : QStringLiteral(" (Bluetooth only)");
+    }
 
-    const auto& options = Options();
-    bool first_basic = true;
-    bool first_advanced = true;
+    if (!first) {
+        col->addWidget(MakeDivider());
+    }
+    first = false;
 
-    auto add_row = [&](QVBoxLayout* col, bool& first, const InputCommon::RenHDrumOption& opt,
-                       int table_index, int def) {
-        OptionRow row;
-        row.key = opt.key;
-        row.table_index = table_index;
-        row.def = def;
+    auto* row_box = new QWidget;
+    auto* row_layout = new QHBoxLayout(row_box);
+    row_layout->setContentsMargins(0, 6, 0, 6);
+    row_layout->setSpacing(12);
+    auto* left = new QVBoxLayout;
+    left->setSpacing(3);
+    auto* title_label = new QLabel(QString::fromStdString(opt.label));
+    title_label->setWordWrap(true);
+    left->addWidget(title_label);
+    if (!help.isEmpty()) {
+        left->addWidget(MakeNote(help));
+    }
+    row_layout->addLayout(left, 1);
 
-        QString help = QString::fromStdString(opt.help);
-        if (opt.link == 1) {
-            help += help.isEmpty() ? QStringLiteral("(wired only)")
-                                   : QStringLiteral(" (wired only)");
-        } else if (opt.link == 2) {
-            help += help.isEmpty() ? QStringLiteral("(Bluetooth only)")
-                                   : QStringLiteral(" (Bluetooth only)");
-        }
-
-        if (!first) {
-            auto* divider = new QFrame;
-            divider->setFrameShape(QFrame::HLine);
-            divider->setFrameShadow(QFrame::Sunken);
-            col->addWidget(divider);
-        }
-        first = false;
-
-        auto* row_box = new QWidget;
-        auto* row_layout = new QHBoxLayout(row_box);
-        row_layout->setContentsMargins(0, 4, 0, 4);
-        row_layout->setSpacing(12);
-        auto* left = new QVBoxLayout;
-        left->setSpacing(2);
-        auto* title_label = new QLabel(QString::fromStdString(opt.label));
-        title_label->setWordWrap(true);
-        left->addWidget(title_label);
+    if (opt.kind == 0) {
+        // The label lives on the left stack; the checkbox is the control on the right
+        row.check = new QCheckBox;
+        row.check->setChecked(def != 0);
+        row.check->setAccessibleName(QString::fromStdString(opt.label));
         if (!help.isEmpty()) {
-            left->addWidget(MakeNote(help));
+            row.check->setToolTip(help);
         }
-        row_layout->addLayout(left, 1);
-
-        if (opt.kind == 0) {
-            // The label lives on the left stack; the checkbox is the control on the right
-            row.check = new QCheckBox;
-            row.check->setChecked(def != 0);
-            row.check->setAccessibleName(QString::fromStdString(opt.label));
-            if (!help.isEmpty()) {
-                row.check->setToolTip(help);
-            }
-            row_layout->addWidget(row.check, 0, Qt::AlignVCenter);
-        } else if (opt.kind == 2) {
-            row.combo = new QComboBox;
-            for (const std::string& choice : opt.choices) {
-                row.combo->addItem(QString::fromStdString(choice));
-            }
-            row.combo->setCurrentIndex(std::clamp(def, 0, row.combo->count() - 1));
-            if (!help.isEmpty()) {
-                row.combo->setToolTip(help);
-            }
-            row_layout->addWidget(row.combo, 0, Qt::AlignVCenter);
-        } else {
-            auto* controls = new QHBoxLayout;
-            controls->setContentsMargins(0, 0, 0, 0);
-            controls->setSpacing(8);
-            row.slider = new QSlider(Qt::Horizontal);
-            row.slider->setMinimumWidth(120);
-            row.slider->setRange(opt.min, opt.max);
-            row.slider->setSingleStep(std::max(1, opt.step));
-            row.slider->setPageStep(std::max(1, opt.step) * 4);
-            row.slider->setValue(std::clamp(def, opt.min, opt.max));
-            row.spin = new QSpinBox;
-            row.spin->setRange(opt.min, opt.max);
-            row.spin->setSingleStep(std::max(1, opt.step));
-            row.spin->setSuffix(QStringLiteral(" %"));
-            row.spin->setValue(std::clamp(def, opt.min, opt.max));
-            if (!help.isEmpty()) {
-                row.spin->setToolTip(help);
-                row.slider->setToolTip(help);
-            }
-            connect(row.slider, &QSlider::valueChanged, row.spin, &QSpinBox::setValue);
-            connect(row.spin, qOverload<int>(&QSpinBox::valueChanged), row.slider,
-                    &QSlider::setValue);
-            controls->addWidget(row.slider);
-            controls->addWidget(row.spin);
-            row_layout->addLayout(controls, 0);
+        row_layout->addWidget(row.check, 0, Qt::AlignVCenter);
+    } else if (opt.kind == 2) {
+        row.combo = new QComboBox;
+        for (const std::string& choice : opt.choices) {
+            row.combo->addItem(QString::fromStdString(choice));
         }
-        col->addWidget(row_box);
-        rows.push_back(row);
-    };
+        row.combo->setCurrentIndex(std::clamp(def, 0, row.combo->count() - 1));
+        if (!help.isEmpty()) {
+            row.combo->setToolTip(help);
+        }
+        row_layout->addWidget(row.combo, 0, Qt::AlignVCenter);
+    } else {
+        auto* controls = new QHBoxLayout;
+        controls->setContentsMargins(0, 0, 0, 0);
+        controls->setSpacing(8);
+        row.slider = new QSlider(Qt::Horizontal);
+        row.slider->setMinimumWidth(120);
+        row.slider->setRange(opt.min, opt.max);
+        row.slider->setSingleStep(std::max(1, opt.step));
+        row.slider->setPageStep(std::max(1, opt.step) * 4);
+        row.slider->setValue(std::clamp(def, opt.min, opt.max));
+        row.spin = new QSpinBox;
+        row.spin->setRange(opt.min, opt.max);
+        row.spin->setSingleStep(std::max(1, opt.step));
+        row.spin->setSuffix(QStringLiteral(" %"));
+        row.spin->setValue(std::clamp(def, opt.min, opt.max));
+        if (!help.isEmpty()) {
+            row.spin->setToolTip(help);
+            row.slider->setToolTip(help);
+        }
+        connect(row.slider, &QSlider::valueChanged, row.spin, &QSpinBox::setValue);
+        connect(row.spin, qOverload<int>(&QSpinBox::valueChanged), row.slider,
+                &QSlider::setValue);
+        controls->addWidget(row.slider);
+        controls->addWidget(row.spin);
+        auto* controls_host = new QWidget;
+        controls_host->setLayout(controls);
+        row_layout->addWidget(controls_host, 0, Qt::AlignVCenter);
+    }
+    row.container = row_box;
+    col->addWidget(row_box);
+    rows.push_back(row);
+}
 
+QWidget* ConfigureHdRumble::CreateDeviceCard(unsigned device, bool connected) {
+    // A card like the upstream panel's: bold title and status pill on a header row, a
+    // divider, then the tier-0 rows of this device
+    auto* card = new QFrame;
+    card->setFrameShape(QFrame::StyledPanel);
+    auto* col = new QVBoxLayout(card);
+    col->setContentsMargins(14, 10, 14, 12);
+    col->setSpacing(6);
+    auto* header = new QHBoxLayout;
+    header->setSpacing(10);
+    auto* title = new QLabel(DeviceTitle(device));
+    QFont bold = title->font();
+    bold.setWeight(QFont::DemiBold);
+    title->setFont(bold);
+    header->addWidget(title);
+    header->addStretch(1);
+    if (connected) {
+        auto* pill = new QLabel(tr("connected"));
+        pill->setStyleSheet(
+            QStringLiteral("border: 1px solid palette(midlight); border-radius: 9px; "
+                            "padding: 1px 8px;"));
+        header->addWidget(pill, 0, Qt::AlignVCenter);
+    }
+    col->addLayout(header);
+    col->addWidget(MakeDivider());
+
+    bool first = false; // the header divider already separates the title from the rows
+    const auto& options = Options();
     for (int i = 0; i < static_cast<int>(options.size()); ++i) {
         const auto& opt = options[i];
-        // The master switch in the header is this table's first row; the pages don't repeat it
+        // The master switch in the header is this table's first row; the cards don't repeat it
         if (opt.key == "enable_hd_rumble") {
             continue;
         }
-        if ((opt.devices & device) == 0) {
+        if ((opt.devices & device) == 0 || opt.tier != 0) {
             continue;
         }
-        if (opt.tier == 1) {
-            if (!advanced_box) {
-                advanced_button = new QToolButton;
-                advanced_button->setText(tr("Advanced"));
-                advanced_button->setCheckable(true);
-                advanced_button->setAutoRaise(true);
-                advanced_button->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
-                advanced_button->setArrowType(Qt::RightArrow);
-                advanced_button->setCursor(Qt::PointingHandCursor);
-                advanced_box = new QWidget;
-                advanced_col = new QVBoxLayout(advanced_box);
-                advanced_col->setContentsMargins(14, 4, 14, 4);
-                advanced_col->setSpacing(6);
-                advanced_box->setVisible(false);
-                connect(advanced_button, &QToolButton::toggled, advanced_button,
-                        [advanced_button, advanced_box](bool open) {
-                            advanced_button->setArrowType(open ? Qt::DownArrow : Qt::RightArrow);
-                            advanced_box->setVisible(open);
-                        });
-            }
-            add_row(advanced_col, first_advanced, opt, i, opt.def);
-        } else {
-            add_row(basic_col, first_basic, opt, i, opt.def);
-        }
+        AddRow(col, first, opt, i, opt.def);
     }
 
-    // Two settings the engine's table does not carry, both long-standing Eglantine rows
-    if (device == 1) {
-        InputCommon::RenHDrumOption extra;
-        extra.key = "bluetooth_level";
-        extra.label = "Bluetooth pacing";
-        extra.help = "Lower levels send less often, which keeps input lag down on a busy "
-                     "Bluetooth link. (Bluetooth only)";
-        extra.choices = {"1 - Stable (60 ms)", "2 - Balanced (45 ms)", "3 - Quality (35 ms)"};
-        extra.kind = 2;
-        if (!advanced_box) {
-            // Only advanced-tier rows exist for this device so far; make the section anyway
-            advanced_button = new QToolButton;
-            advanced_button->setText(tr("Advanced"));
-            advanced_button->setCheckable(true);
-            advanced_button->setAutoRaise(true);
-            advanced_button->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
-            advanced_button->setArrowType(Qt::RightArrow);
-            advanced_button->setCursor(Qt::PointingHandCursor);
-            advanced_box = new QWidget;
-            advanced_col = new QVBoxLayout(advanced_box);
-            advanced_col->setContentsMargins(14, 4, 14, 4);
-            advanced_col->setSpacing(6);
-            advanced_box->setVisible(false);
-            connect(advanced_button, &QToolButton::toggled, advanced_button,
-                    [advanced_button, advanced_box](bool open) {
-                        advanced_button->setArrowType(open ? Qt::DownArrow : Qt::RightArrow);
-                        advanced_box->setVisible(open);
-                    });
-        }
-        add_row(advanced_col, first_advanced, extra, -1, 3);
-    }
-    if (device == 2) {
-        InputCommon::RenHDrumOption extra;
+    // A setting the engine's table does not carry, a long-standing Eglantine row
+    if (device == 2u) {
+        InputCommon::RenHDrumOption extra{};
         extra.key = "speaker_volume";
         extra.label = "Speaker volume";
         extra.help = "How loud the DualSense speaker taps while HD Haptics is on. 0 = off.";
@@ -483,22 +491,15 @@ QWidget* ConfigureHdRumble::CreateOptionPage(unsigned device, const QString& not
         extra.min = 0;
         extra.max = 100;
         extra.step = 5;
-        add_row(basic_col, first_basic, extra, -1, 60);
+        AddRow(col, first, extra, -1, 60);
     }
 
-    layout->addWidget(basic_card);
-    if (advanced_box) {
-        layout->addWidget(advanced_button);
-        layout->addWidget(advanced_box);
-    }
-
-    if (device == 4) {
+    if (device == 4u) {
         // Whether the controller in use has trigger motors, known when the dialog opens
         xbox_triggers_state = InputCommon::GetRenHDrumXboxTriggers();
-        xbox_no_triggers = new QLabel(tr("This controller has no trigger motors."));
-        xbox_no_triggers->setStyleSheet(QStringLiteral("color: palette(mid);"));
+        xbox_no_triggers = MakeNote(tr("This controller has no trigger motors."));
         xbox_no_triggers->setVisible(xbox_triggers_state == 0);
-        layout->addWidget(xbox_no_triggers);
+        col->addWidget(xbox_no_triggers);
         // An official Xbox controller whose trigger motors are out of reach: offer the one
         // setting that reaches them, where the user is setting up the vibration
         if (InputCommon::GetRenHDrumXboxNeedsRawInput() &&
@@ -511,7 +512,7 @@ QWidget* ConfigureHdRumble::CreateOptionPage(unsigned device, const QString& not
             auto* raw_button = new QPushButton(tr("Turn it on"));
             raw_row->addWidget(raw_note, 1);
             raw_row->addWidget(raw_button);
-            layout->addWidget(raw_box);
+            col->addWidget(raw_box);
             connect(raw_button, &QPushButton::clicked, this, [this, raw_box] {
                 Settings::values.enable_raw_input.SetValue(true);
                 // Keep the Controls > Advanced checkbox in step, or its OK would undo this
@@ -523,18 +524,49 @@ QWidget* ConfigureHdRumble::CreateOptionPage(unsigned device, const QString& not
                 raw_box->setVisible(false);
                 QMessageBox::information(
                     this, tr("HD Rumble"),
-                    tr("Turned on. Restart the emulator to feel the triggers.\n\nWhile this is on, "
-                       "games can't open their web pages (some manuals and logins). You can turn "
-                       "it off in Controls > Advanced."));
+                    tr("Turned on. Restart the emulator to feel the triggers.\n\nWhile this is "
+                       "on, games can't open their web pages (some manuals and logins). You can "
+                       "turn it off in Controls > Advanced."));
             });
         }
-        layout->addWidget(MakeNote(tr("Trigger rumble works only with official Xbox "
-                                       "controllers. Most wireless receivers drive just the "
-                                       "grip motors.")));
+        col->addWidget(MakeNote(tr("Trigger rumble works only with official Xbox "
+                                   "controllers. Most wireless receivers drive just the "
+                                   "grip motors.")));
     }
+    return card;
+}
 
-    layout->addStretch();
-    return page;
+QWidget* ConfigureHdRumble::CreateAdvancedCard(unsigned device) {
+    // The tier-1 rows of the active device, behind the Advanced disclosure
+    auto* card = new QFrame;
+    card->setFrameShape(QFrame::StyledPanel);
+    auto* col = new QVBoxLayout(card);
+    col->setContentsMargins(14, 10, 14, 12);
+    col->setSpacing(6);
+    bool first = true;
+    const auto& options = Options();
+    for (int i = 0; i < static_cast<int>(options.size()); ++i) {
+        const auto& opt = options[i];
+        if (opt.key == "enable_hd_rumble") {
+            continue;
+        }
+        if (opt.tier != 1 || (opt.devices & device) == 0) {
+            continue;
+        }
+        AddRow(col, first, opt, i, opt.def);
+    }
+    // A setting the engine's table does not carry, a long-standing Eglantine row
+    if (device == 1u) {
+        InputCommon::RenHDrumOption extra{};
+        extra.key = "bluetooth_level";
+        extra.label = "Bluetooth pacing";
+        extra.help = "Lower levels send less often, which keeps input lag down on a busy "
+                     "Bluetooth link. (Bluetooth only)";
+        extra.choices = {"1 - Stable (60 ms)", "2 - Balanced (45 ms)", "3 - Quality (35 ms)"};
+        extra.kind = 2;
+        AddRow(col, first, extra, -1, 3);
+    }
+    return card;
 }
 
 void ConfigureHdRumble::LoadConfiguration() {
@@ -568,8 +600,7 @@ void ConfigureHdRumble::RestoreDefaults() {
 
 void ConfigureHdRumble::UpdateEnabledState() {
     const bool on = hd_enabled->isChecked();
-    pages->setEnabled(on);
-    page_list->setEnabled(on);
+    body->setEnabled(on);
     for (auto& row : rows) {
         bool parent_on = true;
         if (row.table_index >= 0) {

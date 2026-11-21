@@ -11,17 +11,23 @@
 class QCheckBox;
 class QComboBox;
 class QLabel;
-class QListWidget;
-class QWidget;
 class QSlider;
 class QSpinBox;
-class QStackedWidget;
+class QVBoxLayout;
+class QWidget;
+
+namespace InputCommon {
+struct RenHDrumOption;
+} // namespace InputCommon
 
 /// Settings for RenHDrum: HD Rumble on Switch Pro Controller / Joy-Con, DualSense haptics and
 /// Xbox rumble. The rows come from the engine's own settings table (see
 /// InputCommon::GetRenHDrumOptions), translated to native Qt widgets and bound to the same
 /// Settings::values entries every other input setting uses; the SDL driver re-reads them on
 /// every vibration, so connected controllers pick up a change once the dialog is accepted.
+///
+/// The layout follows the upstream RenHDrum panel: one window, the connected controller's
+/// card first, the other controllers and the advanced rows behind collapsible sections.
 class ConfigureHdRumble : public QDialog {
     Q_OBJECT
 
@@ -45,18 +51,23 @@ private:
         QWidget* container{};
     };
 
-    /// One page per controller family: `device` is the bit RenHDrum's table marks rows with
-    /// (1 Switch, 2 DualSense, 4 Xbox).
-    QWidget* CreateOptionPage(unsigned device, const QString& note);
+    /// One card per controller family: `device` is the bit RenHDrum's table marks rows with
+    /// (1 Switch, 2 DualSense, 4 Xbox). A connected controller gets the status pill.
+    QWidget* CreateDeviceCard(unsigned device, bool connected);
+    /// The tier-1 rows of one device, in a frame of their own behind the Advanced disclosure.
+    QWidget* CreateAdvancedCard(unsigned device);
+    /// One row in the upstream anatomy: label with muted help on the left, control
+    /// right-aligned and vertically centered, appended to `rows` for the binding layer.
+    void AddRow(QVBoxLayout* col, bool& first, const InputCommon::RenHDrumOption& opt,
+                int table_index, int def);
     void LoadConfiguration();
     void RestoreDefaults();
     void UpdateEnabledState();
 
     QCheckBox* hd_enabled{};
-    QListWidget* page_list{};
-    QStackedWidget* pages{};
+    QWidget* body{};
 
-    /// Every option row of every page, in build order; the table index carries requires_row.
+    /// Every option row of every card, in build order; the table index carries requires_row.
     std::vector<OptionRow> rows;
 
     QLabel* xbox_no_triggers{};
