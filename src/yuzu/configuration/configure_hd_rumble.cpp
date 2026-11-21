@@ -74,11 +74,11 @@ QWidget* MakeCollapsible(const QString& title, QWidget* content, bool open) {
 QString DeviceTitle(unsigned device) {
     switch (device) {
     case 1u:
-        return QObject::tr("Switch Controller");
+        return QObject::tr("Switch Controller (first generation Switch only)");
     case 2u:
-        return QObject::tr("DualSense Wireless Controller");
+        return QObject::tr("DualSense Controller (Edge supported)");
     default:
-        return QObject::tr("Xbox Controller");
+        return QObject::tr("Xbox Controller (Xbox One or newer)");
     }
 }
 
@@ -143,8 +143,8 @@ ConfigureHdRumble::ConfigureHdRumble(QWidget* parent) : QDialog(parent) {
     if (active != 0u) {
         body_col->addWidget(CreateDeviceCard(active, true));
     } else {
-        body_col->addWidget(MakeNote(tr("No compatible controller detected: these settings "
-                                        "apply once one connects.")));
+        body_col->addWidget(MakeNote(tr("No compatible controller detected. Connect a compatible "
+                                        "controller to use this feature.")));
     }
 
     // Every other controller family stays one disclosure away, one card each
@@ -364,8 +364,7 @@ void SetOptionValue(const std::string& key, int value) {
 } // namespace
 
 void ConfigureHdRumble::AddRow(QVBoxLayout* col, bool& first,
-                               const InputCommon::RenHDrumOption& opt, int table_index,
-                               int def) {
+                               const InputCommon::RenHDrumOption& opt, int table_index, int def) {
     OptionRow row;
     row.key = opt.key;
     row.table_index = table_index;
@@ -373,8 +372,7 @@ void ConfigureHdRumble::AddRow(QVBoxLayout* col, bool& first,
 
     QString help = QString::fromStdString(opt.help);
     if (opt.link == 1) {
-        help += help.isEmpty() ? QStringLiteral("(wired only)")
-                               : QStringLiteral(" (wired only)");
+        help += help.isEmpty() ? QStringLiteral("(wired only)") : QStringLiteral(" (wired only)");
     } else if (opt.link == 2) {
         help += help.isEmpty() ? QStringLiteral("(Bluetooth only)")
                                : QStringLiteral(" (Bluetooth only)");
@@ -438,8 +436,7 @@ void ConfigureHdRumble::AddRow(QVBoxLayout* col, bool& first,
             row.slider->setToolTip(help);
         }
         connect(row.slider, &QSlider::valueChanged, row.spin, &QSpinBox::setValue);
-        connect(row.spin, qOverload<int>(&QSpinBox::valueChanged), row.slider,
-                &QSlider::setValue);
+        connect(row.spin, qOverload<int>(&QSpinBox::valueChanged), row.slider, &QSlider::setValue);
         controls->addWidget(row.slider);
         controls->addWidget(row.spin);
         auto* controls_host = new QWidget;
@@ -471,7 +468,7 @@ QWidget* ConfigureHdRumble::CreateDeviceCard(unsigned device, bool connected) {
         auto* pill = new QLabel(tr("connected"));
         pill->setStyleSheet(
             QStringLiteral("border: 1px solid palette(midlight); border-radius: 9px; "
-                            "padding: 1px 8px;"));
+                           "padding: 1px 8px;"));
         header->addWidget(pill, 0, Qt::AlignVCenter);
     }
     col->addLayout(header);
@@ -527,7 +524,8 @@ QWidget* ConfigureHdRumble::CreateDeviceCard(unsigned device, bool connected) {
                 Settings::values.enable_raw_input.SetValue(true);
                 // Keep the Controls > Advanced checkbox in step, or its OK would undo this
                 for (QWidget* top : QApplication::topLevelWidgets()) {
-                    if (auto* box = top->findChild<QCheckBox*>(QStringLiteral("enable_raw_input"))) {
+                    if (auto* box =
+                            top->findChild<QCheckBox*>(QStringLiteral("enable_raw_input"))) {
                         box->setChecked(true);
                     }
                 }
