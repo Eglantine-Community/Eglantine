@@ -37,6 +37,98 @@ int SDLCALL SDL_HDRumbleSetBluetoothAfterInput(SDL_Joystick* joystick, int enabl
 }
 #endif
 
+
+namespace {
+
+/// RenHDrum 0.5.0's settings table, for libraries that predate `renhdrum_options` (and for
+/// builds without the library). The dialog binds every row to this build's settings either way,
+/// so an old library only loses the live wording, never an option.
+std::vector<InputCommon::RenHDrumOption> FallbackRenHDrumOptions() {
+    // k: key, l: label, h: help, c: choices ("a|b"), kind, min, max, step, def,
+    // dev: bits (1 Switch, 2 DualSense, 4 Xbox), tier, link, req: requires row index
+    using InputCommon::RenHDrumOption;
+    auto row = [](const char* k, const char* l, const char* h, const char* c, int kind, int mn,
+                  int mx, int st, int df, unsigned dev, int tier, int link, int req) {
+        RenHDrumOption o;
+        o.key = k;
+        o.label = l;
+        o.help = h;
+        if (c && *c) {
+            std::string choices{c};
+            std::size_t start = 0;
+            while (true) {
+                const std::size_t bar = choices.find('|', start);
+                o.choices.push_back(choices.substr(start, bar - start));
+                if (bar == std::string::npos) {
+                    break;
+                }
+                start = bar + 1;
+            }
+        }
+        o.kind = kind;
+        o.min = mn;
+        o.max = mx;
+        o.step = st;
+        o.def = df;
+        o.devices = dev;
+        o.tier = tier;
+        o.link = link;
+        o.requires_row = req;
+        return o;
+    };
+    constexpr unsigned sw = 1, ds = 2, xb = 4, all = sw | ds | xb | 8;
+    return {
+        row("enable_hd_rumble", "HD Rumble",
+            "Plays the game's HD Rumble in full detail. Off: the standard rumble.", "", 0, 0, 1,
+            1, 1, all, 0, 0, -1),
+        row("switch_bt_mode", "Bluetooth mode",
+            "Detailed (5 ms): every detail, like wired. Compatible: works on every Bluetooth "
+            "adapter; used automatically when Detailed cannot run.",
+            "Detailed (5 ms)|Compatible", 2, 0, 1, 1, 0, sw, 0, 2, -1),
+        row("dualsense_haptics", "Haptics",
+            "Rumble through the two haptic voice coils. Off: the standard rumble.", "", 0, 0, 1, 1,
+            1, ds, 0, 0, -1),
+        row("dualsense_hd_haptics", "HD Haptics",
+            "HD Rumble upgraded for DualSense. The controller speaker and the L2/R2 triggers "
+            "react to the rumble. Off = standard HD Rumble.",
+            "", 0, 0, 1, 1, 1, ds, 0, 0, 2),
+        row("dualsense_volume", "Strength", "Lower it if the rumble feels too strong.", "", 1, 10,
+            100, 5, 100, ds, 0, 0, 2),
+        row("xbox_enabled", "HD Rumble on Xbox",
+            "The game's HD Rumble translated for the Xbox motors. Off: the standard rumble.",
+            "", 0, 0, 1, 1, 1, xb, 0, 0, -1),
+        row("gain", "Intensity", "Overall rumble strength.", "", 1, 25, 1000, 5, 100, all, 1, 0,
+            -1),
+        row("low_boost", "Lift weak rumble", "Makes faint rumble easier to feel.", "", 1, 0, 100,
+            5, 0, all, 1, 0, -1),
+        row("usb_no_queue", "Send rumble without queuing", "", "", 0, 0, 1, 1, 1, sw, 1, 1, -1),
+        row("envelope_5ms", "Detailed 5 ms rumble", "", "", 0, 0, 1, 1, 1, sw, 1, 1, -1),
+        row("frequency_in_packet", "Accurate pitch, low band", "", "", 0, 0, 1, 1, 1, sw, 1, 1,
+            -1),
+        row("frequency_both_bands", "Accurate pitch, both bands", "", "", 0, 0, 1, 1, 1, sw, 1, 1,
+            -1),
+        row("crisp_notes", "Accent each note", "", "", 0, 0, 1, 1, 1, sw, 1, 1, -1),
+        row("usb_interval_ms", "Send interval (when detailed rumble is off)",
+            "Used only while Detailed 5 ms rumble is off.", "10 ms|15 ms|20 ms|30 ms", 2, 0, 3, 1,
+            1, sw, 1, 1, -1),
+        row("usb_auto_slow", "Slow down during heavy rumble", "", "", 0, 0, 1, 1, 1, sw, 1, 1,
+            -1),
+        row("bt_after_input", "Send rumble between button reads", "", "", 0, 0, 1, 1, 1, sw, 1, 2,
+            -1),
+        row("bt_crisp_notes", "Accent each note", "", "", 0, 0, 1, 1, 1, sw, 1, 2, -1),
+        row("dualsense_crisp_notes", "Accent each note", "", "", 0, 0, 1, 1, 1, ds, 1, 0, -1),
+        row("xbox_mode", "Mode", "", "RenHDrum|Direct", 2, 0, 1, 1, 0, xb, 1, 0, -1),
+        row("xbox_strength", "Motor strength", "100% = as the game sends it. Raise it if the "
+                                              "rumble feels weak.",
+            "", 1, 0, 1000, 10, 100, xb, 1, 0, 5),
+        row("xbox_detail", "Detail on main motor", "", "", 1, 0, 100, 5, 50, xb, 1, 0, 18),
+        row("xbox_accents", "Hit accents", "", "", 1, 0, 100, 5, 50, xb, 1, 0, 18),
+        row("xbox_trigger_mix", "Trigger rumble", "", "", 1, 0, 100, 5, 20, xb, 1, 0, 18),
+    };
+}
+
+} // namespace
+
 namespace InputCommon {
 
 namespace {
@@ -72,6 +164,8 @@ struct RenHDrumApi {
     decltype(&renhdrum_tri_trigger_note_action) tri_note_action{};
     // Optional (RenHDrum 0.5.0+): the combined rumble + trigger + speaker report 0x36
     decltype(&renhdrum_dualsense_dsp_build_bt36_report) dsp_build_bt36_report{};
+    // Optional (RenHDrum 0.5.0+): the settings table the dialog builds its rows from
+    decltype(&renhdrum_options) options{};
     bool HasTriTrigger() const {
         return tri_create && tri_destroy && tri_update;
     }
@@ -161,6 +255,7 @@ const RenHDrumApi& Api() {
             (void)a.library.GetSymbol("renhdrum_tri_trigger_note_action", &a.tri_note_action);
             (void)a.library.GetSymbol("renhdrum_dualsense_dsp_build_bt36_report",
                                       &a.dsp_build_bt36_report);
+            (void)a.library.GetSymbol("renhdrum_options", &a.options);
             (void)a.library.GetSymbol("renhdrum_xbox_rumble_create", &a.xbox_create);
             (void)a.library.GetSymbol("renhdrum_xbox_rumble_destroy", &a.xbox_destroy);
             (void)a.library.GetSymbol("renhdrum_xbox_rumble_push_half_sample",
@@ -243,6 +338,11 @@ struct UserSettings {
     bool bt_after_input{true};
     bool bt_fast{true};
     bool bt_crisp_notes{true};
+    // The 0.5.0 options-table rows that had no dedicated field before
+    int bt_mode{0};               // 0 Detailed (5 ms), 1 Compatible
+    bool usb_no_queue{true};
+    bool frequency_both_bands{true};
+    bool usb_auto_slow{true};
     bool dualsense_enabled{true};
     int dualsense_volume{100};
     bool dualsense_crisp_notes{true};
@@ -269,8 +369,14 @@ UserSettings ReadUserSettings() {
         .crisp_notes = s.hd_rumble_crisp_notes.GetValue(),
         .bluetooth_level = std::clamp(s.hd_rumble_bluetooth_level.GetValue(), 1, 3),
         .bt_after_input = s.hd_rumble_bt_after_input.GetValue(),
-        .bt_fast = s.hd_rumble_bt_fast.GetValue(),
+        // 0.5.0 exposes one Bluetooth basic mode; it replaces the old "5 ms envelope while
+        // idle" checkbox, whose ini key is kept but no longer read.
+        .bt_fast = s.hd_rumble_bt_mode.GetValue() == 0,
         .bt_crisp_notes = s.hd_rumble_bt_crisp_notes.GetValue(),
+        .bt_mode = std::clamp(s.hd_rumble_bt_mode.GetValue(), 0, 1),
+        .usb_no_queue = s.hd_rumble_usb_no_queue.GetValue(),
+        .frequency_both_bands = s.hd_rumble_frequency_both_bands.GetValue(),
+        .usb_auto_slow = s.hd_rumble_usb_auto_slow.GetValue(),
         .dualsense_enabled = s.dualsense_haptics_enabled.GetValue(),
         .dualsense_volume = std::clamp(s.dualsense_haptics_volume.GetValue(), 0, 100),
         .dualsense_crisp_notes = s.dualsense_crisp_notes.GetValue(),
@@ -393,11 +499,11 @@ struct RenHDrumPad::Impl {
         config.enable_hd_rumble = user.hd_enabled;
         config.hd_rumble_usb_interval_ms = user.usb_interval_ms;
         config.hd_rumble_bluetooth_level = user.bluetooth_level;
-        config.hd_rumble_usb_auto_slow = true;
-        config.hd_rumble_experimental_usb_no_queue = true;
+        config.hd_rumble_usb_auto_slow = user.usb_auto_slow;
+        config.hd_rumble_experimental_usb_no_queue = user.usb_no_queue;
         config.hd_rumble_experimental_envelope_5ms = user.envelope_5ms;
         config.hd_rumble_experimental_frequency_in_packet = user.frequency_in_packet;
-        config.hd_rumble_experimental_frequency_both_bands = user.frequency_in_packet;
+        config.hd_rumble_experimental_frequency_both_bands = user.frequency_both_bands;
         config.hd_rumble_experimental_crisp_notes = user.crisp_notes;
         config.hd_rumble_experimental_bt_after_input = user.bt_after_input;
         config.hd_rumble_experimental_bt_fast = user.bt_fast;
@@ -1058,6 +1164,54 @@ bool IsRenHDrumLoaded() {
     return Api().loaded;
 }
 
+std::vector<RenHDrumOption> GetRenHDrumOptions() {
+    const auto& api = Api();
+    if (api.loaded && api.options) {
+        int32_t count = 0;
+        int32_t stride = 0;
+        const RenHdcOption* table = api.options(&count, &stride);
+        // The core hands out the row stride so a host built against an older header can never
+        // misstep through a newer, larger row.
+        if (table != nullptr && count > 0 && stride >= static_cast<int32_t>(sizeof(RenHdcOption))) {
+            std::vector<RenHDrumOption> out;
+            out.reserve(static_cast<std::size_t>(count));
+            for (int32_t i = 0; i < count; ++i) {
+                const auto& row = *reinterpret_cast<const RenHdcOption*>(
+                    reinterpret_cast<const char*>(table) +
+                    static_cast<std::size_t>(i) * static_cast<std::size_t>(stride));
+                RenHDrumOption option;
+                option.key = row.key != nullptr ? row.key : "";
+                option.label = row.label != nullptr ? row.label : "";
+                option.help = row.help != nullptr ? row.help : "";
+                if (row.choices != nullptr && *row.choices != '\0') {
+                    std::string choices{row.choices};
+                    std::size_t start = 0;
+                    while (true) {
+                        const std::size_t bar = choices.find('|', start);
+                        option.choices.push_back(choices.substr(start, bar - start));
+                        if (bar == std::string::npos) {
+                            break;
+                        }
+                        start = bar + 1;
+                    }
+                }
+                option.kind = row.kind;
+                option.min = row.min;
+                option.max = row.max;
+                option.step = row.step;
+                option.def = row.def;
+                option.devices = static_cast<unsigned>(row.devices);
+                option.tier = row.tier;
+                option.link = row.link;
+                option.requires_row = row.requires_row;
+                out.push_back(std::move(option));
+            }
+            return out;
+        }
+    }
+    return FallbackRenHDrumOptions();
+}
+
 std::shared_ptr<RenHDrumPad> RenHDrumPad::Create(SDL_Joystick* joystick, SDL_Gamepad* gamepad) {
     if (!joystick || !IsRenHDrumLoaded()) {
         return nullptr;
@@ -1505,6 +1659,10 @@ int GetRenHDrumXboxTriggers() {
 
 bool GetRenHDrumXboxNeedsRawInput() {
     return false;
+}
+
+std::vector<RenHDrumOption> GetRenHDrumOptions() {
+    return FallbackRenHDrumOptions();
 }
 
 struct RenHDrumPad::Impl {};

@@ -913,6 +913,17 @@ struct Values {
     Setting<bool> hd_rumble_bt_fast{linkage, true, "hd_rumble_bt_fast", Category::Controls};
     Setting<bool> hd_rumble_bt_crisp_notes{linkage, true, "hd_rumble_bt_crisp_notes",
                                            Category::Controls};
+    // RenHDrum 0.5.0 options-table rows that had no Eglantine setting yet.
+    // Bluetooth basic mode: 0 = Detailed (5 ms envelope), 1 = Compatible (plain, every adapter).
+    Setting<int> hd_rumble_bt_mode{linkage, 0, "hd_rumble_bt_mode", Category::Controls};
+    // Transport switches. usb_no_queue and auto_slow only bite with the patched SDL transport;
+    // with stock SDL the driver clears them, as it already does for the transport modes.
+    Setting<bool> hd_rumble_usb_no_queue{linkage, true, "hd_rumble_usb_no_queue",
+                                         Category::Controls};
+    Setting<bool> hd_rumble_frequency_both_bands{linkage, true, "hd_rumble_frequency_both_bands",
+                                                 Category::Controls};
+    Setting<bool> hd_rumble_usb_auto_slow{linkage, true, "hd_rumble_usb_auto_slow",
+                                          Category::Controls};
     // RenHDrum 0.5.0 HD Haptics: the controller speaker and the L2/R2 trigger kick react to the
     // rumble. Host-side only: the speaker and trigger blocks are sent by the pad driver.
     Setting<bool> dualsense_hd_haptics{linkage, true, "dualsense_hd_haptics", Category::Controls};

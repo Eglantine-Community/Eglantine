@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <limits>
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -17,6 +19,7 @@
 #include <QSlider>
 #include <QSpinBox>
 #include <QStackedWidget>
+#include <QToolButton>
 #include <QVBoxLayout>
 
 #include "common/settings.h"
@@ -62,36 +65,8 @@ ConfigureHdRumble::ConfigureHdRumble(QWidget* parent) : QDialog(parent) {
            "dialog is bypassed: this engine paces the 5 ms packets itself, and the 15 ms filter "
            "would drop the short ticks Switch 2 games send.")));
 
-    // Intensity: all controllers. Saved per game when the game has its own value.
-    auto* gain_row = new QHBoxLayout;
-    gain_slider = new QSlider(Qt::Horizontal);
-    gain_slider->setRange(25, 1000);
-    gain = new QSpinBox;
-    gain->setRange(25, 1000);
-    gain->setSingleStep(25);
-    connect(gain_slider, &QSlider::valueChanged, gain, &QSpinBox::setValue);
-    connect(gain, qOverload<int>(&QSpinBox::valueChanged), gain_slider, &QSlider::setValue);
-    gain_row->addWidget(new QLabel(tr("Intensity")));
-    gain_row->addWidget(gain_slider, 1);
-    gain_row->addWidget(gain);
-    gain_row->addWidget(new QLabel(QStringLiteral("%")));
-    root->addLayout(gain_row);
-
-    auto* boost_row = new QHBoxLayout;
-    boost_slider = new QSlider(Qt::Horizontal);
-    boost_slider->setRange(0, 100);
-    boost = new QSpinBox;
-    boost->setRange(0, 100);
-    boost->setSingleStep(5);
-    boost->setToolTip(tr("Lifts weak vibrations more than strong ones. 0% keeps the game's "
-                         "curve."));
-    connect(boost_slider, &QSlider::valueChanged, boost, &QSpinBox::setValue);
-    connect(boost, qOverload<int>(&QSpinBox::valueChanged), boost_slider, &QSlider::setValue);
-    boost_row->addWidget(new QLabel(tr("Weak rumble boost")));
-    boost_row->addWidget(boost_slider, 1);
-    boost_row->addWidget(boost);
-    boost_row->addWidget(new QLabel(QStringLiteral("%")));
-    root->addLayout(boost_row);
+    // Intensity and Lift weak rumble are rows of the settings table ("all controllers"), so
+    // every device page below carries them; only the per-game note lives here.
     const bool per_game = !Settings::values.hd_rumble_gain.UsingGlobal();
     root->addWidget(MakeNote(
         per_game ? tr("Intensity: this game has its own value, and changes here apply to it.")
@@ -107,9 +82,14 @@ ConfigureHdRumble::ConfigureHdRumble(QWidget* parent) : QDialog(parent) {
     page_list->addItem(tr("Xbox"));
     page_list->setFixedWidth(170);
     pages = new QStackedWidget;
-    pages->addWidget(CreateSwitchPage());
-    pages->addWidget(CreateDualSensePage());
-    pages->addWidget(CreateXboxPage());
+    // Device bits as RenHDrum's options table numbers them: 1 Switch, 2 DualSense, 4 Xbox
+    pages->addWidget(CreateOptionPage(
+        1, tr("Pro Controller and Joy-Con: the game's HD Rumble sent with full detail.")));
+    pages->addWidget(CreateOptionPage(
+        2, tr("Detailed rumble on the DualSense and DualSense Edge haptics, wired or on "
+              "Bluetooth.")));
+    pages->addWidget(CreateOptionPage(
+        4, tr("Xbox controllers and Xbox-style controllers from other brands.")));
     connect(page_list, &QListWidget::currentRowChanged, pages, &QStackedWidget::setCurrentIndex);
     // Open on the page of the controller in use, marked as connected
     const int connected = InputCommon::GetRenHDrumConnectedKind();
@@ -141,276 +121,382 @@ ConfigureHdRumble::ConfigureHdRumble(QWidget* parent) : QDialog(parent) {
     root->addLayout(footer);
 
     connect(hd_enabled, &QCheckBox::toggled, this, &ConfigureHdRumble::UpdateEnabledState);
-    connect(ds_enabled, &QCheckBox::toggled, this, &ConfigureHdRumble::UpdateEnabledState);
-    connect(xbox_enabled, &QCheckBox::toggled, this, &ConfigureHdRumble::UpdateEnabledState);
-    connect(xbox_mode, qOverload<int>(&QComboBox::currentIndexChanged), this,
-            &ConfigureHdRumble::UpdateEnabledState);
-    connect(envelope_5ms, &QCheckBox::toggled, this, &ConfigureHdRumble::UpdateEnabledState);
+    // Every row can gate another one (requires_row), so every control refreshes the state
+    for (const auto& row : rows) {
+        if (row.check != nullptr) {
+            connect(row.check, &QCheckBox::toggled, this, &ConfigureHdRumble::UpdateEnabledState);
+        } else if (row.combo != nullptr) {
+            connect(row.combo, qOverload<int>(&QComboBox::currentIndexChanged), this,
+                    &ConfigureHdRumble::UpdateEnabledState);
+        } else if (row.spin != nullptr) {
+            connect(row.spin, qOverload<int>(&QSpinBox::valueChanged), this,
+                    &ConfigureHdRumble::UpdateEnabledState);
+        }
+    }
 
     LoadConfiguration();
 }
 
 ConfigureHdRumble::~ConfigureHdRumble() = default;
 
-QWidget* ConfigureHdRumble::CreateSwitchPage() {
-    auto* page = new QWidget;
-    auto* layout = new QVBoxLayout(page);
-    layout->setContentsMargins(0, 0, 0, 0);
-    layout->addWidget(MakeNote(tr("Pro Controller and Joy-Con: the game's HD Rumble sent with "
-                                   "full detail instead of a plain motor rumble.")));
-    // The built-in driver is a different path entirely: it talks to the controller over raw HID and
-    // never goes through SDL, so this engine never sees those pads. Its own rumble sends a single
-    // sample per packet with both motors mirrored, which is coarser than what is configured here.
-    layout->addWidget(MakeNote(tr("Eglantine's built-in Joy-Con/Pro Controller driver (Settings, "
-                                   "Advanced) owns the controller instead of SDL and is not driven "
-                                   "by this engine. The Pro Controller driver is off by default; "
-                                   "the Joy-Con driver is on, so turning it off hands Joy-Cons to "
-                                   "this path as well. The built-in driver is still what provides "
-                                   "the IR camera, amiibo and the Ring-Con.")));
+namespace {
 
-    wired_group = new QGroupBox(tr("Wired (USB)"));
-    auto* wired = new QFormLayout(wired_group);
-    usb_interval = new QSpinBox;
-    usb_interval->setRange(5, 100);
-    usb_interval->setSuffix(tr(" ms"));
-    usb_interval->setToolTip(tr("Time between rumble packets. 15 ms is the console's rate."));
-    envelope_5ms = new QCheckBox(tr("5 ms envelope (three samples per packet)"));
-    frequency_in_packet = new QCheckBox(tr("Frequency changes inside a packet"));
-    crisp_notes = new QCheckBox(tr("Crisp notes (stronger attack, softer sustain)"));
-    wired->addRow(tr("Packet interval"), usb_interval);
-    wired->addRow(envelope_5ms);
-    wired->addRow(frequency_in_packet);
-    wired->addRow(crisp_notes);
-    layout->addWidget(wired_group);
-
-    bt_group = new QGroupBox(tr("Bluetooth"));
-    auto* bt = new QFormLayout(bt_group);
-    bt_level = new QComboBox;
-    bt_level->addItem(tr("1 - Stable (60 ms)"), 1);
-    bt_level->addItem(tr("2 - Balanced (45 ms)"), 2);
-    bt_level->addItem(tr("3 - Quality (35 ms)"), 3);
-    bt_level->setToolTip(tr("Lower levels send less often, which keeps input lag down on a busy "
-                            "Bluetooth link."));
-    bt_after_input = new QCheckBox(tr("Send right after an input report"));
-    bt_fast = new QCheckBox(tr("5 ms envelope while the link is idle"));
-    bt_crisp_notes = new QCheckBox(tr("Crisp notes"));
-    bt->addRow(tr("Level"), bt_level);
-    bt->addRow(bt_after_input);
-    bt->addRow(bt_fast);
-    bt->addRow(bt_crisp_notes);
-    layout->addWidget(bt_group);
-
-    layout->addStretch();
-    return page;
+const std::vector<InputCommon::RenHDrumOption>& Options() {
+    static const std::vector<InputCommon::RenHDrumOption> options =
+        InputCommon::GetRenHDrumOptions();
+    return options;
 }
 
-QWidget* ConfigureHdRumble::CreateDualSensePage() {
-    auto* page = new QWidget;
-    auto* layout = new QVBoxLayout(page);
-    layout->setContentsMargins(0, 0, 0, 0);
-    layout->addWidget(MakeNote(tr("Detailed rumble on the DualSense and DualSense Edge haptics, "
-                                  "wired or on Bluetooth.")));
-
-    auto* group = new QGroupBox(tr("Haptics"));
-    auto* form = new QFormLayout(group);
-    ds_enabled = new QCheckBox(tr("Use the haptic voice coils"));
-    ds_enabled->setToolTip(tr("Off: the DualSense uses its standard rumble."));
-    ds_volume_slider = new QSlider(Qt::Horizontal);
-    ds_volume_slider->setRange(0, 100);
-    ds_volume = new QSpinBox;
-    ds_volume->setRange(0, 100);
-    connect(ds_volume_slider, &QSlider::valueChanged, ds_volume, &QSpinBox::setValue);
-    connect(ds_volume, qOverload<int>(&QSpinBox::valueChanged), ds_volume_slider,
-            &QSlider::setValue);
-    auto* volume_row = new QHBoxLayout;
-    volume_row->addWidget(ds_volume_slider, 1);
-    volume_row->addWidget(ds_volume);
-    volume_row->addWidget(new QLabel(QStringLiteral("%")));
-    ds_crisp_notes = new QCheckBox(tr("Crisp notes"));
-    // RenHDrum 0.5.0 HD Haptics: the rumble drives the controller speaker and the L2/R2
-    // trigger kick as well. Wiring (speaker volume, speaker + trigger blocks, report 0x36 on
-    // Bluetooth) lives in the pad driver; nothing happens without the 0.5.0 library.
-    ds_hd_haptics = new QCheckBox(tr("HD Haptics (speaker + trigger kick)"));
-    ds_hd_haptics->setToolTip(tr("HD Rumble upgraded for DualSense. The controller speaker and "
-                                 "the L2/R2 triggers react to the rumble. Off = standard HD "
-                                 "Rumble."));
-    ds_speaker_slider = new QSlider(Qt::Horizontal);
-    ds_speaker_slider->setRange(0, 100);
-    ds_speaker = new QSpinBox;
-    ds_speaker->setRange(0, 100);
-    ds_speaker->setSingleStep(5);
-    ds_speaker->setToolTip(tr("How loud the controller speaker taps. 0 = off."));
-    connect(ds_speaker_slider, &QSlider::valueChanged, ds_speaker, &QSpinBox::setValue);
-    connect(ds_speaker, qOverload<int>(&QSpinBox::valueChanged), ds_speaker_slider,
-            &QSlider::setValue);
-    auto* speaker_row = new QHBoxLayout;
-    speaker_row->addWidget(ds_speaker_slider, 1);
-    speaker_row->addWidget(ds_speaker);
-    speaker_row->addWidget(new QLabel(QStringLiteral("%")));
-    form->addRow(ds_enabled);
-    form->addRow(tr("Volume"), volume_row);
-    form->addRow(ds_crisp_notes);
-    form->addRow(ds_hd_haptics);
-    form->addRow(tr("Speaker volume"), speaker_row);
-    layout->addWidget(group);
-
-    layout->addStretch();
-    return page;
-}
-
-QWidget* ConfigureHdRumble::CreateXboxPage() {
-    auto* page = new QWidget;
-    auto* layout = new QVBoxLayout(page);
-    layout->setContentsMargins(0, 0, 0, 0);
-    layout->addWidget(MakeNote(tr("Xbox controllers and Xbox-style controllers from other "
-                                  "brands.")));
-
-    auto* group = new QGroupBox(tr("Motors"));
-    auto* form = new QFormLayout(group);
-    xbox_enabled = new QCheckBox(tr("Use RenHDrum's Xbox rumble"));
-    xbox_enabled->setToolTip(tr("Off: Xbox controllers use the emulator's standard rumble."));
-    xbox_strength_slider = new QSlider(Qt::Horizontal);
-    xbox_strength_slider->setRange(0, 100);
-    xbox_strength = new QSpinBox;
-    xbox_strength->setRange(0, 100);
-    xbox_strength->setToolTip(tr("How hard the motors run. Raise it if the rumble feels weak."));
-    connect(xbox_strength_slider, &QSlider::valueChanged, xbox_strength, &QSpinBox::setValue);
-    connect(xbox_strength, qOverload<int>(&QSpinBox::valueChanged), xbox_strength_slider,
-            &QSlider::setValue);
-    auto* strength_row = new QHBoxLayout;
-    strength_row->addWidget(xbox_strength_slider, 1);
-    strength_row->addWidget(xbox_strength);
-    strength_row->addWidget(new QLabel(QStringLiteral("%")));
-    xbox_mode = new QComboBox;
-    xbox_mode->addItem(tr("RenHDrum (smart: richer effects, best on official Xbox controllers)"),
-                       0);
-    xbox_mode->addItem(tr("Direct (stronger: full motor power)"), 1);
-    xbox_mode->setToolTip(tr("RenHDrum: richer effects, made for official Xbox controllers.\n"
-                             "Direct: full motor power, simpler feel."));
-    form->addRow(xbox_enabled);
-    form->addRow(tr("Mode"), xbox_mode);
-    form->addRow(tr("Motor strength"), strength_row);
-
-    const auto percent_row = [](QSlider*& slider, QSpinBox*& box, const QString& tip) {
-        slider = new QSlider(Qt::Horizontal);
-        slider->setRange(0, 100);
-        box = new QSpinBox;
-        box->setRange(0, 100);
-        box->setToolTip(tip);
-        slider->setToolTip(tip);
-        QObject::connect(slider, &QSlider::valueChanged, box, &QSpinBox::setValue);
-        QObject::connect(box, qOverload<int>(&QSpinBox::valueChanged), slider,
-                         &QSlider::setValue);
-        auto* row = new QHBoxLayout;
-        row->addWidget(slider, 1);
-        row->addWidget(box);
-        row->addWidget(new QLabel(QStringLiteral("%")));
-        return row;
-    };
-    form->addRow(tr("Detail on main motor"),
-                 percent_row(xbox_detail_slider, xbox_detail,
-                             tr("Adds the fine vibration to the main motor, so it is felt "
-                                "with strength. Direct mode.")));
-    form->addRow(tr("Hit accents"),
-                 percent_row(xbox_accents_slider, xbox_accents,
-                             tr("A short burst when a hit starts, so quick taps are felt. "
-                                "Direct mode.")));
-    form->addRow(tr("Trigger rumble"),
-                 percent_row(xbox_trigger_slider, xbox_trigger,
-                             tr("Fine vibration on the triggers, on controllers that have "
-                                "trigger motors. Direct mode.")));
-    // Whether the controller in use has trigger motors, known when the dialog opens
-    xbox_triggers_state = InputCommon::GetRenHDrumXboxTriggers();
-    xbox_no_triggers = new QLabel(tr("This controller has no trigger motors."));
-    xbox_no_triggers->setStyleSheet(QStringLiteral("color: palette(mid);"));
-    xbox_no_triggers->setVisible(xbox_triggers_state == 0);
-    form->addRow(QString{}, xbox_no_triggers);
-    layout->addWidget(group);
-
-    // An official Xbox controller whose trigger motors are out of reach: offer the one setting
-    // that reaches them, where the user is setting up the vibration
-    if (InputCommon::GetRenHDrumXboxNeedsRawInput() && !Settings::values.enable_raw_input.GetValue()) {
-        auto* raw_box = new QWidget;
-        auto* raw_row = new QHBoxLayout(raw_box);
-        raw_row->setContentsMargins(0, 0, 0, 0);
-        auto* raw_note = new QLabel(tr("Trigger rumble needs \"XInput 8 player support\"."));
-        raw_note->setWordWrap(true);
-        auto* raw_button = new QPushButton(tr("Turn it on"));
-        raw_row->addWidget(raw_note, 1);
-        raw_row->addWidget(raw_button);
-        layout->addWidget(raw_box);
-        connect(raw_button, &QPushButton::clicked, this, [this, raw_box] {
-            Settings::values.enable_raw_input.SetValue(true);
-            // Keep the Controls > Advanced checkbox in step, or its OK would undo this
-            for (QWidget* top : QApplication::topLevelWidgets()) {
-                if (auto* box = top->findChild<QCheckBox*>(QStringLiteral("enable_raw_input"))) {
-                    box->setChecked(true);
-                }
+// Eglantine's storage, keyed the way the settings table names its rows. This is the whole
+// binding layer: the dialog never talks to RenHDrum's own store, so every value behaves like
+// any other input setting, per-game overrides included where the setting is switchable.
+int OptionValue(const std::string& key) {
+    auto& s = Settings::values;
+    if (key == "switch_bt_mode") {
+        return std::clamp(s.hd_rumble_bt_mode.GetValue(), 0, 1);
+    }
+    if (key == "dualsense_haptics") {
+        return s.dualsense_haptics_enabled.GetValue() ? 1 : 0;
+    }
+    if (key == "dualsense_hd_haptics") {
+        return s.dualsense_hd_haptics.GetValue() ? 1 : 0;
+    }
+    if (key == "dualsense_volume") {
+        return std::clamp(s.dualsense_haptics_volume.GetValue(), 10, 100);
+    }
+    if (key == "xbox_enabled") {
+        return s.xbox_rumble_enabled.GetValue() ? 1 : 0;
+    }
+    if (key == "gain") {
+        return std::clamp(s.hd_rumble_gain.GetValue(), 25, 1000);
+    }
+    if (key == "low_boost") {
+        return std::clamp(s.hd_rumble_low_boost.GetValue(), 0, 100);
+    }
+    if (key == "usb_no_queue") {
+        return s.hd_rumble_usb_no_queue.GetValue() ? 1 : 0;
+    }
+    if (key == "envelope_5ms") {
+        return s.hd_rumble_envelope_5ms.GetValue() ? 1 : 0;
+    }
+    if (key == "frequency_in_packet") {
+        return s.hd_rumble_frequency_in_packet.GetValue() ? 1 : 0;
+    }
+    if (key == "frequency_both_bands") {
+        return s.hd_rumble_frequency_both_bands.GetValue() ? 1 : 0;
+    }
+    if (key == "crisp_notes") {
+        return s.hd_rumble_crisp_notes.GetValue() ? 1 : 0;
+    }
+    if (key == "usb_interval_ms") {
+        // The setting keeps milliseconds, the table offers four of them
+        static constexpr std::array<int, 4> ms{10, 15, 20, 30};
+        const int stored = s.hd_rumble_usb_interval_ms.GetValue();
+        int index = 1;
+        int best = std::numeric_limits<int>::max();
+        for (int i = 0; i < 4; ++i) {
+            const int distance = std::abs(stored - ms[i]);
+            if (distance < best) {
+                best = distance;
+                index = i;
             }
-            raw_box->setVisible(false);
-            QMessageBox::information(
-                this, tr("HD Rumble"),
-                tr("Turned on. Restart the emulator to feel the triggers.\n\nWhile this is on, "
-                   "games can't open their web pages (some manuals and logins). You can turn it "
-                   "off in Controls > Advanced."));
-        });
+        }
+        return index;
+    }
+    if (key == "usb_auto_slow") {
+        return s.hd_rumble_usb_auto_slow.GetValue() ? 1 : 0;
+    }
+    if (key == "bt_after_input") {
+        return s.hd_rumble_bt_after_input.GetValue() ? 1 : 0;
+    }
+    if (key == "bt_crisp_notes") {
+        return s.hd_rumble_bt_crisp_notes.GetValue() ? 1 : 0;
+    }
+    if (key == "dualsense_crisp_notes") {
+        return s.dualsense_crisp_notes.GetValue() ? 1 : 0;
+    }
+    if (key == "xbox_mode") {
+        return std::clamp(s.xbox_rumble_mode.GetValue(), 0, 1);
+    }
+    if (key == "xbox_strength") {
+        return std::clamp(s.xbox_motor_strength.GetValue(), 0, 1000);
+    }
+    if (key == "xbox_detail") {
+        return std::clamp(s.xbox_detail_mix.GetValue(), 0, 100);
+    }
+    if (key == "xbox_accents") {
+        return std::clamp(s.xbox_hit_accents.GetValue(), 0, 100);
+    }
+    if (key == "xbox_trigger_mix") {
+        return std::clamp(s.xbox_trigger_mix.GetValue(), 0, 100);
+    }
+    if (key == "bluetooth_level") {
+        return std::clamp(s.hd_rumble_bluetooth_level.GetValue(), 1, 3);
+    }
+    if (key == "speaker_volume") {
+        return std::clamp(s.dualsense_speaker_volume.GetValue(), 0, 100);
+    }
+    return -1;
+}
+
+void SetOptionValue(const std::string& key, int value) {
+    auto& s = Settings::values;
+    if (key == "switch_bt_mode") {
+        s.hd_rumble_bt_mode.SetValue(std::clamp(value, 0, 1));
+    } else if (key == "dualsense_haptics") {
+        s.dualsense_haptics_enabled.SetValue(value != 0);
+    } else if (key == "dualsense_hd_haptics") {
+        s.dualsense_hd_haptics.SetValue(value != 0);
+    } else if (key == "dualsense_volume") {
+        s.dualsense_haptics_volume.SetValue(std::clamp(value, 10, 100));
+    } else if (key == "xbox_enabled") {
+        s.xbox_rumble_enabled.SetValue(value != 0);
+    } else if (key == "gain") {
+        s.hd_rumble_gain.SetValue(std::clamp(value, 25, 1000));
+    } else if (key == "low_boost") {
+        s.hd_rumble_low_boost.SetValue(std::clamp(value, 0, 100));
+    } else if (key == "usb_no_queue") {
+        s.hd_rumble_usb_no_queue.SetValue(value != 0);
+    } else if (key == "envelope_5ms") {
+        s.hd_rumble_envelope_5ms.SetValue(value != 0);
+    } else if (key == "frequency_in_packet") {
+        s.hd_rumble_frequency_in_packet.SetValue(value != 0);
+    } else if (key == "frequency_both_bands") {
+        s.hd_rumble_frequency_both_bands.SetValue(value != 0);
+    } else if (key == "crisp_notes") {
+        s.hd_rumble_crisp_notes.SetValue(value != 0);
+    } else if (key == "usb_interval_ms") {
+        static constexpr std::array<int, 4> ms{10, 15, 20, 30};
+        s.hd_rumble_usb_interval_ms.SetValue(
+            ms[std::clamp(value, 0, 3)]); // a value outside the choices keeps the closest one
+    } else if (key == "usb_auto_slow") {
+        s.hd_rumble_usb_auto_slow.SetValue(value != 0);
+    } else if (key == "bt_after_input") {
+        s.hd_rumble_bt_after_input.SetValue(value != 0);
+    } else if (key == "bt_crisp_notes") {
+        s.hd_rumble_bt_crisp_notes.SetValue(value != 0);
+    } else if (key == "dualsense_crisp_notes") {
+        s.dualsense_crisp_notes.SetValue(value != 0);
+    } else if (key == "xbox_mode") {
+        s.xbox_rumble_mode.SetValue(std::clamp(value, 0, 1));
+    } else if (key == "xbox_strength") {
+        s.xbox_motor_strength.SetValue(std::clamp(value, 0, 1000));
+    } else if (key == "xbox_detail") {
+        s.xbox_detail_mix.SetValue(std::clamp(value, 0, 100));
+    } else if (key == "xbox_accents") {
+        s.xbox_hit_accents.SetValue(std::clamp(value, 0, 100));
+    } else if (key == "xbox_trigger_mix") {
+        s.xbox_trigger_mix.SetValue(std::clamp(value, 0, 100));
+    } else if (key == "bluetooth_level") {
+        s.hd_rumble_bluetooth_level.SetValue(std::clamp(value, 1, 3));
+    } else if (key == "speaker_volume") {
+        s.dualsense_speaker_volume.SetValue(std::clamp(value, 0, 100));
+    }
+}
+
+} // namespace
+
+QWidget* ConfigureHdRumble::CreateOptionPage(unsigned device, const QString& note) {
+    auto* page = new QWidget;
+    auto* layout = new QVBoxLayout(page);
+    layout->setContentsMargins(0, 0, 0, 0);
+    layout->addWidget(MakeNote(note));
+
+    auto* basic = new QFormLayout;
+    QFormLayout* advanced = nullptr;
+    QWidget* advanced_box = nullptr;
+    QToolButton* advanced_button = nullptr;
+
+    const auto& options = Options();
+    auto add_row = [&](const InputCommon::RenHDrumOption& opt, int table_index, int def) {
+        OptionRow row;
+        row.key = opt.key;
+        row.table_index = table_index;
+        row.def = def;
+
+        QString help = QString::fromStdString(opt.help);
+        if (opt.link == 1) {
+            help += help.isEmpty() ? QStringLiteral("(wired only)")
+                                   : QStringLiteral(" (wired only)");
+        } else if (opt.link == 2) {
+            help += help.isEmpty() ? QStringLiteral("(Bluetooth only)")
+                                   : QStringLiteral(" (Bluetooth only)");
+        }
+
+        QFormLayout* form = basic;
+        if (opt.tier == 1) {
+            if (!advanced) {
+                // Collapsible Advanced section, the way the upstream dialog groups its
+                // second-tier rows; native Qt widgets only.
+                advanced_button = new QToolButton;
+                advanced_button->setText(tr("Advanced"));
+                advanced_button->setCheckable(true);
+                advanced_button->setToolButtonStyle(Qt::ToolButtonTextOnly);
+                advanced_button->setArrowType(Qt::DownArrow);
+                advanced_box = new QWidget;
+                advanced = new QFormLayout(advanced_box);
+                advanced->setContentsMargins(0, 0, 0, 0);
+                layout->addWidget(advanced_button);
+                layout->addWidget(advanced_box);
+                advanced_box->setVisible(false);
+                connect(advanced_button, &QToolButton::toggled, advanced_box, &QWidget::setVisible);
+                connect(advanced_button, &QToolButton::toggled, this, [advanced_button](bool on) {
+                    advanced_button->setArrowType(on ? Qt::UpArrow : Qt::DownArrow);
+                });
+            }
+            form = advanced;
+        }
+
+        if (opt.kind == 0) {
+            row.check = new QCheckBox(QString::fromStdString(opt.label));
+            if (!help.isEmpty()) {
+                row.check->setToolTip(help);
+            }
+            form->addRow(row.check);
+        } else if (opt.kind == 2) {
+            row.combo = new QComboBox;
+            for (const std::string& choice : opt.choices) {
+                row.combo->addItem(QString::fromStdString(choice));
+            }
+            if (!help.isEmpty()) {
+                row.combo->setToolTip(help);
+            }
+            form->addRow(QString::fromStdString(opt.label), row.combo);
+        } else {
+            row.slider = new QSlider(Qt::Horizontal);
+            row.slider->setRange(opt.min, opt.max);
+            row.slider->setSingleStep(opt.step);
+            row.spin = new QSpinBox;
+            row.spin->setRange(opt.min, opt.max);
+            row.spin->setSingleStep(opt.step);
+            if (!help.isEmpty()) {
+                row.spin->setToolTip(help);
+                row.slider->setToolTip(help);
+            }
+            connect(row.slider, &QSlider::valueChanged, row.spin, &QSpinBox::setValue);
+            connect(row.spin, qOverload<int>(&QSpinBox::valueChanged), row.slider,
+                    &QSlider::setValue);
+            auto* spin_row = new QHBoxLayout;
+            spin_row->addWidget(row.slider, 1);
+            spin_row->addWidget(row.spin);
+            form->addRow(QString::fromStdString(opt.label), spin_row);
+        }
+        if (!help.isEmpty() && opt.kind != 0) {
+            form->addRow(QString{}, MakeNote(help));
+        }
+        rows.push_back(row);
+    };
+
+    for (int i = 0; i < static_cast<int>(options.size()); ++i) {
+        const auto& opt = options[i];
+        // The master switch in the header is this table's first row; the pages don't repeat it
+        if (opt.key == "enable_hd_rumble") {
+            continue;
+        }
+        if ((opt.devices & device) == 0) {
+            continue;
+        }
+        add_row(opt, i, opt.def);
     }
 
-    layout->addWidget(MakeNote(tr("Trigger rumble works only with official Xbox controllers. "
-                                  "Most wireless receivers drive just the grip motors.")));
+    // Two settings the engine's table does not carry, both long-standing Eglantine rows
+    if (device == 1) {
+        InputCommon::RenHDrumOption extra;
+        extra.key = "bluetooth_level";
+        extra.label = "Bluetooth pacing";
+        extra.help = "Lower levels send less often, which keeps input lag down on a busy "
+                     "Bluetooth link.";
+        extra.choices = {"1 - Stable (60 ms)", "2 - Balanced (45 ms)", "3 - Quality (35 ms)"};
+        extra.kind = 2;
+        extra.def = 3;
+        add_row(extra, -1, 3);
+    }
+    if (device == 2) {
+        InputCommon::RenHDrumOption extra;
+        extra.key = "speaker_volume";
+        extra.label = "Speaker volume";
+        extra.help = "How loud the DualSense speaker taps while HD Haptics is on. 0 = off.";
+        extra.kind = 1;
+        extra.min = 0;
+        extra.max = 100;
+        extra.step = 5;
+        extra.def = 60;
+        add_row(extra, -1, 60);
+    }
+
+    layout->addLayout(basic);
+
+    if (device == 4) {
+        // Whether the controller in use has trigger motors, known when the dialog opens
+        xbox_triggers_state = InputCommon::GetRenHDrumXboxTriggers();
+        xbox_no_triggers = new QLabel(tr("This controller has no trigger motors."));
+        xbox_no_triggers->setStyleSheet(QStringLiteral("color: palette(mid);"));
+        xbox_no_triggers->setVisible(xbox_triggers_state == 0);
+        layout->addWidget(xbox_no_triggers);
+        // An official Xbox controller whose trigger motors are out of reach: offer the one
+        // setting that reaches them, where the user is setting up the vibration
+        if (InputCommon::GetRenHDrumXboxNeedsRawInput() &&
+            !Settings::values.enable_raw_input.GetValue()) {
+            auto* raw_box = new QWidget;
+            auto* raw_row = new QHBoxLayout(raw_box);
+            raw_row->setContentsMargins(0, 0, 0, 0);
+            auto* raw_note = new QLabel(tr("Trigger rumble needs \"XInput 8 player support\"."));
+            raw_note->setWordWrap(true);
+            auto* raw_button = new QPushButton(tr("Turn it on"));
+            raw_row->addWidget(raw_note, 1);
+            raw_row->addWidget(raw_button);
+            layout->addWidget(raw_box);
+            connect(raw_button, &QPushButton::clicked, this, [this, raw_box] {
+                Settings::values.enable_raw_input.SetValue(true);
+                // Keep the Controls > Advanced checkbox in step, or its OK would undo this
+                for (QWidget* top : QApplication::topLevelWidgets()) {
+                    if (auto* box = top->findChild<QCheckBox*>(QStringLiteral("enable_raw_input"))) {
+                        box->setChecked(true);
+                    }
+                }
+                raw_box->setVisible(false);
+                QMessageBox::information(
+                    this, tr("HD Rumble"),
+                    tr("Turned on. Restart the emulator to feel the triggers.\n\nWhile this is on, "
+                       "games can't open their web pages (some manuals and logins). You can turn "
+                       "it off in Controls > Advanced."));
+            });
+        }
+        layout->addWidget(MakeNote(tr("Trigger rumble works only with official Xbox "
+                                       "controllers. Most wireless receivers drive just the "
+                                       "grip motors.")));
+    }
+
     layout->addStretch();
     return page;
 }
 
 void ConfigureHdRumble::LoadConfiguration() {
-    const auto& s = Settings::values;
-    hd_enabled->setChecked(s.hd_rumble_enabled.GetValue());
-    gain->setValue(std::clamp(s.hd_rumble_gain.GetValue(), 25, 1000));
-    boost->setValue(std::clamp(s.hd_rumble_low_boost.GetValue(), 0, 100));
-    usb_interval->setValue(std::clamp(s.hd_rumble_usb_interval_ms.GetValue(), 5, 100));
-    envelope_5ms->setChecked(s.hd_rumble_envelope_5ms.GetValue());
-    frequency_in_packet->setChecked(s.hd_rumble_frequency_in_packet.GetValue());
-    crisp_notes->setChecked(s.hd_rumble_crisp_notes.GetValue());
-    bt_level->setCurrentIndex(std::clamp(s.hd_rumble_bluetooth_level.GetValue(), 1, 3) - 1);
-    bt_after_input->setChecked(s.hd_rumble_bt_after_input.GetValue());
-    bt_fast->setChecked(s.hd_rumble_bt_fast.GetValue());
-    bt_crisp_notes->setChecked(s.hd_rumble_bt_crisp_notes.GetValue());
-    ds_enabled->setChecked(s.dualsense_haptics_enabled.GetValue());
-    ds_volume->setValue(std::clamp(s.dualsense_haptics_volume.GetValue(), 0, 100));
-    ds_crisp_notes->setChecked(s.dualsense_crisp_notes.GetValue());
-    ds_hd_haptics->setChecked(s.dualsense_hd_haptics.GetValue());
-    ds_speaker->setValue(std::clamp(s.dualsense_speaker_volume.GetValue(), 0, 100));
-    xbox_enabled->setChecked(s.xbox_rumble_enabled.GetValue());
-    // Stored as 0-1000 (100 = as sent), shown as 0-100%
-    xbox_strength->setValue(s.xbox_motor_strength.GetValue() / 10);
-    xbox_mode->setCurrentIndex(std::clamp(s.xbox_rumble_mode.GetValue(), 0, 1));
-    xbox_detail->setValue(s.xbox_detail_mix.GetValue());
-    xbox_accents->setValue(s.xbox_hit_accents.GetValue());
-    xbox_trigger->setValue(s.xbox_trigger_mix.GetValue());
+    hd_enabled->setChecked(Settings::values.hd_rumble_enabled.GetValue());
+    for (const auto& row : rows) {
+        const int value = OptionValue(row.key);
+        if (row.check != nullptr) {
+            row.check->setChecked(value != 0);
+        } else if (row.combo != nullptr) {
+            row.combo->setCurrentIndex(std::clamp(value, 0, row.combo->count() - 1));
+        } else if (row.spin != nullptr) {
+            row.spin->setValue(std::clamp(value, row.spin->minimum(), row.spin->maximum()));
+        }
+    }
     UpdateEnabledState();
 }
 
 void ConfigureHdRumble::RestoreDefaults() {
     hd_enabled->setChecked(true);
-    gain->setValue(100);
-    boost->setValue(0);
-    usb_interval->setValue(15);
-    envelope_5ms->setChecked(true);
-    frequency_in_packet->setChecked(true);
-    crisp_notes->setChecked(true);
-    bt_level->setCurrentIndex(2);
-    bt_after_input->setChecked(true);
-    bt_fast->setChecked(true);
-    bt_crisp_notes->setChecked(true);
-    ds_enabled->setChecked(true);
-    ds_volume->setValue(100);
-    ds_crisp_notes->setChecked(true);
-    xbox_enabled->setChecked(true);
-    xbox_strength->setValue(10);
-    xbox_mode->setCurrentIndex(0);
-    xbox_detail->setValue(50);
-    xbox_accents->setValue(50);
-    xbox_trigger->setValue(20);
+    for (const auto& row : rows) {
+        if (row.check != nullptr) {
+            row.check->setChecked(row.def != 0);
+        } else if (row.combo != nullptr) {
+            row.combo->setCurrentIndex(std::clamp(row.def, 0, row.combo->count() - 1));
+        } else if (row.spin != nullptr) {
+            row.spin->setValue(std::clamp(row.def, row.spin->minimum(), row.spin->maximum()));
+        }
+    }
     UpdateEnabledState();
 }
 
@@ -418,48 +504,42 @@ void ConfigureHdRumble::UpdateEnabledState() {
     const bool on = hd_enabled->isChecked();
     pages->setEnabled(on);
     page_list->setEnabled(on);
-    // The extra wired cards only run on top of the 5 ms envelope
-    frequency_in_packet->setEnabled(envelope_5ms->isChecked());
-    crisp_notes->setEnabled(envelope_5ms->isChecked());
-    ds_volume_slider->setEnabled(ds_enabled->isChecked());
-    ds_volume->setEnabled(ds_enabled->isChecked());
-    ds_crisp_notes->setEnabled(ds_enabled->isChecked());
-    xbox_strength_slider->setEnabled(xbox_enabled->isChecked());
-    xbox_strength->setEnabled(xbox_enabled->isChecked());
-    xbox_mode->setEnabled(xbox_enabled->isChecked());
-    const bool direct = xbox_enabled->isChecked() && xbox_mode->currentData().toInt() == 1;
-    xbox_detail_slider->setEnabled(direct);
-    xbox_detail->setEnabled(direct);
-    xbox_accents_slider->setEnabled(direct);
-    xbox_accents->setEnabled(direct);
-    xbox_trigger_slider->setEnabled(direct && xbox_triggers_state != 0);
-    xbox_trigger->setEnabled(direct && xbox_triggers_state != 0);
+    for (auto& row : rows) {
+        bool parent_on = true;
+        if (row.table_index >= 0) {
+            // requires_row points at a table index; that row must be non-zero for this one
+            const auto& options = Options();
+            const int parent_index = options[row.table_index].requires_row;
+            if (parent_index >= 0 && parent_index < static_cast<int>(options.size())) {
+                const auto& parent_key = options[parent_index].key;
+                parent_on = OptionValue(parent_key) != 0;
+            }
+        }
+        const bool triggers_ok = row.key != "xbox_trigger_mix" || xbox_triggers_state != 0;
+        const bool enabled = on && parent_on && triggers_ok;
+        if (row.check != nullptr) {
+            row.check->setEnabled(enabled);
+        }
+        if (row.combo != nullptr) {
+            row.combo->setEnabled(enabled);
+        }
+        if (row.slider != nullptr && row.spin != nullptr) {
+            row.slider->setEnabled(enabled);
+            row.spin->setEnabled(enabled);
+        }
+    }
 }
 
 void ConfigureHdRumble::ApplyConfiguration() {
     auto& s = Settings::values;
-    const bool on = hd_enabled->isChecked();
-    s.hd_rumble_enabled.SetValue(on);
-    s.hd_rumble_gain.SetValue(gain->value());
-    s.hd_rumble_low_boost.SetValue(boost->value());
-    s.hd_rumble_usb_interval_ms.SetValue(usb_interval->value());
-    s.hd_rumble_envelope_5ms.SetValue(envelope_5ms->isChecked());
-    s.hd_rumble_frequency_in_packet.SetValue(frequency_in_packet->isChecked());
-    s.hd_rumble_crisp_notes.SetValue(crisp_notes->isChecked());
-    s.hd_rumble_bluetooth_level.SetValue(bt_level->currentData().toInt());
-    s.hd_rumble_bt_after_input.SetValue(bt_after_input->isChecked());
-    s.hd_rumble_bt_fast.SetValue(bt_fast->isChecked());
-    s.hd_rumble_bt_crisp_notes.SetValue(bt_crisp_notes->isChecked());
-    // The master switch also turns the DualSense haptics off (the SDL driver checks both)
-    s.dualsense_haptics_enabled.SetValue(ds_enabled->isChecked());
-    s.dualsense_haptics_volume.SetValue(ds_volume->value());
-    s.dualsense_crisp_notes.SetValue(ds_crisp_notes->isChecked());
-    s.dualsense_hd_haptics.SetValue(ds_hd_haptics->isChecked());
-    s.dualsense_speaker_volume.SetValue(ds_speaker->value());
-    s.xbox_rumble_enabled.SetValue(xbox_enabled->isChecked());
-    s.xbox_motor_strength.SetValue(xbox_strength->value() * 10);
-    s.xbox_rumble_mode.SetValue(xbox_mode->currentData().toInt());
-    s.xbox_detail_mix.SetValue(xbox_detail->value());
-    s.xbox_hit_accents.SetValue(xbox_accents->value());
-    s.xbox_trigger_mix.SetValue(xbox_trigger->value());
+    s.hd_rumble_enabled.SetValue(hd_enabled->isChecked());
+    for (const auto& row : rows) {
+        if (row.check != nullptr) {
+            SetOptionValue(row.key, row.check->isChecked() ? 1 : 0);
+        } else if (row.combo != nullptr) {
+            SetOptionValue(row.key, row.combo->currentIndex());
+        } else if (row.spin != nullptr) {
+            SetOptionValue(row.key, row.spin->value());
+        }
+    }
 }
