@@ -77,7 +77,28 @@ LogFile ReadLogFile(const std::filesystem::path& file, const ForEach& for_each) 
     return log;
 }
 
-WriteResult AppendToLog(const std::filesystem::path& file, std::span<const u8> records) {
+std::optional<std::vector<u8>> ReadRecordPayload(const std::filesystem::path& file,
+                                                 RecordKind kind, u64 key, u64 offset,
+                                                 u64 payload_size) {
+    std::vector<u8> bytes(RecordHeaderSize + payload_size + RecordHashSize);
+    std::ifstream stream(file, std::ios::binary);
+    if (!stream.seekg(static_cast<std::streamoff>(offset)) ||
+        !stream.read(reinterpret_cast<char*>(bytes.data()),
+                     static_cast<std::streamsize>(bytes.size()))) {
+        return std::nullopt;
+    }
+    const std::optional<LogRecord> record = ParseRecord(bytes, offset);
+    if (!record || record->kind != kind || record->key != key ||
+        record->payload.size() != payload_size) {
+        return std::nullopt;
+    }
+    bytes.erase(bytes.begin(), bytes.begin() + RecordHeaderSize);
+    bytes.resize(payload_size);
+    return bytes;
+}
+
+WriteResult AppendToLog(const std::filesystem::path& file, std::span<const u8> records,
+                        u64* records_offset) {
     // Without locks on this file system (the lock is neither held nor busy) it goes on as the
     // other caches do there.
     const Common::FS::FileLock lock{PipelineCacheLockPath(file)};
@@ -95,6 +116,9 @@ WriteResult AppendToLog(const std::filesystem::path& file, std::span<const u8> r
                             FileShareFlag::ShareReadWrite};
         if (target.IsOpen() && target.WriteSpan(std::span<const u8>{bytes}) == bytes.size() &&
             target.Flush()) {
+            if (records_offset) {
+                *records_offset = FileHeaderSize;
+            }
             return WriteResult::Written;
         }
         LOG_ERROR(Common_Filesystem, "Failed to create shader cache {}",
@@ -128,7 +152,8 @@ WriteResult AppendToLog(const std::filesystem::path& file, std::span<const u8> r
         }
     }
     // A record cut off by a crash leaves the end off a record boundary.
-    bytes.resize((RecordAlignment - size % RecordAlignment) % RecordAlignment);
+    const u64 padding = (RecordAlignment - size % RecordAlignment) % RecordAlignment;
+    bytes.resize(padding);
     bytes.insert(bytes.end(), records.begin(), records.end());
     bool written{};
     {
@@ -138,6 +163,9 @@ WriteResult AppendToLog(const std::filesystem::path& file, std::span<const u8> r
                   target.WriteSpan(std::span<const u8>{bytes}) == bytes.size() && target.Flush();
     }
     if (written) {
+        if (records_offset) {
+            *records_offset = size + padding;
+        }
         return WriteResult::Written;
     }
     // Cut off what was written (a full disk), so that the next records follow complete ones.
