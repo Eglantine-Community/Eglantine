@@ -263,7 +263,8 @@ private:
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline(
         ShaderPools& pools, const GraphicsPipelineCacheKey& key,
         std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
-        bool build_in_parallel, bool native_turing = false, bool parallel_stages = false);
+        bool build_in_parallel, bool native_turing = false, bool parallel_stages = false,
+        bool new_pipeline = false);
 
     /// Runs task(0..count-1) on the translation workers and this thread; rethrows the first
     /// exception a task threw.
@@ -359,9 +360,9 @@ private:
     std::filesystem::path layouts_filename;
     void LoadPipelineLayouts();
     void SavePipelineLayouts();
-    /// Compiles the parts a link still misses, beside the thread that links (never `workers`,
-    /// whose threads wait for these). Declared after library_cache and before `workers`, so it
-    /// stops after the builds that wait for it and before the parts it compiles go away.
+    /// Compiles library parts in the background (GraphicsPipeline::QueueLibraryParts), never on
+    /// `workers`. Declared after library_cache and before `workers`, so it stops before the
+    /// parts it compiles go away.
     std::unique_ptr<Common::ThreadWorker> library_part_workers;
     struct ShaderSetEntry {
         std::array<u64, Maxwell::MaxShaderStage> hashes{};

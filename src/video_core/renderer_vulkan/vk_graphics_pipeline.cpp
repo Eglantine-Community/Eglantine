@@ -285,35 +285,36 @@ struct DefaultSpec {
     static constexpr bool has_images = true;
 };
 
-// With VK_EXT_graphics_pipeline_library: how many pipelines were linked from library parts and
-// how long the driver took, against the ones compiled whole, every 10 s.
-void ReportLibraryBuild(bool linked, std::chrono::steady_clock::duration time) {
+enum class LibraryBuild { Whole, Linked, Parts };
+
+// With VK_EXT_graphics_pipeline_library, every 10 s: pipelines linked from compiled parts,
+// pipelines compiled whole, and background part compiles (QueueLibraryParts), with their times.
+void ReportLibraryBuild(LibraryBuild kind, std::chrono::steady_clock::duration time) {
     static std::mutex mutex;
-    static std::array<u32, 2> count{};
-    static std::array<std::chrono::steady_clock::duration, 2> total{};
-    static u32 fast_links{};
+    static std::array<u32, 3> count{};
+    static std::array<std::chrono::steady_clock::duration, 3> total{};
     static auto window = std::chrono::steady_clock::now();
     std::scoped_lock lock{mutex};
-    ++count[linked];
-    total[linked] += time;
-    // Under 5 ms, every part was compiled already: only the link ran.
-    fast_links += linked && time < std::chrono::milliseconds{5} ? 1 : 0;
+    const size_t index = static_cast<size_t>(kind);
+    ++count[index];
+    total[index] += time;
     const auto now = std::chrono::steady_clock::now();
     if (now - window < std::chrono::seconds{10}) {
         return;
     }
-    const auto mean = [&](size_t index) {
-        return count[index] ? std::chrono::duration<double, std::milli>(total[index]).count() /
-                                  count[index]
-                            : 0.0;
+    const auto mean = [&](LibraryBuild which) {
+        const size_t i = static_cast<size_t>(which);
+        return count[i] ? std::chrono::duration<double, std::milli>(total[i]).count() / count[i]
+                        : 0.0;
     };
     LOG_INFO(Render_Vulkan,
-             "Graphics pipeline library in the last 10 s: {} linked from parts ({:.1f} ms mean, "
-             "parts compiled included; {} under 5 ms), {} compiled whole ({:.1f} ms mean)",
-             count[1], mean(1), fast_links, count[0], mean(0));
+             "Graphics pipeline library in the last 10 s: {} linked from compiled parts ({:.1f} "
+             "ms mean), {} compiled whole ({:.1f} ms mean), {} part sets compiled in the "
+             "background ({:.1f} ms mean)",
+             count[1], mean(LibraryBuild::Linked), count[0], mean(LibraryBuild::Whole), count[2],
+             mean(LibraryBuild::Parts));
     count = {};
     total = {};
-    fast_links = 0;
     window = now;
 }
 
@@ -338,13 +339,14 @@ GraphicsPipeline::GraphicsPipeline(
     std::optional<MeshEmulationSetup> mesh_emulation_,
     std::shared_ptr<const GraphicsShaderSet> shader_set_,
     GraphicsPipelineLibraryCache* library_cache_, Common::ThreadWorker* library_part_workers_,
-    PipelineLayoutCache* layout_cache)
+    PipelineLayoutCache* layout_cache, bool fill_library_parts_)
     : key{key_}, device{device_}, texture_cache{texture_cache_}, buffer_cache{buffer_cache_},
       pipeline_cache(pipeline_cache_), scheduler{scheduler_},
       guest_descriptor_queue{guest_descriptor_queue_},
       descriptor_buffer_ring{descriptor_buffer_ring_}, spv_modules{std::move(stages)},
       shader_set{std::move(shader_set_)}, library_cache{library_cache_},
-      library_part_workers{library_part_workers_},
+      library_part_workers{library_part_workers_}, build_workers{worker_thread},
+      fill_library_parts{fill_library_parts_},
       mesh_emulation{std::move(mesh_emulation_)} {
     for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
         modules[stage] = shader_set ? *shader_set->modules[stage] : *spv_modules[stage];
@@ -516,11 +518,16 @@ GraphicsPipeline::GraphicsPipeline(
         modules = {};
         ReportPipelineBuild("Graphics", key.Hash(), queued_at, started_at);
 
-        std::scoped_lock lock{build_mutex};
-        is_built = true;
-        build_condvar.notify_one();
-        if (shader_notify) {
-            shader_notify->MarkShaderComplete();
+        {
+            std::scoped_lock lock{build_mutex};
+            is_built = true;
+            build_condvar.notify_one();
+            if (shader_notify) {
+                shader_notify->MarkShaderComplete();
+            }
+        }
+        if (compiled_whole_for_library) {
+            QueueLibraryParts(render_pass_cache);
         }
     }};
     // Before the build: it frees the modules this looks at.
@@ -1526,7 +1533,44 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
 
 /// Creates the Vulkan pipeline for `render_pass`. A mesh pipeline without VK_EXT_mesh_shader is
 /// built from the mesh emulation's vertex shader as a point, line or triangle list.
-void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+GraphicsPipeline::~GraphicsPipeline() {
+    if (library_parts_task) {
+        std::scoped_lock lock{library_parts_task->mutex};
+        library_parts_task->cancelled = true;
+    }
+}
+
+void GraphicsPipeline::QueueLibraryParts(RenderPassCache& render_pass_cache) {
+    library_parts_task = std::make_shared<LibraryPartsTask>();
+    // The pipeline may be gone before the task runs: only `task` and `builds` are read before
+    // the cancellation check (the build workers outlive the part workers).
+    library_part_workers->QueueWork([this, task = library_parts_task, builds = build_workers,
+                                     &render_pass_cache] {
+        // After the builds draws wait for: compiling parts beside them slowed them down.
+        for (int attempt = 0; attempt < 200 && builds && builds->PendingWork() != 0; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{5});
+        }
+        std::scoped_lock lock{task->mutex};
+        if (task->cancelled) {
+            return;
+        }
+        // The build cleared its module handles; the shared set still holds the modules.
+        for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+            modules[stage] = *shader_set->modules[stage];
+        }
+        const auto begin = std::chrono::steady_clock::now();
+        try {
+            MakePipeline(render_pass_cache.Get(MakeRenderPassKey(key.state, device)), true);
+        } catch (const vk::Exception& exception) {
+            LOG_DEBUG(Render_Vulkan, "Graphics pipeline library parts not compiled: {}",
+                      exception.what());
+        }
+        modules = {};
+        ReportLibraryBuild(LibraryBuild::Parts, std::chrono::steady_clock::now() - begin);
+    });
+}
+
+void GraphicsPipeline::MakePipeline(VkRenderPass render_pass, bool parts_only) {
     if (IsMeshPipeline() && !device.IsExtMeshShaderSupported() && !mesh_emulation) {
         return;
     }
@@ -2048,25 +2092,36 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         .basePipelineHandle = nullptr,
         .basePipelineIndex = 0,
     };
-    // Pipelines sharing a shader set link library parts compiled once (null when the create
-    // info holds something the parts can't express); the others compile whole.
+    // Pipelines sharing a shader set link when every library part is compiled already (a few
+    // ms). Otherwise they compile whole, which the driver's cache serves like with the library
+    // off: compiling missing parts first took up to a second for passes a frame waits for.
+    // Parts for later pipelines come from QueueLibraryParts.
     if (library_cache && shader_set && !mesh_emulation) {
         try {
-            pipeline = library_cache->Link(pipeline_ci, *pipeline_cache, shader_set, false,
-                                           library_part_workers);
+            if (parts_only) {
+                static_cast<void>(
+                    library_cache->Link(pipeline_ci, *pipeline_cache, shader_set, false));
+                return;
+            }
+            pipeline = library_cache->Link(pipeline_ci, *pipeline_cache, shader_set, true);
         } catch (const vk::Exception& exception) {
             LOG_WARNING(Render_Vulkan, "Graphics pipeline library link failed ({}), compiling whole",
                         exception.what());
         }
     }
+    if (parts_only) {
+        return;
+    }
     const bool linked = static_cast<bool>(pipeline);
+    compiled_whole_for_library = !linked && fill_library_parts && library_cache && shader_set &&
+                                 library_part_workers && !mesh_emulation;
     if (!linked) {
         pipeline = device.GetLogical().CreateGraphicsPipeline(pipeline_ci, *pipeline_cache);
     }
     const auto build_time = std::chrono::steady_clock::now() - build_begin;
     DriverBuildReport::Record(DriverBuildReport::Kind::Graphics, build_time);
     if (library_cache) {
-        ReportLibraryBuild(linked, build_time);
+        ReportLibraryBuild(linked ? LibraryBuild::Linked : LibraryBuild::Whole, build_time);
     }
 
     // Log graphics pipeline creation

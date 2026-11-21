@@ -550,9 +550,10 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     }
     if (device.IsExtGraphicsPipelineLibrarySupported()) {
         library_cache = std::make_unique<GraphicsPipelineLibraryCache>(device);
-        library_part_workers.reset(new Common::ThreadWorker(GetTotalPipelineWorkers(),
-                                                            "VkPipelineLibraryPart", {},
-                                                            Common::ThreadPlacement::Background));
+        // Two threads: parts are compiled in the background only (QueueLibraryParts), after the
+        // pipelines draws wait for.
+        library_part_workers.reset(new Common::ThreadWorker(
+            2, "VkPipelineLibraryPart", {}, Common::ThreadPlacement::Background));
         LOG_INFO(Render_Vulkan, "Graphics pipelines that share shaders link library parts");
     }
     build_budget = std::chrono::milliseconds{[] {
@@ -2721,7 +2722,7 @@ struct PhaseTimer {
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     ShaderPools& pools, const GraphicsPipelineCacheKey& key,
     std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
-    bool build_in_parallel, bool native_turing, bool parallel_stages) try {
+    bool build_in_parallel, bool native_turing, bool parallel_stages, bool new_pipeline) try {
     auto hash = key.Hash();
     LOG_DEBUG(Render_Vulkan, "{:#016x}", hash);
     size_t env_index{0};
@@ -3292,7 +3293,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         std::move(mesh_emulation), std::move(shader_set), library_cache.get(),
         library_part_workers.get(),
         VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::SharedPipelineLayouts) ? &layout_cache
-                                                                                  : nullptr);
+                                                                                  : nullptr,
+        new_pipeline && library_cache);
 
 } catch (const Shader::Exception& exception) {
     auto hash = key.Hash();
@@ -3511,7 +3513,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
         }
         main_pools.ReleaseContents();
         auto pipeline{CreateGraphicsPipeline(main_pools, graphics_key, MakeSpan(env_ptrs), nullptr,
-                                             true, native_turing)};
+                                             true, native_turing, false, true)};
         if (pipeline && !pipeline_cache_filename.empty()) {
             QueueVulkanPipelineCacheFlush();
         }
@@ -3525,7 +3527,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
 
     main_pools.ReleaseContents();
     auto pipeline{CreateGraphicsPipeline(main_pools, graphics_key, environments.Span(), nullptr,
-                                         true, native_turing)};
+                                         true, native_turing, false, true)};
     if (pipeline) {
         StoreGraphicsPipeline(graphics_key, std::move(environments.envs),
                               pipeline->IsMeshPipeline());
@@ -3815,7 +3817,7 @@ void PipelineCache::TranslateGraphicsPipeline(const GraphicsPipelineCacheKey& ke
         }
         try {
             pipeline = CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs), nullptr, true,
-                                              true, true);
+                                              true, true, true);
         } catch (const std::exception& exception) {
             // Shader errors are handled inside; nothing else may end the worker thread.
             LOG_ERROR(Render_Vulkan, "Graphics pipeline translation failed: {}", exception.what());

@@ -131,7 +131,8 @@ public:
         std::shared_ptr<const GraphicsShaderSet> shader_set = {},
         GraphicsPipelineLibraryCache* library_cache = nullptr,
         Common::ThreadWorker* library_part_workers = nullptr,
-        PipelineLayoutCache* layout_cache = nullptr);
+        PipelineLayoutCache* layout_cache = nullptr, bool fill_library_parts = false);
+    ~GraphicsPipeline();
 
     bool HasDynamicVertexInput() const noexcept { return key.state.dynamic_vertex_input; }
     const std::array<u64, 6>& ShaderHashes() const noexcept {
@@ -290,7 +291,13 @@ private:
     bool ConfigureDraw(const RescalingPushConstant& rescaling,
                        const RenderAreaPushConstant& render_are, bool is_indexed);
 
-    void MakePipeline(VkRenderPass render_pass);
+    /// With `parts_only`, compiles the library parts of this pipeline's create info and keeps
+    /// nothing else (QueueLibraryParts).
+    void MakePipeline(VkRenderPass render_pass, bool parts_only = false);
+
+    /// After a pipeline new this session was compiled whole: its library parts on the part
+    /// workers, for the next pipeline with the same shaders to link.
+    void QueueLibraryParts(RenderPassCache& render_pass_cache);
 
     void Validate();
 
@@ -319,6 +326,18 @@ private:
     std::shared_ptr<const GraphicsShaderSet> shader_set;
     GraphicsPipelineLibraryCache* library_cache{};
     Common::ThreadWorker* library_part_workers{};
+    /// The pipeline cache's build workers (null for builds on the calling thread).
+    Common::ThreadWorker* build_workers{};
+    bool fill_library_parts{};
+    /// Set by MakePipeline when it compiled whole a pipeline that could link from parts.
+    bool compiled_whole_for_library{};
+    /// A queued QueueLibraryParts task checks `cancelled` under `mutex`: the destructor sets it,
+    /// waiting for a task that runs.
+    struct LibraryPartsTask {
+        std::mutex mutex;
+        bool cancelled{};
+    };
+    std::shared_ptr<LibraryPartsTask> library_parts_task;
 
     std::array<Shader::Info, NUM_STAGES> stage_infos;
     std::array<std::vector<VideoCommon::TextureHandleCache>, NUM_STAGES> handle_caches;
