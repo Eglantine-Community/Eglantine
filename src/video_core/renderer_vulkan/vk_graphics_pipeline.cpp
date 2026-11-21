@@ -337,12 +337,13 @@ GraphicsPipeline::GraphicsPipeline(
     std::function<std::array<vk::ShaderModule, NUM_STAGES>()> emit_stages,
     std::optional<MeshEmulationSetup> mesh_emulation_,
     std::shared_ptr<const GraphicsShaderSet> shader_set_,
-    GraphicsPipelineLibraryCache* library_cache_)
+    GraphicsPipelineLibraryCache* library_cache_, Common::ThreadWorker* library_part_workers_)
     : key{key_}, device{device_}, texture_cache{texture_cache_}, buffer_cache{buffer_cache_},
       pipeline_cache(pipeline_cache_), scheduler{scheduler_},
       guest_descriptor_queue{guest_descriptor_queue_},
       descriptor_buffer_ring{descriptor_buffer_ring_}, spv_modules{std::move(stages)},
       shader_set{std::move(shader_set_)}, library_cache{library_cache_},
+      library_part_workers{library_part_workers_},
       mesh_emulation{std::move(mesh_emulation_)} {
     for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
         modules[stage] = shader_set ? *shader_set->modules[stage] : *spv_modules[stage];
@@ -2044,7 +2045,8 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
     // info holds something the parts can't express); the others compile whole.
     if (library_cache && shader_set && !mesh_emulation) {
         try {
-            pipeline = library_cache->Link(pipeline_ci, *pipeline_cache, shader_set, false);
+            pipeline = library_cache->Link(pipeline_ci, *pipeline_cache, shader_set, false,
+                                           library_part_workers);
         } catch (const vk::Exception& exception) {
             LOG_WARNING(Render_Vulkan, "Graphics pipeline library link failed ({}), compiling whole",
                         exception.what());

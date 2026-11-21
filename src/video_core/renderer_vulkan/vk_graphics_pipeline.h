@@ -129,7 +129,8 @@ public:
         std::function<std::array<vk::ShaderModule, NUM_STAGES>()> emit_stages = {},
         std::optional<MeshEmulationSetup> mesh_emulation = std::nullopt,
         std::shared_ptr<const GraphicsShaderSet> shader_set = {},
-        GraphicsPipelineLibraryCache* library_cache = nullptr);
+        GraphicsPipelineLibraryCache* library_cache = nullptr,
+        Common::ThreadWorker* library_part_workers = nullptr);
 
     bool HasDynamicVertexInput() const noexcept { return key.state.dynamic_vertex_input; }
     const std::array<u64, 6>& ShaderHashes() const noexcept {
@@ -316,6 +317,7 @@ private:
     std::array<VkShaderModule, NUM_STAGES> modules{};
     std::shared_ptr<const GraphicsShaderSet> shader_set;
     GraphicsPipelineLibraryCache* library_cache{};
+    Common::ThreadWorker* library_part_workers{};
 
     std::array<Shader::Info, NUM_STAGES> stage_infos;
     std::array<std::vector<VideoCommon::TextureHandleCache>, NUM_STAGES> handle_caches;

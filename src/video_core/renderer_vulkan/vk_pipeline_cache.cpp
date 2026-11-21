@@ -534,6 +534,9 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     }
     if (device.IsExtGraphicsPipelineLibrarySupported()) {
         library_cache = std::make_unique<GraphicsPipelineLibraryCache>(device);
+        library_part_workers.reset(new Common::ThreadWorker(GetTotalPipelineWorkers(),
+                                                            "VkPipelineLibraryPart", {},
+                                                            Common::ThreadPlacement::Background));
         LOG_INFO(Render_Vulkan, "Graphics pipelines that share shaders link library parts");
     }
     build_budget = std::chrono::milliseconds{[] {
@@ -3248,7 +3251,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         render_pass_cache, key, std::move(modules), infos,
         std::function<
             std::array<vk::ShaderModule, Tegra::Engines::Maxwell3D::Regs::MaxShaderStage>()>{},
-        std::move(mesh_emulation), std::move(shader_set), library_cache.get());
+        std::move(mesh_emulation), std::move(shader_set), library_cache.get(),
+        library_part_workers.get());
 
 } catch (const Shader::Exception& exception) {
     auto hash = key.Hash();

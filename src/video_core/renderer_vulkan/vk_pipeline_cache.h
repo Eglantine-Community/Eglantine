@@ -352,6 +352,10 @@ private:
     /// Pipeline library parts (VK_EXT_graphics_pipeline_library, EDEN_NX2_GPL=1), and the
     /// shader module sets they are keyed by: pipelines whose stages are the same SPIR-V share one.
     std::unique_ptr<GraphicsPipelineLibraryCache> library_cache;
+    /// Compiles the parts a link still misses, beside the thread that links (never `workers`,
+    /// whose threads wait for these). Declared after library_cache and before `workers`, so it
+    /// stops after the builds that wait for it and before the parts it compiles go away.
+    std::unique_ptr<Common::ThreadWorker> library_part_workers;
     struct ShaderSetEntry {
         std::array<u64, Maxwell::MaxShaderStage> hashes{};
         std::array<size_t, Maxwell::MaxShaderStage> sizes{};
