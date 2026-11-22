@@ -47,11 +47,11 @@ class HomeBackground;
 class HomeCustomizePanel;
 class HomeSidePanel;
 class HomeSurface;
-class FloatingActionButton;
 class QHBoxLayout;
 class QPropertyAnimation;
 class QThreadPool;
 class QTimer;
+class QToolButton;
 struct GameDetailsInfo;
 
 class QAbstractItemView;
@@ -187,7 +187,6 @@ private:
     void SetHomeBackground(const QString& path);
     void RemoveRecentBackground(const QString& path);
     void UpdateViewTransparency();
-    void PlaceCustomizeButton();
     void LoadGameDetailsExtras();
     /// Docks the sidebars beside the games, or lays them over the games on narrow windows.
     void UpdatePanelPlacement();
@@ -205,7 +204,7 @@ private:
     HomeBackground* background = nullptr;
     HomeCustomizePanel* customize_panel = nullptr;
     QPropertyAnimation* customize_animation = nullptr;
-    FloatingActionButton* customize_button = nullptr;
+    QToolButton* customize_button = nullptr;
     GameDetailsPanel* details_panel = nullptr;
     QPropertyAnimation* details_animation = nullptr;
     QPersistentModelIndex details_index;

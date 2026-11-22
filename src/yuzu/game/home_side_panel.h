@@ -3,7 +3,6 @@
 
 #pragma once
 
-#include <QAbstractButton>
 #include <QFrame>
 #include <QIcon>
 
@@ -73,24 +72,4 @@ private:
     QWidget* footer = nullptr;
     bool palette_refresh_queued = false;
     bool language_refresh_queued = false;
-};
-
-/// Round accent-coloured button that floats over the home screen.
-class FloatingActionButton : public QAbstractButton {
-    Q_OBJECT
-
-public:
-    static constexpr int Diameter = 52;
-
-    explicit FloatingActionButton(QWidget* parent = nullptr);
-
-    QSize sizeHint() const override;
-
-protected:
-    void paintEvent(QPaintEvent* event) override;
-    void enterEvent(QEnterEvent* event) override;
-    void leaveEvent(QEvent* event) override;
-
-private:
-    bool hovered = false;
 };

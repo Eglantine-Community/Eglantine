@@ -32,6 +32,7 @@
 #include <QScrollerProperties>
 #include <QThreadPool>
 #include <QTimer>
+#include <QStyle>
 #include <QToolButton>
 #include <QVariantAnimation>
 #include <qlayoutitem.h>
@@ -612,32 +613,29 @@ void GameList::SetupCustomization() {
     connect(carousel_view, &GameCarousel::CenteredGameChanged, surface,
             &HomeSurface::SetBannerGame);
 
-    customize_button = new FloatingActionButton(surface);
+    // A plain tool button at the end of the search bar, drawn by the platform style and the
+    // theme like the rest of the window. View > Customize Home Screen covers a hidden bar.
+    customize_button = new QToolButton(search_field);
+    customize_button->setAutoRaise(true);
+    customize_button->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    customize_button->setText(tr("Customize"));
     customize_button->setToolTip(tr("Customize Home Screen"));
     RefreshCustomizeButtonIcon();
     connect(customize_button, &QAbstractButton::clicked, this, [this] {
         ShowCustomizePanel(!(customize_panel->isVisible() && customize_panel->maximumWidth() > 0));
     });
-    surface->installEventFilter(this);
-    search_field->installEventFilter(this);
-    PlaceCustomizeButton();
+    search_field->AddTrailingWidget(customize_button);
 
     // Restore the saved background kind, and with it the saved picture when it is the kind.
     apply_background(
         HomeBackground::KindFromInt(UISettings::values.home_background_kind.GetValue()));
 }
 
-void GameList::PlaceCustomizeButton() {
-    constexpr int Margin = 20;
-    const int bottom = search_field->isVisible() ? search_field->geometry().top() : surface->height();
-    customize_button->move(surface->width() - customize_button->width() - Margin,
-                           bottom - customize_button->height() - Margin / 2);
-    customize_button->raise();
-}
-
 void GameList::RefreshCustomizeButtonIcon() {
-    customize_button->setIcon(HomeGlyphs::Brush(palette().color(QPalette::HighlightedText),
-                                                devicePixelRatioF(), 24));
+    const int size = style()->pixelMetric(QStyle::PM_SmallIconSize, nullptr, customize_button);
+    customize_button->setIcon(QIcon::fromTheme(
+        QStringLiteral("preferences-desktop"),
+        HomeGlyphs::Brush(palette().color(QPalette::ButtonText), devicePixelRatioF(), size)));
 }
 
 QPropertyAnimation* GameList::MakeSlideAnimation(QWidget* panel) {
@@ -1648,18 +1646,6 @@ void GameList::SetupScrollAnimation() {
 }
 
 bool GameList::eventFilter(QObject* obj, QEvent* event) {
-    if (customize_button && (obj == surface || obj == search_field)) {
-        switch (event->type()) {
-        case QEvent::Resize:
-        case QEvent::Move:
-        case QEvent::Show:
-        case QEvent::Hide:
-            PlaceCustomizeButton();
-            break;
-        default:
-            break;
-        }
-    }
     if (!m_currentView) {
         return QWidget::eventFilter(obj, event);
     }
