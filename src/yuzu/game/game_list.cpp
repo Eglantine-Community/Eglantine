@@ -49,10 +49,12 @@
 #include "qt_common/config/uisettings.h"
 #include "qt_common/game_list/game_list_p.h"
 #include "qt_common/game_list/model.h"
+#include "qt_common/game_list/worker.h"
 #include "qt_common/qt_common.h"
 #include "qt_common/util/game.h"
 #include "qt_common/util/game_art.h"
 #include "yuzu/game/carousel.h"
+#include "yuzu/game/carousel_hub.h"
 #include "yuzu/game/game_details_panel.h"
 #include "yuzu/game/game_grid.h"
 #include "yuzu/game/game_list.h"
@@ -326,8 +328,18 @@ GameList::GameList(FileSys::VirtualFilesystem vfs_, FileSys::ManualContentProvid
                 if (!this->isActiveWindow()) {
                     return;
                 }
+                // Into the view, or the carousel's action tiles when the focus is on them.
+                QWidget* target = m_currentView;
+                if (QWidget* focus = QApplication::focusWidget();
+                    focus && m_currentView->isAncestorOf(focus)) {
+                    target = focus;
+                }
+                if (!controller_used) {
+                    controller_used = true;
+                    UpdateControllerHints();
+                }
                 QKeyEvent* event = new QKeyEvent(QEvent::KeyPress, key, Qt::NoModifier);
-                QCoreApplication::postEvent(m_currentView, event);
+                QCoreApplication::postEvent(target, event);
             });
 
     connect(item_model, &GameListModel::PopulatingCompleted, this,
@@ -340,10 +352,6 @@ GameList::GameList(FileSys::VirtualFilesystem vfs_, FileSys::ManualContentProvid
     // TODO: impl on grid
     connect(tree_view, &GameTree::FilterResultReady, search_field,
             [this](int visible, int total) { search_field->setFilterResult(visible, total); });
-    connect(carousel_view, &GameCarousel::LaunchRequested, this, [this](const QModelIndex& index) {
-        click_timer->stop();
-        ValidateEntry(index);
-    });
     connect(carousel_view, &GameCarousel::BackgroundClicked, this, &GameList::HideGameDetails);
     connect(carousel_view, &GameCarousel::FilterResultReady, search_field,
             [this](int visible, int total) { search_field->setFilterResult(visible, total); });
@@ -483,6 +491,16 @@ void GameList::ResetViewMode() {
 
     // The banner backdrop belongs to the carousel; leaving the mode must repaint it away.
     surface->update();
+    // The carousel uses its game page, the other views the sidebar.
+    if (m_currentView != carousel_view) {
+        carousel_view->Hub()->ClosePanel();
+    }
+    if (details_panel && m_currentView == carousel_view) {
+        HideGameDetails();
+    }
+    if (controller_hints) {
+        UpdateControllerHints();
+    }
 
     // The carousel has no scroll range and handles drags itself.
     if (m_currentView != carousel_view) {
@@ -615,6 +633,11 @@ void GameList::SetupCustomization() {
 
     // A plain tool button at the end of the search bar, drawn by the platform style and the
     // theme like the rest of the window. View > Customize Home Screen covers a hidden bar.
+    // Button hints, shown once a controller has been used.
+    controller_hints = new QLabel(search_field);
+    controller_hints->hide();
+    search_field->AddTrailingWidget(controller_hints);
+
     customize_button = new QToolButton(search_field);
     customize_button->setAutoRaise(true);
     customize_button->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
@@ -629,6 +652,23 @@ void GameList::SetupCustomization() {
     // Restore the saved background kind, and with it the saved picture when it is the kind.
     apply_background(
         HomeBackground::KindFromInt(UISettings::values.home_background_kind.GetValue()));
+}
+
+void GameList::UpdateControllerHints() {
+    if (!controller_used) {
+        controller_hints->hide();
+        return;
+    }
+    QStringList hints;
+    if (carousel_view->Hub()->isAncestorOf(QApplication::focusWidget())) {
+        hints << tr("\u24B6 Select") << tr("\u24B7 Back") << tr("\u24CE Favorite")
+              << tr("\u24CD Settings");
+    } else {
+        hints << tr("\u24B6 Play") << tr("\u2295 Options") << tr("\u24CE Favorite")
+              << tr("\u24CD Settings");
+    }
+    controller_hints->setText(hints.join(QStringLiteral("   ")));
+    controller_hints->show();
 }
 
 void GameList::RefreshCustomizeButtonIcon() {
@@ -767,10 +807,11 @@ void GameList::SetupGameDetails() {
         }
     });
     connect(details_panel, &GameDetailsPanel::ConfigureRequested, this, [this] {
-        emit OpenPerGameGeneralRequested(details_panel->Game().path.toStdString());
+        const GameDetailsInfo& game = details_panel->Game();
+        emit OpenPerGameGeneralRequested(game.path.toStdString());
         // The dialog is modal: refresh the custom settings and add-on state it may have changed.
         if (details_index.isValid()) {
-            LoadGameDetailsExtras();
+            LoadGameDetailsExtras(game.program_id, game.path);
         }
     });
     connect(details_panel, &GameDetailsPanel::OpenLocationRequested, this, [this] {
@@ -780,24 +821,13 @@ void GameList::SetupGameDetails() {
         const GameDetailsInfo& game = details_panel->Game();
         emit PrepareShaderWarmRequested(game.program_id, game.path.toStdString());
         if (details_index.isValid()) {
-            LoadGameDetailsExtras();
+            LoadGameDetailsExtras(game.program_id, game.path);
         }
     });
     connect(details_panel, &GameDetailsPanel::DisabledAddOnsChanged, this,
             [this](const QStringList& disabled) {
-                const u64 program_id = details_panel->Game().program_id;
-                if (program_id == 0) {
-                    return;
-                }
-                std::vector<std::string> list;
-                for (const QString& key : disabled) {
-                    list.push_back(key.toStdString());
-                }
-                Settings::values.disabled_addons[program_id] = std::move(list);
-                Common::FS::RemoveFile(Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) /
-                                       "game_list" / fmt::format("{:016X}.pv.txt", program_id));
-                add_ons_changed = true;
-                emit SaveConfig();
+                const GameDetailsInfo& game = details_panel->Game();
+                ApplyDisabledAddOns(game.program_id, game.path, disabled);
             });
     connect(details_panel, &GameDetailsPanel::FavoriteToggled, this,
             [this] { ToggleFavorite(details_panel->Game().program_id); });
@@ -811,6 +841,123 @@ void GameList::SetupGameDetails() {
     // A saved or removed banner changes the backdrop pixels without changing the centered game.
     connect(details_panel, &GameDetailsPanel::HeroChanged, this,
             [this](u64) { surface->RefreshBanner(); });
+
+    SetupHub();
+}
+
+void GameList::SetupHub() {
+    CarouselHub* hub = carousel_view->Hub();
+    connect(hub, &CarouselHub::PlayRequested, this, [this] {
+        if (const QModelIndex index = carousel_view->CenteredIndex(); index.isValid()) {
+            ValidateEntry(index);
+        }
+    });
+    connect(hub, &CarouselHub::FavoriteToggled, this,
+            [this, hub] { ToggleFavorite(hub->Game().program_id); });
+    connect(hub, &CarouselHub::ConfigureRequested, this, [this, hub] {
+        const GameDetailsInfo& game = hub->Game();
+        emit OpenPerGameGeneralRequested(game.path.toStdString());
+        LoadGameDetailsExtras(game.program_id, game.path);
+    });
+    connect(hub, &CarouselHub::OpenLocationRequested, this, [this, hub] {
+        emit OpenDirectory(QFileInfo(hub->Game().path).absolutePath());
+    });
+    connect(hub, &CarouselHub::PrecompileShadersRequested, this, [this, hub] {
+        const GameDetailsInfo& game = hub->Game();
+        emit PrepareShaderWarmRequested(game.program_id, game.path.toStdString());
+        LoadGameDetailsExtras(game.program_id, game.path);
+    });
+    connect(hub, &CarouselHub::DisabledAddOnsChanged, this,
+            [this, hub](const QStringList& disabled) {
+                const GameDetailsInfo& game = hub->Game();
+                ApplyDisabledAddOns(game.program_id, game.path, disabled);
+            });
+    connect(hub, &CarouselHub::IconChanged, this, &GameList::UpdateGameIcon);
+    connect(hub, &CarouselHub::HeroChanged, this, [this](u64) { surface->RefreshBanner(); });
+    connect(hub, &CarouselHub::ExtrasNeeded, this, [this, hub] {
+        LoadGameDetailsExtras(hub->Game().program_id, hub->Game().path);
+    });
+    // The tiles always act on the centered game.
+    connect(carousel_view, &GameCarousel::CenteredGameChanged, this, [this, hub] {
+        if (const QModelIndex index = carousel_view->CenteredIndex(); index.isValid()) {
+            hub->SetGame(MakeDetailsInfo(index, false));
+        }
+    });
+    connect(qApp, &QApplication::focusChanged, this, [this] {
+        if (controller_used) {
+            UpdateControllerHints();
+        }
+    });
+}
+
+void GameList::ApplyDisabledAddOns(u64 program_id, const QString& path,
+                                   const QStringList& disabled) {
+    if (program_id == 0) {
+        return;
+    }
+    std::vector<std::string> list;
+    for (const QString& key : disabled) {
+        list.push_back(key.toStdString());
+    }
+    Settings::values.disabled_addons[program_id] = std::move(list);
+    Common::FS::RemoveFile(Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) /
+                           "game_list" / fmt::format("{:016X}.pv.txt", program_id));
+    emit SaveConfig();
+    RefreshAddOnsRow(program_id, path);
+}
+
+void GameList::RefreshAddOnsRow(u64 program_id, const QString& path) {
+    // Only this game's Add-ons column and version change; a full rescan would reload every row.
+    details_pool->start([guard = QPointer<GameList>(this), vfs_ = vfs, &system_ = system,
+                         program_id, path] {
+        const auto file = Core::GetGameFileFromPath(vfs_, path.toStdString());
+        const auto loader = file ? Loader::GetLoader(system_, file) : nullptr;
+        if (!loader) {
+            return;
+        }
+        const FileSys::PatchManager patch_manager{program_id, system_.GetFileSystemController(),
+                                                  system_.GetContentProvider()};
+        GameListPatchInfo info = ReadGameListPatchInfo(*loader, patch_manager);
+        QMetaObject::invokeMethod(qApp, [guard, program_id, info = std::move(info)] {
+            if (!guard) {
+                return;
+            }
+            static const QRegularExpression update_regex{
+                QStringLiteral(R"(^Update \(([0-9\.]+)\))")};
+            QString tooltip_version = tr("Version: 1.0.0");
+            for (const QString& line : info.add_ons.split(QLatin1Char('\n'))) {
+                if (const auto match = update_regex.match(line); match.hasMatch()) {
+                    tooltip_version = tr("Version: %1").arg(match.captured(1));
+                    break;
+                }
+            }
+            // The same game can appear under its directory and under Favorites.
+            const std::function<void(QStandardItem*)> visit = [&](QStandardItem* parent) {
+                for (int row = 0; row < parent->rowCount(); ++row) {
+                    QStandardItem* child = parent->child(row, 0);
+                    if (!child) {
+                        continue;
+                    }
+                    if (child->type() == static_cast<int>(GameListItemType::Game) &&
+                        child->data(GameListItemPath::ProgramIdRole).toULongLong() ==
+                            program_id) {
+                        child->setData(info.version, GameListItemPath::VersionRole);
+                        const QString tooltip = child->data(Qt::ToolTipRole).toString();
+                        child->setData(QStringLiteral("%1\n%2").arg(
+                                           tooltip.section(QLatin1Char('\n'), 0, 0),
+                                           tooltip_version),
+                                       Qt::ToolTipRole);
+                        if (QStandardItem* add_ons =
+                                parent->child(row, GameListModel::COLUMN_ADD_ONS)) {
+                            add_ons->setText(info.add_ons);
+                        }
+                    }
+                    visit(child);
+                }
+            };
+            visit(guard->item_model->invisibleRootItem());
+        });
+    });
 }
 
 void GameList::ShowGameDetailsForPath(const QString& path) {
@@ -866,6 +1013,11 @@ bool GameList::RevealPendingGame() {
     }
     m_currentView->setCurrentIndex(index);
     m_currentView->scrollTo(index);
+    // Back from a game, the carousel lands on its card, as a console's home screen does.
+    if (m_currentView == carousel_view) {
+        pending_details_path.clear();
+        return true;
+    }
     ShowGameDetails(index);
     return true;
 }
@@ -886,11 +1038,7 @@ void GameList::OnItemClicked(const QModelIndex& index) {
     click_timer->start(QApplication::doubleClickInterval());
 }
 
-void GameList::ShowGameDetails(const QModelIndex& index) {
-    const QModelIndex selected = index.sibling(index.row(), 0);
-    if (selected.data(GameListItem::TypeRole).value<GameListItemType>() != GameListItemType::Game) {
-        return;
-    }
+GameDetailsInfo GameList::MakeDetailsInfo(const QModelIndex& selected, bool with_icon) const {
     const auto column_text = [&](int column) {
         return selected.sibling(selected.row(), column).data(Qt::DisplayRole).toString().trimmed();
     };
@@ -908,6 +1056,9 @@ void GameList::ShowGameDetails(const QModelIndex& index) {
     info.size = column_text(GameListModel::COLUMN_SIZE);
     info.play_time = column_text(GameListModel::COLUMN_PLAY_TIME);
     info.favorite = UISettings::values.favorited_ids.contains(info.program_id);
+    if (!with_icon) {
+        return info;
+    }
     // Prefer the full-size custom icon; list icons are scaled down to the icon size setting.
     if (QtCommon::GameArt::HasIcon(info.program_id)) {
         info.icon.load(QtCommon::GameArt::IconPath(info.program_id));
@@ -915,22 +1066,34 @@ void GameList::ShowGameDetails(const QModelIndex& index) {
     if (info.icon.isNull()) {
         info.icon = selected.data(Qt::DecorationRole).value<QPixmap>();
     }
+    return info;
+}
 
+void GameList::ShowGameDetails(const QModelIndex& index) {
+    const QModelIndex selected = index.sibling(index.row(), 0);
+    if (selected.data(GameListItem::TypeRole).value<GameListItemType>() != GameListItemType::Game) {
+        return;
+    }
+    // The carousel shows its game's actions under the card instead of the sidebar.
+    if (m_currentView == carousel_view) {
+        carousel_view->Hub()->FocusTiles();
+        return;
+    }
+    const GameDetailsInfo info = MakeDetailsInfo(selected);
     details_index = selected;
     details_panel->SetGame(info);
-    LoadGameDetailsExtras();
+    LoadGameDetailsExtras(info.program_id, info.path);
     if (customize_panel->isVisible()) {
         ShowCustomizePanel(false);
     }
     SlidePanel(details_panel, details_animation, details_panel->PreferredWidth());
 }
 
-void GameList::LoadGameDetailsExtras() {
-    const GameDetailsInfo& game = details_panel->Game();
-    const u64 program_id = game.program_id;
-    const QString path = game.path;
+void GameList::LoadGameDetailsExtras(u64 program_id, const QString& path) {
     if (program_id == 0) {
-        details_panel->SetExtras(GameDetailsExtras{.program_id = program_id, .path = path});
+        const GameDetailsExtras empty{.program_id = program_id, .path = path};
+        details_panel->SetExtras(empty);
+        carousel_view->Hub()->SetExtras(empty);
         return;
     }
 
@@ -994,8 +1157,10 @@ void GameList::LoadGameDetailsExtras() {
             fmt::format("{:016X}.ini", program_id));
 
         QMetaObject::invokeMethod(qApp, [guard, extras = std::move(extras)] {
+            // Each view ignores extras for a game it does not show.
             if (guard) {
                 guard->details_panel->SetExtras(extras);
+                guard->carousel_view->Hub()->SetExtras(extras);
             }
         });
     });
@@ -1006,11 +1171,6 @@ void GameList::HideGameDetails() {
     details_index = QPersistentModelIndex{};
     details_timer->stop();
     SlidePanel(details_panel, details_animation, 0);
-    // The Add-ons column only picks up toggles made in the sidebar on a rescan.
-    if (add_ons_changed) {
-        add_ons_changed = false;
-        RefreshGameDirectory();
-    }
 }
 
 void GameList::UpdateGameIcon(u64 program_id) {
@@ -1287,6 +1447,9 @@ void GameList::ToggleFavorite(u64 program_id) {
     item_model->ToggleFavorite(program_id);
     if (details_panel && details_panel->Game().program_id == program_id) {
         details_panel->SetFavorite(UISettings::values.favorited_ids.contains(program_id));
+    }
+    if (CarouselHub* hub = carousel_view->Hub(); hub->Game().program_id == program_id) {
+        hub->SetFavorite(UISettings::values.favorited_ids.contains(program_id));
     }
 
     if (UISettings::values.favorited_ids.contains(program_id)) {
@@ -1662,6 +1825,13 @@ bool GameList::eventFilter(QObject* obj, QEvent* event) {
         case Qt::Key_Escape:
             if (details_panel->isVisible()) {
                 HideGameDetails();
+                return true;
+            }
+            break;
+        // The Menu key, and controller +: the game's options.
+        case Qt::Key_Menu:
+            if (m_currentView->currentIndex().isValid()) {
+                ShowGameDetails(m_currentView->currentIndex());
                 return true;
             }
             break;

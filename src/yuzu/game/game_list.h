@@ -43,6 +43,7 @@ enum class StartGameType;
 
 class GameCarousel;
 class GameDetailsPanel;
+struct GameDetailsInfo;
 class HomeBackground;
 class HomeCustomizePanel;
 class HomeSidePanel;
@@ -187,7 +188,14 @@ private:
     void SetHomeBackground(const QString& path);
     void RemoveRecentBackground(const QString& path);
     void UpdateViewTransparency();
-    void LoadGameDetailsExtras();
+    void LoadGameDetailsExtras(u64 program_id, const QString& path);
+    GameDetailsInfo MakeDetailsInfo(const QModelIndex& selected, bool with_icon = true) const;
+    /// Wires the carousel's action tiles, which take the sidebar's place in that view.
+    void SetupHub();
+    void ApplyDisabledAddOns(u64 program_id, const QString& path, const QStringList& disabled);
+    /// Re-reads one game's add-ons into its rows instead of rescanning the whole list.
+    void RefreshAddOnsRow(u64 program_id, const QString& path);
+    void UpdateControllerHints();
     /// Docks the sidebars beside the games, or lays them over the games on narrow windows.
     void UpdatePanelPlacement();
     void RefreshCustomizeButtonIcon();
@@ -213,7 +221,8 @@ private:
     QTimer* click_timer = nullptr;
     QPersistentModelIndex clicked_index;
     QThreadPool* details_pool = nullptr;
-    bool add_ons_changed = false;
+    QLabel* controller_hints = nullptr;
+    bool controller_used = false;
     bool panels_overlay = false;
     QString pending_details_path;
 

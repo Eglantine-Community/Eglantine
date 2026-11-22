@@ -4,21 +4,16 @@
 #include "yuzu/game/carousel.h"
 
 #include <QEasingCurve>
-#include <QHBoxLayout>
 #include <QAccessible>
 #include <QApplication>
 #include <QImage>
-#include <QLabel>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
 #include <QPixmapCache>
 #include <QPolygonF>
-#include <QPushButton>
 #include <QScrollBar>
-#include <QStyle>
 #include <QTimer>
-#include <QToolButton>
 #include <QTransform>
 #include <QVariantAnimation>
 #include <QWheelEvent>
@@ -31,6 +26,7 @@
 #include "qt_common/game_list/game_list_p.h"
 #include "qt_common/game_list/model.h"
 #include "qt_common/util/game_art.h"
+#include "yuzu/game/carousel_hub.h"
 #include "yuzu/game/common.h"
 #include "yuzu/game/game_card.h"
 
@@ -39,8 +35,11 @@ namespace {
 constexpr int SideGap = 16;
 /// Room under the centered card for its title, when game names are shown.
 constexpr int TitleReserve = 36;
-/// Room under the title for the pager row, which is always shown.
-constexpr int PagerReserve = 44;
+/// Room for the line under the title: play time and the position in the list.
+constexpr int InfoReserve = 24;
+/// The gap above the line when no title is shown, and below the hub.
+constexpr int SmallGap = 6;
+constexpr int HubMargin = 16;
 constexpr int MinCenterSize = 160;
 /// The narrowest a stacked card may peek past the one in front of it. Below this the stack
 /// shows fewer cards instead of slivers nobody can recognise.
@@ -264,10 +263,11 @@ struct CarouselMetrics {
     bool names = false;
 };
 
-CarouselMetrics MetricsFor(const QSize& area) {
+/// `hub` is the height the action tiles and their panel take under the info line.
+CarouselMetrics MetricsFor(const QSize& area, int hub) {
     CarouselMetrics m;
     m.names = UISettings::values.show_game_name.GetValue();
-    const qreal title = (m.names ? TitleReserve : 0.0) + PagerReserve;
+    const qreal title = (m.names ? TitleReserve : SmallGap) + InfoReserve + hub;
     // The stored index picks a share of the available height; anything out of range reads as
     // full, so a stale value can never shrink the card away.
     const auto fractions = GameCarousel::CardSizeFractions;
@@ -389,6 +389,33 @@ void DrawTitle(QPainter& p, const QModelIndex& index, const CarouselMetrics& m,
     p.drawText(QRectF(slot.center().x() - text_width / 2.0, slot.bottom() + 6, text_width,
                       TitleReserve - 6),
                Qt::AlignHCenter | Qt::AlignTop, line);
+    p.setFont(base_font);
+}
+
+/// The play time and the card's place in the list, under the title.
+void DrawInfo(QPainter& p, const QModelIndex& index, const CarouselMetrics& m,
+              const QPalette& pal, int position, int count) {
+    QStringList parts;
+    const QString play_time = index.sibling(index.row(), GameListModel::COLUMN_PLAY_TIME)
+                                  .data(Qt::DisplayRole)
+                                  .toString()
+                                  .trimmed();
+    if (!play_time.isEmpty()) {
+        parts << play_time;
+    }
+    parts << QStringLiteral("%1 / %2").arg(position + 1).arg(count);
+    const QFont base_font = p.font();
+    QFont font = base_font;
+    font.setPixelSize(std::max(12, TitleFont(base_font, m).pixelSize() * 3 / 4));
+    p.setFont(font);
+    QColor muted = pal.color(QPalette::Text);
+    muted.setAlpha(170);
+    p.setPen(muted);
+    const QRectF slot = CardRect(0.0, m);
+    const qreal width = m.card_w * 1.4;
+    p.drawText(QRectF(slot.center().x() - width / 2.0,
+                      slot.bottom() + (m.names ? TitleReserve : SmallGap), width, InfoReserve),
+               Qt::AlignHCenter | Qt::AlignTop, parts.join(QStringLiteral("  \u00B7  ")));
     p.setFont(base_font);
 }
 
@@ -611,54 +638,11 @@ GameCarousel::GameCarousel(QWidget* parent) : QListView{parent} {
     });
     setAccessibleName(tr("Games"));
 
-    m_pager = new QWidget(viewport());
-    auto* pager_layout = new QHBoxLayout(m_pager);
-    pager_layout->setContentsMargins(0, 0, 0, 0);
-    pager_layout->setSpacing(6);
-    m_pager_left = new QWidget(m_pager);
-    m_pager_right = new QWidget(m_pager);
-    m_play_time = new QLabel(m_pager);
-    m_play_time->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-    m_prev = new QToolButton(m_pager);
-    m_prev->setArrowType(Qt::LeftArrow);
-    m_prev->setAutoRaise(true);
-    m_prev->setFocusPolicy(Qt::TabFocus);
-    m_count = new QLabel(m_pager);
-    m_count->setAlignment(Qt::AlignCenter);
-    m_next = new QToolButton(m_pager);
-    m_next->setArrowType(Qt::RightArrow);
-    m_next->setAutoRaise(true);
-    m_next->setFocusPolicy(Qt::TabFocus);
-    m_play = new QPushButton(m_pager);
-    m_play->setIcon(style()->standardIcon(QStyle::SP_MediaPlay, nullptr, m_play));
-    m_play->setFocusPolicy(Qt::TabFocus);
-    m_play->setDefault(true);
-    auto* left_layout = new QHBoxLayout(m_pager_left);
-    left_layout->setContentsMargins(0, 0, 0, 0);
-    left_layout->setSpacing(6);
-    left_layout->addStretch();
-    left_layout->addWidget(m_play_time);
-    left_layout->addSpacing(6);
-    left_layout->addWidget(m_prev);
-    auto* right_layout = new QHBoxLayout(m_pager_right);
-    right_layout->setContentsMargins(0, 0, 0, 0);
-    right_layout->setSpacing(6);
-    right_layout->addWidget(m_next);
-    right_layout->addSpacing(6);
-    right_layout->addWidget(m_play);
-    right_layout->addStretch();
-    pager_layout->addWidget(m_pager_left);
-    pager_layout->addWidget(m_count);
-    pager_layout->addWidget(m_pager_right);
-    connect(m_prev, &QToolButton::clicked, this, [this] { Step(-1); });
-    connect(m_next, &QToolButton::clicked, this, [this] { Step(1); });
-    connect(m_play, &QPushButton::clicked, this, [this] {
-        if (!m_visible.empty() && model()) {
-            emit LaunchRequested(model()->index(m_visible[CurrentPosition()], 0));
-        }
-    });
-    RetranslatePager();
-    RefreshPagerPalette();
+    m_hub = new CarouselHub(viewport());
+    m_hub->hide();
+    connect(m_hub, &CarouselHub::HeightChanged, viewport(), qOverload<>(&QWidget::update));
+    connect(m_hub, &CarouselHub::ExitRequested, this,
+            [this] { setFocus(Qt::OtherFocusReason); });
 }
 
 void GameCarousel::SetModel(GameListModel* model) {
@@ -796,7 +780,7 @@ void GameCarousel::MoveTo(int position, int duration_ms) {
     // The card settling into the center slot swaps to the center-sized icon; warm it now so
     // the last frame of the slide does not hitch on its first resample.
     if (model() && position >= 0 && position < int(m_visible.size())) {
-        const CarouselMetrics metrics = MetricsFor(viewport()->size());
+        const CarouselMetrics metrics = MetricsFor(viewport()->size(), HubReserve());
         ScaledCardIcon(model()->index(m_visible[position], 0), SizeBucketOf(metrics.card_w),
                        devicePixelRatioF(), MaxCenterSourcePx);
     }
@@ -836,16 +820,16 @@ void GameCarousel::ScheduleRelayout() {
 void GameCarousel::paintEvent(QPaintEvent*) {
     QPainter p(viewport());
     if (m_visible.empty() || !model()) {
-        m_pager->hide();
+        m_hub->hide();
         return;
     }
     p.setRenderHint(QPainter::Antialiasing);
     p.setRenderHint(QPainter::SmoothPixmapTransform);
 
-    const CarouselMetrics m = MetricsFor(viewport()->size());
-    // Every state change that matters to the pager repaints the strip, so it follows here.
-    // The setters are no-ops when nothing changed, so this does not repaint in a loop.
-    SyncPager();
+    const CarouselMetrics m = MetricsFor(viewport()->size(), HubReserve());
+    // Every change that moves the hub repaints the strip, so it follows here. Its geometry is
+    // only set when it changed, so this does not repaint in a loop.
+    SyncHub();
     const bool borders = UISettings::values.game_icon_borders.GetValue();
     const bool focused = hasFocus();
     const qreal dpr = p.device() ? p.device()->devicePixelRatio() : 1.0;
@@ -894,17 +878,20 @@ void GameCarousel::paintEvent(QPaintEvent*) {
                  center_bucket, stack_bucket, alpha, hovered ? HoverFogScale : 1.0);
     }
 
-    if (m.names) {
-        // The title belongs to the card settling into the center slot and fades with it.
-        const auto nearest = std::min_element(
-            cards.begin(), cards.end(), [](const Card& a, const Card& b) {
-                return std::abs(a.depth) < std::abs(b.depth);
-            });
-        if (nearest != cards.end() && std::abs(nearest->depth) < 0.5) {
-            p.setOpacity(std::max<qreal>(0.0, 1.0 - 2.0 * std::abs(nearest->depth)));
-            DrawTitle(p, model()->index(m_visible[nearest->position], 0), m, palette());
-            p.setOpacity(1.0);
+    // The title and the info line belong to the card settling into the center slot and fade
+    // with it.
+    const auto nearest =
+        std::min_element(cards.begin(), cards.end(), [](const Card& a, const Card& b) {
+            return std::abs(a.depth) < std::abs(b.depth);
+        });
+    if (nearest != cards.end() && std::abs(nearest->depth) < 0.5) {
+        const QModelIndex index = model()->index(m_visible[nearest->position], 0);
+        p.setOpacity(std::max<qreal>(0.0, 1.0 - 2.0 * std::abs(nearest->depth)));
+        if (m.names) {
+            DrawTitle(p, index, m, palette());
         }
+        DrawInfo(p, index, m, palette(), nearest->position, int(m_visible.size()));
+        p.setOpacity(1.0);
     }
 }
 
@@ -912,7 +899,7 @@ QModelIndex GameCarousel::indexAt(const QPoint& point) const {
     if (m_visible.empty() || !model()) {
         return {};
     }
-    const CarouselMetrics m = MetricsFor(viewport()->size());
+    const CarouselMetrics m = MetricsFor(viewport()->size(), HubReserve());
     // The cartridge slot carries a transparent margin around the solid body, and the next
     // card's art shows through it: hit-test the body, or a click on what looks like the
     // neighbour's cartridge lands on the centered card's empty margin and selects nothing.
@@ -946,7 +933,7 @@ QRect GameCarousel::visualRect(const QModelIndex& index) const {
     if (position < 0) {
         return {};
     }
-    const CarouselMetrics m = MetricsFor(viewport()->size());
+    const CarouselMetrics m = MetricsFor(viewport()->size(), HubReserve());
     return CardRect(position - m_position, m).toAlignedRect();
 }
 
@@ -1121,85 +1108,52 @@ bool GameCarousel::viewportEvent(QEvent* event) {
     return QListView::viewportEvent(event);
 }
 
-void GameCarousel::changeEvent(QEvent* event) {
-    if (event->type() == QEvent::LanguageChange) {
-        RetranslatePager();
-    } else if (event->type() == QEvent::PaletteChange) {
-        RefreshPagerPalette();
-    }
-    QListView::changeEvent(event);
+CarouselHub* GameCarousel::Hub() const {
+    return m_hub;
 }
 
-void GameCarousel::RetranslatePager() {
-    m_prev->setToolTip(tr("Previous game"));
-    m_prev->setAccessibleName(tr("Previous game"));
-    m_next->setToolTip(tr("Next game"));
-    m_next->setAccessibleName(tr("Next game"));
-    m_play->setText(tr("Play"));
-}
-
-void GameCarousel::RefreshPagerPalette() {
-    // Muted like the details panel's secondary text.
-    QPalette pal = m_play_time->palette();
-    QColor muted = palette().color(QPalette::WindowText);
-    muted.setAlpha(170);
-    pal.setColor(QPalette::WindowText, muted);
-    m_play_time->setPalette(pal);
-}
-
-void GameCarousel::Step(int direction) {
+QModelIndex GameCarousel::CenteredIndex() const {
     if (m_visible.empty() || !model()) {
+        return {};
+    }
+    return model()->index(m_visible[CurrentPosition()], 0);
+}
+
+int GameCarousel::HubReserve() const {
+    return m_hub->ReservedHeight() + SmallGap;
+}
+
+void GameCarousel::SyncHub() {
+    if (m_visible.empty() || !model()) {
+        m_hub->hide();
         return;
     }
-    const int target =
-        std::clamp(CurrentPosition() + direction, 0, int(m_visible.size()) - 1);
-    setCurrentIndex(model()->index(m_visible[target], 0));
-}
-
-void GameCarousel::SyncPager() {
-    if (m_visible.empty() || !model()) {
-        m_pager->hide();
-        return;
-    }
-    const int position = CurrentPosition();
-    const int count = int(m_visible.size());
-    const QModelIndex index = model()->index(m_visible[position], 0);
-    const QString play_time = index.sibling(index.row(), GameListModel::COLUMN_PLAY_TIME)
-                                  .data(Qt::DisplayRole)
-                                  .toString()
-                                  .trimmed();
-    // An empty play time keeps its room, so the arrows and Play stay under the cursor.
-    m_play_time->setText(play_time);
-    m_count->setText(QStringLiteral("%1 / %2").arg(position + 1).arg(count));
-    // Wide enough for the largest position, so the arrows do not shift while stepping.
-    m_count->setMinimumWidth(m_count->fontMetrics().horizontalAdvance(
-        QStringLiteral("%1 / %1").arg(count)));
-    // Both side columns get the room the wider one needs at most: the longest play time
-    // (hours can pass 999) on the left, Play on the right.
-    const int spacing = 12;
-    const int left_needed =
-        m_play_time->fontMetrics().horizontalAdvance(QStringLiteral("0000:00:00")) + spacing +
-        m_prev->sizeHint().width();
-    const int right_needed = m_next->sizeHint().width() + spacing + m_play->sizeHint().width();
-    const int side = std::max(left_needed, right_needed);
-    if (m_pager_left->minimumWidth() != side) {
-        m_pager_left->setFixedWidth(side);
-        m_pager_right->setFixedWidth(side);
-    }
-    m_prev->setEnabled(position > 0);
-    m_next->setEnabled(position < count - 1);
-
-    const CarouselMetrics m = MetricsFor(viewport()->size());
+    m_hub->SetAvailableHeight(viewport()->height());
+    const CarouselMetrics m = MetricsFor(viewport()->size(), HubReserve());
     const QRectF slot = CardRect(0.0, m);
-    const qreal title_h = m.names ? TitleReserve : 0.0;
-    const QSize size = m_pager->sizeHint();
-    const QRect geometry(qRound(slot.center().x() - size.width() / 2.0),
-                         qRound(slot.bottom() + title_h + (PagerReserve - size.height()) / 2.0),
-                         size.width(), size.height());
-    if (m_pager->geometry() != geometry) {
-        m_pager->setGeometry(geometry);
+    const int top = qRound(slot.bottom() + (m.names ? TitleReserve : SmallGap) + InfoReserve);
+    const QRect geometry(HubMargin, top, std::max(0, viewport()->width() - 2 * HubMargin),
+                         m_hub->ReservedHeight());
+    if (m_hub->geometry() != geometry) {
+        m_hub->setGeometry(geometry);
     }
-    m_pager->show();
+    m_hub->show();
+}
+
+void GameCarousel::keyPressEvent(QKeyEvent* event) {
+    // Down leaves the cards for the game's action tiles below them; nothing sits above.
+    if (event->key() == Qt::Key_Down && m_hub->isVisible()) {
+        m_hub->FocusTiles();
+        return;
+    }
+    if (event->key() == Qt::Key_Up) {
+        return;
+    }
+    if (event->key() == Qt::Key_Escape && m_hub->PanelOpen()) {
+        m_hub->ClosePanel();
+        return;
+    }
+    QListView::keyPressEvent(event);
 }
 
 void GameCarousel::mousePressEvent(QMouseEvent* event) {
@@ -1232,7 +1186,7 @@ void GameCarousel::mouseMoveEvent(QMouseEvent* event) {
         UpdateHover(pos);
         return;
     }
-    const CarouselMetrics m = MetricsFor(viewport()->size());
+    const CarouselMetrics m = MetricsFor(viewport()->size(), HubReserve());
     if (!m_dragging) {
         if (std::abs(pos.x() - m_press_pos.x()) < QApplication::startDragDistance()) {
             return;
@@ -1333,9 +1287,9 @@ void GameCarousel::mouseReleaseEvent(QMouseEvent* event) {
         // A side card, or one still sliding in: bring it to the center, nothing more.
         setCurrentIndex(index);
         UpdateHover(pos);
-        return;
     }
-    emit clicked(index);
+    // The centered card is already the selection: a click on it does nothing more. Options
+    // opens its page, a double-click or Play starts it.
 }
 
 void GameCarousel::mouseDoubleClickEvent(QMouseEvent* event) {
