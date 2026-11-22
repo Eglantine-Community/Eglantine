@@ -289,8 +289,11 @@ enum class SparseTilesMode {
 // The most device memory one SparseLayers image binds: 768 MiB, 384 MiB on GPUs with less than
 // 7 GiB (title 1's BC6H arrays are 85 MB a layer).
 [[nodiscard]] VkDeviceSize SparseLayersCap(const Device& device) {
-    return device.GetDeviceLocalMemory() < (u64{7} << 30) ? (VkDeviceSize{384} << 20)
-                                                           : (VkDeviceSize{768} << 20);
+    const u64 local = device.GetDeviceLocalMemory();
+    if (local <= (u64{3} << 30)) {
+        return VkDeviceSize{192} << 20;
+    }
+    return local < (u64{7} << 30) ? (VkDeviceSize{384} << 20) : (VkDeviceSize{768} << 20);
 }
 
 // The host format of a huge ASTC array: the GPU decoder's RGBA8 (sRGB kept for sampling).
@@ -357,7 +360,11 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
     if (forced != 0) {
         return forced;
     }
-    return device.GetDeviceLocalMemory() < (u64{7} << 30) ? (u64{256} << 20) : (u64{512} << 20);
+    const u64 local = device.GetDeviceLocalMemory();
+    if (local <= (u64{3} << 30)) {
+        return u64{128} << 20;
+    }
+    return local < (u64{7} << 30) ? (u64{256} << 20) : (u64{512} << 20);
 }
 
 // The host shape of an image whose decoded copy would not fit in VRAM: a GPU-decoded ASTC array
@@ -3000,29 +3007,7 @@ void TextureCacheRuntime::TickFrame() {
         }
     }
     static constexpr u32 MAX_UNUSED_SCRATCH_FRAMES = 60;
-    // Finished decode images wait for the next texture of their shape, up to this much memory.
-    static constexpr u64 MaxFreeTranscodeBytes = u64{256} << 20;
-    const auto decode_bytes = [](const PendingTranscode& t) {
-        u64 bytes{};
-        for (u32 level = 0; level < t.levels; ++level) {
-            bytes += u64{(std::max)(t.width >> level, 1U)} * (std::max)(t.height >> level, 1U) * 4;
-        }
-        return bytes * t.layers;
-    };
-    u64 free_bytes{};
-    for (const PendingTranscode& t : free_transcodes) {
-        free_bytes += decode_bytes(t);
-    }
-    while (!pending_transcodes.empty() && scheduler.IsFree(pending_transcodes.front().tick)) {
-        PendingTranscode& done = pending_transcodes.front();
-        const u64 bytes = decode_bytes(done);
-        if (free_bytes + bytes <= MaxFreeTranscodeBytes) {
-            done.unused_frames = 0;
-            free_bytes += bytes;
-            free_transcodes.push_back(std::move(done));
-        }
-        pending_transcodes.pop_front();
-    }
+    RecycleTranscodes();
     std::erase_if(free_transcodes, [](PendingTranscode& t) {
         return ++t.unused_frames > MAX_UNUSED_SCRATCH_FRAMES;
     });
@@ -5055,6 +5040,36 @@ void TextureCacheRuntime::AccelerateImageUploadLayers(
     astc_decoder_pass->AssembleLayers(image, map, swizzles, layers);
 }
 
+u64 TextureCacheRuntime::TranscodeDecodeBytes(const PendingTranscode& t) {
+    u64 bytes{};
+    for (u32 level = 0; level < t.levels; ++level) {
+        bytes += u64{(std::max)(t.width >> level, 1U)} * (std::max)(t.height >> level, 1U) * 4;
+    }
+    return bytes * t.layers;
+}
+
+void TextureCacheRuntime::RecycleTranscodes() {
+    // Finished decode images wait for the next texture of their shape, up to this much memory;
+    // the rest are destroyed, which returns their video memory.
+    const bool small_vram =
+        device.IsIntegrated() || device.GetDeviceLocalMemory() <= (u64{4} << 30);
+    const u64 max_free_bytes = small_vram ? (u64{32} << 20) : (u64{256} << 20);
+    u64 free_bytes{};
+    for (const PendingTranscode& t : free_transcodes) {
+        free_bytes += TranscodeDecodeBytes(t);
+    }
+    while (!pending_transcodes.empty() && scheduler.IsFree(pending_transcodes.front().tick)) {
+        PendingTranscode& done = pending_transcodes.front();
+        const u64 bytes = TranscodeDecodeBytes(done);
+        if (free_bytes + bytes <= max_free_bytes) {
+            done.unused_frames = 0;
+            free_bytes += bytes;
+            free_transcodes.push_back(std::move(done));
+        }
+        pending_transcodes.pop_front();
+    }
+}
+
 void TextureCacheRuntime::TranscodeAstcToBcn(
     Image& image, const StagingBufferRef& map,
     std::span<const VideoCommon::SwizzleParameters> swizzles) {
@@ -5064,6 +5079,32 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     const u32 levels = static_cast<u32>(info.resources.levels);
     const u32 layers = static_cast<u32>(info.resources.layers);
     constexpr VkFormat DecodeFormat = VK_FORMAT_A8B8G8R8_UNORM_PACK32;
+    const bool small_vram =
+        device.IsIntegrated() || device.GetDeviceLocalMemory() <= (u64{4} << 30);
+    const u64 max_in_flight_bytes = small_vram ? (u64{128} << 20) : (u64{512} << 20);
+    RecycleTranscodes();
+    {
+        u64 in_flight{};
+        for (const PendingTranscode& t : pending_transcodes) {
+            in_flight += TranscodeDecodeBytes(t);
+        }
+        const u64 needed = (std::min)(
+            TranscodeDecodeBytes(PendingTranscode{
+                .tick = 0,
+                .image{},
+                .views{},
+                .width = width,
+                .height = height,
+                .levels = levels,
+                .layers = layers,
+                .unused_frames = 0,
+            }),
+            u64{64} << 20);
+        if (!pending_transcodes.empty() && in_flight + needed > max_in_flight_bytes) {
+            scheduler.Wait(pending_transcodes.back().tick);
+            RecycleTranscodes();
+        }
+    }
     // A decode image of the same shape the GPU is done with: title 1's title screen decodes
     // dozens of textures a frame, mostly of a few shapes. Making one took 263 us; from VMA's
     // shared blocks 90 us, but freeing them there left ~1 GB of those blocks unused.

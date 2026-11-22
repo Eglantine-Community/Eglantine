@@ -30,6 +30,11 @@
 #include "common/env_gate.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
+#include "common/literals.h"
+#include "common/memory_detect.h"
 #include "common/scope_exit.h"
 #include "common/thread_worker.h"
 #include "core/core.h"
@@ -76,6 +81,12 @@
 namespace Vulkan {
 
 namespace {
+void TrimHostHeapIfSupported() noexcept {
+#if defined(__GLIBC__)
+    malloc_trim(0);
+#endif
+}
+
 using Shader::Backend::SPIRV::EmitSPIRV;
 using Shader::Maxwell::ConvertLegacyToGeneric;
 using Shader::Maxwell::GenerateGeometryPassthrough;
@@ -379,9 +390,13 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
     return info;
 }
 
-size_t GetTotalPipelineWorkers() {
-    const size_t max_core_threads =
-        std::max<size_t>(static_cast<size_t>(std::thread::hardware_concurrency()), 2ULL) - 1ULL;
+size_t GetTotalPipelineWorkers(const Device& device) {
+    if (const char* const forced = std::getenv("EDEN_NX2_PIPELINE_WORKERS")) {
+        return std::clamp<size_t>(static_cast<size_t>(std::strtoull(forced, nullptr, 10)), 1, 32);
+    }
+    const size_t hw_threads =
+        std::max<size_t>(static_cast<size_t>(std::thread::hardware_concurrency()), 2ULL);
+    const size_t max_core_threads = hw_threads - 1ULL;
 #ifdef __ANDROID__
     const int configured = AndroidSettings::values.pipeline_worker_count.GetValue();
     const int clamped = std::clamp(configured, 2, 8);
@@ -391,6 +406,12 @@ size_t GetTotalPipelineWorkers() {
     }
     return std::min(max_core_threads, desired);
 #else
+    using namespace Common::Literals;
+    const u64 host_ram = Common::GetMemInfo().TotalPhysicalMemory;
+    if (device.IsIntegrated() || (host_ram != 0 && host_ram <= 18_GiB)) {
+        // Concurrent driver shader builds spike >100 MiB each and starve CPU cores on APUs.
+        return std::clamp<size_t>(hw_threads / 3, 2, 4);
+    }
     return max_core_threads;
 #endif
 }
@@ -476,7 +497,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
       use_asynchronous_shaders{Settings::values.use_asynchronous_shaders.GetValue()},
       use_vulkan_pipeline_cache{Settings::values.use_vulkan_driver_pipeline_cache.GetValue() &&
                                 !DriverCachesPipelines(device_)},
-      workers(device.HasBrokenParallelShaderCompiling() ? 1ULL : GetTotalPipelineWorkers(),
+      workers(device.HasBrokenParallelShaderCompiling() ? 1ULL : GetTotalPipelineWorkers(device_),
               "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
       disk_replay_workers(device.HasBrokenParallelShaderCompiling() ? 1ULL : 2ULL,
                           "VkDiskPipelineReplay", {}, Common::ThreadPlacement::Background),
@@ -494,7 +515,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         } else {
             // As many as the driver compile workers. Both run below normal priority, so a burst
             // of new pipelines takes idle cores without slowing the emulated CPU and GPU threads.
-            num_translation_threads = GetTotalPipelineWorkers();
+            num_translation_threads = GetTotalPipelineWorkers(device);
         }
         translation_wait = MillisecondsFromEnv("EDEN_NX2_ASYNC_TRANSLATION_WAIT_MS", 2.0);
         translation_frame_budget = MillisecondsFromEnv("EDEN_NX2_ASYNC_TRANSLATION_FRAME_MS", 4.0);
@@ -781,9 +802,17 @@ bool BackgroundPipelinesEnabled() {
     return enabled;
 }
 
-size_t BackgroundPipelineThreads() {
+size_t BackgroundPipelineThreads(const Device& device) {
     if (const char* value = std::getenv("EDEN_NX2_BACKGROUND_PIPELINE_THREADS")) {
         return std::clamp<size_t>(static_cast<size_t>(std::strtoull(value, nullptr, 10)), 1, 16);
+    }
+    using namespace Common::Literals;
+    if (device.IsIntegrated()) {
+        return 1;
+    }
+    const u64 host_ram = Common::GetMemInfo().TotalPhysicalMemory;
+    if (host_ram != 0 && host_ram <= 18_GiB) {
+        return std::clamp<size_t>(std::thread::hardware_concurrency() / 6, 1, 2);
     }
     return std::clamp<size_t>(std::thread::hardware_concurrency() / 4, 1, 6);
 }
@@ -1465,7 +1494,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     }
 
     if (!deferred_graphics.empty() && !stop_loading.stop_requested()) {
-        const size_t threads = BackgroundPipelineThreads();
+        const size_t threads = BackgroundPipelineThreads(device);
         LOG_INFO(Render_Vulkan,
                  "Building {} cached graphics pipelines in the background ({} threads)",
                  deferred_graphics.size(), threads);
@@ -2043,6 +2072,14 @@ void PipelineCache::TickFrame() {
             over_budget_mesh = 0;
         }
     }
+    static const bool low_host_ram = [] {
+        using namespace Common::Literals;
+        const u64 host_ram = Common::GetMemInfo().TotalPhysicalMemory;
+        return host_ram != 0 && host_ram <= 18_GiB;
+    }();
+    if (low_host_ram && frame_count % 1800 == 0) {
+        TrimHostHeapIfSupported();
+    }
 }
 
 void PipelineCache::EvictUnusedPipelines() {
@@ -2055,11 +2092,15 @@ void PipelineCache::EvictUnusedPipelines() {
     // with every place a session went (title 1: 1,500 on its title screen alone). One unused for
     // this long is destroyed; rebuilding it later requires a full GPU-thread shader translation
     // (~8.5 ms each) plus a driver pipeline cache hit.
-    constexpr u64 EvictAfterFrames = 9000;
-    if (frame_count <= EvictAfterFrames) {
+    static const u64 evict_after_frames = [this] {
+        using namespace Common::Literals;
+        const u64 host_ram = Common::GetMemInfo().TotalPhysicalMemory;
+        return (device.IsIntegrated() || (host_ram != 0 && host_ram <= 18_GiB)) ? 3600ULL : 9000ULL;
+    }();
+    if (frame_count <= evict_after_frames) {
         return;
     }
-    const u64 cutoff = frame_count - EvictAfterFrames;
+    const u64 cutoff = frame_count - evict_after_frames;
     const u64 tick = scheduler.CurrentTick();
     // Nx2Perf pipeline_keep_preloaded (on by default): the ones built at boot from the used list
     // that this session has not drawn with yet keep LastUse() == 0; they are kept, not evicted
@@ -2106,7 +2147,8 @@ void PipelineCache::EvictUnusedPipelines() {
     skipped_geometry = {};
     last_skipped_geometry_frame = ~u64{};
     LOG_INFO(Render_Vulkan, "Evicted {} graphics pipelines unused for {} frames, {} left", evicted,
-             EvictAfterFrames, graphics_cache.size());
+             evict_after_frames, graphics_cache.size());
+    TrimHostHeapIfSupported();
 }
 
 std::unique_ptr<GraphicsPipeline> PipelineCache::TakeBackgroundPipeline(
@@ -2212,7 +2254,7 @@ void PipelineCache::StartShaderPrecache(u64 title_id) {
         write_marker();
         return;
     }
-    const size_t threads = BackgroundPipelineThreads();
+    const size_t threads = BackgroundPipelineThreads(device);
     LOG_INFO(Render_Vulkan,
              "Shader precache: building {} of {} compute programs in the background ({} threads)",
              programs.size(), entries, threads);
