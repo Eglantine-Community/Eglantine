@@ -3,4 +3,4 @@
 // installed is handed to it here instead of being guessed from the loader search path.
 #pragma once
 
-#define RENHDRUM_LIBRARY_PATH "@RENHDRUM_LIBRARY_PATH@"
+#define RENHDRUM_LIBRARY_PATH "@RENHDRUM_LIBRARY_PATH_ESCAPED@"

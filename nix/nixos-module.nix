@@ -8,6 +8,7 @@
 # Usage:
 #   inputs.eglantine.url = "github:Octelly/Eglantine";
 #   nixpkgs.overlays = [ inputs.eglantine.overlays.default ];
+#   imports = [ inputs.eglantine.nixosModules.default ];
 #   programs.eglantine.enable = true;
 #
 # The default package is `pkgs.eglantine`, which the overlay provides. Set

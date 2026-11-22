@@ -1128,13 +1128,16 @@ Result IHidServer::SendVibrationValuesInMode(
     InArray<Core::HID::VibrationValue, BufferAttr_HipcPointer> vibration_values) {
     LOG_DEBUG(Service_HID, "called, mode={}, applet_resource_user_id={}", mode, aruid.pid);
 
-    // Mode 2 is the Switch 2 translation RenHDrum applies; every other value plays as Switch 1.
-    Settings::values.nx2_active_mode.store(mode == 2 ? 2 : 0, std::memory_order_relaxed);
-
     // Unlike 206 this never fails: rumble is best effort and the command is only known from
     // captures, so an unexpected handle or layout shouldn't return an error a game may treat as
     // fatal.
     const auto count = (std::min)(vibration_handles.size(), vibration_values.size());
+    if (count > 0) {
+        // Mode 2 is the Switch 2 translation RenHDrum applies; every other value plays as
+        // Switch 1. Only a request that delivers a sample sets it: an empty one must not
+        // change the translation a still-active Mode 2 stream is using.
+        Settings::values.nx2_active_mode.store(mode == 2 ? 2 : 0, std::memory_order_relaxed);
+    }
     for (std::size_t i = 0; i < count; i++) {
         const auto result = GetResourceManager()->SendVibrationValue(
             aruid.pid, vibration_handles[i], vibration_values[i]);

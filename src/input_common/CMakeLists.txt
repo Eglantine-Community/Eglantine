@@ -111,6 +111,11 @@ if (ENABLE_RENHDRUM AND NOT ANDROID)
             message(FATAL_ERROR
                 "RENHDRUM_LIBRARY_PATH does not exist: ${RENHDRUM_LIBRARY_PATH}")
         endif()
+        # The path lands inside a C++ string literal: escape what a literal cannot carry raw.
+        string(REPLACE "\\" "\\\\" RENHDRUM_LIBRARY_PATH_ESCAPED "${RENHDRUM_LIBRARY_PATH}")
+        string(REPLACE "\"" "\\\"" RENHDRUM_LIBRARY_PATH_ESCAPED "${RENHDRUM_LIBRARY_PATH_ESCAPED}")
+        string(REPLACE "\r" "" RENHDRUM_LIBRARY_PATH_ESCAPED "${RENHDRUM_LIBRARY_PATH_ESCAPED}")
+        string(REPLACE "\n" "" RENHDRUM_LIBRARY_PATH_ESCAPED "${RENHDRUM_LIBRARY_PATH_ESCAPED}")
         configure_file(
             "${CMAKE_CURRENT_SOURCE_DIR}/renhdrum_library_path.h.in"
             "${CMAKE_CURRENT_BINARY_DIR}/renhdrum_library_path.h"

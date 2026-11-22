@@ -218,27 +218,39 @@ const RenHDrumApi& Api() {
         std::string opened;
         for (const auto& candidate : candidates) {
             a.library = Common::DynamicLibrary(candidate.c_str());
-            if (a.library.IsOpen()) {
-                opened = candidate;
-                break;
+            if (!a.library.IsOpen()) {
+                continue;
             }
+            // An opened candidate is only accepted when every required symbol resolves: a
+            // custom build that predates the ABI this emulator compiled against must not
+            // stop the search for the packaged library later in the list.
+            a.loaded =
+                a.library.GetSymbol("renhdrum_engine_create", &a.engine_create) &&
+                a.library.GetSymbol("renhdrum_engine_destroy", &a.engine_destroy) &&
+                a.library.GetSymbol("renhdrum_engine_apply_settings", &a.engine_apply_settings) &&
+                a.library.GetSymbol("renhdrum_engine_push_half_sample",
+                                     &a.engine_push_half_sample) &&
+                a.library.GetSymbol("renhdrum_engine_tick", &a.engine_tick) &&
+                a.library.GetSymbol("renhdrum_settings_resolve", &a.settings_resolve) &&
+                a.library.GetSymbol("renhdrum_dualsense_dsp_create", &a.dsp_create) &&
+                a.library.GetSymbol("renhdrum_dualsense_dsp_destroy", &a.dsp_destroy) &&
+                a.library.GetSymbol("renhdrum_dualsense_dsp_set_half_target",
+                                     &a.dsp_set_half_target) &&
+                a.library.GetSymbol("renhdrum_dualsense_dsp_fill_f32", &a.dsp_fill_f32);
+            if (!a.loaded) {
+                LOG_WARNING(Input,
+                            "RenHDrum: {} is missing functions, trying the next candidate",
+                            candidate);
+                a.library = Common::DynamicLibrary{};
+                continue;
+            }
+            opened = candidate;
+            break;
         }
         if (opened.empty()) {
-            LOG_INFO(Input, "RenHDrum: {} not found, using the standard rumble", name);
+            LOG_INFO(Input, "RenHDrum: no usable {} found, using the standard rumble", name);
             return a;
         }
-        a.loaded = a.library.GetSymbol("renhdrum_engine_create", &a.engine_create) &&
-                   a.library.GetSymbol("renhdrum_engine_destroy", &a.engine_destroy) &&
-                   a.library.GetSymbol("renhdrum_engine_apply_settings", &a.engine_apply_settings) &&
-                   a.library.GetSymbol("renhdrum_engine_push_half_sample",
-                                       &a.engine_push_half_sample) &&
-                   a.library.GetSymbol("renhdrum_engine_tick", &a.engine_tick) &&
-                   a.library.GetSymbol("renhdrum_settings_resolve", &a.settings_resolve) &&
-                   a.library.GetSymbol("renhdrum_dualsense_dsp_create", &a.dsp_create) &&
-                   a.library.GetSymbol("renhdrum_dualsense_dsp_destroy", &a.dsp_destroy) &&
-                   a.library.GetSymbol("renhdrum_dualsense_dsp_set_half_target",
-                                       &a.dsp_set_half_target) &&
-                   a.library.GetSymbol("renhdrum_dualsense_dsp_fill_f32", &a.dsp_fill_f32);
         Settings::values.renhdrum_available.SetValue(a.loaded);
         if (a.loaded) {
             // Optional: a missing symbol leaves it null
@@ -612,6 +624,10 @@ struct RenHDrumPad::Impl {
                 const auto& api = Api();
                 api.dsp_destroy(dsp);
                 dsp = api.dsp_create(now.dualsense_volume, now.dualsense_crisp_notes);
+                // The new DSP has no speaker applied yet, even when the volume did not
+                // change; forget the applied level so SyncHdHaptics sets it again. The
+                // separate speaker_on state stays: it says the physical speaker is on.
+                speaker_volume_applied = -1;
             }
             if (audio_stream) {
                 SDL_UnlockAudioStream(audio_stream);

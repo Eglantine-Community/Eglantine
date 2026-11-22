@@ -200,6 +200,36 @@ ConfigureHdRumble::ConfigureHdRumble(QWidget* parent) : QDialog(parent) {
         }
     }
 
+    // Intensity and Lift weak rumble belong to every family, so each card carries its own
+    // copy bound to the same setting: keep the copies in step, or the last one to apply
+    // would silently overwrite an edit made in another card. Qt does not re-emit when a
+    // value is set to the one it already holds, so the two-way links cannot loop.
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        for (std::size_t j = i + 1; j < rows.size(); ++j) {
+            if (rows[i].key != rows[j].key) {
+                continue;
+            }
+            if (rows[i].check != nullptr && rows[j].check != nullptr) {
+                connect(rows[i].check, &QCheckBox::toggled, rows[j].check, &QCheckBox::setChecked);
+                connect(rows[j].check, &QCheckBox::toggled, rows[i].check, &QCheckBox::setChecked);
+            } else if (rows[i].combo != nullptr && rows[j].combo != nullptr) {
+                connect(rows[i].combo, qOverload<int>(&QComboBox::currentIndexChanged),
+                        rows[j].combo, &QComboBox::setCurrentIndex);
+                connect(rows[j].combo, qOverload<int>(&QComboBox::currentIndexChanged),
+                        rows[i].combo, &QComboBox::setCurrentIndex);
+            } else if (rows[i].spin != nullptr && rows[i].slider != nullptr &&
+                       rows[j].spin != nullptr && rows[j].slider != nullptr) {
+                const auto link_spin = [this](QSpinBox* from, QSlider* slider, QSpinBox* to) {
+                    connect(from, qOverload<int>(&QSpinBox::valueChanged), slider,
+                            &QSlider::setValue);
+                    connect(from, qOverload<int>(&QSpinBox::valueChanged), to, &QSpinBox::setValue);
+                };
+                link_spin(rows[i].spin, rows[j].slider, rows[j].spin);
+                link_spin(rows[j].spin, rows[i].slider, rows[i].spin);
+            }
+        }
+    }
+
     LoadConfiguration();
 }
 
@@ -297,7 +327,8 @@ int OptionValue(const std::string& key) {
         return std::clamp(s.xbox_trigger_mix.GetValue(), 0, 100);
     }
     if (key == "bluetooth_level") {
-        return std::clamp(s.hd_rumble_bluetooth_level.GetValue(), 1, 3);
+        // The setting stores levels 1-3 while the combo carries indices 0-2
+        return std::clamp(s.hd_rumble_bluetooth_level.GetValue(), 1, 3) - 1;
     }
     if (key == "speaker_volume") {
         return std::clamp(s.dualsense_speaker_volume.GetValue(), 0, 100);
@@ -354,7 +385,7 @@ void SetOptionValue(const std::string& key, int value) {
     } else if (key == "xbox_trigger_mix") {
         s.xbox_trigger_mix.SetValue(std::clamp(value, 0, 100));
     } else if (key == "bluetooth_level") {
-        s.hd_rumble_bluetooth_level.SetValue(std::clamp(value, 1, 3));
+        s.hd_rumble_bluetooth_level.SetValue(std::clamp(value, 0, 2) + 1);
     } else if (key == "speaker_volume") {
         s.dualsense_speaker_volume.SetValue(std::clamp(value, 0, 100));
     }
@@ -572,7 +603,8 @@ QWidget* ConfigureHdRumble::CreateAdvancedRows(unsigned device) {
                      "Bluetooth link. (Bluetooth only)";
         extra.choices = {"1 - Stable (60 ms)", "2 - Balanced (45 ms)", "3 - Quality (35 ms)"};
         extra.kind = 2;
-        AddRow(col, first, extra, -1, 3);
+        // def is the combo index of level 3 ("Quality"), see OptionValue for the mapping
+        AddRow(col, first, extra, -1, 2);
     }
     return host;
 }

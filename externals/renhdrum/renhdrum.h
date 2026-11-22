@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+/* frame_count below is size_t: keep the public header self-contained. */
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {

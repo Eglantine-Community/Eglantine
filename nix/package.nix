@@ -302,7 +302,7 @@ buildEdenEmulator (
       # configure time: the binary references the store path directly, which is how it finds it
       # and what keeps the package in the closure.
       "-DENABLE_RENHDRUM=ON"
-      "-DRENHDRUM_LIBRARY_PATH=${renhdrum}/lib/librenhdrum.so"
+      "-DRENHDRUM_LIBRARY_PATH=${renhdrum}/lib/librenhdrum${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}"
 
       # Nix deviations:
       # 1. QT6 is found through the setup hook,
