@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <QElapsedTimer>
 #include <QListView>
+#include <QPersistentModelIndex>
 #include <QPixmap>
 #include <QString>
 
@@ -54,12 +56,23 @@ protected:
     void currentChanged(const QModelIndex& current, const QModelIndex& previous) override;
     void updateGeometries() override;
     void scrollContentsBy(int dx, int dy) override;
+    void mousePressEvent(QMouseEvent* event) override;
+    void mouseMoveEvent(QMouseEvent* event) override;
+    void mouseReleaseEvent(QMouseEvent* event) override;
+    void mouseDoubleClickEvent(QMouseEvent* event) override;
+    bool viewportEvent(QEvent* event) override;
 
 private:
     int PositionOf(int row) const;
     /// The selected game's position, or the centered one's when nothing visible is selected.
     int CurrentPosition() const;
-    void MoveTo(int position);
+    /// Slides to `position`; a negative duration uses the default.
+    void MoveTo(int position, int duration_ms = -1);
+    /// Nudges the strip toward `direction` and back: the end of the list was reached.
+    void Bounce(int direction);
+    void UpdateHover(const QPoint& pos);
+    /// The play button on the centered card, in viewport coordinates.
+    QRectF PlayButtonRect() const;
     /// Re-applies the stored filter once the model has changed shape.
     void ScheduleRelayout();
 
@@ -78,9 +91,30 @@ private:
     /// Wheel travel not yet turned into a step, in eighths of a degree.
     int m_wheel_accum = 0;
 
+    // Mouse: a press becomes a drag past the start-drag distance, otherwise a click on release.
+    bool m_pressed = false;
+    bool m_dragging = false;
+    QPoint m_press_pos;
+    qreal m_drag_origin = 0.0;
+    QPersistentModelIndex m_press_index;
+    /// The card the last click landed on, so a double-click launches it even after it slid.
+    QPersistentModelIndex m_last_click_index;
+    QElapsedTimer m_drag_clock;
+    struct DragSample {
+        qint64 ms;
+        qreal position;
+    };
+    std::vector<DragSample> m_drag_samples;
+    int m_hover_position = -1;
+    bool m_hover_play = false;
+
 signals:
     /// The game the backdrop should feature: the slide's destination once one is running, the
     /// settled center otherwise. Emitted on selection changes and relayouts.
     void CenteredGameChanged(u64 program_id);
     void FilterResultReady(int visible, int total);
+    /// The centered card's play button was clicked, or a card double-clicked.
+    void LaunchRequested(const QModelIndex& index);
+    /// A click, not a drag, that landed on no card.
+    void BackgroundClicked();
 };
