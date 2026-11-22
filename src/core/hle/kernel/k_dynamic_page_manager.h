@@ -6,9 +6,10 @@
 
 #pragma once
 
-#include <vector>
+#include <cstring>
 
 #include "common/alignment.h"
+#include "common/host_memory.h"
 #include "core/hle/kernel/k_page_bitmap.h"
 #include "core/hle/kernel/k_spin_lock.h"
 #include "core/hle/kernel/k_typed_address.h"
@@ -27,32 +28,44 @@ public:
 
 public:
     KDynamicPageManager() = default;
+    ~KDynamicPageManager() {
+        ReleaseBacking();
+    }
+
+    KDynamicPageManager(const KDynamicPageManager&) = delete;
+    KDynamicPageManager& operator=(const KDynamicPageManager&) = delete;
+    KDynamicPageManager(KDynamicPageManager&&) = delete;
+    KDynamicPageManager& operator=(KDynamicPageManager&&) = delete;
 
     template <typename T>
     T* GetPointer(KVirtualAddress addr) {
-        return reinterpret_cast<T*>(m_backing_memory.data() + (addr - m_address));
+        return reinterpret_cast<T*>(m_backing_memory + (addr - m_address));
     }
 
     template <typename T>
     const T* GetPointer(KVirtualAddress addr) const {
-        return reinterpret_cast<T*>(m_backing_memory.data() + (addr - m_address));
+        return reinterpret_cast<T*>(m_backing_memory + (addr - m_address));
     }
 
     Result Initialize(KVirtualAddress memory, size_t size, size_t align) {
         // We need to have positive size.
         R_UNLESS(size > 0, ResultOutOfMemory);
-        m_backing_memory.resize(size);
 
-        // Set addresses.
-        m_address = memory;
-        m_aligned_address = Common::AlignDown(GetInteger(memory), align);
-
-        // Calculate extents.
-        const size_t managed_size = m_address + size - m_aligned_address;
+        const KVirtualAddress aligned_address = Common::AlignDown(GetInteger(memory), align);
+        const size_t managed_size = memory + size - aligned_address;
         const size_t overhead_size = Common::AlignUp(
             KPageBitmap::CalculateManagementOverheadSize(managed_size / sizeof(PageBuffer)),
             sizeof(PageBuffer));
         R_UNLESS(overhead_size < size, ResultOutOfMemory);
+
+        ReleaseBacking();
+        void* const raw = Common::AllocateZeroedVirtualPages(size);
+        R_UNLESS(raw != nullptr, ResultOutOfMemory);
+        m_backing_memory = static_cast<u8*>(raw);
+        m_backing_size = size;
+
+        m_address = memory;
+        m_aligned_address = aligned_address;
 
         // Set tracking fields.
         m_size = Common::AlignDown(size - overhead_size, sizeof(PageBuffer));
@@ -69,12 +82,8 @@ public:
 
         m_page_bitmap.Initialize(management_ptr, allocatable_region_size / sizeof(PageBuffer));
 
-        // Free the pages to the bitmap.
+        // Freshly mapped OS virtual pages are zero-filled on demand; only set bitmap free bits.
         for (size_t i = 0; i < m_count; i++) {
-            // Ensure the freed page is all-zero.
-            std::memset(GetPointer<PageBuffer>(m_address) + i, 0, PageSize);
-
-            // Set the bit for the free page.
             m_page_bitmap.SetBit((m_address + (i * sizeof(PageBuffer)) - m_aligned_address) /
                                  sizeof(PageBuffer));
         }
@@ -157,6 +166,12 @@ public:
     }
 
 private:
+    void ReleaseBacking() noexcept {
+        Common::FreeVirtualPages(m_backing_memory, m_backing_size);
+        m_backing_memory = nullptr;
+        m_backing_size = 0;
+    }
+
     KSpinLock m_lock;
     KPageBitmap m_page_bitmap;
     size_t m_used{};
@@ -167,7 +182,8 @@ private:
     size_t m_size{};
 
     // TODO(bunnei): Back by host memory until we emulate kernel virtual address space.
-    std::vector<u8> m_backing_memory;
+    u8* m_backing_memory{};
+    size_t m_backing_size{};
 };
 
 } // namespace Kernel

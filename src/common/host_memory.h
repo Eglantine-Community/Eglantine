@@ -39,9 +39,22 @@ DECLARE_ENUM_FLAG_OPERATORS(MemoryPermission)
 void OverrideColdHintMode(Settings::ColdHintMode mode);
 
 /// Whether the system is short of memory: memory pressure stalls over 5% of the last 10 s (Linux
-/// PSI, this process's cgroup or the whole system), or less than a tenth of RAM (at least 1 GiB)
-/// available. Re-read at most once a second.
+/// PSI, this process's cgroup or the whole system), or less than one-seventh of RAM (at least
+/// 2 GiB) available. Re-read at most once a second.
 [[nodiscard]] bool MemoryIsLow();
+
+/// Tunes the host allocator (glibc on Linux) for low-RAM hosts to bound thread arenas and return
+/// freed large allocations to the OS promptly.
+void ConfigureLowMemoryAllocator();
+
+/// Releases free pages from the host heap back to the OS when supported (glibc malloc_trim).
+void TrimHostHeap();
+
+/// Allocates OS zero-filled virtual pages lazily committed on first touch (nullptr on failure).
+[[nodiscard]] void* AllocateZeroedVirtualPages(std::size_t size);
+
+/// Frees memory returned by AllocateZeroedVirtualPages.
+void FreeVirtualPages(void* ptr, std::size_t size) noexcept;
 
 enum class ColdHintAction { None, MarkedCold, PagedOut };
 

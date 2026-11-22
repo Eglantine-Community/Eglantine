@@ -14,6 +14,7 @@
 
 #include "common/driver_shader_cache.h"
 #include "common/fs/path_util.h"
+#include "common/host_memory.h"
 #include "common/settings.h"
 #include "frontend_common/config.h"
 #include "startup_checks.h"
@@ -169,6 +170,7 @@ static void LoadNx2Switches(const char* argv0) {
 
 int main(int argc, char* argv[]) {
     LoadNx2Switches(argv[0]);
+    Common::ConfigureLowMemoryAllocator();
     // Before StartupChecks: its Vulkan check is the first thing to load a GPU driver. The config
     // isn't loaded yet, so the setting is read from the file.
     Config::ReadGlobalSettingEarly("qt-config", Settings::values.private_driver_shader_cache);
