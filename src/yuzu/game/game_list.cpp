@@ -509,6 +509,8 @@ void GameList::SetupCustomization() {
     outer_layout->addWidget(customize_panel);
 
     customize_animation = MakeSlideAnimation(customize_panel);
+    SetupPanelResize(customize_panel, customize_animation,
+                     UISettings::values.home_customize_panel_width);
 
     connect(customize_panel, &HomeCustomizePanel::CloseRequested, this,
             [this] { ShowCustomizePanel(false); });
@@ -649,6 +651,20 @@ QPropertyAnimation* GameList::MakeSlideAnimation(QWidget* panel) {
     return animation;
 }
 
+void GameList::SetupPanelResize(HomeSidePanel* panel, QPropertyAnimation* animation,
+                                Settings::Setting<u32, true>& setting) {
+    panel->SetPreferredWidth(static_cast<int>(setting.GetValue()));
+    connect(panel, &HomeSidePanel::WidthDragged, this, [this, panel, animation](int width) {
+        animation->stop();
+        panel->setMaximumWidth(width);
+        UpdatePanelPlacement();
+    });
+    connect(panel, &HomeSidePanel::WidthChosen, this, [this, &setting](int width) {
+        setting = static_cast<u32>(width);
+        emit SaveConfig();
+    });
+}
+
 void GameList::UpdatePanelPlacement() {
     // Below this width, docking a sidebar would leave too little room for the games.
     constexpr int OverlayBelowWidth = 900;
@@ -670,7 +686,8 @@ void GameList::UpdatePanelPlacement() {
     for (QWidget* panel :
          {static_cast<QWidget*>(customize_panel), static_cast<QWidget*>(details_panel)}) {
         if (panel->isVisible()) {
-            const int panel_width = std::min(panel->maximumWidth(), HomeSidePanel::PanelWidth);
+            const int panel_width = std::min(panel->maximumWidth(),
+                                             static_cast<HomeSidePanel*>(panel)->PreferredWidth());
             panel->setGeometry(width() - panel_width, 0, panel_width, height());
             panel->raise();
         }
@@ -704,7 +721,7 @@ void GameList::ShowCustomizePanel(bool show) {
         customize_panel->show();
         customize_panel->setFocus();
     }
-    SlidePanel(customize_panel, customize_animation, show ? HomeCustomizePanel::PanelWidth : 0);
+    SlidePanel(customize_panel, customize_animation, show ? customize_panel->PreferredWidth() : 0);
 }
 
 void GameList::SetupGameDetails() {
@@ -713,6 +730,7 @@ void GameList::SetupGameDetails() {
     details_panel->hide();
     outer_layout->addWidget(details_panel);
     details_animation = MakeSlideAnimation(details_panel);
+    SetupPanelResize(details_panel, details_animation, UISettings::values.home_details_panel_width);
 
     details_timer = new QTimer(this);
     details_timer->setSingleShot(true);
@@ -896,7 +914,7 @@ void GameList::ShowGameDetails(const QModelIndex& index) {
     if (customize_panel->isVisible()) {
         ShowCustomizePanel(false);
     }
-    SlidePanel(details_panel, details_animation, GameDetailsPanel::PanelWidth);
+    SlidePanel(details_panel, details_animation, details_panel->PreferredWidth());
 }
 
 void GameList::LoadGameDetailsExtras() {

@@ -845,7 +845,7 @@ QImage GameDetailsPanel::LoadHero(u64 program_id) {
         // Decode at the size the banner is shown at, not the stored size.
         QImageReader reader(path);
         const QSize full = reader.size();
-        const int target = static_cast<int>(PanelWidth * devicePixelRatioF() * 1.25);
+        const int target = static_cast<int>(MaxPanelWidth * devicePixelRatioF());
         if (full.isValid() && full.width() > target) {
             reader.setScaledSize(QSize(target, full.height() * target / full.width()));
         }
@@ -952,7 +952,7 @@ void GameDetailsPanel::RefreshAddOns() {
         auto* version = new QLabel(row);
         version->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
         version->setText(version->fontMetrics().elidedText(add_on.version, Qt::ElideRight,
-                                                           (PanelWidth - 2 * SideMargin) * 2 / 5));
+                                                           (PreferredWidth() - 2 * SideMargin) * 2 / 5));
         version->setToolTip(add_on.version);
         SetMuted(version);
 

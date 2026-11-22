@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
+
 #include <QKeyEvent>
+#include <QMouseEvent>
 #include <QLabel>
 #include <QPainter>
 #include <QPainterPath>
@@ -57,6 +60,75 @@ QIcon Brush(const QColor& color, qreal dpr, int size) {
 
 } // namespace HomeGlyphs
 
+/// The strip along the panel's left edge that resizes it.
+class HomeSidePanelGrip : public QWidget {
+public:
+    static constexpr int Width = 6;
+
+    explicit HomeSidePanelGrip(HomeSidePanel* panel_) : QWidget{panel_}, panel{panel_} {
+        setCursor(Qt::SizeHorCursor);
+        setMouseTracking(true);
+    }
+
+protected:
+    void mousePressEvent(QMouseEvent* event) override {
+        if (event->button() != Qt::LeftButton) {
+            QWidget::mousePressEvent(event);
+            return;
+        }
+        dragging = true;
+        press_x = event->globalPosition().x();
+        press_width = panel->PreferredWidth();
+    }
+
+    void mouseMoveEvent(QMouseEvent* event) override {
+        if (!dragging) {
+            return;
+        }
+        // The panel sits on the right, so dragging left widens it.
+        const int width =
+            panel->ClampWidth(press_width + qRound(press_x - event->globalPosition().x()));
+        if (width != panel->PreferredWidth()) {
+            panel->preferred_width = width;
+            panel->updateGeometry();
+            emit panel->WidthDragged(width);
+        }
+    }
+
+    void mouseReleaseEvent(QMouseEvent* event) override {
+        if (!dragging || event->button() != Qt::LeftButton) {
+            return;
+        }
+        dragging = false;
+        update();
+        emit panel->WidthChosen(panel->PreferredWidth());
+    }
+
+    void enterEvent(QEnterEvent*) override {
+        hovered = true;
+        update();
+    }
+
+    void leaveEvent(QEvent*) override {
+        hovered = false;
+        update();
+    }
+
+    void paintEvent(QPaintEvent*) override {
+        if (hovered || dragging) {
+            QPainter p(this);
+            p.fillRect(QRect(0, 0, 2, height()), palette().color(QPalette::Highlight));
+        }
+    }
+
+private:
+    HomeSidePanel* panel;
+    qreal press_x = 0.0;
+    int press_width = 0;
+    bool dragging = false;
+    bool hovered = false;
+};
+
 HomeSidePanel::HomeSidePanel(QWidget* parent) : QFrame{parent} {
     setFrameShape(QFrame::NoFrame);
     setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Preferred);
@@ -78,10 +150,33 @@ HomeSidePanel::HomeSidePanel(QWidget* parent) : QFrame{parent} {
 
     content = new QWidget(scroll);
     scroll->setWidget(content);
+
+    grip = new HomeSidePanelGrip(this);
+    grip->raise();
 }
 
 QSize HomeSidePanel::sizeHint() const {
-    return {PanelWidth, QFrame::sizeHint().height()};
+    return {preferred_width, QFrame::sizeHint().height()};
+}
+
+int HomeSidePanel::ClampWidth(int width) const {
+    // Leave the games some room beside a docked panel.
+    int limit = MaxPanelWidth;
+    if (parentWidget()) {
+        limit = std::min(limit, parentWidget()->width() - 240);
+    }
+    return std::clamp(width, MinPanelWidth, std::max(MinPanelWidth, limit));
+}
+
+void HomeSidePanel::SetPreferredWidth(int width) {
+    preferred_width = std::clamp(width, MinPanelWidth, MaxPanelWidth);
+    updateGeometry();
+}
+
+void HomeSidePanel::resizeEvent(QResizeEvent* event) {
+    QFrame::resizeEvent(event);
+    grip->setGeometry(0, 0, HomeSidePanelGrip::Width, height());
+    grip->raise();
 }
 
 void HomeSidePanel::SetFooter(QWidget* footer_) {

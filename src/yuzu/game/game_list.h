@@ -45,6 +45,7 @@ class GameCarousel;
 class GameDetailsPanel;
 class HomeBackground;
 class HomeCustomizePanel;
+class HomeSidePanel;
 class HomeSurface;
 class FloatingActionButton;
 class QHBoxLayout;
@@ -177,6 +178,8 @@ private:
     void SetupGameDetails();
     QPropertyAnimation* MakeSlideAnimation(QWidget* panel);
     void SlidePanel(QWidget* panel, QPropertyAnimation* animation, int width);
+    void SetupPanelResize(HomeSidePanel* panel, QPropertyAnimation* animation,
+                          Settings::Setting<u32, true>& setting);
     void OnItemClicked(const QModelIndex& index);
     void UpdateGameIcon(u64 program_id);
     QModelIndex FindGame(const QString& path) const;
