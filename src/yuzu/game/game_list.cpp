@@ -336,8 +336,10 @@ GameList::GameList(FileSys::VirtualFilesystem vfs_, FileSys::ManualContentProvid
     connect(item_model, &GameListModel::SaveConfig, this, &GameList::SaveConfig);
     connect(item_model, &GameListModel::PopulatingStarted, this, &GameList::OnPopulate);
 
-    // TODO: impl on grid/carousel
+    // TODO: impl on grid
     connect(tree_view, &GameTree::FilterResultReady, search_field,
+            [this](int visible, int total) { search_field->setFilterResult(visible, total); });
+    connect(carousel_view, &GameCarousel::FilterResultReady, search_field,
             [this](int visible, int total) { search_field->setFilterResult(visible, total); });
 
     qRegisterMetaType<QList<QStandardItem*>>("QList<QStandardItem*>");
@@ -473,21 +475,24 @@ void GameList::ResetViewMode() {
     auto view = m_currentView->viewport();
     view->installEventFilter(this);
 
-    view->grabGesture(Qt::SwipeGesture);
-    view->grabGesture(Qt::PanGesture);
-
-    QScroller::grabGesture(view, QScroller::LeftMouseButtonGesture);
-
     // The banner backdrop belongs to the carousel; leaving the mode must repaint it away.
     surface->update();
 
-    auto scroller = QScroller::scroller(view);
-    QScrollerProperties props;
-    props.setScrollMetric(QScrollerProperties::HorizontalOvershootPolicy,
-                          QScrollerProperties::OvershootAlwaysOff);
-    props.setScrollMetric(QScrollerProperties::VerticalOvershootPolicy,
-                          QScrollerProperties::OvershootAlwaysOff);
-    scroller->setScrollerProperties(props);
+    // The carousel has no scroll range and handles drags itself.
+    if (m_currentView != carousel_view) {
+        view->grabGesture(Qt::SwipeGesture);
+        view->grabGesture(Qt::PanGesture);
+
+        QScroller::grabGesture(view, QScroller::LeftMouseButtonGesture);
+
+        auto scroller = QScroller::scroller(view);
+        QScrollerProperties props;
+        props.setScrollMetric(QScrollerProperties::HorizontalOvershootPolicy,
+                              QScrollerProperties::OvershootAlwaysOff);
+        props.setScrollMetric(QScrollerProperties::VerticalOvershootPolicy,
+                              QScrollerProperties::OvershootAlwaysOff);
+        scroller->setScrollerProperties(props);
+    }
 
     if (m_isTreeMode != newTreeMode) {
         m_isTreeMode = newTreeMode;
@@ -1107,6 +1112,7 @@ void GameList::OnTextChanged(const QString& new_text) {
         tree_view->ApplyFilter(edit_filter_text, item_model);
     } else {
         grid_view->ApplyFilter(edit_filter_text, item_model);
+        carousel_view->ApplyFilter(edit_filter_text, item_model);
     }
 }
 
@@ -1692,7 +1698,9 @@ bool GameList::eventFilter(QObject* obj, QEvent* event) {
         }
     }
 
-    if (obj == m_currentView->viewport() && event->type() == QEvent::Wheel) {
+    // The carousel steps between games on the wheel itself.
+    if (obj == m_currentView->viewport() && obj != carousel_view->viewport() &&
+        event->type() == QEvent::Wheel) {
         QWheelEvent* wheelEvent = static_cast<QWheelEvent*>(event);
 
         bool horizontal = wheelEvent->modifiers() & Qt::ShiftModifier;
@@ -1741,8 +1749,11 @@ bool GameList::eventFilter(QObject* obj, QEvent* event) {
 
         QModelIndex index = m_currentView->indexAt(mouseEvent->pos());
         if (!index.isValid()) {
-            m_currentView->selectionModel()->clearSelection();
-            m_currentView->setCurrentIndex(QModelIndex());
+            // The carousel's centered card is always the selection.
+            if (m_currentView != carousel_view) {
+                m_currentView->selectionModel()->clearSelection();
+                m_currentView->setCurrentIndex(QModelIndex());
+            }
             HideGameDetails();
         }
     }

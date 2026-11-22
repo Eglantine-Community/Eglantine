@@ -9,6 +9,7 @@
 #include <QPainterPath>
 #include <QPixmapCache>
 #include <QPolygonF>
+#include <QScrollBar>
 #include <QTransform>
 #include <QVariantAnimation>
 #include <QWheelEvent>
@@ -533,7 +534,23 @@ GameCarousel::GameCarousel(QWidget* parent) : QListView{parent} {
 
 void GameCarousel::SetModel(GameListModel* model) {
     QListView::setModel(model);
-    // A repopulate replaces the rows, so the stored filter has to run over the new ones.
+    // A repopulate replaces the rows, so the stored filter has to run over the new ones. The
+    // centered game is remembered before its row goes, so the reload does not land elsewhere.
+    const auto remember_center = [this] {
+        if (m_restore_path.isEmpty() && !m_visible.empty() && this->model()) {
+            m_restore_path = this->model()
+                                 ->index(m_visible[CurrentPosition()], 0)
+                                 .data(GameListItemPath::FullPathRole)
+                                 .toString();
+        }
+    };
+    connect(model, &QAbstractItemModel::rowsAboutToBeRemoved, this, remember_center);
+    connect(model, &QAbstractItemModel::modelAboutToBeReset, this, remember_center);
+    connect(model, &GameListModel::PopulatingStarted, this, [this] { m_populating = true; });
+    connect(model, &GameListModel::PopulatingCompleted, this, [this] {
+        m_populating = false;
+        ScheduleRelayout();
+    });
     connect(model, &QAbstractItemModel::rowsInserted, this, [this] { ScheduleRelayout(); });
     connect(model, &QAbstractItemModel::rowsRemoved, this, [this] { ScheduleRelayout(); });
     connect(model, &QAbstractItemModel::modelReset, this, [this] { ScheduleRelayout(); });
@@ -549,8 +566,43 @@ void GameCarousel::ApplyFilter(const QString& edit_filter_text, GameListModel* m
             m_visible.push_back(row);
         }
     }
-    if (m_position >= m_visible.size()) {
-        m_position = std::max<qreal>(0.0, qreal(m_visible.size()) - 1.0);
+    emit FilterResultReady(int(m_visible.size()), model->rowCount());
+
+    int restored = -1;
+    if (!m_restore_path.isEmpty()) {
+        for (int position = 0; position < int(m_visible.size()); ++position) {
+            if (model->index(m_visible[position], 0).data(GameListItemPath::FullPathRole) ==
+                m_restore_path) {
+                restored = position;
+                break;
+            }
+        }
+        if (restored < 0 && m_populating) {
+            // Still loading: leave the position, selection and backdrop until the game returns.
+            viewport()->update();
+            return;
+        }
+        m_restore_path.clear();
+    }
+    m_position_anim->stop();
+    m_pending_center = -1;
+    if (m_visible.empty()) {
+        m_position = 0.0;
+        viewport()->update();
+        emit CenteredGameChanged(0);
+        return;
+    }
+    // The selected game stays centered when the filter keeps it. Otherwise the game left in the
+    // center becomes the selection, so Enter and the sidebar act on the card on screen.
+    const QModelIndex current = currentIndex();
+    const int kept = restored >= 0 ? -1 : current.isValid() ? PositionOf(current.row()) : -1;
+    const int position =
+        restored >= 0 ? restored
+        : kept >= 0   ? kept
+                      : std::clamp(int(std::lround(m_position)), 0, int(m_visible.size()) - 1);
+    m_position = position;
+    if (kept < 0) {
+        setCurrentIndex(model->index(m_visible[position], 0));
     }
     viewport()->update();
     emit CenteredGameChanged(CenteredProgramId());
@@ -577,6 +629,19 @@ void GameCarousel::UpdateIconSize() {
 int GameCarousel::PositionOf(int row) const {
     const auto it = std::find(m_visible.begin(), m_visible.end(), row);
     return it == m_visible.end() ? -1 : int(it - m_visible.begin());
+}
+
+int GameCarousel::CurrentPosition() const {
+    const QModelIndex current = currentIndex();
+    if (current.isValid()) {
+        if (const int position = PositionOf(current.row()); position >= 0) {
+            return position;
+        }
+    }
+    if (m_pending_center >= 0 && m_pending_center < int(m_visible.size())) {
+        return m_pending_center;
+    }
+    return std::clamp(int(std::lround(m_position)), 0, std::max(0, int(m_visible.size()) - 1));
 }
 
 void GameCarousel::MoveTo(int position) {
@@ -748,8 +813,7 @@ QModelIndex GameCarousel::moveCursor(CursorAction cursor_action, Qt::KeyboardMod
     if (m_visible.empty() || !model()) {
         return {};
     }
-    const QModelIndex current = currentIndex();
-    int position = current.isValid() ? std::max(0, PositionOf(current.row())) : 0;
+    int position = CurrentPosition();
     switch (cursor_action) {
     case MoveLeft:
     case MoveUp:
@@ -803,17 +867,39 @@ void GameCarousel::wheelEvent(QWheelEvent* event) {
         QListView::wheelEvent(event);
         return;
     }
-    // The strip is one row deep: the wheel steps between games instead of scrolling.
+    // The strip is one row deep: the wheel steps between games instead of scrolling. Trackpads
+    // and smooth wheels send many small deltas, so travel adds up to one step per notch.
+    constexpr int Notch = 120;
     const int delta = event->angleDelta().x() + event->angleDelta().y();
     if (delta == 0) {
         event->ignore();
         return;
     }
-    const QModelIndex current = currentIndex();
-    int position = current.isValid() ? std::max(0, PositionOf(current.row())) : 0;
-    position = std::clamp(position + (delta > 0 ? -1 : 1), 0, int(m_visible.size()) - 1);
-    setCurrentIndex(model()->index(m_visible[position], 0));
+    if ((delta > 0) != (m_wheel_accum > 0)) {
+        m_wheel_accum = 0;
+    }
+    m_wheel_accum += delta;
+    const int steps = m_wheel_accum / Notch;
+    m_wheel_accum -= steps * Notch;
     event->accept();
+    if (steps == 0) {
+        return;
+    }
+    const int position =
+        std::clamp(CurrentPosition() - steps, 0, int(m_visible.size()) - 1);
+    setCurrentIndex(model()->index(m_visible[position], 0));
+}
+
+void GameCarousel::updateGeometries() {
+    // The cards follow m_position, not QListView's item layout. Without a scroll range nothing
+    // can shift the viewport's pixels under the painted strip.
+    QAbstractItemView::updateGeometries();
+    horizontalScrollBar()->setRange(0, 0);
+    verticalScrollBar()->setRange(0, 0);
+}
+
+void GameCarousel::scrollContentsBy(int, int) {
+    viewport()->update();
 }
 
 void GameCarousel::currentChanged(const QModelIndex& current, const QModelIndex& previous) {

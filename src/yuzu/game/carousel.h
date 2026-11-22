@@ -52,9 +52,13 @@ protected:
     QRegion visualRegionForSelection(const QItemSelection& selection) const override;
     void wheelEvent(QWheelEvent* event) override;
     void currentChanged(const QModelIndex& current, const QModelIndex& previous) override;
+    void updateGeometries() override;
+    void scrollContentsBy(int dx, int dy) override;
 
 private:
     int PositionOf(int row) const;
+    /// The selected game's position, or the centered one's when nothing visible is selected.
+    int CurrentPosition() const;
     void MoveTo(int position);
     /// Re-applies the stored filter once the model has changed shape.
     void ScheduleRelayout();
@@ -68,9 +72,15 @@ private:
     /// The slide's destination position, or -1 when no slide is running.
     int m_pending_center = -1;
     bool m_relayout_queued = false;
+    /// The game centered before the rows were removed, reselected once a reload brings it back.
+    QString m_restore_path;
+    bool m_populating = false;
+    /// Wheel travel not yet turned into a step, in eighths of a degree.
+    int m_wheel_accum = 0;
 
 signals:
     /// The game the backdrop should feature: the slide's destination once one is running, the
     /// settled center otherwise. Emitted on selection changes and relayouts.
     void CenteredGameChanged(u64 program_id);
+    void FilterResultReady(int visible, int total);
 };
