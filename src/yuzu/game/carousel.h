@@ -15,7 +15,10 @@
 #include "common/common_types.h"
 
 class GameListModel;
+class QLabel;
+class QPushButton;
 class QTimer;
+class QToolButton;
 class QVariantAnimation;
 
 /// The home screen's carousel: one large centered game card with the neighbouring games stacked
@@ -62,6 +65,7 @@ protected:
     void mouseReleaseEvent(QMouseEvent* event) override;
     void mouseDoubleClickEvent(QMouseEvent* event) override;
     bool viewportEvent(QEvent* event) override;
+    void changeEvent(QEvent* event) override;
 
 private:
     int PositionOf(int row) const;
@@ -72,13 +76,11 @@ private:
     /// Nudges the strip toward `direction` and back: the end of the list was reached.
     void Bounce(int direction);
     void UpdateHover(const QPoint& pos);
-    /// The play button on the centered card, in viewport coordinates.
-    QRectF PlayButtonRect() const;
-    /// The previous (-1) or next (1) arrow button, in viewport coordinates.
-    QRectF ArrowRect(int direction) const;
-    bool ArrowEnabled(int direction) const;
-    /// The arrow button under `pos`: -1, 1, or 0 for none.
-    int ArrowAt(const QPoint& pos) const;
+    /// Brings the pager row's labels, enabled states and place under the title up to date.
+    void SyncPager();
+    void Step(int direction);
+    void RetranslatePager();
+    void RefreshPagerPalette();
     /// Tells screen readers which game is centered and where it sits in the list.
     void Announce();
     /// Re-applies the stored filter once the model has changed shape.
@@ -113,9 +115,6 @@ private:
     /// card launches on a double-click.
     QPersistentModelIndex m_last_click_index;
     bool m_last_click_center = false;
-    int m_press_arrow = 0;
-    int m_hover_arrow = 0;
-    bool m_mouse_inside = false;
     /// Holds the backdrop and the screen reader announcement until the strip settles.
     QTimer* m_settle_timer = nullptr;
     QElapsedTimer m_drag_clock;
@@ -125,14 +124,26 @@ private:
     };
     std::vector<DragSample> m_drag_samples;
     int m_hover_position = -1;
-    bool m_hover_play = false;
+
+    /// The row under the title: play time, previous, position, next and Play, all stock
+    /// widgets so the platform style and the theme draw them.
+    QWidget* m_pager = nullptr;
+    /// Equal-width columns either side of the position, so it sits under the card's center
+    /// and no control moves when the play time or the game changes.
+    QWidget* m_pager_left = nullptr;
+    QWidget* m_pager_right = nullptr;
+    QLabel* m_play_time = nullptr;
+    QToolButton* m_prev = nullptr;
+    QLabel* m_count = nullptr;
+    QToolButton* m_next = nullptr;
+    QPushButton* m_play = nullptr;
 
 signals:
     /// The game the backdrop should feature: the slide's destination once one is running, the
     /// settled center otherwise. Emitted on selection changes and relayouts.
     void CenteredGameChanged(u64 program_id);
     void FilterResultReady(int visible, int total);
-    /// The centered card's play button was clicked, or a card double-clicked.
+    /// The pager's Play button was clicked.
     void LaunchRequested(const QModelIndex& index);
     /// A click, not a drag, that landed on no card.
     void BackgroundClicked();

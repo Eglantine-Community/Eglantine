@@ -4,16 +4,21 @@
 #include "yuzu/game/carousel.h"
 
 #include <QEasingCurve>
+#include <QHBoxLayout>
 #include <QAccessible>
 #include <QApplication>
 #include <QImage>
+#include <QLabel>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
 #include <QPixmapCache>
 #include <QPolygonF>
+#include <QPushButton>
 #include <QScrollBar>
+#include <QStyle>
 #include <QTimer>
+#include <QToolButton>
 #include <QTransform>
 #include <QVariantAnimation>
 #include <QWheelEvent>
@@ -32,8 +37,10 @@
 namespace {
 
 constexpr int SideGap = 16;
-/// Room under the centered card for its title and detail rows, when game names are shown.
-constexpr int TitleReserve = 64;
+/// Room under the centered card for its title, when game names are shown.
+constexpr int TitleReserve = 36;
+/// Room under the title for the pager row, which is always shown.
+constexpr int PagerReserve = 44;
 constexpr int MinCenterSize = 160;
 /// How far each stacked card peeks past the card in front of it, as a share of the center card.
 constexpr qreal PeekFraction = 0.12;
@@ -71,8 +78,6 @@ constexpr qreal HoverFogScale = 0.35;
 constexpr qreal PressScale = 0.96;
 /// Pointer travel to card travel while dragging: 1 keeps the grabbed card under the pointer.
 constexpr qreal DragGain = 1.0;
-constexpr int ArrowDiameter = 40;
-constexpr int ArrowMargin = 16;
 /// The backdrop and the screen reader wait this long for the strip to stop on a game.
 constexpr int SettleMs = 120;
 /// How far a flick carries on after release: seconds of the release velocity.
@@ -259,7 +264,7 @@ struct CarouselMetrics {
 CarouselMetrics MetricsFor(const QSize& area) {
     CarouselMetrics m;
     m.names = UISettings::values.show_game_name.GetValue();
-    const qreal title = m.names ? TitleReserve : 0.0;
+    const qreal title = (m.names ? TitleReserve : 0.0) + PagerReserve;
     // The stored index picks a share of the available height; anything out of range reads as
     // full, so a stale value can never shrink the card away.
     const auto fractions = GameCarousel::CardSizeFractions;
@@ -336,33 +341,6 @@ qreal DepthForSlotX(qreal x, const CarouselMetrics& m) {
     return (lo + hi) / 2.0;
 }
 
-void DrawArrowButton(QPainter& p, const QRectF& rect, int direction, const QPalette& pal,
-                     bool hot) {
-    p.save();
-    p.setPen(Qt::NoPen);
-    for (int i = 3; i >= 1; --i) {
-        p.setBrush(QColor(0, 0, 0, 16));
-        p.drawEllipse(rect.adjusted(-i, -i + 2, i, i + 2));
-    }
-    QColor fill = hot ? pal.color(QPalette::Highlight) : pal.color(QPalette::Window);
-    fill.setAlpha(hot ? 240 : 210);
-    p.setBrush(fill);
-    QColor edge = pal.color(QPalette::WindowText);
-    edge.setAlpha(60);
-    p.setPen(QPen(edge, 1));
-    p.drawEllipse(rect);
-    const QColor ink = hot ? pal.color(QPalette::HighlightedText) : pal.color(QPalette::WindowText);
-    p.setPen(QPen(ink, 2.2, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
-    p.setBrush(Qt::NoBrush);
-    const qreal s = rect.width() * 0.16;
-    const QPointF c = rect.center() + QPointF(-direction * s * 0.3, 0);
-    QPolygonF chevron;
-    chevron << QPointF(c.x() - direction * s, c.y() - s * 1.6) << QPointF(c.x() + direction * s, c.y())
-            << QPointF(c.x() - direction * s, c.y() + s * 1.6);
-    p.drawPolyline(chevron);
-    p.restore();
-}
-
 void DrawCardShadow(QPainter& p, const QRectF& rect, int alpha) {
     if (alpha <= 0) {
         return;
@@ -376,71 +354,29 @@ void DrawCardShadow(QPainter& p, const QRectF& rect, int alpha) {
     }
 }
 
-/// The title of the card taking the center slot, fading in as the card settles, and under it
-/// the play time and where the card sits in the list.
+/// The title of the card taking the center slot, fading in as the card settles.
+QFont TitleFont(const QFont& base, const CarouselMetrics& m) {
+    QFont font = base;
+    font.setBold(true);
+    font.setPixelSize(qRound(std::clamp(m.card_w * 0.045, qreal(13), qreal(24))));
+    return font;
+}
+
 void DrawTitle(QPainter& p, const QModelIndex& index, const CarouselMetrics& m,
-               const QPalette& pal, int position, int count) {
+               const QPalette& pal) {
     const QString title =
         index.data(Qt::DisplayRole).toString().split(QLatin1Char('\n')).first();
     const QFont base_font = p.font();
-    QFont font = base_font;
-    font.setBold(true);
-    const int title_px = qRound(std::clamp(m.card_w * 0.045, qreal(13), qreal(24)));
-    font.setPixelSize(title_px);
+    const QFont font = TitleFont(base_font, m);
     const int text_width = qRound(m.card_w * 1.4);
     const QString line = QFontMetrics(font).elidedText(title, Qt::ElideRight, text_width);
     p.setFont(font);
     p.setPen(pal.color(QPalette::Text));
     const QRectF slot = CardRect(0.0, m);
-    const qreal left = slot.center().x() - text_width / 2.0;
-    const qreal title_h = QFontMetrics(font).height();
-    p.drawText(QRectF(left, slot.bottom() + 6, text_width, title_h),
+    p.drawText(QRectF(slot.center().x() - text_width / 2.0, slot.bottom() + 6, text_width,
+                      TitleReserve - 6),
                Qt::AlignHCenter | Qt::AlignTop, line);
-
-    QStringList details;
-    const QString play_time = index.sibling(index.row(), GameListModel::COLUMN_PLAY_TIME)
-                                  .data(Qt::DisplayRole)
-                                  .toString()
-                                  .trimmed();
-    if (!play_time.isEmpty()) {
-        details << play_time;
-    }
-    details << QStringLiteral("%1 / %2").arg(position + 1).arg(count);
-    QFont detail_font = base_font;
-    detail_font.setPixelSize(std::max(11, title_px * 2 / 3));
-    p.setFont(detail_font);
-    QColor muted = pal.color(QPalette::Text);
-    muted.setAlpha(170);
-    p.setPen(muted);
-    const qreal detail_top = slot.bottom() + 6 + title_h + 2;
-    p.drawText(QRectF(left, detail_top, text_width, TitleReserve - (detail_top - slot.bottom())),
-               Qt::AlignHCenter | Qt::AlignTop,
-               details.join(QStringLiteral("  \u00B7  ")));
     p.setFont(base_font);
-}
-
-/// Round play button on the centered card, shown while the mouse is over the card.
-void DrawPlayButton(QPainter& p, const QRectF& rect, const QPalette& pal, bool hot) {
-    p.save();
-    p.setPen(Qt::NoPen);
-    for (int i = 3; i >= 1; --i) {
-        p.setBrush(QColor(0, 0, 0, 22));
-        p.drawEllipse(rect.adjusted(-i, -i + 2, i, i + 2));
-    }
-    QColor fill = pal.color(QPalette::Highlight);
-    fill = hot ? fill.lighter(115) : fill;
-    fill.setAlpha(hot ? 255 : 225);
-    p.setBrush(fill);
-    p.drawEllipse(rect);
-    // The triangle sits a little right of center so it looks centered.
-    const qreal s = rect.width() * 0.36;
-    const QPointF c = rect.center() + QPointF(s * 0.12, 0);
-    QPolygonF triangle;
-    triangle << QPointF(c.x() - s * 0.42, c.y() - s * 0.5) << QPointF(c.x() + s * 0.5, c.y())
-             << QPointF(c.x() - s * 0.42, c.y() + s * 0.5);
-    p.setBrush(pal.color(QPalette::HighlightedText));
-    p.drawPolygon(triangle);
-    p.restore();
 }
 
 /// A stacked cartridge card: the label art and the frame under one tilt, drawn full body. The
@@ -661,6 +597,55 @@ GameCarousel::GameCarousel(QWidget* parent) : QListView{parent} {
         Announce();
     });
     setAccessibleName(tr("Games"));
+
+    m_pager = new QWidget(viewport());
+    auto* pager_layout = new QHBoxLayout(m_pager);
+    pager_layout->setContentsMargins(0, 0, 0, 0);
+    pager_layout->setSpacing(6);
+    m_pager_left = new QWidget(m_pager);
+    m_pager_right = new QWidget(m_pager);
+    m_play_time = new QLabel(m_pager);
+    m_play_time->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    m_prev = new QToolButton(m_pager);
+    m_prev->setArrowType(Qt::LeftArrow);
+    m_prev->setAutoRaise(true);
+    m_prev->setFocusPolicy(Qt::TabFocus);
+    m_count = new QLabel(m_pager);
+    m_count->setAlignment(Qt::AlignCenter);
+    m_next = new QToolButton(m_pager);
+    m_next->setArrowType(Qt::RightArrow);
+    m_next->setAutoRaise(true);
+    m_next->setFocusPolicy(Qt::TabFocus);
+    m_play = new QPushButton(m_pager);
+    m_play->setIcon(style()->standardIcon(QStyle::SP_MediaPlay, nullptr, m_play));
+    m_play->setFocusPolicy(Qt::TabFocus);
+    m_play->setDefault(true);
+    auto* left_layout = new QHBoxLayout(m_pager_left);
+    left_layout->setContentsMargins(0, 0, 0, 0);
+    left_layout->setSpacing(6);
+    left_layout->addStretch();
+    left_layout->addWidget(m_play_time);
+    left_layout->addSpacing(6);
+    left_layout->addWidget(m_prev);
+    auto* right_layout = new QHBoxLayout(m_pager_right);
+    right_layout->setContentsMargins(0, 0, 0, 0);
+    right_layout->setSpacing(6);
+    right_layout->addWidget(m_next);
+    right_layout->addSpacing(6);
+    right_layout->addWidget(m_play);
+    right_layout->addStretch();
+    pager_layout->addWidget(m_pager_left);
+    pager_layout->addWidget(m_count);
+    pager_layout->addWidget(m_pager_right);
+    connect(m_prev, &QToolButton::clicked, this, [this] { Step(-1); });
+    connect(m_next, &QToolButton::clicked, this, [this] { Step(1); });
+    connect(m_play, &QPushButton::clicked, this, [this] {
+        if (!m_visible.empty() && model()) {
+            emit LaunchRequested(model()->index(m_visible[CurrentPosition()], 0));
+        }
+    });
+    RetranslatePager();
+    RefreshPagerPalette();
 }
 
 void GameCarousel::SetModel(GameListModel* model) {
@@ -838,12 +823,16 @@ void GameCarousel::ScheduleRelayout() {
 void GameCarousel::paintEvent(QPaintEvent*) {
     QPainter p(viewport());
     if (m_visible.empty() || !model()) {
+        m_pager->hide();
         return;
     }
     p.setRenderHint(QPainter::Antialiasing);
     p.setRenderHint(QPainter::SmoothPixmapTransform);
 
     const CarouselMetrics m = MetricsFor(viewport()->size());
+    // Every state change that matters to the pager repaints the strip, so it follows here.
+    // The setters are no-ops when nothing changed, so this does not repaint in a loop.
+    SyncPager();
     const bool borders = UISettings::values.game_icon_borders.GetValue();
     const bool focused = hasFocus();
     const qreal dpr = p.device() ? p.device()->devicePixelRatio() : 1.0;
@@ -893,22 +882,6 @@ void GameCarousel::paintEvent(QPaintEvent*) {
                  center_bucket, stack_bucket, alpha, hovered ? HoverFogScale : 1.0);
     }
 
-    // The play button belongs to the settled center card under the mouse.
-    const int center = std::clamp(int(std::lround(m_position)), 0, int(m_visible.size()) - 1);
-    if (!m_dragging && m_hover_position == center &&
-        std::abs(m_position - center) < 0.02) {
-        DrawPlayButton(p, PlayButtonRect(), palette(), m_hover_play);
-    }
-
-    if (m_mouse_inside && !m_dragging) {
-        for (const int direction : {-1, 1}) {
-            if (ArrowEnabled(direction)) {
-                DrawArrowButton(p, ArrowRect(direction), direction, palette(),
-                                m_hover_arrow == direction);
-            }
-        }
-    }
-
     if (m.names) {
         // The title belongs to the card settling into the center slot and fades with it.
         const auto nearest = std::min_element(
@@ -917,8 +890,7 @@ void GameCarousel::paintEvent(QPaintEvent*) {
             });
         if (nearest != cards.end() && std::abs(nearest->depth) < 0.5) {
             p.setOpacity(std::max<qreal>(0.0, 1.0 - 2.0 * std::abs(nearest->depth)));
-            DrawTitle(p, model()->index(m_visible[nearest->position], 0), m, palette(),
-                      nearest->position, int(m_visible.size()));
+            DrawTitle(p, model()->index(m_visible[nearest->position], 0), m, palette());
             p.setOpacity(1.0);
         }
     }
@@ -1098,40 +1070,6 @@ void GameCarousel::currentChanged(const QModelIndex& current, const QModelIndex&
     }
 }
 
-QRectF GameCarousel::PlayButtonRect() const {
-    const CarouselMetrics m = MetricsFor(viewport()->size());
-    const QRectF card = CardRect(0.0, m);
-    const qreal diameter = std::clamp(m.card_w * 0.17, qreal(44), qreal(72));
-    const qreal bottom = card.bottom() - std::max<qreal>(12.0, m.card_h * 0.07);
-    return {card.center().x() - diameter / 2.0, bottom - diameter, diameter, diameter};
-}
-
-QRectF GameCarousel::ArrowRect(int direction) const {
-    const CarouselMetrics m = MetricsFor(viewport()->size());
-    const qreal x = direction < 0 ? ArrowMargin : viewport()->width() - ArrowMargin - ArrowDiameter;
-    return {x, m.center.y() - ArrowDiameter / 2.0, qreal(ArrowDiameter), qreal(ArrowDiameter)};
-}
-
-bool GameCarousel::ArrowEnabled(int direction) const {
-    if (m_visible.size() < 2) {
-        return false;
-    }
-    const int position = CurrentPosition();
-    return direction < 0 ? position > 0 : position < int(m_visible.size()) - 1;
-}
-
-int GameCarousel::ArrowAt(const QPoint& pos) const {
-    if (!m_mouse_inside) {
-        return 0;
-    }
-    for (const int direction : {-1, 1}) {
-        if (ArrowEnabled(direction) && ArrowRect(direction).contains(QPointF(pos))) {
-            return direction;
-        }
-    }
-    return 0;
-}
-
 void GameCarousel::Announce() {
     if (!QAccessible::isActive() || !hasFocus() || m_visible.empty() || !model()) {
         return;
@@ -1155,34 +1093,102 @@ void GameCarousel::Announce() {
 }
 
 void GameCarousel::UpdateHover(const QPoint& pos) {
-    // The arrows show while the mouse is over the view.
-    const bool entered = !m_mouse_inside;
-    m_mouse_inside = true;
-    const int arrow = ArrowAt(pos);
-    const QModelIndex index = arrow != 0 ? QModelIndex{} : indexAt(pos);
+    const QModelIndex index = indexAt(pos);
     const int position = index.isValid() ? PositionOf(index.row()) : -1;
-    const bool play = position >= 0 && position == CurrentPosition() &&
-                      PlayButtonRect().contains(QPointF(pos));
-    viewport()->setCursor(position >= 0 || arrow != 0 ? Qt::PointingHandCursor
-                                                      : Qt::ArrowCursor);
-    if (entered || position != m_hover_position || play != m_hover_play ||
-        arrow != m_hover_arrow) {
+    viewport()->setCursor(position >= 0 ? Qt::PointingHandCursor : Qt::ArrowCursor);
+    if (position != m_hover_position) {
         m_hover_position = position;
-        m_hover_play = play;
-        m_hover_arrow = arrow;
         viewport()->update();
     }
 }
 
 bool GameCarousel::viewportEvent(QEvent* event) {
-    if (event->type() == QEvent::Leave && !m_pressed) {
-        m_mouse_inside = false;
+    if (event->type() == QEvent::Leave && !m_pressed && m_hover_position >= 0) {
         m_hover_position = -1;
-        m_hover_play = false;
-        m_hover_arrow = 0;
         viewport()->update();
     }
     return QListView::viewportEvent(event);
+}
+
+void GameCarousel::changeEvent(QEvent* event) {
+    if (event->type() == QEvent::LanguageChange) {
+        RetranslatePager();
+    } else if (event->type() == QEvent::PaletteChange) {
+        RefreshPagerPalette();
+    }
+    QListView::changeEvent(event);
+}
+
+void GameCarousel::RetranslatePager() {
+    m_prev->setToolTip(tr("Previous game"));
+    m_prev->setAccessibleName(tr("Previous game"));
+    m_next->setToolTip(tr("Next game"));
+    m_next->setAccessibleName(tr("Next game"));
+    m_play->setText(tr("Play"));
+}
+
+void GameCarousel::RefreshPagerPalette() {
+    // Muted like the details panel's secondary text.
+    QPalette pal = m_play_time->palette();
+    QColor muted = palette().color(QPalette::WindowText);
+    muted.setAlpha(170);
+    pal.setColor(QPalette::WindowText, muted);
+    m_play_time->setPalette(pal);
+}
+
+void GameCarousel::Step(int direction) {
+    if (m_visible.empty() || !model()) {
+        return;
+    }
+    const int target =
+        std::clamp(CurrentPosition() + direction, 0, int(m_visible.size()) - 1);
+    setCurrentIndex(model()->index(m_visible[target], 0));
+}
+
+void GameCarousel::SyncPager() {
+    if (m_visible.empty() || !model()) {
+        m_pager->hide();
+        return;
+    }
+    const int position = CurrentPosition();
+    const int count = int(m_visible.size());
+    const QModelIndex index = model()->index(m_visible[position], 0);
+    const QString play_time = index.sibling(index.row(), GameListModel::COLUMN_PLAY_TIME)
+                                  .data(Qt::DisplayRole)
+                                  .toString()
+                                  .trimmed();
+    // An empty play time keeps its room, so the arrows and Play stay under the cursor.
+    m_play_time->setText(play_time);
+    m_count->setText(QStringLiteral("%1 / %2").arg(position + 1).arg(count));
+    // Wide enough for the largest position, so the arrows do not shift while stepping.
+    m_count->setMinimumWidth(m_count->fontMetrics().horizontalAdvance(
+        QStringLiteral("%1 / %1").arg(count)));
+    // Both side columns get the room the wider one needs at most: the longest play time
+    // (hours can pass 999) on the left, Play on the right.
+    const int spacing = 12;
+    const int left_needed =
+        m_play_time->fontMetrics().horizontalAdvance(QStringLiteral("0000:00:00")) + spacing +
+        m_prev->sizeHint().width();
+    const int right_needed = m_next->sizeHint().width() + spacing + m_play->sizeHint().width();
+    const int side = std::max(left_needed, right_needed);
+    if (m_pager_left->minimumWidth() != side) {
+        m_pager_left->setFixedWidth(side);
+        m_pager_right->setFixedWidth(side);
+    }
+    m_prev->setEnabled(position > 0);
+    m_next->setEnabled(position < count - 1);
+
+    const CarouselMetrics m = MetricsFor(viewport()->size());
+    const QRectF slot = CardRect(0.0, m);
+    const qreal title_h = m.names ? TitleReserve : 0.0;
+    const QSize size = m_pager->sizeHint();
+    const QRect geometry(qRound(slot.center().x() - size.width() / 2.0),
+                         qRound(slot.bottom() + title_h + (PagerReserve - size.height()) / 2.0),
+                         size.width(), size.height());
+    if (m_pager->geometry() != geometry) {
+        m_pager->setGeometry(geometry);
+    }
+    m_pager->show();
 }
 
 void GameCarousel::mousePressEvent(QMouseEvent* event) {
@@ -1195,17 +1201,16 @@ void GameCarousel::mousePressEvent(QMouseEvent* event) {
     m_pressed = true;
     m_dragging = false;
     m_press_pos = event->position().toPoint();
-    m_press_arrow = ArrowAt(m_press_pos);
     // A press on a strip still travelling (a flick, a long jump) stops it where it is, as a
     // finger would. The tail of a one-card slide is left to finish, so quick clicks still land.
     m_caught = false;
-    if (m_press_arrow == 0 && m_position_anim->state() == QAbstractAnimation::Running &&
+    if (m_position_anim->state() == QAbstractAnimation::Running &&
         std::abs(m_position_anim->endValue().toReal() - m_position) > 0.5) {
         m_position_anim->stop();
         m_caught = true;
     }
-    m_press_index = m_press_arrow != 0 || m_caught ? QPersistentModelIndex{}
-                                                   : QPersistentModelIndex(indexAt(m_press_pos));
+    m_press_index =
+        m_caught ? QPersistentModelIndex{} : QPersistentModelIndex(indexAt(m_press_pos));
     viewport()->update();
     event->accept();
 }
@@ -1214,9 +1219,6 @@ void GameCarousel::mouseMoveEvent(QMouseEvent* event) {
     const QPoint pos = event->position().toPoint();
     if (!m_pressed || !(event->buttons() & Qt::LeftButton)) {
         UpdateHover(pos);
-        return;
-    }
-    if (m_press_arrow != 0) {
         return;
     }
     const CarouselMetrics m = MetricsFor(viewport()->size());
@@ -1305,19 +1307,6 @@ void GameCarousel::mouseReleaseEvent(QMouseEvent* event) {
         return;
     }
 
-    if (m_press_arrow != 0) {
-        const int direction = m_press_arrow;
-        m_press_arrow = 0;
-        m_last_click_index = QPersistentModelIndex{};
-        if (ArrowAt(pos) == direction) {
-            const int target = std::clamp(CurrentPosition() + direction, 0,
-                                          int(m_visible.size()) - 1);
-            setCurrentIndex(model()->index(m_visible[target], 0));
-        }
-        UpdateHover(pos);
-        return;
-    }
-
     const QModelIndex index = indexAt(pos);
     if (!index.isValid() || index != QModelIndex(m_press_index)) {
         m_last_click_index = QPersistentModelIndex{};
@@ -1333,11 +1322,6 @@ void GameCarousel::mouseReleaseEvent(QMouseEvent* event) {
         // A side card, or one still sliding in: bring it to the center, nothing more.
         setCurrentIndex(index);
         UpdateHover(pos);
-        return;
-    }
-    if (PlayButtonRect().contains(QPointF(pos))) {
-        m_last_click_index = QPersistentModelIndex{};
-        emit LaunchRequested(index);
         return;
     }
     emit clicked(index);
