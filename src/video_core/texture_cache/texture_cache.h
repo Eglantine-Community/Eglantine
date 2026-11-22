@@ -3420,9 +3420,10 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         ++images_created;
     }
 
+    // The device's tiling, not the image's: Maxwell GOB images in a sparse region are split too.
     if (!gpu_memory->IsContinuousRange(new_image.gpu_addr, new_image.guest_size_bytes) &&
         (new_info.is_sparse ||
-         (new_info.native_tiling &&
+         (gpu_memory->UsesNativeTiling() &&
           Tegra::Nx2InSparseRegion(new_image.gpu_addr, new_image.guest_size_bytes)))) {
         new_image.flags |= ImageFlagBits::Sparse;
     }
