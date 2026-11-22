@@ -643,7 +643,7 @@ struct Values {
     // GPU threads (Mario Kart World: 60-700 ms every 600 frames); WhenRamIsLow only marks it to be
     // reclaimed first, and pages it out while the system is short of memory.
     Setting<ColdHintMode> cold_hint_mode{linkage,
-                                         ColdHintMode::Off,
+                                         ColdHintMode::WhenRamIsLow,
                                          "cold_hint_mode",
                                          Category::RendererMemory,
                                          Specialization::Default,

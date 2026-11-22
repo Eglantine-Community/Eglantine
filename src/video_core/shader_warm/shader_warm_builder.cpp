@@ -24,6 +24,7 @@
 #include "common/cityhash.h"
 #include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
+#include "common/host_memory.h"
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/thread.h"
@@ -431,7 +432,9 @@ bool RefreshWarmFiles(Core::System& system, u64 title_id, std::stop_token stop) 
         game_path /= "main";
     }
     LOG_INFO(Render_Vulkan, "Shader precache for {:016x}: {}, building it", title_id, *reason);
-    return BuildWarmFiles(system, game_path, title_id, {}, std::move(stop)).ok;
+    const bool built = BuildWarmFiles(system, game_path, title_id, {}, std::move(stop)).ok;
+    Common::TrimHostHeap();
+    return built;
 }
 
 Result BuildWarmFiles(Core::System& system, const fs::path& game_path, u64 title_id,

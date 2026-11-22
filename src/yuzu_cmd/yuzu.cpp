@@ -38,6 +38,7 @@
 #include "common/driver_shader_cache.h"
 #include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
+#include "common/host_memory.h"
 #include "common/logging.h"
 #include "common/nx2_sampler.h"
 #include "common/scm_rev.h"
@@ -564,6 +565,7 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
 #ifdef _WIN32
     SetUnhandledExceptionFilter(WriteCrashDump);
 #endif
+    Common::ConfigureLowMemoryAllocator();
     Nx2Sampler::StartFromEnvironment();
     // SDL calls SDL_AppIterate back to back by default, which kept a host core at 100% polling
     // input; 240 Hz is plenty for input and the key script.

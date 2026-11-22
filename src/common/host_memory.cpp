@@ -63,13 +63,18 @@
 #include <cstring>
 #include <cstdio>
 #include <chrono>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/div_ceil.h"
 #include "common/free_region_manager.h"
 #include "common/host_memory.h"
+#include "common/literals.h"
 #include "common/logging.h"
+#include "common/memory_detect.h"
 #include "common/settings.h"
 
 #if defined(__ANDROID__) && __ANDROID_API__ < 30
@@ -848,7 +853,7 @@ bool ReadMemoryIsLow() {
     if (!GlobalMemoryStatusEx(&status)) {
         return false;
     }
-    const u64 floor = std::max<u64>(u64{1} << 30, status.ullTotalPhys / 10);
+    const u64 floor = std::max<u64>(u64{2} << 30, status.ullTotalPhys / 7);
     return status.ullAvailPhys < floor;
 #elif defined(__linux__)
     const auto read_file = [](const char* path) {
@@ -895,12 +900,67 @@ bool ReadMemoryIsLow() {
     if (total == 0 || available == 0) {
         return false;
     }
-    return available < std::max<u64>(u64{1} << 30, total / 10);
+    return available < std::max<u64>(u64{2} << 30, total / 7);
 #else
     return false;
 #endif
 }
 } // Anonymous namespace
+
+void ConfigureLowMemoryAllocator() {
+#if defined(__GLIBC__)
+    using namespace Common::Literals;
+    bool enabled = false;
+    if (const char* value = std::getenv("EDEN_NX2_LOW_RAM")) {
+        if (value[0] == '0') {
+            return;
+        }
+        enabled = value[0] == '1';
+    }
+    if (!enabled) {
+        const u64 host_ram = GetMemInfo().TotalPhysicalMemory;
+        enabled = host_ram != 0 && host_ram <= 18_GiB;
+    }
+    if (!enabled) {
+        return;
+    }
+    if (std::getenv("MALLOC_ARENA_MAX") == nullptr) {
+        mallopt(M_ARENA_MAX, 4);
+    }
+    // Keep glibc's mmap threshold from ratcheting up to 32 MiB on transient frees.
+    mallopt(M_MMAP_THRESHOLD, 128 * 1024);
+    mallopt(M_TRIM_THRESHOLD, 128 * 1024);
+#endif
+}
+
+void TrimHostHeap() {
+#if defined(__GLIBC__)
+    malloc_trim(0);
+#endif
+}
+
+void* AllocateZeroedVirtualPages(std::size_t size) {
+    if (size == 0) {
+        return nullptr;
+    }
+#ifdef _WIN32
+    return VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return ptr == MAP_FAILED ? nullptr : ptr;
+#endif
+}
+
+void FreeVirtualPages(void* ptr, std::size_t size) noexcept {
+    if (ptr == nullptr || size == 0) {
+        return;
+    }
+#ifdef _WIN32
+    VirtualFree(ptr, 0, MEM_RELEASE);
+#else
+    munmap(ptr, size);
+#endif
+}
 
 Settings::ColdHintMode ColdHintModeInEffect() {
     const int override_value = g_cold_hint_override.load(std::memory_order_relaxed);
