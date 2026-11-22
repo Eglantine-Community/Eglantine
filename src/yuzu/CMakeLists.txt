@@ -540,24 +540,4 @@ target_link_libraries(yuzu PRIVATE OpenSSL::SSL OpenSSL::Crypto SDL3::SDL3)
 
 create_target_directory_groups(yuzu)
 
-if (ENABLE_RENHDRUM AND RENHDRUM_DOWNLOAD AND WIN32 AND NOT ARCHITECTURE_x86_64)
-    message(WARNING "RENHDRUM_DOWNLOAD: the prebuilt renhdrum.dll is x64 only; skipped for this architecture")
-endif()
-# An explicitly supplied DLL (RENHDRUM_DLL) wins: never fetch over it, or the download
-# block would register a second POST_BUILD copy and replace the chosen file.
-if (ENABLE_RENHDRUM AND RENHDRUM_DOWNLOAD AND WIN32 AND ARCHITECTURE_x86_64 AND NOT RENHDRUM_DLL)
-    # Must stay in step with externals/renhdrum/renhdrum.h: the vendored ABI is 0.5.0's, and a
-    # library older than the header drops the DualSense HD Haptics symbols at best.
-    set(RENHDRUM_VERSION 0.5.0)
-    set(RENHDRUM_DLL "${CMAKE_BINARY_DIR}/renhdrum/${RENHDRUM_VERSION}/renhdrum.dll")
-    if (NOT EXISTS "${RENHDRUM_DLL}")
-        file(DOWNLOAD
-            "https://github.com/trzz1214/RenHDrum/releases/download/v${RENHDRUM_VERSION}/renhdrum.dll"
-            "${RENHDRUM_DLL}"
-            EXPECTED_HASH SHA256=c6859c17ad0f9f689ffa00028ab0066454d199c25a98e3fb68f136d1d0049669
-            SHOW_PROGRESS)
-    endif()
-    add_custom_command(TARGET yuzu POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${RENHDRUM_DLL}" "$<TARGET_FILE_DIR:yuzu>"
-        VERBATIM)
-endif()
+
