@@ -85,6 +85,7 @@ add_executable(tests
     video_core/shader_precache.cpp
     video_core/shader_precache_identity.cpp
     video_core/h264_packet.cpp
+    video_core/nx2_video_gpu_fallback.cpp
     video_core/vertex_repack.cpp
     video_core/virtual_range_cache.cpp
     video_core/query_copy.cpp
