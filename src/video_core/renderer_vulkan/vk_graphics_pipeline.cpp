@@ -288,16 +288,20 @@ struct DefaultSpec {
 enum class LibraryBuild { Whole, Linked, Parts };
 
 // With VK_EXT_graphics_pipeline_library, every 10 s: pipelines linked from compiled parts,
-// pipelines compiled whole, and background part compiles (QueueLibraryParts), with their times.
-void ReportLibraryBuild(LibraryBuild kind, std::chrono::steady_clock::duration time) {
+// pipelines compiled whole (and how many of those got no parts because no other pipeline shares
+// their shaders yet), and background part compiles (QueueLibraryParts), with their times.
+void ReportLibraryBuild(LibraryBuild kind, std::chrono::steady_clock::duration time,
+                        bool parts_skipped = false) {
     static std::mutex mutex;
     static std::array<u32, 3> count{};
     static std::array<std::chrono::steady_clock::duration, 3> total{};
+    static u32 skipped{};
     static auto window = std::chrono::steady_clock::now();
     std::scoped_lock lock{mutex};
     const size_t index = static_cast<size_t>(kind);
     ++count[index];
     total[index] += time;
+    skipped += parts_skipped ? 1 : 0;
     const auto now = std::chrono::steady_clock::now();
     if (now - window < std::chrono::seconds{10}) {
         return;
@@ -309,12 +313,13 @@ void ReportLibraryBuild(LibraryBuild kind, std::chrono::steady_clock::duration t
     };
     LOG_INFO(Render_Vulkan,
              "Graphics pipeline library in the last 10 s: {} linked from compiled parts ({:.1f} "
-             "ms mean), {} compiled whole ({:.1f} ms mean), {} part sets compiled in the "
-             "background ({:.1f} ms mean)",
-             count[1], mean(LibraryBuild::Linked), count[0], mean(LibraryBuild::Whole), count[2],
-             mean(LibraryBuild::Parts));
+             "ms mean), {} compiled whole ({:.1f} ms mean, {} with shaders no other pipeline "
+             "shares, so no parts), {} part sets compiled in the background ({:.1f} ms mean)",
+             count[1], mean(LibraryBuild::Linked), count[0], mean(LibraryBuild::Whole), skipped,
+             count[2], mean(LibraryBuild::Parts));
     count = {};
     total = {};
+    skipped = 0;
     window = now;
 }
 
@@ -2113,15 +2118,21 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass, bool parts_only) {
         return;
     }
     const bool linked = static_cast<bool>(pipeline);
-    compiled_whole_for_library = !linked && fill_library_parts && library_cache && shader_set &&
-                                 library_part_workers && !mesh_emulation;
+    const bool can_fill_parts = !linked && fill_library_parts && library_cache && shader_set &&
+                                library_part_workers && !mesh_emulation;
+    // Parts are keyed by the shader set, so a set no other pipeline uses would compile four
+    // parts nothing links from, beside the whole pipeline: about twice the driver work.
+    const bool shared_set =
+        can_fill_parts && shader_set->pipelines.load(std::memory_order_relaxed) > 1;
+    compiled_whole_for_library = can_fill_parts && shared_set;
     if (!linked) {
         pipeline = device.GetLogical().CreateGraphicsPipeline(pipeline_ci, *pipeline_cache);
     }
     const auto build_time = std::chrono::steady_clock::now() - build_begin;
     DriverBuildReport::Record(DriverBuildReport::Kind::Graphics, build_time);
     if (library_cache) {
-        ReportLibraryBuild(linked ? LibraryBuild::Linked : LibraryBuild::Whole, build_time);
+        ReportLibraryBuild(linked ? LibraryBuild::Linked : LibraryBuild::Whole, build_time,
+                           can_fill_parts && !shared_set);
     }
 
     // Log graphics pipeline creation

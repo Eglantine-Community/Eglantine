@@ -90,6 +90,9 @@ class GraphicsPipelineLibraryCache;
 /// parts by this object's address and keeps it alive with them.
 struct GraphicsShaderSet {
     std::array<vk::ShaderModule, Tegra::Engines::Maxwell3D::Regs::MaxShaderStage> modules;
+    /// Pipelines built from this set (PipelineCache::FindOrMakeShaderSet). Parts are only
+    /// compiled once a second pipeline shares the set: with one, nothing would link from them.
+    mutable std::atomic<u32> pipelines{0};
 };
 
 struct MeshEmulationSetup {

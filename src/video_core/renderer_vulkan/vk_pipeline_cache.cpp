@@ -3462,6 +3462,7 @@ std::shared_ptr<const GraphicsShaderSet> PipelineCache::FindOrMakeShaderSet(
         if (it != shader_sets.end() && it->second.hashes == entry.hashes &&
             it->second.sizes == entry.sizes) {
             if (auto set = it->second.set.lock()) {
+                set->pipelines.fetch_add(1, std::memory_order_relaxed);
                 return set;
             }
         }
@@ -3473,6 +3474,7 @@ std::shared_ptr<const GraphicsShaderSet> PipelineCache::FindOrMakeShaderSet(
             set->modules[stage] = BuildShader(device, code[stage]);
         }
     }
+    set->pipelines.store(1, std::memory_order_relaxed);
     entry.set = set;
     std::scoped_lock lock{shader_sets_mutex};
     shader_sets.insert_or_assign(key, std::move(entry));
