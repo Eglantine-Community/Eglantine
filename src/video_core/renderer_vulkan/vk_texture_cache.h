@@ -293,6 +293,8 @@ public:
     std::deque<PendingTranscode> pending_transcodes;
     /// Decode images the GPU is done with, for the next texture of the same shape.
     std::vector<PendingTranscode> free_transcodes;
+    static u64 TranscodeDecodeBytes(const PendingTranscode& t);
+    void RecycleTranscodes();
 
     std::optional<BlockLinearUnswizzle3DPass> bl3d_unswizzle_pass;
     std::optional<PlainUnswizzlePass> plain_unswizzle_pass;
