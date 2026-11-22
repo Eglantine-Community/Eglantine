@@ -15,6 +15,7 @@
 #include "common/common_types.h"
 
 class GameListModel;
+class QTimer;
 class QVariantAnimation;
 
 /// The home screen's carousel: one large centered game card with the neighbouring games stacked
@@ -73,6 +74,13 @@ private:
     void UpdateHover(const QPoint& pos);
     /// The play button on the centered card, in viewport coordinates.
     QRectF PlayButtonRect() const;
+    /// The previous (-1) or next (1) arrow button, in viewport coordinates.
+    QRectF ArrowRect(int direction) const;
+    bool ArrowEnabled(int direction) const;
+    /// The arrow button under `pos`: -1, 1, or 0 for none.
+    int ArrowAt(const QPoint& pos) const;
+    /// Tells screen readers which game is centered and where it sits in the list.
+    void Announce();
     /// Re-applies the stored filter once the model has changed shape.
     void ScheduleRelayout();
 
@@ -94,11 +102,22 @@ private:
     // Mouse: a press becomes a drag past the start-drag distance, otherwise a click on release.
     bool m_pressed = false;
     bool m_dragging = false;
+    /// The press stopped a moving strip: its release only settles the strip, it clicks nothing.
+    bool m_caught = false;
     QPoint m_press_pos;
-    qreal m_drag_origin = 0.0;
+    /// The card the drag holds, and where its slot center was when the drag began.
+    int m_grab_position = 0;
+    qreal m_grab_x = 0.0;
     QPersistentModelIndex m_press_index;
-    /// The card the last click landed on, so a double-click launches it even after it slid.
+    /// The card the last click landed on, and whether it was the settled center: only that
+    /// card launches on a double-click.
     QPersistentModelIndex m_last_click_index;
+    bool m_last_click_center = false;
+    int m_press_arrow = 0;
+    int m_hover_arrow = 0;
+    bool m_mouse_inside = false;
+    /// Holds the backdrop and the screen reader announcement until the strip settles.
+    QTimer* m_settle_timer = nullptr;
     QElapsedTimer m_drag_clock;
     struct DragSample {
         qint64 ms;

@@ -4,6 +4,7 @@
 #include "yuzu/game/carousel.h"
 
 #include <QEasingCurve>
+#include <QAccessible>
 #include <QApplication>
 #include <QImage>
 #include <QMouseEvent>
@@ -12,6 +13,7 @@
 #include <QPixmapCache>
 #include <QPolygonF>
 #include <QScrollBar>
+#include <QTimer>
 #include <QTransform>
 #include <QVariantAnimation>
 #include <QWheelEvent>
@@ -65,6 +67,14 @@ constexpr int FocusRingWidth = 2;
 constexpr int AnimationMs = 220;
 /// A hovered stacked card keeps this share of its depth fog, so it brightens under the mouse.
 constexpr qreal HoverFogScale = 0.35;
+/// A pressed card shrinks to this, so the press shows before anything else happens.
+constexpr qreal PressScale = 0.96;
+/// Pointer travel to card travel while dragging: 1 keeps the grabbed card under the pointer.
+constexpr qreal DragGain = 1.0;
+constexpr int ArrowDiameter = 40;
+constexpr int ArrowMargin = 16;
+/// The backdrop and the screen reader wait this long for the strip to stop on a game.
+constexpr int SettleMs = 120;
 /// How far a flick carries on after release: seconds of the release velocity.
 constexpr qreal FlingSeconds = 0.22;
 constexpr int MaxFlingCards = 12;
@@ -296,6 +306,61 @@ QRectF CardRect(qreal depth, const CarouselMetrics& m) {
         return {left, y, w, h};
     }
     return {m.center.x() - w / 2.0, y, w, h};
+}
+
+/// Where the center of a card resting at `depth` sits, joined linearly between whole depths.
+/// The painted center is not monotonic just off the center slot (the card shrinks faster than it
+/// moves), so a drag follows this rail instead.
+qreal SlotCenterX(qreal depth, const CarouselMetrics& m) {
+    const qreal lower = std::floor(depth);
+    const qreal t = depth - lower;
+    const qreal a = CardRect(lower, m).center().x();
+    if (t < 1e-6) {
+        return a;
+    }
+    return a + (CardRect(lower + 1.0, m).center().x() - a) * t;
+}
+
+/// The depth at which a card's rail center lands on `x`.
+qreal DepthForSlotX(qreal x, const CarouselMetrics& m) {
+    qreal lo = -64.0;
+    qreal hi = 64.0;
+    for (int i = 0; i < 48; ++i) {
+        const qreal mid = (lo + hi) / 2.0;
+        if (SlotCenterX(mid, m) < x) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    return (lo + hi) / 2.0;
+}
+
+void DrawArrowButton(QPainter& p, const QRectF& rect, int direction, const QPalette& pal,
+                     bool hot) {
+    p.save();
+    p.setPen(Qt::NoPen);
+    for (int i = 3; i >= 1; --i) {
+        p.setBrush(QColor(0, 0, 0, 16));
+        p.drawEllipse(rect.adjusted(-i, -i + 2, i, i + 2));
+    }
+    QColor fill = hot ? pal.color(QPalette::Highlight) : pal.color(QPalette::Window);
+    fill.setAlpha(hot ? 240 : 210);
+    p.setBrush(fill);
+    QColor edge = pal.color(QPalette::WindowText);
+    edge.setAlpha(60);
+    p.setPen(QPen(edge, 1));
+    p.drawEllipse(rect);
+    const QColor ink = hot ? pal.color(QPalette::HighlightedText) : pal.color(QPalette::WindowText);
+    p.setPen(QPen(ink, 2.2, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+    p.setBrush(Qt::NoBrush);
+    const qreal s = rect.width() * 0.16;
+    const QPointF c = rect.center() + QPointF(-direction * s * 0.3, 0);
+    QPolygonF chevron;
+    chevron << QPointF(c.x() - direction * s, c.y() - s * 1.6) << QPointF(c.x() + direction * s, c.y())
+            << QPointF(c.x() - direction * s, c.y() + s * 1.6);
+    p.drawPolyline(chevron);
+    p.restore();
 }
 
 void DrawCardShadow(QPainter& p, const QRectF& rect, int alpha) {
@@ -587,6 +652,15 @@ GameCarousel::GameCarousel(QWidget* parent) : QListView{parent} {
             });
 
     viewport()->setMouseTracking(true);
+
+    m_settle_timer = new QTimer(this);
+    m_settle_timer->setSingleShot(true);
+    m_settle_timer->setInterval(SettleMs);
+    connect(m_settle_timer, &QTimer::timeout, this, [this] {
+        emit CenteredGameChanged(CenteredProgramId());
+        Announce();
+    });
+    setAccessibleName(tr("Games"));
 }
 
 void GameCarousel::SetModel(GameListModel* model) {
@@ -717,9 +791,10 @@ void GameCarousel::MoveTo(int position, int duration_ms) {
     m_position_anim->setDuration(duration_ms < 0 ? AnimationMs : duration_ms);
     m_position_anim->setEasingCurve(QEasingCurve::OutCubic);
     m_position_anim->setKeyValues({{0.0, m_position}, {1.0, qreal(position)}});
-    // The backdrop follows the slide's destination, not the games it passes.
+    // The backdrop follows the slide's destination, not the games it passes, and only once
+    // key repeats or wheel steps stop picking a new one.
     m_pending_center = position;
-    emit CenteredGameChanged(CenteredProgramId());
+    m_settle_timer->start();
     // The card settling into the center slot swaps to the center-sized icon; warm it now so
     // the last frame of the slide does not hitch on its first resample.
     if (model() && position >= 0 && position < int(m_visible.size())) {
@@ -807,7 +882,14 @@ void GameCarousel::paintEvent(QPaintEvent*) {
         }
         const QModelIndex index = model()->index(m_visible[card.position], 0);
         const bool hovered = card.position == m_hover_position && !m_dragging;
-        DrawCard(p, index, rect, card.depth, palette(), focused, borders, dpr, m.peek,
+        const bool pressed = m_pressed && !m_dragging && !m_caught && m_press_index.isValid() &&
+                             card.position == PositionOf(m_press_index.row());
+        QRectF shown = rect;
+        if (pressed) {
+            shown = QRectF(QPointF(), rect.size() * PressScale);
+            shown.moveCenter(rect.center());
+        }
+        DrawCard(p, index, shown, card.depth, palette(), focused, borders, dpr, m.peek,
                  center_bucket, stack_bucket, alpha, hovered ? HoverFogScale : 1.0);
     }
 
@@ -816,6 +898,15 @@ void GameCarousel::paintEvent(QPaintEvent*) {
     if (!m_dragging && m_hover_position == center &&
         std::abs(m_position - center) < 0.02) {
         DrawPlayButton(p, PlayButtonRect(), palette(), m_hover_play);
+    }
+
+    if (m_mouse_inside && !m_dragging) {
+        for (const int direction : {-1, 1}) {
+            if (ArrowEnabled(direction)) {
+                DrawArrowButton(p, ArrowRect(direction), direction, palette(),
+                                m_hover_arrow == direction);
+            }
+        }
     }
 
     if (m.names) {
@@ -1015,23 +1106,80 @@ QRectF GameCarousel::PlayButtonRect() const {
     return {card.center().x() - diameter / 2.0, bottom - diameter, diameter, diameter};
 }
 
+QRectF GameCarousel::ArrowRect(int direction) const {
+    const CarouselMetrics m = MetricsFor(viewport()->size());
+    const qreal x = direction < 0 ? ArrowMargin : viewport()->width() - ArrowMargin - ArrowDiameter;
+    return {x, m.center.y() - ArrowDiameter / 2.0, qreal(ArrowDiameter), qreal(ArrowDiameter)};
+}
+
+bool GameCarousel::ArrowEnabled(int direction) const {
+    if (m_visible.size() < 2) {
+        return false;
+    }
+    const int position = CurrentPosition();
+    return direction < 0 ? position > 0 : position < int(m_visible.size()) - 1;
+}
+
+int GameCarousel::ArrowAt(const QPoint& pos) const {
+    if (!m_mouse_inside) {
+        return 0;
+    }
+    for (const int direction : {-1, 1}) {
+        if (ArrowEnabled(direction) && ArrowRect(direction).contains(QPointF(pos))) {
+            return direction;
+        }
+    }
+    return 0;
+}
+
+void GameCarousel::Announce() {
+    if (!QAccessible::isActive() || !hasFocus() || m_visible.empty() || !model()) {
+        return;
+    }
+    const int position = CurrentPosition();
+    const QString title = model()
+                              ->index(m_visible[position], 0)
+                              .data(Qt::DisplayRole)
+                              .toString()
+                              .split(QLatin1Char('\n'))
+                              .first();
+    const QString text =
+        tr("%1, %2 of %3").arg(title).arg(position + 1).arg(int(m_visible.size()));
+    setAccessibleDescription(text);
+#if QT_VERSION >= QT_VERSION_CHECK(6, 8, 0)
+    QAccessibleAnnouncementEvent event(this, text);
+#else
+    QAccessibleEvent event(this, QAccessible::DescriptionChanged);
+#endif
+    QAccessible::updateAccessibility(&event);
+}
+
 void GameCarousel::UpdateHover(const QPoint& pos) {
-    const QModelIndex index = indexAt(pos);
+    // The arrows show while the mouse is over the view.
+    const bool entered = !m_mouse_inside;
+    m_mouse_inside = true;
+    const int arrow = ArrowAt(pos);
+    const QModelIndex index = arrow != 0 ? QModelIndex{} : indexAt(pos);
     const int position = index.isValid() ? PositionOf(index.row()) : -1;
     const bool play = position >= 0 && position == CurrentPosition() &&
                       PlayButtonRect().contains(QPointF(pos));
-    viewport()->setCursor(position >= 0 ? Qt::PointingHandCursor : Qt::ArrowCursor);
-    if (position != m_hover_position || play != m_hover_play) {
+    viewport()->setCursor(position >= 0 || arrow != 0 ? Qt::PointingHandCursor
+                                                      : Qt::ArrowCursor);
+    if (entered || position != m_hover_position || play != m_hover_play ||
+        arrow != m_hover_arrow) {
         m_hover_position = position;
         m_hover_play = play;
+        m_hover_arrow = arrow;
         viewport()->update();
     }
 }
 
 bool GameCarousel::viewportEvent(QEvent* event) {
     if (event->type() == QEvent::Leave && !m_pressed) {
+        m_mouse_inside = false;
         m_hover_position = -1;
         m_hover_play = false;
+        m_hover_arrow = 0;
         viewport()->update();
     }
     return QListView::viewportEvent(event);
@@ -1047,7 +1195,18 @@ void GameCarousel::mousePressEvent(QMouseEvent* event) {
     m_pressed = true;
     m_dragging = false;
     m_press_pos = event->position().toPoint();
-    m_press_index = indexAt(m_press_pos);
+    m_press_arrow = ArrowAt(m_press_pos);
+    // A press on a strip still travelling (a flick, a long jump) stops it where it is, as a
+    // finger would. The tail of a one-card slide is left to finish, so quick clicks still land.
+    m_caught = false;
+    if (m_press_arrow == 0 && m_position_anim->state() == QAbstractAnimation::Running &&
+        std::abs(m_position_anim->endValue().toReal() - m_position) > 0.5) {
+        m_position_anim->stop();
+        m_caught = true;
+    }
+    m_press_index = m_press_arrow != 0 || m_caught ? QPersistentModelIndex{}
+                                                   : QPersistentModelIndex(indexAt(m_press_pos));
+    viewport()->update();
     event->accept();
 }
 
@@ -1057,24 +1216,33 @@ void GameCarousel::mouseMoveEvent(QMouseEvent* event) {
         UpdateHover(pos);
         return;
     }
+    if (m_press_arrow != 0) {
+        return;
+    }
     const CarouselMetrics m = MetricsFor(viewport()->size());
     if (!m_dragging) {
         if (std::abs(pos.x() - m_press_pos.x()) < QApplication::startDragDistance()) {
             return;
         }
-        // The strip picks up where it is, mid-slide included, without jumping to the press.
+        // The drag holds the card under the press, or the centered one from empty space, and
+        // picks the strip up where it is, mid-slide included.
         m_dragging = true;
         m_position_anim->stop();
-        m_drag_origin = m_position;
+        const QModelIndex grabbed = indexAt(m_press_pos);
+        const int grabbed_position = grabbed.isValid() ? PositionOf(grabbed.row()) : -1;
+        m_grab_position = grabbed_position >= 0
+                              ? grabbed_position
+                              : std::clamp(int(std::lround(m_position)), 0,
+                                           int(m_visible.size()) - 1);
+        m_grab_x = SlotCenterX(m_grab_position - m_position, m);
         m_press_pos = pos;
         m_last_click_index = QPersistentModelIndex{};
         m_drag_samples.clear();
         m_drag_clock.start();
         viewport()->setCursor(Qt::ClosedHandCursor);
     }
-    // One game per this many pixels: about the distance a card travels into the center slot.
-    const qreal step = std::clamp(m.card_w * 0.33, qreal(67), qreal(217));
-    const qreal raw = m_drag_origin - (pos.x() - m_press_pos.x()) / step;
+    const qreal target_x = m_grab_x + (pos.x() - m_press_pos.x()) * DragGain;
+    const qreal raw = m_grab_position - DepthForSlotX(target_x, m);
     // Past either end the strip follows with growing resistance, then springs back on release.
     const qreal last = qreal(m_visible.size() - 1);
     const auto resist = [](qreal over) { return 0.5 * over / (1.0 + over); };
@@ -1086,11 +1254,8 @@ void GameCarousel::mouseMoveEvent(QMouseEvent* event) {
            m_drag_samples.back().ms - m_drag_samples.front().ms > 100) {
         m_drag_samples.erase(m_drag_samples.begin());
     }
-    const int center = std::clamp(int(std::lround(m_position)), 0, int(m_visible.size()) - 1);
-    if (center != m_pending_center) {
-        m_pending_center = center;
-        emit CenteredGameChanged(CenteredProgramId());
-    }
+    // The backdrop waits for the release: it would flicker through every game passed.
+    m_pending_center = std::clamp(int(std::lround(m_position)), 0, int(m_visible.size()) - 1);
     viewport()->update();
 }
 
@@ -1105,6 +1270,7 @@ void GameCarousel::mouseReleaseEvent(QMouseEvent* event) {
     }
     m_pressed = false;
     const QPoint pos = event->position().toPoint();
+    viewport()->update();
 
     if (m_dragging) {
         m_dragging = false;
@@ -1128,6 +1294,30 @@ void GameCarousel::mouseReleaseEvent(QMouseEvent* event) {
         return;
     }
 
+    if (m_caught) {
+        // Settle on the nearest card; the press only stopped the strip.
+        m_caught = false;
+        m_last_click_index = QPersistentModelIndex{};
+        const int target =
+            std::clamp(int(std::lround(m_position)), 0, int(m_visible.size()) - 1);
+        setCurrentIndex(model()->index(m_visible[target], 0));
+        MoveTo(target);
+        return;
+    }
+
+    if (m_press_arrow != 0) {
+        const int direction = m_press_arrow;
+        m_press_arrow = 0;
+        m_last_click_index = QPersistentModelIndex{};
+        if (ArrowAt(pos) == direction) {
+            const int target = std::clamp(CurrentPosition() + direction, 0,
+                                          int(m_visible.size()) - 1);
+            setCurrentIndex(model()->index(m_visible[target], 0));
+        }
+        UpdateHover(pos);
+        return;
+    }
+
     const QModelIndex index = indexAt(pos);
     if (!index.isValid() || index != QModelIndex(m_press_index)) {
         m_last_click_index = QPersistentModelIndex{};
@@ -1138,9 +1328,8 @@ void GameCarousel::mouseReleaseEvent(QMouseEvent* event) {
     }
     m_last_click_index = index;
     const int position = PositionOf(index.row());
-    const bool settled_center =
-        position == CurrentPosition() && std::abs(m_position - position) < 0.05;
-    if (!settled_center) {
+    m_last_click_center = position == CurrentPosition() && std::abs(m_position - position) < 0.05;
+    if (!m_last_click_center) {
         // A side card, or one still sliding in: bring it to the center, nothing more.
         setCurrentIndex(index);
         UpdateHover(pos);
@@ -1159,9 +1348,10 @@ void GameCarousel::mouseDoubleClickEvent(QMouseEvent* event) {
         QListView::mouseDoubleClickEvent(event);
         return;
     }
-    // The first click may have slid its card away from under the mouse: launch that card.
+    // Only the card that was already centered launches. A double-click on a side card just
+    // centers it, its first click already did, so quick browsing never starts a game.
     m_pressed = false;
-    if (m_last_click_index.isValid()) {
+    if (m_last_click_index.isValid() && m_last_click_center) {
         const QModelIndex index = m_last_click_index;
         m_last_click_index = QPersistentModelIndex{};
         emit doubleClicked(index);
