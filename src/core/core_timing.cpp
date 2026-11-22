@@ -61,7 +61,7 @@ static u32 ReadCntpctMode() {
 
 void CoreTiming::ConfigureInlineCntpct(bool supported) {
     const char* value = std::getenv("EDEN_NX2_JIT_INLINE_CNTPCT");
-    const bool enabled = value && value[0] == '1' && supported && is_multicore &&
+    const bool enabled = (value == nullptr || value[0] != '0') && supported && is_multicore &&
                          Common::g_wall_clock.IsNative();
     inline_cntpct_mode.store(enabled ? ReadCntpctMode() : InlineCntpctDisabled,
                              std::memory_order_relaxed);
