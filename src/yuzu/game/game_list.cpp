@@ -339,6 +339,11 @@ GameList::GameList(FileSys::VirtualFilesystem vfs_, FileSys::ManualContentProvid
     // TODO: impl on grid
     connect(tree_view, &GameTree::FilterResultReady, search_field,
             [this](int visible, int total) { search_field->setFilterResult(visible, total); });
+    connect(carousel_view, &GameCarousel::LaunchRequested, this, [this](const QModelIndex& index) {
+        click_timer->stop();
+        ValidateEntry(index);
+    });
+    connect(carousel_view, &GameCarousel::BackgroundClicked, this, &GameList::HideGameDetails);
     connect(carousel_view, &GameCarousel::FilterResultReady, search_field,
             [this](int visible, int total) { search_field->setFilterResult(visible, total); });
 
@@ -1744,16 +1749,16 @@ bool GameList::eventFilter(QObject* obj, QEvent* event) {
         return true;
     }
 
-    if (obj == m_currentView->viewport() && event->type() == QEvent::MouseButtonPress) {
+    // The carousel reports background clicks itself, so a drag from empty space keeps the
+    // sidebar, and its centered card stays the selection.
+    if (obj == m_currentView->viewport() && obj != carousel_view->viewport() &&
+        event->type() == QEvent::MouseButtonPress) {
         QMouseEvent* mouseEvent = static_cast<QMouseEvent*>(event);
 
         QModelIndex index = m_currentView->indexAt(mouseEvent->pos());
         if (!index.isValid()) {
-            // The carousel's centered card is always the selection.
-            if (m_currentView != carousel_view) {
-                m_currentView->selectionModel()->clearSelection();
-                m_currentView->setCurrentIndex(QModelIndex());
-            }
+            m_currentView->selectionModel()->clearSelection();
+            m_currentView->setCurrentIndex(QModelIndex());
             HideGameDetails();
         }
     }
