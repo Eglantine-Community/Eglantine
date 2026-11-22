@@ -302,7 +302,10 @@ GameList::GameList(FileSys::VirtualFilesystem vfs_, FileSys::ManualContentProvid
     for (QAbstractItemView* view :
          {static_cast<QAbstractItemView*>(tree_view), static_cast<QAbstractItemView*>(grid_view),
           static_cast<QAbstractItemView*>(carousel_view)}) {
-        connect(view, &QAbstractItemView::doubleClicked, this, &GameList::ValidateEntry);
+        connect(view, &QAbstractItemView::doubleClicked, this, [this](const QModelIndex& index) {
+            click_timer->stop();
+            ValidateEntry(index);
+        });
         connect(view, &QAbstractItemView::clicked, this, &GameList::OnItemClicked);
         connect(view, &QWidget::customContextMenuRequested, this, &GameList::PopupContextMenu);
         // Wait for the selection to settle so holding an arrow key doesn't load every game.
@@ -721,6 +724,13 @@ void GameList::SetupGameDetails() {
             ShowGameDetails(current);
         }
     });
+    click_timer = new QTimer(this);
+    click_timer->setSingleShot(true);
+    connect(click_timer, &QTimer::timeout, this, [this] {
+        if (clicked_index.isValid()) {
+            ShowGameDetails(clicked_index);
+        }
+    });
     details_pool = new QThreadPool(this);
     details_pool->setMaxThreadCount(1);
 
@@ -837,9 +847,17 @@ bool GameList::RevealPendingGame() {
 void GameList::OnItemClicked(const QModelIndex& index) {
     pending_details_path.clear();
     const auto type = index.sibling(index.row(), 0).data(GameListItem::TypeRole);
-    if (type.value<GameListItemType>() == GameListItemType::Game) {
-        ShowGameDetails(index);
+    if (type.value<GameListItemType>() != GameListItemType::Game) {
+        return;
     }
+    // An open sidebar follows the click at once; a closed one waits so a double-click only
+    // starts the game.
+    if (details_panel->isVisible() && details_panel->maximumWidth() > 0) {
+        ShowGameDetails(index);
+        return;
+    }
+    clicked_index = index;
+    click_timer->start(QApplication::doubleClickInterval());
 }
 
 void GameList::ShowGameDetails(const QModelIndex& index) {

@@ -207,6 +207,9 @@ private:
     QPropertyAnimation* details_animation = nullptr;
     QPersistentModelIndex details_index;
     QTimer* details_timer = nullptr;
+    /// Holds a click's details sidebar back until it can no longer become a double-click.
+    QTimer* click_timer = nullptr;
+    QPersistentModelIndex clicked_index;
     QThreadPool* details_pool = nullptr;
     bool add_ons_changed = false;
     bool panels_overlay = false;
