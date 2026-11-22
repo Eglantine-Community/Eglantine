@@ -730,7 +730,7 @@ struct Values {
     SwitchableSetting<bool> mkw_60fps{linkage, false, "mkw_60fps", Category::RendererAdvanced};
     SwitchableSetting<bool> mkw_60fps_fallback{linkage, true, "mkw_60fps_fallback",
                                                Category::RendererAdvanced};
-    SwitchableSetting<bool> mkw_dynamic_fps{linkage, false, "mkw_dynamic_fps",
+    SwitchableSetting<bool> mkw_dynamic_fps{linkage, true, "mkw_dynamic_fps",
                                             Category::RendererAdvanced};
 
     SwitchableSetting<bool> use_reactive_flushing{linkage,

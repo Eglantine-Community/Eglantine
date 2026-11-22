@@ -994,6 +994,9 @@ void MainWindow::InitializeWidgets() {
         if (emulation_running) {
             render_window->show();
             render_window->setFocus();
+            if (!ui->action_Fullscreen->isChecked()) {
+                ui->menubar->show();
+            }
         }
     });
 

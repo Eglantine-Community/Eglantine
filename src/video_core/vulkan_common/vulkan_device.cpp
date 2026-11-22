@@ -1800,6 +1800,20 @@ void Device::RemoveUnsuitableExtensions() {
         LOG_WARNING(Render_Vulkan, "EDEN_NX2_FORCE_MESH_FALLBACK: VK_EXT_mesh_shader disabled");
         extensions.mesh_shader = false;
     }
+    // AMD runs task shaders on a compute queue ganged with the graphics queue. With the guest's
+    // task programs that hangs the GPU (RDNA2/RDNA3 on AMD drivers: gfx ring timeout, device lost),
+    // while the compute fallback runs the same draws fine. NVIDIA and Intel have task and mesh
+    // stages in the graphics pipe. EDEN_NX2_NATIVE_MESH=1 keeps the extension for testing.
+    const VkDriverId mesh_driver{properties.driver.driverID};
+    const bool amd_task_on_compute_queue{mesh_driver == VK_DRIVER_ID_MESA_RADV ||
+                                         mesh_driver == VK_DRIVER_ID_AMD_PROPRIETARY ||
+                                         mesh_driver == VK_DRIVER_ID_AMD_OPEN_SOURCE};
+    if (extensions.mesh_shader && amd_task_on_compute_queue &&
+        std::getenv("EDEN_NX2_NATIVE_MESH") == nullptr) {
+        LOG_INFO(Render_Vulkan, "AMD driver: VK_EXT_mesh_shader disabled, task/mesh draws use the "
+                                "compute fallback (EDEN_NX2_NATIVE_MESH=1 keeps it)");
+        extensions.mesh_shader = false;
+    }
     RemoveExtensionFeatureIfUnsuitable(extensions.mesh_shader, features.mesh_shader,
                                        VK_EXT_MESH_SHADER_EXTENSION_NAME);
 

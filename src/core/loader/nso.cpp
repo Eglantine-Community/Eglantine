@@ -232,12 +232,13 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
     // 30 FPS fallback, the mode load becomes a call to `ldr w8, <word>; ret` in the padding after
     // .text, a word nx2:vi2 switches between 1 and 2 (one 1/30 s step a frame) at runtime: 60
     // while frames make it, 30 at full speed while they don't.
-    const bool mkw_dynamic = Settings::values.mkw_dynamic_fps.GetValue();
-    const bool mkw_60 = !mkw_dynamic && Settings::values.mkw_60fps.GetValue();
+    const bool mkw_30 = Settings::values.mkw_30fps.GetValue();
+    const bool mkw_dynamic = !mkw_30 && (Settings::values.mkw_dynamic_fps.GetValue() || !Settings::values.mkw_60fps.GetValue());
+    const bool mkw_60 = !mkw_30 && !mkw_dynamic && Settings::values.mkw_60fps.GetValue();
     const bool mkw_60_switching = mkw_60 && Settings::values.mkw_60fps_fallback.GetValue();
     bool mkw_dynamic_fps_patch_applied = false;
     u64 mkw_mode_word_offset = 0;
-    if ((mkw_dynamic || mkw_60 || Settings::values.mkw_30fps.GetValue()) && name == "main" &&
+    if ((mkw_dynamic || mkw_60 || mkw_30) && name == "main" &&
         process.GetProgramId() == Settings::MarioKartWorldProgramId) {
         constexpr u32 ModeLoadInsn = 0xB9421268; // ldr w8, [x19, #0x210]
         const u32 mode = mkw_dynamic ? 0U : mkw_60 ? 1U : 2U;

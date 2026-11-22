@@ -64,6 +64,7 @@ artifacts
 /install*
 vulkansdk*.exe
 *.tar.zst
+/Dalia/
 
 # Build-time generated external sources
 externals/generated
