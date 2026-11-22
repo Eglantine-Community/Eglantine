@@ -428,6 +428,10 @@ struct Impl {
 } // Anonymous namespace
 
 void Filter::ParseFilterString(std::string_view filter_view) {
+    while (filter_view.size() >= 2 && filter_view.front() == '"' && filter_view.back() == '"') {
+        filter_view.remove_prefix(1);
+        filter_view.remove_suffix(1);
+    }
     auto clause_begin = filter_view.cbegin();
     while (clause_begin < filter_view.cend()) {
         auto clause_end = std::find(clause_begin, filter_view.cend(), ' ');

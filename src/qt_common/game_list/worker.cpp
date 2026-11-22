@@ -273,12 +273,12 @@ QList<QStandardItem*> MakeGameListEntry(const std::string& path, const std::stri
             return FormatPatchNameVersions(patch, loader, loader.IsRomFSUpdatable());
         });
 
-    FileSys::NACP nacp{};
+    auto nacp = std::make_unique<FileSys::NACP>();
     // An NX tree snapshot, like a NUP, is already the updated game: no patch manager update.
     if ((file_type == Loader::FileType::NUP ||
          (file_type == Loader::FileType::NX && !loader.IsRomFSUpdatable())) &&
-        loader.ReadControlData(nacp) == Loader::ResultStatus::Success) {
-        const std::string version_string = nacp.GetVersionString();
+        loader.ReadControlData(*nacp) == Loader::ResultStatus::Success) {
+        const std::string version_string = nacp->GetVersionString();
         if (!version_string.empty()) {
             if (!patch_versions.isEmpty()) {
                 patch_versions += QLatin1Char('\n');

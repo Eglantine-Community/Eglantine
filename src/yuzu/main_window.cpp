@@ -3495,6 +3495,9 @@ void MainWindow::OnStartGame() {
     QtCommon::emu_thread->SetRunning(true);
 
     UpdateMenuState();
+    if (!ui->action_Fullscreen->isChecked()) {
+        ui->menubar->show();
+    }
     OnTasStateChanged();
 
     play_time_manager->SetProgramId(QtCommon::system->GetApplicationProcessProgramID());
@@ -3521,6 +3524,9 @@ void MainWindow::OnPauseGame() {
     QtCommon::emu_thread->SetRunning(false);
     play_time_manager->Stop();
     UpdateMenuState();
+    if (!ui->action_Fullscreen->isChecked()) {
+        ui->menubar->show();
+    }
     AllowOSSleep();
     Common::FeralGamemode::Stop();
 }
