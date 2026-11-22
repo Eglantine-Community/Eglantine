@@ -47,7 +47,7 @@ Este proyecto se basa y continúa el trabajo de destacados emuladores de la comu
 ## 📦 Descarga y uso
 
 ### Descargas
-Puedes descargar las versiones compiladas más recientes directamente desde la sección de **[Releases](https://github.com/azeselh/Eglantine_Aze/releases)** del repositorio.
+Puedes descargar las versiones compiladas más recientes directamente desde la sección de **[Releases](https://github.com/azeselh/Dalia/releases)** del repositorio.
 
 En Windows, extrae el archivo en una carpeta y ejecuta:
 - **`dalia.exe`**: Interfaz gráfica de usuario (GUI).
@@ -81,8 +81,8 @@ En su primer inicio no portátil, Dalia permite importar automáticamente config
 
 ```bash
 # 1. Clonar el repositorio
-git clone https://github.com/azeselh/Eglantine_Aze.git
-cd Eglantine_Aze
+git clone https://github.com/azeselh/Dalia.git
+cd Dalia
 
 # 2. Configurar el proyecto con CMake
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -103,7 +103,7 @@ Para más detalles sobre dependencias de plataformas específicas, consulta la [
 
 Si encuentras algún fallo técnico o incompatibilidad gráfica:
 
-1. Comprueba si el problema ya ha sido reportado en la sección de **[Issues](https://github.com/azeselh/Eglantine_Aze/issues)**.
+1. Comprueba si el problema ya ha sido reportado en la sección de **[Issues](https://github.com/azeselh/Dalia/issues)**.
 2. Al abrir un nuevo reporte, incluye:
    - Especificaciones completas de hardware (CPU, GPU, versión del controlador gráfico, SO).
    - Título e ID del programa afectado.
