@@ -183,8 +183,10 @@ QPixmap ScaledCardIcon(const QModelIndex& index, int bucket, qreal dpr, int cap_
     const int px = std::min(cap_px, std::max(1, qRound(bucket * dpr)));
     // The icon the user chose through the artwork feature overrides the embedded one, as in
     // every other view; otherwise the embedded original beats the pre-scaled decoration.
+    const u64 program_id = index.data(GameListItemPath::ProgramIdRole).toULongLong();
+    const bool custom_icon = QtCommon::GameArt::HasIcon(program_id);
     QPixmap source;
-    if (QtCommon::GameArt::HasIcon(index.data(GameListItemPath::ProgramIdRole).toULongLong())) {
+    if (custom_icon) {
         source = index.data(Qt::DecorationRole).value<QPixmap>();
     }
     if (source.isNull()) {
@@ -206,13 +208,22 @@ QPixmap ScaledCardIcon(const QModelIndex& index, int bucket, qreal dpr, int cap_
     if (QPixmapCache::find(key, &cached)) {
         return cached;
     }
+    // A custom icon's decoration is scaled down to the icon-size setting; resample the file
+    // instead. The key stays the decoration's, which changes whenever the custom icon does.
+    QImage full = source.toImage();
+    if (custom_icon) {
+        QImage original(QtCommon::GameArt::IconPath(program_id));
+        if (!original.isNull()) {
+            full = std::move(original);
+        }
+    }
     const QSize physical(px, px);
-    const QSize fitted = source.size().scaled(physical, Qt::KeepAspectRatio);
+    const QSize fitted = full.size().scaled(physical, Qt::KeepAspectRatio);
     QImage square(physical, QImage::Format_ARGB32);
     square.fill(Qt::transparent);
     QPainter sq(&square);
     sq.drawImage((physical.width() - fitted.width()) / 2, (physical.height() - fitted.height()) / 2,
-                 MitchellResample(source.toImage(), fitted));
+                 MitchellResample(full, fitted));
     QPixmap out = QPixmap::fromImage(square);
     out.setDevicePixelRatio(dpr);
     QPixmapCache::insert(key, out);
