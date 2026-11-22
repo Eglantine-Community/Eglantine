@@ -42,8 +42,9 @@ constexpr int TitleReserve = 36;
 /// Room under the title for the pager row, which is always shown.
 constexpr int PagerReserve = 44;
 constexpr int MinCenterSize = 160;
-/// How far each stacked card peeks past the card in front of it, as a share of the center card.
-constexpr qreal PeekFraction = 0.12;
+/// The narrowest a stacked card may peek past the one in front of it. Below this the stack
+/// shows fewer cards instead of slivers nobody can recognise.
+constexpr qreal MinPeek = 40.0;
 /// Size falloff per step into the stack, so the strip reads as receding.
 constexpr qreal ScaleStep = 0.90;
 constexpr qreal MinScale = 0.40;
@@ -258,6 +259,8 @@ struct CarouselMetrics {
     qreal card_w = 0.0;
     qreal card_h = 0.0;
     qreal peek = 0.0;
+    /// Stacked cards shown on each side: the setting, or fewer when the width cannot fit them.
+    int side_count = 1;
     bool names = false;
 };
 
@@ -281,7 +284,17 @@ CarouselMetrics MetricsFor(const QSize& area) {
     m.card_w = cartridge ? m.card_h * GameCard::CartridgeAspect : m.card_h;
     // The card floats centered in the available height at every size.
     m.center = QPointF(area.width() / 2.0, SideGap + available / 2.0);
-    m.peek = std::clamp(m.card_w * PeekFraction, qreal(40), qreal(96));
+    // The stacks share the width beside the center card, so a wide window shows more of each
+    // neighbour instead of empty space. A narrow one shows fewer neighbours, not thinner ones.
+    const int wanted =
+        std::clamp(int(UISettings::values.carousel_side_count.GetValue()), 1, MaxSideCount);
+    const qreal room = std::max<qreal>(0.0, area.width() / 2.0 - m.card_w / 2.0 - SideGap);
+    m.side_count = std::clamp(int(room / MinPeek), 1, wanted);
+    // Never wider than the deepest card shown, so neighbours still overlap instead of
+    // leaving gaps between them.
+    const qreal deepest = m.card_w * std::max(MinScale, std::pow(ScaleStep, m.side_count)) *
+                          (1.0 - TiltSqueeze);
+    m.peek = std::clamp(room / m.side_count, MinPeek, std::max(MinPeek, deepest));
     return m;
 }
 
@@ -845,8 +858,7 @@ void GameCarousel::paintEvent(QPaintEvent*) {
         qreal depth;
     };
     std::vector<Card> cards;
-    const int max_depth =
-        std::clamp(int(UISettings::values.carousel_side_count.GetValue()), 1, MaxSideCount);
+    const int max_depth = m.side_count;
     const int base = int(std::floor(m_position));
     for (int position = std::max(0, base - max_depth - 1);
          position <= std::min<int>(int(m_visible.size()) - 1, base + max_depth + 1); ++position) {
@@ -907,8 +919,7 @@ QModelIndex GameCarousel::indexAt(const QPoint& point) const {
     const bool cartridge = UISettings::values.game_icon_borders.GetValue() &&
                            UISettings::values.game_cartridge_kind.GetValue() == 1;
     // Only cards paintEvent draws can be hit: a faded-out card past the stack is not there.
-    const int max_depth =
-        std::clamp(int(UISettings::values.carousel_side_count.GetValue()), 1, MaxSideCount);
+    const int max_depth = m.side_count;
     int best = -1;
     qreal best_depth = 0.0;
     for (int position = 0; position < int(m_visible.size()); ++position) {
