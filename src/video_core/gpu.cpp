@@ -239,9 +239,25 @@ struct GPU::Impl {
         cpu_context->DoneCurrent();
     }
 
-    /// Push GPU command entries to be processed
+    void RecordNx2VideoFrame() {
+        last_video_frame.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+                               std::memory_order_relaxed);
+    }
+
+    bool IsNx2VideoPlaying() const {
+        const auto last_frame = last_video_frame.load(std::memory_order_relaxed);
+        return last_frame != 0 &&
+               std::chrono::steady_clock::now().time_since_epoch() -
+                       std::chrono::steady_clock::duration{last_frame} <
+                   std::chrono::milliseconds{500};
+    }
+
     void PushGPUEntries(s32 channel, Tegra::CommandList&& entries) {
-        gpu_thread.SubmitList(channel, std::move(entries), is_async);
+        constexpr u64 YoshiProgramId = 0x0400245021D2C000;
+        // Yoshi's movie draws can read stale texture bindings when submits run ahead.
+        const bool sync_movie = is_async && system.GetApplicationProcessProgramID() == YoshiProgramId &&
+                                IsNx2VideoPlaying();
+        gpu_thread.SubmitList(channel, std::move(entries), is_async && !sync_movie);
     }
 
     // Queued without waiting, also with synchronous GPU: callers hold nx2:gpu locks that the GPU
@@ -425,6 +441,7 @@ struct GPU::Impl {
     std::atomic<bool> has_sync_requests{};
     std::atomic<u64> current_sync_fence{};
     std::atomic<u64> present_ns{};
+    std::atomic<std::chrono::steady_clock::rep> last_video_frame{};
     mutable std::atomic<s8> legacy_timestamps{-1};
     u64 last_sync_fence{};
 
@@ -609,6 +626,14 @@ bool GPU::UseNvdec() const {
 
 void GPU::RendererFrameEndNotify() {
     impl->RendererFrameEndNotify();
+}
+
+void GPU::RecordNx2VideoFrame() {
+    impl->RecordNx2VideoFrame();
+}
+
+bool GPU::IsNx2VideoPlaying() const {
+    return impl->IsNx2VideoPlaying();
 }
 
 void GPU::Start() {
