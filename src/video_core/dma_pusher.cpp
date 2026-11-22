@@ -217,15 +217,16 @@ bool DmaPusher::Step() {
                     LOG_DEBUG(HW_GPU, "  previous entry ends {:08x}; next entry starts {:08x}",
                               fmt::join(prev_words, " "), fmt::join(next_words, " "));
                 }
-                // Without the variable, an entry elsewhere is still a call when it cannot be the
-                // rest of the method and the rest comes later in this submission, right where the
-                // split entry ended: title 4's subroutine entry holds exactly the words left, the
-                // call of #926 (OoT on Intel) 6 words against 4 left, then its rest contiguous.
-                // Taking the call's words as data read a header from the rest and left a channel
-                // waiting on a semaphore made of pushbuffer data.
+                // Without the variable, an entry elsewhere is still a call when the split method
+                // is a register write (not a macro), the entry cannot be its rest, and the rest
+                // comes later in this submission right where the split entry ended: the call of
+                // #926 (OoT on Intel, method 0x4c7) was 6 words against 4 left. Macro parameters
+                // do stream through entries elsewhere: title 4's 5-word subroutine entry, and
+                // MKW's macro 0xe59, whose 381 words come in 1-, 5- and 24-word entries.
                 const bool park_call =
                     park_split_methods ||
-                    (dma_state.method_count != 0 && header.addr != split_method_end &&
+                    (dma_state.method_count != 0 && dma_state.method < MacroRegistersStart &&
+                     header.addr != split_method_end &&
                      header.size != dma_state.method_count &&
                      SplitResumesLater(command_list, dma_pushbuffer_subindex + 1));
                 if (park_call) {
