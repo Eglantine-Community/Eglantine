@@ -2184,6 +2184,13 @@ private:
     } m_mkw{};
 
     void UpdateMkwFrameMode(u64 address) {
+        if (!Settings::values.mkw_60fps_fallback.GetValue()) {
+            if (m_mkw.mode != 1) {
+                m_mkw.mode = 1;
+                system.ApplicationMemory().Write32(address, 1);
+            }
+            return;
+        }
         using namespace std::chrono_literals;
         const auto now = std::chrono::steady_clock::now();
         const auto gap = now - std::exchange(m_mkw.last_present, now);
@@ -2440,16 +2447,19 @@ private:
             const char* value = std::getenv("EDEN_NX2_SWAP_INTERVAL");
             return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
         }();
-        const bool mkw_dynamic =
+        const bool mkw_target_60 =
             process != nullptr && process->GetProgramId() == Settings::MarioKartWorldProgramId &&
-            process->IsMkwDynamicFpsPatchApplied();
+            (process->IsMkwDynamicFpsPatchApplied() ||
+             process->GetMkwFrameModeAddress() != 0 ||
+             Settings::values.mkw_60fps.GetValue() ||
+             Settings::values.mkw_dynamic_fps.GetValue());
         if (process != nullptr && process->GetProgramId() == Settings::MarioKartWorldProgramId) {
             if (const u64 address = process->GetMkwFrameModeAddress(); address != 0) {
                 UpdateMkwFrameMode(address);
             }
         }
         u32 swap_interval = std::clamp<u32>(timing >> 16, 1, 4);
-        if (mkw_dynamic) {
+        if (mkw_target_60) {
             swap_interval = 1;
         }
         if (forced_interval != 0) {

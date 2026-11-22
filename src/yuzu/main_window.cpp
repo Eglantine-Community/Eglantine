@@ -450,6 +450,11 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     auto* dalia_overlay_shortcut = new QShortcut(QKeySequence(Qt::Key_F10), this);
     connect(dalia_overlay_shortcut, &QShortcut::activated, this, &MainWindow::OnToggleGameplayOverlay);
 
+    auto* toggle_menubar_shortcut = new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_M), this);
+    connect(toggle_menubar_shortcut, &QShortcut::activated, this, [this] {
+        ui->menubar->setVisible(!ui->menubar->isVisible());
+    });
+
     UpdateWindowTitle();
 
     show();
@@ -2399,6 +2404,9 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
         game_list->hide();
         game_list_placeholder->hide();
     }
+    if (!ui->action_Fullscreen->isChecked()) {
+        ui->menubar->show();
+    }
     status_bar_update_timer.start(500);
     renderer_status_button->setDisabled(true);
     frame_gen_status_button->setDisabled(true);
@@ -3563,6 +3571,9 @@ bool MainWindow::ConfirmShutdownGame() {
 
 void MainWindow::OnLoadComplete() {
     loading_screen->OnLoadComplete();
+    if (!ui->action_Fullscreen->isChecked()) {
+        ui->menubar->show();
+    }
 
     perf_overlay = new PerformanceOverlay(this);
     perf_overlay->setVisible(ui->action_Show_Performance_Overlay->isChecked());
@@ -3763,7 +3774,13 @@ void MainWindow::HideFullscreen() {
         }
 
         statusBar()->setVisible(ui->action_Show_Status_Bar->isChecked());
-        ui->menubar->show();
+        if (emulation_running) {
+            ui->menubar->show();
+        } else if (dalia_main_container) {
+            ui->menubar->hide();
+        } else {
+            ui->menubar->show();
+        }
     } else {
         if (UsingExclusiveFullscreen()) {
             render_window->showNormal();
