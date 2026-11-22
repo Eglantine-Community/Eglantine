@@ -215,6 +215,7 @@ int main(int argc, char* argv[]) {
                     &MainWindow::OnAppFocusStateChanged);
         return app.exec();
     } catch (const std::exception& exception) {
+        LOG_CRITICAL(Frontend, "Startup exception caught in main: {}", exception.what());
         QMessageBox::critical(nullptr, QObject::tr("DALIA startup stopped"),
                               QString::fromUtf8(exception.what()));
         return EXIT_FAILURE;

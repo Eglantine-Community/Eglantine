@@ -315,7 +315,11 @@ void SetupContentProviders() {
 }
 
 void SetupHID() {
-    system->HIDCore().ReloadInputDevices();
+    try {
+        system->HIDCore().ReloadInputDevices();
+    } catch (const std::exception& e) {
+        LOG_CRITICAL(Frontend, "SetupHID error: {}", e.what());
+    }
 }
 
 QString ReadableByteSize(qulonglong size) {
