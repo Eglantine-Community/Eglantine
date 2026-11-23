@@ -191,7 +191,6 @@ private:
     void LoadGameDetailsExtras(u64 program_id, const QString& path);
     GameDetailsInfo MakeDetailsInfo(const QModelIndex& selected, bool with_icon = true) const;
     /// Wires the carousel's action tiles, which take the sidebar's place in that view.
-    void SetupHub();
     void ApplyDisabledAddOns(u64 program_id, const QString& path, const QStringList& disabled);
     /// Re-reads one game's add-ons into its rows instead of rescanning the whole list.
     void RefreshAddOnsRow(u64 program_id, const QString& path);

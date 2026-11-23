@@ -15,8 +15,10 @@
 #include "common/common_types.h"
 
 class GameListModel;
-class CarouselHub;
+class QLabel;
+class QPushButton;
 class QTimer;
+class QToolButton;
 class QVariantAnimation;
 
 /// The home screen's carousel: one large centered game card with the neighbouring games stacked
@@ -43,9 +45,6 @@ public:
     /// The program whose game the backdrop should feature: the slide's destination once one is
     /// running, the settled center otherwise.
     u64 CenteredProgramId() const;
-    /// The selected game, which is the one centered or sliding into the center.
-    QModelIndex CenteredIndex() const;
-    CarouselHub* Hub() const;
 
     QModelIndex indexAt(const QPoint& point) const override;
     QRect visualRect(const QModelIndex& index) const override;
@@ -66,9 +65,7 @@ protected:
     void mouseReleaseEvent(QMouseEvent* event) override;
     void mouseDoubleClickEvent(QMouseEvent* event) override;
     bool viewportEvent(QEvent* event) override;
-    bool event(QEvent* event) override;
-    void keyPressEvent(QKeyEvent* event) override;
-    void focusInEvent(QFocusEvent* event) override;
+    void changeEvent(QEvent* event) override;
 
 private:
     int PositionOf(int row) const;
@@ -79,8 +76,11 @@ private:
     /// Nudges the strip toward `direction` and back: the end of the list was reached.
     void Bounce(int direction);
     void UpdateHover(const QPoint& pos);
-    /// Places the details band under the strip, following the card and the band's height.
-    void SyncHub();
+    /// Brings the pager row's labels, enabled states and place under the title up to date.
+    void SyncPager();
+    void Step(int direction);
+    void RetranslatePager();
+    void RefreshPagerPalette();
     /// Tells screen readers which game is centered and where it sits in the list.
     void Announce();
     /// Re-applies the stored filter once the model has changed shape.
@@ -125,14 +125,26 @@ private:
     std::vector<DragSample> m_drag_samples;
     int m_hover_position = -1;
 
-    /// The centered game's details band, under the strip.
-    CarouselHub* m_hub = nullptr;
+    /// The row under the title: play time, previous, position, next and Play, all stock
+    /// widgets so the platform style and the theme draw them.
+    QWidget* m_pager = nullptr;
+    /// Equal-width columns either side of the position, so it sits under the card's center
+    /// and no control moves when the play time or the game changes.
+    QWidget* m_pager_left = nullptr;
+    QWidget* m_pager_right = nullptr;
+    QLabel* m_play_time = nullptr;
+    QToolButton* m_prev = nullptr;
+    QLabel* m_count = nullptr;
+    QToolButton* m_next = nullptr;
+    QPushButton* m_play = nullptr;
 
 signals:
     /// The game the backdrop should feature: the slide's destination once one is running, the
     /// settled center otherwise. Emitted on selection changes and relayouts.
     void CenteredGameChanged(u64 program_id);
     void FilterResultReady(int visible, int total);
+    /// The pager's Play button was clicked.
+    void LaunchRequested(const QModelIndex& index);
     /// A click, not a drag, that landed on no card.
     void BackgroundClicked();
 };

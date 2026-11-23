@@ -54,7 +54,6 @@
 #include "qt_common/util/game.h"
 #include "qt_common/util/game_art.h"
 #include "yuzu/game/carousel.h"
-#include "yuzu/game/carousel_hub.h"
 #include "yuzu/game/game_details_panel.h"
 #include "yuzu/game/game_grid.h"
 #include "yuzu/game/game_list.h"
@@ -328,18 +327,12 @@ GameList::GameList(FileSys::VirtualFilesystem vfs_, FileSys::ManualContentProvid
                 if (!this->isActiveWindow()) {
                     return;
                 }
-                // Into the view, or the carousel's action tiles when the focus is on them.
-                QWidget* target = m_currentView;
-                if (QWidget* focus = QApplication::focusWidget();
-                    focus && m_currentView->isAncestorOf(focus)) {
-                    target = focus;
-                }
                 if (!controller_used) {
                     controller_used = true;
                     UpdateControllerHints();
                 }
                 QKeyEvent* event = new QKeyEvent(QEvent::KeyPress, key, Qt::NoModifier);
-                QCoreApplication::postEvent(target, event);
+                QCoreApplication::postEvent(m_currentView, event);
             });
 
     connect(item_model, &GameListModel::PopulatingCompleted, this,
@@ -352,6 +345,10 @@ GameList::GameList(FileSys::VirtualFilesystem vfs_, FileSys::ManualContentProvid
     // TODO: impl on grid
     connect(tree_view, &GameTree::FilterResultReady, search_field,
             [this](int visible, int total) { search_field->setFilterResult(visible, total); });
+    connect(carousel_view, &GameCarousel::LaunchRequested, this, [this](const QModelIndex& index) {
+        click_timer->stop();
+        ValidateEntry(index);
+    });
     connect(carousel_view, &GameCarousel::BackgroundClicked, this, &GameList::HideGameDetails);
     connect(carousel_view, &GameCarousel::FilterResultReady, search_field,
             [this](int visible, int total) { search_field->setFilterResult(visible, total); });
@@ -491,13 +488,6 @@ void GameList::ResetViewMode() {
 
     // The banner backdrop belongs to the carousel; leaving the mode must repaint it away.
     surface->update();
-    // The carousel uses its game page, the other views the sidebar.
-    if (m_currentView != carousel_view) {
-        carousel_view->Hub()->ClosePanel();
-    }
-    if (details_panel && m_currentView == carousel_view) {
-        HideGameDetails();
-    }
     if (controller_hints) {
         UpdateControllerHints();
     }
@@ -620,13 +610,6 @@ void GameList::SetupCustomization() {
                 carousel_view->viewport()->update();
                 emit SaveConfig();
             });
-    connect(customize_panel, &HomeCustomizePanel::CarouselDetailsRequested, this,
-            [this](u8 style) {
-                UISettings::values.carousel_details = style;
-                carousel_view->Hub()->ApplyStyle();
-                carousel_view->viewport()->update();
-                emit SaveConfig();
-            });
     connect(customize_panel, &HomeCustomizePanel::CarouselBannerBackgroundRequested, this,
             [this](bool show) {
                 UISettings::values.carousel_banner_background = show;
@@ -667,16 +650,8 @@ void GameList::UpdateControllerHints() {
         return;
     }
     QStringList hints;
-    if (carousel_view->Hub()->isAncestorOf(QApplication::focusWidget())) {
-        hints << tr("\u24B6 Select") << tr("\u24B7 Back") << tr("\u24C1\u24C7 Pages")
-              << tr("\u24CE Favorite") << tr("\u24CD Settings");
-    } else if (m_currentView == carousel_view) {
-        hints << tr("\u24B6 Play") << tr("\u2295 Details") << tr("\u24C1\u24C7 Pages")
-              << tr("\u24CE Favorite") << tr("\u24CD Settings");
-    } else {
-        hints << tr("\u24B6 Play") << tr("\u2295 Options") << tr("\u24CE Favorite")
-              << tr("\u24CD Settings");
-    }
+    hints << tr("\u24B6 Play") << tr("\u2295 Options") << tr("\u24CE Favorite")
+          << tr("\u24CD Settings");
     controller_hints->setText(hints.join(QStringLiteral("   ")));
     controller_hints->show();
 }
@@ -852,52 +827,6 @@ void GameList::SetupGameDetails() {
     connect(details_panel, &GameDetailsPanel::HeroChanged, this,
             [this](u64) { surface->RefreshBanner(); });
 
-    SetupHub();
-}
-
-void GameList::SetupHub() {
-    CarouselHub* hub = carousel_view->Hub();
-    connect(hub, &CarouselHub::PlayRequested, this, [this] {
-        if (const QModelIndex index = carousel_view->CenteredIndex(); index.isValid()) {
-            ValidateEntry(index);
-        }
-    });
-    connect(hub, &CarouselHub::FavoriteToggled, this,
-            [this, hub] { ToggleFavorite(hub->Game().program_id); });
-    connect(hub, &CarouselHub::ConfigureRequested, this, [this, hub] {
-        const GameDetailsInfo& game = hub->Game();
-        emit OpenPerGameGeneralRequested(game.path.toStdString());
-        LoadGameDetailsExtras(game.program_id, game.path);
-    });
-    connect(hub, &CarouselHub::OpenLocationRequested, this, [this, hub] {
-        emit OpenDirectory(QFileInfo(hub->Game().path).absolutePath());
-    });
-    connect(hub, &CarouselHub::PrecompileShadersRequested, this, [this, hub] {
-        const GameDetailsInfo& game = hub->Game();
-        emit PrepareShaderWarmRequested(game.program_id, game.path.toStdString());
-        LoadGameDetailsExtras(game.program_id, game.path);
-    });
-    connect(hub, &CarouselHub::DisabledAddOnsChanged, this,
-            [this, hub](const QStringList& disabled) {
-                const GameDetailsInfo& game = hub->Game();
-                ApplyDisabledAddOns(game.program_id, game.path, disabled);
-            });
-    connect(hub, &CarouselHub::IconChanged, this, &GameList::UpdateGameIcon);
-    connect(hub, &CarouselHub::HeroChanged, this, [this](u64) { surface->RefreshBanner(); });
-    connect(hub, &CarouselHub::ExtrasNeeded, this, [this, hub] {
-        LoadGameDetailsExtras(hub->Game().program_id, hub->Game().path);
-    });
-    // The tiles always act on the centered game.
-    connect(carousel_view, &GameCarousel::CenteredGameChanged, this, [this, hub] {
-        if (const QModelIndex index = carousel_view->CenteredIndex(); index.isValid()) {
-            hub->SetGame(MakeDetailsInfo(index, false));
-        }
-    });
-    connect(qApp, &QApplication::focusChanged, this, [this] {
-        if (controller_used) {
-            UpdateControllerHints();
-        }
-    });
 }
 
 void GameList::ApplyDisabledAddOns(u64 program_id, const QString& path,
@@ -1023,11 +952,6 @@ bool GameList::RevealPendingGame() {
     }
     m_currentView->setCurrentIndex(index);
     m_currentView->scrollTo(index);
-    // Back from a game, the carousel lands on its card, as a console's home screen does.
-    if (m_currentView == carousel_view) {
-        pending_details_path.clear();
-        return true;
-    }
     ShowGameDetails(index);
     return true;
 }
@@ -1085,11 +1009,6 @@ void GameList::ShowGameDetails(const QModelIndex& index) {
     if (selected.data(GameListItem::TypeRole).value<GameListItemType>() != GameListItemType::Game) {
         return;
     }
-    // The carousel shows its game's details under the strip instead of the sidebar.
-    if (m_currentView == carousel_view) {
-        carousel_view->Hub()->FocusActions();
-        return;
-    }
     const GameDetailsInfo info = MakeDetailsInfo(selected);
     details_index = selected;
     details_panel->SetGame(info);
@@ -1104,7 +1023,6 @@ void GameList::LoadGameDetailsExtras(u64 program_id, const QString& path) {
     if (program_id == 0) {
         const GameDetailsExtras empty{.program_id = program_id, .path = path};
         details_panel->SetExtras(empty);
-        carousel_view->Hub()->SetExtras(empty);
         return;
     }
 
@@ -1168,10 +1086,8 @@ void GameList::LoadGameDetailsExtras(u64 program_id, const QString& path) {
             fmt::format("{:016X}.ini", program_id));
 
         QMetaObject::invokeMethod(qApp, [guard, extras = std::move(extras)] {
-            // Each view ignores extras for a game it does not show.
             if (guard) {
                 guard->details_panel->SetExtras(extras);
-                guard->carousel_view->Hub()->SetExtras(extras);
             }
         });
     });
@@ -1458,9 +1374,6 @@ void GameList::ToggleFavorite(u64 program_id) {
     item_model->ToggleFavorite(program_id);
     if (details_panel && details_panel->Game().program_id == program_id) {
         details_panel->SetFavorite(UISettings::values.favorited_ids.contains(program_id));
-    }
-    if (CarouselHub* hub = carousel_view->Hub(); hub->Game().program_id == program_id) {
-        hub->SetFavorite(UISettings::values.favorited_ids.contains(program_id));
     }
 
     if (UISettings::values.favorited_ids.contains(program_id)) {

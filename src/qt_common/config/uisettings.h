@@ -239,8 +239,6 @@ struct Values {
                                              Category::UiGameList};
     /// How many stacked cards the carousel shows on each side of the centered one.
     Setting<u8> carousel_side_count{linkage, 6, "carousel_side_count", Category::UiGameList};
-    /// The carousel's details band under the strip: 0 full, 1 compact, 2 off.
-    Setting<u8> carousel_details{linkage, 0, "carousel_details", Category::UiGameList};
     /// Widths the home screen sidebars were dragged to, in logical pixels.
     Setting<u32, true> home_details_panel_width{
         linkage, 340, 280, 800, "home_details_panel_width", Category::UiGameList};

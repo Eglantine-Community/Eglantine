@@ -97,8 +97,6 @@ signals:
     void CartridgeKindRequested(u8 kind);
     void CarouselCardSizeRequested(u8 index);
     void CarouselSideCountRequested(u8 count);
-    /// 0 full, 1 compact, 2 off.
-    void CarouselDetailsRequested(u8 style);
     void CarouselBannerBackgroundRequested(bool show);
 
 protected:
@@ -148,10 +146,6 @@ private:
     QLabel* side_count_label = nullptr;
     QButtonGroup* side_count_group = nullptr;
     std::array<QToolButton*, 5> side_count_buttons{};
-    QWidget* details_row = nullptr;
-    QLabel* details_label = nullptr;
-    QButtonGroup* details_group = nullptr;
-    std::array<QToolButton*, 3> details_buttons{};
     QCheckBox* banner_check = nullptr;
     QLabel* icon_size_title = nullptr;
     QLabel* icon_size_value = nullptr;

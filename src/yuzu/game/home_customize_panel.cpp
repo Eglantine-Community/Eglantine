@@ -591,32 +591,6 @@ HomeCustomizePanel::HomeCustomizePanel(HomeBackground* background_, QWidget* par
     side_count_layout->addLayout(side_count_buttons_row);
     layout->addWidget(side_count_row);
 
-    // How much of the centered game's details the band under the carousel shows.
-    details_row = new QWidget(scroll_content);
-    auto* details_layout = new QVBoxLayout(details_row);
-    details_layout->setContentsMargins(0, 0, 0, 0);
-    details_layout->setSpacing(8);
-    details_label = MakeHeading(details_row);
-    details_layout->addWidget(details_label);
-    auto* details_buttons_row = new QHBoxLayout;
-    details_buttons_row->setSpacing(8);
-    details_group = new QButtonGroup(this);
-    details_group->setExclusive(true);
-    for (size_t i = 0; i < details_buttons.size(); ++i) {
-        auto* button = new QToolButton(details_row);
-        button->setCheckable(true);
-        button->setFixedHeight(28);
-        button->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-        details_group->addButton(button, static_cast<int>(i));
-        details_buttons_row->addWidget(button);
-        details_buttons[i] = button;
-    }
-    connect(details_group, &QButtonGroup::idClicked, this, [this](int id) {
-        emit CarouselDetailsRequested(static_cast<u8>(id));
-    });
-    details_layout->addLayout(details_buttons_row);
-    layout->addWidget(details_row);
-
     // The centered game's banner can stand in for the background.
     banner_check = new QCheckBox(scroll_content);
     banner_check->setCursor(Qt::PointingHandCursor);
@@ -689,12 +663,6 @@ void HomeCustomizePanel::SyncFromSettings() {
         if (std::abs(SideCounts[i] - side_count) < std::abs(SideCounts[nearest] - side_count)) {
             nearest = i;
         }
-    }
-    details_row->setVisible(mode == Settings::GameListMode::CarouselView);
-    const size_t details = std::min<size_t>(UISettings::values.carousel_details.GetValue(),
-                                            details_buttons.size() - 1);
-    for (size_t i = 0; i < details_buttons.size(); ++i) {
-        details_buttons[i]->setChecked(i == details);
     }
     for (size_t i = 0; i < side_count_buttons.size(); ++i) {
         side_count_buttons[i]->setChecked(i == nearest);
@@ -912,12 +880,6 @@ void HomeCustomizePanel::RetranslateUI() {
     for (size_t i = 0; i < side_count_buttons.size(); ++i) {
         side_count_buttons[i]->setText(QString::number(SideCounts[i]));
     }
-    details_label->setText(tr("Game details"));
-    details_label->setToolTip(tr("How much of the centered game's details the carousel shows "
-                                 "under the cards"));
-    details_buttons[0]->setText(tr("Full"));
-    details_buttons[1]->setText(tr("Compact"));
-    details_buttons[2]->setText(tr("Off"));
     banner_check->setText(tr("Show game banner as background"));
     banner_check->setToolTip(tr("Behind the carousel, show the centered game's banner, softly "
                                 "blurred, when the game has one"));
