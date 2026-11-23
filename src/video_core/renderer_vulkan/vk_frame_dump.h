@@ -306,7 +306,10 @@ private:
     /// (compute shader hash, image address, format/level/layer) already read back this frame.
     std::vector<std::tuple<u64, GPUVAddr, u32>> dispatch_sampled;
     /// (shader hash, storage, binding index, device address, size) already recorded this frame.
-    std::vector<std::tuple<u64, bool, u32, u64, u32>> seen_buffers;
+    /// Shader, storage, index, address and size of a recorded buffer, with the hash of the guest
+    /// bytes last recorded for it (0 for host-read buffers).
+    using SeenBuffer = std::pair<std::tuple<u64, bool, u32, u64, u32>, u64>;
+    std::vector<SeenBuffer> seen_buffers;
     /// (device address, size) of the index and vertex buffers already recorded this frame.
     std::vector<std::pair<u64, u32>> seen_vertex_inputs;
     /// Content hashes of the buffer files written; writer thread only.

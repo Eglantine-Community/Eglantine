@@ -498,27 +498,41 @@ bool FrameDump::NoteBuffers(bool compute, std::span<const u64> shader_hashes,
     for (BoundBuffer& buffer : buffers) {
         const size_t program = compute ? 0 : buffer.stage + 1;
         const u64 shader = program < shader_hashes.size() ? shader_hashes[program] : 0;
+        const bool from_host = buffer.guest.empty();
+        // Guest-read buffers are recorded again whenever their bytes change between draws, so
+        // per-draw constants (inline cbuf writes) show the value each draw saw.
+        const u64 contents =
+            from_host ? 0
+                      : Common::CityHash64(reinterpret_cast<const char*>(buffer.guest.data()),
+                                           buffer.guest.size());
         const std::tuple<u64, bool, u32, u64, u32> key{shader, buffer.storage, buffer.index,
                                                        buffer.device_addr, buffer.size};
-        if (std::ranges::find(seen_buffers, key) != seen_buffers.end()) {
-            continue;
+        const auto seen = std::ranges::find(seen_buffers, key, &SeenBuffer::first);
+        if (seen != seen_buffers.end()) {
+            if (from_host || seen->second == contents) {
+                continue;
+            }
+            seen->second = contents;
+        } else {
+            seen_buffers.emplace_back(key, contents);
         }
-        seen_buffers.push_back(key);
         const std::string owner =
             compute ? fmt::format(R"("dispatch":{},"after_draws":{})", dispatches, draws)
                     : fmt::format(R"("pass":{},"draw":{})", pass_index, draws - 1);
-        const bool from_host = buffer.guest.empty();
-        std::string tags = fmt::format(
-            R"("kind":"buffer",{},"stage":{},"shader":"{:016x}","key":"{}","type":"{}",)"
-            R"("index":{},"written":{},"gpu_addr":"{:#x}","device_addr":"{:#x}",)"
-            R"("bound_size":{},"size":{},"gpu_modified":{},"source":"{}")",
-            owner, buffer.stage, shader, KeyOf(shader), buffer.storage ? "storage" : "uniform",
-            buffer.index, buffer.written, buffer.gpu_addr, buffer.device_addr, buffer.bound_size,
-            buffer.size, buffer.gpu_modified, from_host ? "host" : "guest");
+        const auto make_tags = [&](std::string_view source) {
+            return fmt::format(
+                R"("kind":"buffer",{},"stage":{},"shader":"{:016x}","key":"{}","type":"{}",)"
+                R"("index":{},"written":{},"gpu_addr":"{:#x}","device_addr":"{:#x}",)"
+                R"("bound_size":{},"size":{},"gpu_modified":{},"source":"{}")",
+                owner, buffer.stage, shader, KeyOf(shader), buffer.storage ? "storage" : "uniform",
+                buffer.index, buffer.written, buffer.gpu_addr, buffer.device_addr,
+                buffer.bound_size, buffer.size, buffer.gpu_modified, source);
+        };
         if (!from_host) {
-            Enqueue({.tags = std::move(tags), .data = std::move(buffer.guest), .raw = true});
+            Enqueue({.tags = make_tags("guest"), .data = std::move(buffer.guest), .raw = true});
             continue;
         }
+        std::string tags = make_tags("host");
         recorded |= RecordBuffer(buffer.host, buffer.host_offset, buffer.size, std::move(tags));
     }
     return recorded;
