@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -14,8 +15,13 @@
 
 #include "common/common_types.h"
 
+struct AVPacket;
+
 namespace FFmpeg {
+class Decoder;
+class DecoderContext;
 class Frame;
+class HardwareContext;
 }
 
 namespace Tegra::Host1x {
@@ -24,7 +30,7 @@ namespace Tegra::Host1x {
 struct Nx2Picture {
     u32 width{};
     u32 height{};
-    u64 pts{};
+    u64 pts{}; ///< As submitted with the compressed frame
     std::shared_ptr<FFmpeg::Frame> frame;
 };
 
@@ -34,28 +40,16 @@ enum class Nx2PictureFormat : u32 {
     Bgra8,
 };
 
-enum class Nx2GpuDecodeFault {
-    None,
-    Open,
-    Packet,
-    Busy,
-    NoCpu,
-    Replay,
-    Hold,
-    ReplayReceive,
-    SwitchReceive,
-};
-
 bool IsH264Stream(std::span<const u8> data);
 
+/// The decoder behind the Switch 2 video decoder service (nn::codec::video): FFmpeg decodes the
+/// elementary stream the game demuxed, in software or on the host GPU (NVDEC emulation setting).
+/// Used from one thread at a time.
 class Nx2VideoDecoder {
 public:
     /// mime: the codec name nn::codec sends with Configure ("video/vp9", "video/vp8", ...).
-    explicit Nx2VideoDecoder(std::string_view mime,
-                             Nx2GpuDecodeFault fault = Nx2GpuDecodeFault::None);
+    explicit Nx2VideoDecoder(std::string_view mime);
     ~Nx2VideoDecoder();
-
-    void SetGpuDecodeFault(Nx2GpuDecodeFault fault);
 
     bool IsOpen() const;
 
@@ -71,8 +65,25 @@ public:
                 u64 pitch, u64 chroma_offset, std::span<u8> out);
 
 private:
+    friend class Nx2VideoDecoderTestAccess;
+
+    struct ReceiveResult {
+        std::shared_ptr<FFmpeg::Frame> frame;
+        bool failed{};
+    };
+
+    struct CodecBackend {
+        std::function<bool(FFmpeg::HardwareContext&, FFmpeg::DecoderContext&,
+                           const FFmpeg::Decoder&)> initialize_hardware;
+        std::function<bool(FFmpeg::DecoderContext&, const FFmpeg::Decoder&, bool)> open;
+        std::function<int(FFmpeg::DecoderContext&, const AVPacket*, bool)> send;
+        std::function<ReceiveResult(FFmpeg::DecoderContext&, bool)> receive;
+    };
+
+    Nx2VideoDecoder(std::string_view mime, CodecBackend backend);
+
     struct Impl;
     std::unique_ptr<Impl> impl;
 };
 
-}
+} // namespace Tegra::Host1x

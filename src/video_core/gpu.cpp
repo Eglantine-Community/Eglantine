@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "common/assert.h"
+#include "common/game_presets.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "core/core.h"
@@ -253,9 +254,11 @@ struct GPU::Impl {
     }
 
     void PushGPUEntries(s32 channel, Tegra::CommandList&& entries) {
-        constexpr u64 YoshiProgramId = 0x0400245021D2C000;
-        // Yoshi's movie draws can read stale texture bindings when submits run ahead.
-        const bool sync_movie = is_async && system.GetApplicationProcessProgramID() == YoshiProgramId &&
+        // Yoshi's first movie color pass can read invalid TICs for the textures bound at
+        // cbuf 3 offsets 0x0 and 0x8 when submissions run ahead.
+        const bool sync_movie = is_async &&
+                                system.GetApplicationProcessProgramID() == Settings::YoshiProgramId &&
+                                Settings::values.yoshi_sync_movie_submits.GetValue() &&
                                 IsNx2VideoPlaying();
         gpu_thread.SubmitList(channel, std::move(entries), is_async && !sync_movie);
     }
