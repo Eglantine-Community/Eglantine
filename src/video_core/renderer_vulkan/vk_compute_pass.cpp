@@ -22,6 +22,7 @@
 #include "common/logging.h"
 #include "common/div_ceil.h"
 #include "common/vector_math.h"
+#include "video_core/host_shaders/astc_bc_comp_spv.h"
 #include "video_core/host_shaders/astc_decoder_comp_spv.h"
 #include "video_core/host_shaders/bc_encoder_comp_spv.h"
 #include "video_core/host_shaders/queries_prefix_scan_sum_comp_spv.h"
