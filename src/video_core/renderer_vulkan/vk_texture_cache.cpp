@@ -5007,6 +5007,62 @@ void TextureCacheRuntime::AccelerateImageUploadLayers(
     astc_decoder_pass->AssembleLayers(image, map, swizzles, layers);
 }
 
+namespace {
+/// The ASTC→BCn transcode's own meter, per 5 s window: how much intermediate RGBA8 the decode
+/// images pass through and hold at their peak, against the BC bytes written. The point of the
+/// fusion work is to remove that intermediate, so this line is the before and after.
+/// EDEN_NX2_TRANSCODE_LOG=0 silences it.
+struct TranscodeMeter {
+    std::chrono::steady_clock::time_point window_start{std::chrono::steady_clock::now()};
+    u64 transcodes{};
+    u64 chunked{};
+    u64 decode_traffic{};
+    u64 output_bytes{};
+    u64 in_flight_peak{};
+    u64 resident_peak{};
+
+    void Note(u64 traffic, u64 output, bool was_chunked, u64 in_flight, u64 resident) {
+        static const bool enabled = [] {
+            const char* value = std::getenv("EDEN_NX2_TRANSCODE_LOG");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (!enabled) {
+            return;
+        }
+        ++transcodes;
+        chunked += was_chunked ? 1U : 0U;
+        decode_traffic += traffic;
+        output_bytes += output;
+        in_flight_peak = std::max(in_flight_peak, in_flight);
+        resident_peak = std::max(resident_peak, resident);
+
+        const auto now = std::chrono::steady_clock::now();
+        const auto window =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - window_start);
+        if (window < std::chrono::seconds{5}) {
+            return;
+        }
+        constexpr double mib = 1.0 / (1024.0 * 1024.0);
+        LOG_INFO(Render_Vulkan,
+                 "ASTC BC transcode: {} in {} ms, {} chunked; RGBA8 through {:.1f} MiB, BC out "
+                 "{:.1f} MiB; decode images {:.1f} MiB in flight peak, {:.1f} MiB resident peak",
+                 transcodes, window.count(), chunked, static_cast<double>(decode_traffic) * mib,
+                 static_cast<double>(output_bytes) * mib,
+                 static_cast<double>(in_flight_peak) * mib,
+                 static_cast<double>(resident_peak) * mib);
+        window_start = now;
+        transcodes = 0;
+        chunked = 0;
+        decode_traffic = 0;
+        output_bytes = 0;
+        in_flight_peak = 0;
+        resident_peak = 0;
+    }
+};
+
+TranscodeMeter transcode_meter;
+} // Anonymous namespace
+
 u64 TextureCacheRuntime::TranscodeDecodeBytes(const PendingTranscode& t) {
     u64 bytes{};
     for (u32 level = 0; level < t.levels; ++level) {
@@ -5122,6 +5178,10 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     const bool bc3 = !IsOpaqueBc1Astc(device, info) &&
                      Settings::GetAstcRecompression() != Settings::AstcRecompression::Bc1;
     const u64 block_bytes = bc3 ? 16 : 8;
+    // What this one texture costs the metre: the RGBA8 that passes through the decode images (a
+    // chunk at a time for big arrays) and the BC bytes that come out.
+    u64 decode_traffic{};
+    u64 output_bytes{};
     std::vector<u32> chunk_layer_indices(chunk_layers);
     for (u32 i = 0; i < chunk_layers; ++i) {
         chunk_layer_indices[i] = i;
@@ -5201,6 +5261,10 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
                                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, barrier);
         });
         image.UploadMemory(output.buffer, output.offset, copies);
+        decode_traffic += TranscodeDecodeBytes(PendingTranscode{
+            .tick = 0, .image{}, .views{}, .layer_views{}, .width = width, .height = height,
+            .levels = levels, .layers = count, .unused_frames = 0});
+        output_bytes += total;
     }
     pending.tick = scheduler.CurrentTick();
     pending_transcodes.push_back(std::move(pending));
@@ -5212,6 +5276,13 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     if (pending_transcodes.size() > 1 && in_flight > MaxInFlightTranscodeBytes) {
         scheduler.Wait(pending_transcodes.back().tick);
         RecycleTranscodes();
+    }
+    {
+        u64 resident{in_flight};
+        for (const PendingTranscode& t : free_transcodes) {
+            resident += TranscodeDecodeBytes(t);
+        }
+        transcode_meter.Note(decode_traffic, output_bytes, chunked, in_flight, resident);
     }
 }
 
