@@ -3,8 +3,16 @@
 
 /* This tree's BC1/BC3/BC4/BC5 block encoders, the body bc_encoder.comp and astc_bc.comp share so
    the fused and two-pass paths write the same bytes. The caller declares blocks_x, blocks_y,
-   width, height and the output as `uvec2 blocks[]`; MODE_* and REFINE select the format and the
-   refined endpoints. */
+   width, height, the output as `uvec2 blocks[]`, and Texel(i) - the i-th of the block's sixteen
+   texels. MODE_* and REFINE select the format and the refined endpoints.
+
+   The texels come in through Texel() rather than an array of vec4 because a fused pass already
+   holds a decoded ASTC block's state: sixteen vec4 on top of it is 64 registers, where sixteen
+   packed RGBA8 words are 16, and registers are what decides how many workgroups the GPU keeps in
+   flight. The two-pass encoder defines Texel() over its vec4 array and pays what it always paid. */
+
+/* the i-th texel of the block, RGBA in 0..1: the including shader's */
+vec4 Texel(int i);
 
 const uint MODE_BC1 = 0u;        // punch-through where a texel's alpha is below 0.5
 const uint MODE_BC3 = 1u;
@@ -33,15 +41,15 @@ float Distance2(vec3 a, vec3 b) {
 
 // BC1 colour block. With punch_through (BC1 only), texels with alpha < 0.5 use the transparent
 // index of the three-colour mode; otherwise the four-colour mode is used (BC3 always decodes so).
-uvec2 EncodeColor(in vec4 texels[16], bool punch_through) {
+uvec2 EncodeColor(bool punch_through) {
     vec3 lo = vec3(1.0);
     vec3 hi = vec3(0.0);
     for (int i = 0; i < 16; ++i) {
-        if (punch_through && texels[i].a < 0.5) {
+        if (punch_through && Texel(i).a < 0.5) {
             continue;
         }
-        lo = min(lo, texels[i].rgb);
-        hi = max(hi, texels[i].rgb);
+        lo = min(lo, Texel(i).rgb);
+        hi = max(hi, Texel(i).rgb);
     }
     if (any(greaterThan(lo, hi))) {
         // Every texel transparent: colour0 == colour1 selects three-colour mode, index 3.
@@ -52,10 +60,10 @@ uvec2 EncodeColor(in vec4 texels[16], bool punch_through) {
     const int major = extent.g >= extent.r && extent.g >= extent.b ? 1 : (extent.r >= extent.b ? 0 : 2);
     vec3 covariance = vec3(0.0);
     for (int i = 0; i < 16; ++i) {
-        if (punch_through && texels[i].a < 0.5) {
+        if (punch_through && Texel(i).a < 0.5) {
             continue;
         }
-        const vec3 d = texels[i].rgb - center;
+        const vec3 d = Texel(i).rgb - center;
         covariance += d * d[major];
     }
     vec3 e0 = hi;
@@ -95,12 +103,12 @@ uvec2 EncodeColor(in vec4 texels[16], bool punch_through) {
     uint indices = 0u;
     for (int i = 0; i < 16; ++i) {
         uint best = 0u;
-        if (punch_through && texels[i].a < 0.5) {
+        if (punch_through && Texel(i).a < 0.5) {
             best = 3u;
         } else {
-            float best_distance = Distance2(texels[i].rgb, palette[0]);
+            float best_distance = Distance2(Texel(i).rgb, palette[0]);
             for (int p = 1; p < entries; ++p) {
-                const float distance = Distance2(texels[i].rgb, palette[p]);
+                const float distance = Distance2(Texel(i).rgb, palette[p]);
                 if (distance < best_distance) {
                     best_distance = distance;
                     best = uint(p);
@@ -115,7 +123,7 @@ uvec2 EncodeColor(in vec4 texels[16], bool punch_through) {
 // A four-colour block of endpoints `q0` and `q1` (565, in either order): the texels' nearest
 // palette entries in `block` (all index 0 when the endpoints are equal), the squared error of the
 // texels in `real` (bit i: texel i is inside the level, not an edge block's repeat) returned.
-float FitFourColor(in vec4 texels[16], uint real, uint q0, uint q1, out uvec2 block) {
+float FitFourColor(uint real, uint q0, uint q1, out uvec2 block) {
     if (q0 < q1) {
         const uint t = q0;
         q0 = q1;
@@ -128,7 +136,7 @@ float FitFourColor(in vec4 texels[16], uint real, uint q0, uint q1, out uvec2 bl
     float error = 0.0;
     uint indices = 0u;
     for (int i = 0; i < 16; ++i) {
-        const vec3 t = texels[i].rgb;
+        const vec3 t = Texel(i).rgb;
         float best_distance = Distance2(t, c0);
         uint best = 0u;
         if (q0 != q1) {
@@ -158,7 +166,7 @@ float FitFourColor(in vec4 texels[16], uint real, uint q0, uint q1, out uvec2 bl
 // Least-squares endpoints for the indices of `block` (index 0: colour0, 1: colour1, 2 and 3 at a
 // third and two thirds) over the texels in `real`, as 565 codes; false when the indices don't
 // determine them.
-bool RefitFourColor(in vec4 texels[16], uint real, uvec2 block, out uint q0, out uint q1) {
+bool RefitFourColor(uint real, uvec2 block, out uint q0, out uint q1) {
     vec3 sums = vec3(0.0); // aa, ab, bb
     vec3 ax = vec3(0.0);
     vec3 bx = vec3(0.0);
@@ -170,8 +178,8 @@ bool RefitFourColor(in vec4 texels[16], uint real, uvec2 block, out uint q0, out
         const float b = index == 0u ? 0.0 : (index == 1u ? 1.0 : (index == 2u ? 1.0 / 3.0 : 2.0 / 3.0));
         const float a = 1.0 - b;
         sums += vec3(a * a, a * b, b * b);
-        ax += a * texels[i].rgb;
-        bx += b * texels[i].rgb;
+        ax += a * Texel(i).rgb;
+        bx += b * Texel(i).rgb;
     }
     const float det = sums.x * sums.z - sums.y * sums.y;
     if (abs(det) < 1e-4) {
@@ -189,24 +197,24 @@ bool RefitFourColor(in vec4 texels[16], uint real, uvec2 block, out uint q0, out
 // from the whole four-entry palette (what the BC7 encoder's neighbour check approximates), and
 // the error of the texels inside the level (`real`) decides, so no block ends worse than
 // EncodeColor's.
-uvec2 EncodeColorRefined(in vec4 texels[16], uint real) {
-    uvec2 best_block = EncodeColor(texels, false);
+uvec2 EncodeColorRefined(uint real) {
+    uvec2 best_block = EncodeColor(false);
     float best =
-        FitFourColor(texels, real, best_block.x & 0xFFFFu, best_block.x >> 16, best_block);
+        FitFourColor(real, best_block.x & 0xFFFFu, best_block.x >> 16, best_block);
     if (best == 0.0) {
         return best_block;
     }
     const float count = float(bitCount(real));
     vec3 mean = vec3(0.0);
     for (int i = 0; i < 16; ++i) {
-        mean += ((real >> i) & 1u) != 0u ? texels[i].rgb : vec3(0.0);
+        mean += ((real >> i) & 1u) != 0u ? Texel(i).rgb : vec3(0.0);
     }
     mean /= count;
     vec3 cov0 = vec3(0.0); // rows of the covariance matrix
     vec3 cov1 = vec3(0.0);
     vec3 cov2 = vec3(0.0);
     for (int i = 0; i < 16; ++i) {
-        const vec3 d = ((real >> i) & 1u) != 0u ? texels[i].rgb - mean : vec3(0.0);
+        const vec3 d = ((real >> i) & 1u) != 0u ? Texel(i).rgb - mean : vec3(0.0);
         cov0 += d * d.r;
         cov1 += d * d.g;
         cov2 += d * d.b;
@@ -226,14 +234,14 @@ uvec2 EncodeColorRefined(in vec4 texels[16], uint real) {
         float t_hi = -1e9;
         for (int i = 0; i < 16; ++i) {
             if (((real >> i) & 1u) != 0u) {
-                const float t = dot(texels[i].rgb - mean, axis);
+                const float t = dot(Texel(i).rgb - mean, axis);
                 t_lo = min(t_lo, t);
                 t_hi = max(t_hi, t);
             }
         }
         const float inset = (t_hi - t_lo) / 16.0;
         uvec2 block;
-        const float error = FitFourColor(texels, real, Pack565(mean + axis * (t_hi - inset)),
+        const float error = FitFourColor(real, Pack565(mean + axis * (t_hi - inset)),
                                          Pack565(mean + axis * (t_lo + inset)), block);
         if (error < best) {
             best = error;
@@ -243,11 +251,11 @@ uvec2 EncodeColorRefined(in vec4 texels[16], uint real) {
     for (int k = 0; k < 2; ++k) {
         uint q0;
         uint q1;
-        if (!RefitFourColor(texels, real, best_block, q0, q1)) {
+        if (!RefitFourColor(real, best_block, q0, q1)) {
             break;
         }
         uvec2 block;
-        const float error = FitFourColor(texels, real, q0, q1, block);
+        const float error = FitFourColor(real, q0, q1, block);
         if (error >= best) {
             break;
         }
@@ -275,7 +283,7 @@ uvec2 EncodeColorRefined(in vec4 texels[16], uint real) {
                     q1 = moved;
                 }
                 uvec2 block;
-                const float error = FitFourColor(texels, real, q0, q1, block);
+                const float error = FitFourColor(real, q0, q1, block);
                 if (error < best) {
                     best = error;
                     best_block = block;
@@ -323,18 +331,18 @@ uvec2 EncodeChannel(in float values[16]) {
     return uvec2(bits_lo, bits_hi);
 }
 
-uvec2 EncodeAlpha(in vec4 texels[16]) {
+uvec2 EncodeAlpha() {
     float values[16];
     for (int i = 0; i < 16; ++i) {
-        values[i] = texels[i].a;
+        values[i] = Texel(i).a;
     }
     return EncodeChannel(values);
 }
 
-uvec2 EncodeRed(in vec4 texels[16]) {
+uvec2 EncodeRed() {
     float values[16];
     for (int i = 0; i < 16; ++i) {
-        values[i] = texels[i].r;
+        values[i] = Texel(i).r;
     }
     return EncodeChannel(values);
 }

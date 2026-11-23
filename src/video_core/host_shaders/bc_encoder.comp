@@ -31,6 +31,13 @@ layout (push_constant) uniform PushConstants {
     uint out_offset; // in 8-byte units
 };
 
+/* the block's texels, and the accessor bcn_encode.glsl's encoders take them through */
+vec4 texels[16];
+
+vec4 Texel(int i) {
+    return texels[i];
+}
+
 #include "bcn_encode.glsl"
 
 void main() {
@@ -38,7 +45,6 @@ void main() {
     if (id.x >= blocks_x || id.y >= blocks_y) {
         return;
     }
-    vec4 texels[16];
     const ivec2 base = ivec2(id.xy) * 4;
     const ivec2 last = ivec2(width, height) - 1;
     bool any_transparent = false;
@@ -58,17 +64,17 @@ void main() {
     const uint row = (1u << inside.x) - 1u;
     const uint real = row * (((1u << (4u * inside.y)) - 1u) / 15u); // the row in each nibble
     if (kind == MODE_BC3) {
-        blocks[out_offset + block * 2u] = EncodeAlpha(texels);
+        blocks[out_offset + block * 2u] = EncodeAlpha();
         blocks[out_offset + block * 2u + 1u] =
-            refine ? EncodeColorRefined(texels, real) : EncodeColor(texels, false);
+            refine ? EncodeColorRefined(real) : EncodeColor(false);
     } else if (kind == MODE_BC4) {
-        blocks[out_offset + block] = EncodeRed(texels);
+        blocks[out_offset + block] = EncodeRed();
     } else if (kind == MODE_BC5) {
-        blocks[out_offset + block * 2u] = EncodeRed(texels);
-        blocks[out_offset + block * 2u + 1u] = EncodeAlpha(texels);
+        blocks[out_offset + block * 2u] = EncodeRed();
+        blocks[out_offset + block * 2u + 1u] = EncodeAlpha();
     } else {
         const bool punch_through = kind != MODE_BC1_OPAQUE && any_transparent;
-        blocks[out_offset + block] = refine && !punch_through ? EncodeColorRefined(texels, real)
-                                                              : EncodeColor(texels, punch_through);
+        blocks[out_offset + block] = refine && !punch_through ? EncodeColorRefined(real)
+                                                              : EncodeColor(punch_through);
     }
 }

@@ -20,8 +20,9 @@
    A block past the level's edge repeats its last texels, as the two-pass encoder does: padding
    adds no colour to the line. */
 
-/* the invocation's texels, and whether any of them has alpha below a half (for punch-through) */
-vec4 px[16];
+/* the invocation's texels, packed RGBA8 so they cost 16 registers and not 64, and whether any of
+   them has alpha below a half (for punch-through) */
+uint px[16];
 bool any_transparent;
 
 /* The byte offset of block (ax, ay) of layer z in the upload's block-linear staging buffer: the
@@ -50,6 +51,11 @@ vec4 UnpackTexel(uint word) {
            255.0;
 }
 
+/* the i-th texel of the block, from the packed words: what bcn_encode.glsl's encoders read */
+vec4 Texel(int i) {
+    return UnpackTexel(px[i]);
+}
+
 /* the texel coordinates of block (bx, by) inside the level, its last row and column repeated */
 void Bounds(uint bx, uint by, out uint x0, out uint y0, out uint x1, out uint y1) {
     x0 = bx * 4u;
@@ -73,19 +79,19 @@ void Store(uint cx, uint cy, uint bx, uint by, uint z) {
     const bool refine = (mode & REFINE) != 0u;
     const uint real = InsideMask(bx, by);
     if (kind == MODE_BC3) {
-        out_blocks[out_offset + at * 2u] = EncodeAlpha(px);
+        out_blocks[out_offset + at * 2u] = EncodeAlpha();
         out_blocks[out_offset + at * 2u + 1u] =
-            refine ? EncodeColorRefined(px, real) : EncodeColor(px, false);
+            refine ? EncodeColorRefined(real) : EncodeColor(false);
     } else if (kind == MODE_BC4) {
-        out_blocks[out_offset + at] = EncodeRed(px);
+        out_blocks[out_offset + at] = EncodeRed();
     } else if (kind == MODE_BC5) {
-        out_blocks[out_offset + at * 2u] = EncodeRed(px);
-        out_blocks[out_offset + at * 2u + 1u] = EncodeAlpha(px);
+        out_blocks[out_offset + at * 2u] = EncodeRed();
+        out_blocks[out_offset + at * 2u + 1u] = EncodeAlpha();
     } else {
         const bool punch_through = kind != MODE_BC1_OPAQUE && any_transparent;
         out_blocks[out_offset + at] = refine && !punch_through
-                                          ? EncodeColorRefined(px, real)
-                                          : EncodeColor(px, punch_through);
+                                          ? EncodeColorRefined(real)
+                                          : EncodeColor(punch_through);
     }
 }
 
@@ -106,8 +112,8 @@ void LoadBlock(uint bx, uint by, uint z) {
         for (uint k = 0u; k < 16u; k++) {
             const uint i = min(x0 + (k & 3u), x1) - left;
             const uint j = min(y0 + (k >> 2u), y1) - top;
-            px[k] = UnpackTexel(SlotTexel(0u, i, j, infill_ds, infill_dt));
-            any_transparent = any_transparent || px[k].a < 0.5;
+            px[k] = SlotTexel(0u, i, j, infill_ds, infill_dt);
+            any_transparent = any_transparent || (px[k] >> 24u) < 128u;
         }
         return;
     }
@@ -125,8 +131,8 @@ void LoadBlock(uint bx, uint by, uint z) {
                 const uint i = min(x0 + (k & 3u), x1) - left;
                 const uint j = min(y0 + (k >> 2u), y1) - top;
                 if (i < block_w && j < block_h) {
-                    px[k] = UnpackTexel(SlotTexel(0u, i, j, infill_ds, infill_dt));
-                    any_transparent = any_transparent || px[k].a < 0.5;
+                    px[k] = SlotTexel(0u, i, j, infill_ds, infill_dt);
+                    any_transparent = any_transparent || (px[k] >> 24u) < 128u;
                 }
             }
         }
@@ -164,8 +170,8 @@ void PerAstcBlock(uint cx, uint cy) {
             for (uint k = 0u; k < 16u; k++) {
                 const uint i = min(x0 + (k & 3u), x1) - left;
                 const uint j = min(y0 + (k >> 2u), y1) - top;
-                px[k] = UnpackTexel(SlotTexel(0u, i, j, infill_ds, infill_dt));
-                any_transparent = any_transparent || px[k].a < 0.5;
+                px[k] = SlotTexel(0u, i, j, infill_ds, infill_dt);
+                any_transparent = any_transparent || (px[k] >> 24u) < 128u;
             }
             Store(cx, cy, bx, by, z);
         }
