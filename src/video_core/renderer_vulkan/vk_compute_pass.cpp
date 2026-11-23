@@ -987,8 +987,8 @@ AstcBcPass::~AstcBcPass() = default;
 
 VkPipeline AstcBcPass::PipelineFor(u32 kind, bool refine) {
     const size_t slot = static_cast<size_t>(kind & 0xFU) + (refine ? 5U : 0U);
-    if (pipelines[slot] != VK_NULL_HANDLE) {
-        return pipelines[slot];
+    if (pipelines[slot]) {
+        return **pipelines[slot];
     }
     // The kind and the refined fit are the module's specialisation constants (astc_bc.glsl's
     // ASTC_BC_KIND and ASTC_BC_REFINE), so the driver drops every other kind and the refined path
@@ -1005,8 +1005,8 @@ VkPipeline AstcBcPass::PipelineFor(u32 kind, bool refine) {
         .dataSize = sizeof(values),
         .pData = values.data(),
     };
-    pipelines[slot] = *CreatePipeline(&spec);
-    return pipelines[slot];
+    pipelines[slot].emplace(CreatePipeline(&spec));
+    return **pipelines[slot];
 }
 
 void AstcBcPass::Run(const AstcBcPushConstants& params, u32 kind, bool refine, u32 layers,

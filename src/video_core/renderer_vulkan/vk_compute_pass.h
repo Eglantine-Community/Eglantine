@@ -264,8 +264,10 @@ private:
 
     Scheduler& scheduler;
     ComputePassDescriptorQueue& compute_pass_descriptor_queue;
-    /// MODE_BC1 to MODE_BC1_OPAQUE with refine off, then the same with refine on.
-    std::array<VkPipeline, 10> pipelines{};
+    /// MODE_BC1 to MODE_BC1_OPAQUE with refine off, then the same with refine on. vk::Pipeline is
+    /// an owning handle: it destroys the pipeline when it dies, so these hold it, not the raw
+    /// VkPipeline.
+    std::array<std::optional<vk::Pipeline>, 10> pipelines;
 };
 
 class BlockLinearUnswizzle3DPass final : public ComputePass {
