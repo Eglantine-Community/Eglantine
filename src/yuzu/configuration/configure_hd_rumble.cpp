@@ -618,38 +618,76 @@ QWidget* ConfigureHdRumble::CreateAdvancedRows(unsigned device) {
 }
 
 void ConfigureHdRumble::TestRumble() {
-    // The Vibration tab's test pattern, sent to every player's pad: the temporarily forced
-    // enable and strength are restored right after the call, the same way the tab does it.
-    const Core::HID::VibrationValue vibration{
-        .low_amplitude = 1.0f,
-        .low_frequency = 160.0f,
-        .high_amplitude = 1.0f,
-        .high_frequency = 320.0f,
+    // A short HD Rumble show, our own composition: two rising notes, then two deep thumps.
+    // RenHDrum renders the frequencies as distinct pitches on a pad it drives; a plain
+    // rumble pad still feels the rhythm. The temporarily forced enable and strength are
+    // restored right after each call, the same way the Vibration tab does it.
+    struct Step {
+        Core::HID::VibrationValue value;
+        int at_ms;
+        int hold_ms;
     };
-    auto& players = Settings::values.players.GetValue();
-    for (std::size_t i = 0; i < players.size(); ++i) {
-        auto& player = players[i];
-        auto controller = hid_core.GetEmulatedControllerByIndex(static_cast<int>(i));
-        const bool old_enabled = player.vibration_enabled;
-        const int old_strength = player.vibration_strength;
-        player.vibration_enabled = true;
-        player.vibration_strength = 100;
-        controller->SetVibration(Core::HID::DeviceIndex::Left, vibration);
-        controller->SetVibration(Core::HID::DeviceIndex::Right, vibration);
-        player.vibration_enabled = old_enabled;
-        player.vibration_strength = old_strength;
-    }
-    const int generation = ++test_generation;
-    QTimer::singleShot(1200, this, [this, generation]() {
-        if (generation != test_generation) {
-            return;
+    const std::array<Step, 4> steps{{
+        {{.low_amplitude = 1.0f, .low_frequency = 170.0f, .high_amplitude = 1.0f,
+          .high_frequency = 340.0f},
+         0, 110},
+        {{.low_amplitude = 1.0f, .low_frequency = 255.0f, .high_amplitude = 1.0f,
+          .high_frequency = 510.0f},
+         150, 110},
+        {{.low_amplitude = 1.0f, .low_frequency = 60.0f, .high_amplitude = 1.0f,
+          .high_frequency = 120.0f},
+         310, 150},
+        {{.low_amplitude = 1.0f, .low_frequency = 60.0f, .high_amplitude = 1.0f,
+          .high_frequency = 120.0f},
+         580, 150},
+    }};
+
+    const auto send = [this](const Core::HID::VibrationValue& value) {
+        auto& players = Settings::values.players.GetValue();
+        for (std::size_t i = 0; i < players.size(); ++i) {
+            auto& player = players[i];
+            auto controller = hid_core.GetEmulatedControllerByIndex(static_cast<int>(i));
+            const bool old_enabled = player.vibration_enabled;
+            const int old_strength = player.vibration_strength;
+            player.vibration_enabled = true;
+            player.vibration_strength = 100;
+            controller->SetVibration(Core::HID::DeviceIndex::Left, value);
+            controller->SetVibration(Core::HID::DeviceIndex::Right, value);
+            player.vibration_enabled = old_enabled;
+            player.vibration_strength = old_strength;
         }
+    };
+    const auto silence = [this]() {
         for (std::size_t i = 0; i < Settings::values.players.GetValue().size(); ++i) {
             auto controller = hid_core.GetEmulatedControllerByIndex(static_cast<int>(i));
             controller->SetVibration(Core::HID::DeviceIndex::Left,
                                       Core::HID::DEFAULT_VIBRATION_VALUE);
             controller->SetVibration(Core::HID::DeviceIndex::Right,
                                       Core::HID::DEFAULT_VIBRATION_VALUE);
+        }
+    };
+
+    // A new click starts a new show; stale scheduled steps from an earlier one must not
+    // cut into it, and closing the dialog cancels them with the context object.
+    const int generation = ++test_generation;
+    const auto alive = [this, generation]() { return generation == test_generation; };
+    for (const Step& step : steps) {
+        QTimer::singleShot(step.at_ms, this, [this, alive, send, value = step.value]() {
+            if (!alive()) {
+                return;
+            }
+            send(value);
+        });
+        QTimer::singleShot(step.at_ms + step.hold_ms, this, [this, alive, silence]() {
+            if (!alive()) {
+                return;
+            }
+            silence();
+        });
+    }
+    QTimer::singleShot(780, this, [this, alive, silence]() {
+        if (alive()) {
+            silence();
         }
     });
 }
