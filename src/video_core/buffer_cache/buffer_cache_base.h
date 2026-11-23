@@ -642,6 +642,11 @@ public:
     }
 
     Common::SpinRecursiveMutex mutex;
+    /// Pages the GPU has written. Inner invalidations of them always reach the cache, also with
+    /// skip_cpu_inner_invalidation: games reset GPU-written records and counters that way.
+    [[nodiscard]] const PageFilter& GpuWriteFilter() const noexcept {
+        return inline_gpu_write_filter;
+    }
     Runtime& runtime;
     bool any_buffer_uploaded = false;
     /// Indirectly read banks of native programs already uploaded this frame.

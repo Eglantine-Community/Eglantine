@@ -2372,6 +2372,18 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
     }
     // Cached textures must observe GPU-side copies even when the remaining invalidations are skipped.
     if (Settings::values.skip_cpu_inner_invalidation.GetValue()) {
+        // Memory the GPU wrote still follows these writes: a game that resets GPU-written
+        // records or counters with them (Welcome Tour's map instance counts) otherwise draws
+        // from a host copy that only ever grows.
+        const auto& gpu_written = buffer_cache.GpuWriteFilter();
+        if (any(gpu_written)) {
+            std::scoped_lock lock{buffer_cache.mutex};
+            for (const auto& [addr, size] : sequences) {
+                if (gpu_written.Any(addr, size)) {
+                    buffer_cache.WriteMemory(addr, size);
+                }
+            }
+        }
         return;
     }
     {
