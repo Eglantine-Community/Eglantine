@@ -65,9 +65,10 @@ private:
     /// right-aligned and vertically centered, appended to `rows` for the binding layer.
     void AddRow(QVBoxLayout* col, bool& first, const InputCommon::RenHDrumOption& opt,
                 int table_index, int def);
-    /// Plays a short own composition -- two rising notes, two deep thumps -- on every
-    /// player's pad: RenHDrum renders the pitches on a pad it drives, and whichever
-    /// controllers are in reach answer, so a user can feel which pad is which.
+    /// Plays a short HD Rumble tech demo on every player's pad -- soft/hard, long, deep,
+    /// shrill, a climbing sweep, an echoed thump: RenHDrum renders every axis on a pad it
+    /// drives, and whichever controllers are in reach answer, so a user can both verify the
+    /// pipeline and feel which pad is which.
     void TestRumble();
     void LoadConfiguration();
     void RestoreDefaults();

@@ -618,28 +618,41 @@ QWidget* ConfigureHdRumble::CreateAdvancedRows(unsigned device) {
 }
 
 void ConfigureHdRumble::TestRumble() {
-    // A short HD Rumble show, our own composition: two rising notes, then two deep thumps.
-    // RenHDrum renders the frequencies as distinct pitches on a pad it drives; a plain
-    // rumble pad still feels the rhythm. The temporarily forced enable and strength are
-    // restored right after each call, the same way the Vibration tab does it.
+    // A little HD Rumble tech demo, our own composition: every axis the engine controls
+    // gets one unmistakable turn -- intensity, duration, tone, a climbing sweep, and an
+    // echoed thump. RenHDrum renders the pitches on a pad it drives; a plain rumble pad
+    // still feels the rhythm. The temporarily forced enable and strength are restored
+    // right after each call, the same way the Vibration tab does it.
     struct Step {
         Core::HID::VibrationValue value;
         int at_ms;
         int hold_ms;
     };
-    const std::array<Step, 4> steps{{
-        {{.low_amplitude = 1.0f, .low_frequency = 170.0f, .high_amplitude = 1.0f,
-          .high_frequency = 340.0f},
-         0, 110},
-        {{.low_amplitude = 1.0f, .low_frequency = 255.0f, .high_amplitude = 1.0f,
-          .high_frequency = 510.0f},
-         150, 110},
-        {{.low_amplitude = 1.0f, .low_frequency = 60.0f, .high_amplitude = 1.0f,
-          .high_frequency = 120.0f},
-         310, 150},
-        {{.low_amplitude = 1.0f, .low_frequency = 60.0f, .high_amplitude = 1.0f,
-          .high_frequency = 120.0f},
-         580, 150},
+    const auto tone = [](float frequency, float amplitude) {
+        return Core::HID::VibrationValue{
+            .low_amplitude = amplitude,
+            .low_frequency = frequency,
+            .high_amplitude = amplitude,
+            .high_frequency = frequency,
+        };
+    };
+    const std::array<Step, 12> steps{{
+        // Soft tick, then the same pitch at full force: intensity alone
+        {tone(600.0f, 0.30f), 0, 60},
+        {tone(600.0f, 1.00f), 120, 60},
+        // Long deep drone, then a long shrill drone: duration and tone
+        {tone(45.0f, 1.00f), 240, 400},
+        {tone(550.0f, 1.00f), 700, 400},
+        // A climbing sweep: continuous pitch is the engine's party trick
+        {tone(120.0f, 0.85f), 1180, 45},
+        {tone(180.0f, 0.85f), 1225, 45},
+        {tone(270.0f, 0.85f), 1270, 45},
+        {tone(400.0f, 0.85f), 1315, 45},
+        {tone(550.0f, 0.85f), 1360, 45},
+        {tone(700.0f, 0.85f), 1405, 45},
+        // One hard thump, then its quiet echo
+        {tone(50.0f, 1.00f), 1520, 130},
+        {tone(50.0f, 0.35f), 1700, 130},
     }};
 
     const auto send = [this](const Core::HID::VibrationValue& value) {
@@ -685,7 +698,7 @@ void ConfigureHdRumble::TestRumble() {
             silence();
         });
     }
-    QTimer::singleShot(780, this, [this, alive, silence]() {
+    QTimer::singleShot(2000, this, [this, alive, silence]() {
         if (alive()) {
             silence();
         }
