@@ -464,7 +464,10 @@ struct RenHDrumPad::Impl {
     std::int64_t audio_next_us{};
     UserSettings user{};
     // Switch 2 Mode last handed to the engine; -1 forces the first update
-    int nx2_mode{-1};
+    /// hidapi answers wired or wireless; anything else arrived through the kernel's driver
+    /// (Linux hid-nintendo over Bluetooth) and refuses every raw rumble packet, so Vibrate
+    /// does not claim those pads and the standard rumble runs instead.
+    bool raw_transport{};
 
     RenHdcXboxRumble* xbox{};
     bool xbox_triggers{};
@@ -476,6 +479,16 @@ struct RenHDrumPad::Impl {
     // Direct mode accents: the level to settle on once the kick ends
     std::array<std::uint16_t, 2> direct_target{};
     std::int64_t kick_until_us{};
+    /// Direct-mode bookkeeping: the sent state is only recorded once SDL accepts a write
+    /// (pending forces the next sample to retry), a steady nonzero level is renewed before
+    /// SDL's 2000 ms expiry, and send_mutex serializes this pad's rumble writes against
+    /// Tick's settle so a stale level cannot land over a newer one.
+    bool direct_pending{};
+    bool trigger_pending{};
+    std::int64_t last_direct_ok_us{};
+    std::int64_t last_trigger_ok_us{};
+    std::uint64_t direct_generation{};
+    std::mutex send_mutex;
     // Direct mode triggers: the fine vibration of each side, and what was last sent
     std::array<std::uint16_t, 2> trigger_target{};
     std::array<std::uint16_t, 2> trigger_sent{};
@@ -1279,12 +1292,13 @@ std::shared_ptr<RenHDrumPad> RenHDrumPad::Create(SDL_Joystick* joystick, SDL_Gam
         // kernel's hid-nintendo driver -- and evdev answers every raw rumble packet with
         // SDL_Unsupported, so the engine's packets never leave the host.
         const SDL_JoystickConnectionState connection = SDL_GetJoystickConnectionState(joystick);
-        if (connection != SDL_JOYSTICK_CONNECTION_WIRED &&
-            connection != SDL_JOYSTICK_CONNECTION_WIRELESS) {
+        state->raw_transport = connection == SDL_JOYSTICK_CONNECTION_WIRED ||
+                               connection == SDL_JOYSTICK_CONNECTION_WIRELESS;
+        if (!state->raw_transport) {
             LOG_WARNING(Input,
                         "RenHDrum: SDL reports neither wired nor wireless for this pad, so it "
                         "likely arrived through the kernel's driver and will refuse raw rumble "
-                        "packets");
+                        "packets: HD Rumble stays off for it and the standard rumble runs");
         }
         state->ConfigureEngine();
     } else {
@@ -1420,13 +1434,23 @@ bool RenHDrumPad::Vibrate(std::int64_t now_us, bool is_right,
         change = impl->RefreshUserSettings();
         const auto& u = impl->user;
         const auto& api = Api();
-        // Guest Switch 2 Mode (commands 213 / 214): the engine picks its translation law from it.
-        // Process-wide, so only push it when it changed.
+        // Direct-mode kick state only means something while Direct owns this pad's output;
+        // leaving it behind lets Tick settle a stale level over whichever path took over
+        if (!(impl->xbox && u.hd_enabled && u.xbox_enabled && u.xbox_direct)) {
+            impl->kick_until_us = 0;
+        }
+        // Guest Switch 2 Mode (commands 213 / 214): the engine picks its translation law from
+        // it. One process-wide selector, so remember the last value ANY pad pushed: with a
+        // per-pad cache, a second pad's unchanged value would skip the push and leave the
+        // selector on the first pad's mode.
         if (api.set_nx2_mode) {
             const int mode = Settings::values.nx2_active_mode.load(std::memory_order_relaxed);
-            if (mode != impl->nx2_mode) {
+            static std::mutex nx2_mode_mutex;
+            static int last_pushed_mode = -1;
+            std::scoped_lock nx2_lock{nx2_mode_mutex};
+            if (mode != last_pushed_mode) {
                 api.set_nx2_mode(mode);
-                impl->nx2_mode = mode;
+                last_pushed_mode = mode;
             }
         }
         if (impl->xbox && u.hd_enabled && u.xbox_enabled && u.xbox_direct) {
@@ -1447,6 +1471,8 @@ bool RenHDrumPad::Vibrate(std::int64_t now_us, bool is_right,
             // A sudden rise gets a short burst so the motor spins up in time for quick taps
             constexpr int KickRise = 65535 * 15 / 100;
             constexpr std::int64_t KickUs = 25'000;
+            // Renew a steady level 500 ms before SDL's rumble effects expire
+            constexpr std::int64_t DirectRenewUs = 1'500'000;
             const float accent = static_cast<float>(u.xbox_hit_accents) / 100.0f;
             const auto kicked = [accent](std::uint16_t t) {
                 return static_cast<std::uint16_t>(t + (65535.0f - t) * accent);
@@ -1485,19 +1511,19 @@ bool RenHDrumPad::Vibrate(std::int64_t now_us, bool is_right,
             } else {
                 impl->kick_until_us = 0;
                 direct = target;
-                send_direct = direct != impl->direct_sent;
+                // Send on change, and renew a steady nonzero level before SDL expires the
+                // write it accepted (rumble effects end after 2000 ms)
+                send_direct = direct != impl->direct_sent || impl->direct_pending ||
+                              (now_us - impl->last_direct_ok_us > DirectRenewUs &&
+                               (direct[0] != 0 || direct[1] != 0));
                 trigger = trigger_target;
-                send_trigger = trigger != impl->trigger_sent;
+                send_trigger = trigger != impl->trigger_sent || impl->trigger_pending ||
+                               (now_us - impl->last_trigger_ok_us > DirectRenewUs &&
+                                (trigger[0] != 0 || trigger[1] != 0));
             }
             impl->direct_target = target;
             impl->trigger_target = trigger_target;
-            if (send_direct) {
-                impl->direct_sent = direct;
-            }
             send_trigger = send_trigger && impl->xbox_triggers;
-            if (send_trigger) {
-                impl->trigger_sent = trigger;
-            }
             handled = true;
         } else if (impl->xbox) {
             if (u.hd_enabled && u.xbox_enabled) {
@@ -1510,7 +1536,9 @@ bool RenHDrumPad::Vibrate(std::int64_t now_us, bool is_right,
                 engine_sample = true;
             }
         } else if (impl->engine) {
-            if (u.hd_enabled) {
+            // A pad whose raw packets SDL refuses (kernel-owned evdev) must not claim the
+            // sample: claiming it silences the standard rumble too
+            if (u.hd_enabled && impl->raw_transport) {
                 api.engine_push_half_sample(impl->engine, now_us, is_right,
                                             ShapeAmplitude(status.low_amplitude, u),
                                             status.low_frequency,
@@ -1541,11 +1569,38 @@ bool RenHDrumPad::Vibrate(std::int64_t now_us, bool is_right,
         }
     }
     if (send_direct) {
-        // A stop always arrives as a zero; the duration only guards a lost one
-        SDL_RumbleJoystick(joystick, direct[0], direct[1], 2000);
+        // A stop always arrives as a zero; the duration only guards a lost one. The sent
+        // state is recorded only when SDL accepts the write; a rejection leaves the level
+        // pending so the next sample retries.
+        bool ok = false;
+        {
+            std::scoped_lock send{impl->send_mutex};
+            ok = SDL_RumbleJoystick(joystick, direct[0], direct[1], 2000);
+        }
+        std::scoped_lock lock{impl->mutex};
+        if (ok) {
+            impl->direct_sent = direct;
+            impl->direct_pending = false;
+            impl->last_direct_ok_us = now_us;
+            impl->direct_generation++;
+        } else {
+            impl->direct_pending = true;
+        }
     }
     if (send_trigger) {
-        SDL_RumbleJoystickTriggers(joystick, trigger[0], trigger[1], 2000);
+        bool ok = false;
+        {
+            std::scoped_lock send{impl->send_mutex};
+            ok = SDL_RumbleJoystickTriggers(joystick, trigger[0], trigger[1], 2000);
+        }
+        std::scoped_lock lock{impl->mutex};
+        if (ok) {
+            impl->trigger_sent = trigger;
+            impl->trigger_pending = false;
+            impl->last_trigger_ok_us = now_us;
+        } else {
+            impl->trigger_pending = true;
+        }
     }
     if (change.stop_engine) {
         SendNeutralPacket(joystick);
@@ -1571,6 +1626,7 @@ void RenHDrumPad::Tick(std::int64_t now_us) {
     bool triggers = false;
     std::uint32_t strength = 100;
     bool send_settle = false;
+    std::uint64_t settle_generation = 0;
     std::array<std::uint16_t, 2> settle{};
     bool send_settle_trigger = false;
     std::array<std::uint16_t, 2> settle_trigger{};
@@ -1598,6 +1654,7 @@ void RenHDrumPad::Tick(std::int64_t now_us) {
             if (send_settle_trigger) {
                 impl->trigger_sent = settle_trigger;
             }
+            settle_generation = impl->direct_generation;
         }
         send_xbox = impl->xbox && !impl->user.xbox_direct &&
                     Api().xbox_tick(impl->xbox, now_us, motors.data()) == 1;
@@ -1605,10 +1662,43 @@ void RenHDrumPad::Tick(std::int64_t now_us) {
         strength = static_cast<std::uint32_t>(impl->user.xbox_strength);
     }
     if (send_settle) {
-        SDL_RumbleJoystick(joystick, settle[0], settle[1], 2000);
+        // A Direct write that happened while this settle was captured supersedes it: drop
+        // the stale level instead of laying it over the newer one
+        std::scoped_lock send{impl->send_mutex};
+        bool superseded = false;
+        {
+            std::scoped_lock lock{impl->mutex};
+            superseded = impl->direct_generation != settle_generation;
+        }
+        if (!superseded) {
+            const bool ok = SDL_RumbleJoystick(joystick, settle[0], settle[1], 2000);
+            std::scoped_lock lock{impl->mutex};
+            if (ok) {
+                impl->direct_pending = false;
+                impl->last_direct_ok_us = now_us;
+            } else {
+                impl->direct_pending = true;
+            }
+        }
     }
     if (send_settle_trigger) {
-        SDL_RumbleJoystickTriggers(joystick, settle_trigger[0], settle_trigger[1], 2000);
+        std::scoped_lock send{impl->send_mutex};
+        bool superseded = false;
+        {
+            std::scoped_lock lock{impl->mutex};
+            superseded = impl->direct_generation != settle_generation;
+        }
+        if (!superseded) {
+            const bool ok =
+                SDL_RumbleJoystickTriggers(joystick, settle_trigger[0], settle_trigger[1], 2000);
+            std::scoped_lock lock{impl->mutex};
+            if (ok) {
+                impl->trigger_pending = false;
+                impl->last_trigger_ok_us = now_us;
+            } else {
+                impl->trigger_pending = true;
+            }
+        }
     }
     if (send_xbox) {
         // RenHDrum's mix tops out near 10 % of the range (tuned on the Xbox One S motors);
