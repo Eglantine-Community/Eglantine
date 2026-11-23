@@ -1986,6 +1986,8 @@ void MainWindow::ConnectMenuEvents() {
     connect_menu(ui->action_Single_Window_Mode, &MainWindow::ToggleWindowMode);
     connect_menu(ui->action_Show_Filter_Bar, &MainWindow::OnToggleFilterBar);
     connect_menu(ui->action_Show_Status_Bar, &MainWindow::OnToggleStatusBar);
+    connect(ui->action_Customize_Home_Screen, &QAction::triggered, this,
+            [this] { game_list->ShowCustomizePanel(true); });
     connect_menu(ui->action_Show_Performance_Overlay, &MainWindow::OnTogglePerfOverlay);
 #ifdef HAS_RESHADE
     connect_menu(ui->action_Post_Processing_Shaders, &MainWindow::OnPostProcessingShaders);

@@ -271,23 +271,16 @@ QString FormatPatchNameVersions(const FileSys::PatchManager& patch_manager,
     return out;
 }
 
-QList<QStandardItem*> MakeGameListEntry(const std::string& path, const std::string& name,
-                                        const std::size_t size, const std::vector<u8>& icon,
-                                        Loader::AppLoader& loader, u64 program_id, bool is_switch2,
-                                        const PlayTime::PlayTimeManager& play_time_manager,
-                                        const FileSys::PatchManager& patch) {
-    auto const file_type = loader.GetFileType();
-    auto const file_type_string = QString::fromStdString(Loader::GetFileTypeString(file_type));
-
+/// `nacp` is null when the game has none.
+GameListPatchInfo ReadPatchInfo(Loader::AppLoader& loader, const FileSys::PatchManager& patch,
+                                const FileSys::NACP* nacp) {
     QString patch_versions = GetGameListCachedObject(
         fmt::format("{:016X}", patch.GetTitleID()), "pv.txt", [&patch, &loader] {
             return FormatPatchNameVersions(patch, loader, loader.IsRomFSUpdatable());
         });
 
-    FileSys::NACP nacp{};
-    const bool has_nacp = loader.ReadControlData(nacp) == Loader::ResultStatus::Success;
-    if (file_type == Loader::FileType::NUP && has_nacp) {
-        const std::string version_string = nacp.GetVersionString();
+    if (loader.GetFileType() == Loader::FileType::NUP && nacp) {
+        const std::string version_string = nacp->GetVersionString();
         if (!version_string.empty()) {
             if (!patch_versions.isEmpty()) {
                 patch_versions += QLatin1Char('\n');
@@ -297,7 +290,7 @@ QList<QStandardItem*> MakeGameListEntry(const std::string& path, const std::stri
         }
     }
 
-    QString version = has_nacp ? QString::fromStdString(nacp.GetVersionString()) : QString{};
+    QString version = nacp ? QString::fromStdString(nacp->GetVersionString()) : QString{};
     static const QRegularExpression update_regex{QStringLiteral(R"(^Update \(([^)]+)\))")};
     for (const QString& line : patch_versions.split(QLatin1Char('\n'))) {
         if (const auto match = update_regex.match(line); match.hasMatch()) {
@@ -305,6 +298,21 @@ QList<QStandardItem*> MakeGameListEntry(const std::string& path, const std::stri
             break;
         }
     }
+    return {std::move(patch_versions), std::move(version)};
+}
+
+
+QList<QStandardItem*> MakeGameListEntry(const std::string& path, const std::string& name,
+                                        const std::size_t size, const std::vector<u8>& icon,
+                                        Loader::AppLoader& loader, u64 program_id, bool is_switch2,
+                                        const PlayTime::PlayTimeManager& play_time_manager,
+                                        const FileSys::PatchManager& patch) {
+    auto const file_type = loader.GetFileType();
+    auto const file_type_string = QString::fromStdString(Loader::GetFileTypeString(file_type));
+
+    FileSys::NACP nacp{};
+    const bool has_nacp = loader.ReadControlData(nacp) == Loader::ResultStatus::Success;
+    auto [patch_versions, version] = ReadPatchInfo(loader, patch, has_nacp ? &nacp : nullptr);
 
     u64 play_time = play_time_manager.GetPlayTime(program_id);
     auto* path_item = new GameListItemPath(FormatGameName(path), icon, QString::fromStdString(name),
@@ -324,6 +332,14 @@ QList<QStandardItem*> MakeGameListEntry(const std::string& path, const std::stri
     };
 }
 } // Anonymous namespace
+
+GameListPatchInfo ReadGameListPatchInfo(Loader::AppLoader& loader,
+                                        const FileSys::PatchManager& patch) {
+    FileSys::NACP nacp{};
+    const bool has_nacp = loader.ReadControlData(nacp) == Loader::ResultStatus::Success;
+    return ReadPatchInfo(loader, patch, has_nacp ? &nacp : nullptr);
+}
+
 
 GameListWorker::GameListWorker(FileSys::VirtualFilesystem vfs_,
                                FileSys::ManualContentProvider* provider_,
