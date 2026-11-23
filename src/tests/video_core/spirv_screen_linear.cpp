@@ -11,6 +11,7 @@
 #include "shader_recompiler/environment.h"
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
 #include "shader_recompiler/ir_opt/passes.h"
+#include "video_core/stage_cache.h"
 
 namespace {
 namespace IR = Shader::IR;
@@ -132,4 +133,14 @@ TEST_CASE("Last vertex stage writes screen-linear generics times Position.w",
     geometry.program.output_vertices = 1;
     CHECK(Count(geometry.Emit(true)).vector_times_scalar ==
           Count(geometry.Emit(false)).vector_times_scalar);
+}
+
+
+TEST_CASE("SPIR-V stage cache distinguishes screen-linear generic masks",
+          "[video_core][spirv][screen_linear]") {
+    Shader::RuntimeInfo info{};
+    const Shader::Backend::Bindings bindings{};
+    const auto plain = VideoCommon::StageCache::RuntimeKey(info, bindings);
+    info.screen_linear_generics.set(0);
+    CHECK(VideoCommon::StageCache::RuntimeKey(info, bindings) != plain);
 }

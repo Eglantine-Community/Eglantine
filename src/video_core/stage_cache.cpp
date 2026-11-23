@@ -311,6 +311,7 @@ std::vector<u8> StageCache::RuntimeKey(const Shader::RuntimeInfo& info,
         writer.Put(word);
     }
     writer.Put(static_cast<u32>(info.per_primitive_generics.to_ulong()));
+    writer.Put(static_cast<u32>(info.screen_linear_generics.to_ulong()));
     writer.Put(static_cast<u32>(info.previous_stage_legacy_stores_mapping.size()));
     for (const auto& [from, to] : info.previous_stage_legacy_stores_mapping) {
         writer.Put(from);
