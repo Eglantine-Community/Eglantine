@@ -54,7 +54,7 @@ ConfigureVibration::ConfigureVibration(QWidget* parent, Core::HID::HIDCore& hid_
     hd_rumble_button->setToolTip(
         tr("HD Rumble for Pro Controller / Joy-Con and DualSense haptics (RenHDrum)."));
     connect(hd_rumble_button, &QPushButton::clicked, this, [this] {
-        ConfigureHdRumble dialog(this);
+        ConfigureHdRumble dialog(hid_core, this);
         if (dialog.exec() == QDialog::Accepted) {
             dialog.ApplyConfiguration();
         }

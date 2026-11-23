@@ -16,6 +16,10 @@ class QSpinBox;
 class QVBoxLayout;
 class QWidget;
 
+namespace Core::HID {
+class HIDCore;
+} // namespace Core::HID
+
 namespace InputCommon {
 struct RenHDrumOption;
 } // namespace InputCommon
@@ -32,7 +36,7 @@ class ConfigureHdRumble : public QDialog {
     Q_OBJECT
 
 public:
-    explicit ConfigureHdRumble(QWidget* parent);
+    explicit ConfigureHdRumble(Core::HID::HIDCore& hid_core_, QWidget* parent);
     ~ConfigureHdRumble() override;
 
     void ApplyConfiguration();
@@ -61,12 +65,19 @@ private:
     /// right-aligned and vertically centered, appended to `rows` for the binding layer.
     void AddRow(QVBoxLayout* col, bool& first, const InputCommon::RenHDrumOption& opt,
                 int table_index, int def);
+    /// Pulses every player's pad with the Vibration tab's test pattern: whichever controllers
+    /// are in reach answer, so a user can feel which pad is which.
+    void TestRumble();
     void LoadConfiguration();
     void RestoreDefaults();
     void UpdateEnabledState();
 
+    Core::HID::HIDCore& hid_core;
     QCheckBox* hd_enabled{};
     QWidget* body{};
+    /// Each Test rumble click gets a new one; a stale timed stop from an earlier click must
+    /// not cut a newer pulse short.
+    int test_generation{};
 
     /// Every option row of every card, in build order; the table index carries requires_row.
     std::vector<OptionRow> rows;

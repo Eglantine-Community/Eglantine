@@ -7,6 +7,7 @@
 
 #include <QApplication>
 #include <QCheckBox>
+#include <QTimer>
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QFont>
@@ -22,6 +23,9 @@
 #include <QVBoxLayout>
 
 #include "common/settings.h"
+#include "hid_core/frontend/emulated_controller.h"
+#include "hid_core/hid_core.h"
+#include "hid_core/hid_types.h"
 #include "input_common/drivers/renhdrum_pad.h"
 #include "yuzu/configuration/configure_hd_rumble.h"
 
@@ -84,7 +88,8 @@ QString DeviceTitle(unsigned device) {
 
 } // namespace
 
-ConfigureHdRumble::ConfigureHdRumble(QWidget* parent) : QDialog(parent) {
+ConfigureHdRumble::ConfigureHdRumble(Core::HID::HIDCore& hid_core_, QWidget* parent)
+    : QDialog(parent), hid_core{hid_core_} {
     setWindowTitle(tr("HD Rumble"));
     setMinimumSize(560, 480);
 
@@ -106,6 +111,9 @@ ConfigureHdRumble::ConfigureHdRumble(QWidget* parent) : QDialog(parent) {
     hd_enabled->setToolTip(tr("Off: the controllers use the emulator's standard rumble."));
     header->addWidget(title);
     header->addStretch(1);
+    auto* test = new QPushButton(tr("Test rumble"));
+    connect(test, &QPushButton::clicked, this, &ConfigureHdRumble::TestRumble);
+    header->addWidget(test, 0, Qt::AlignVCenter);
     header->addWidget(hd_enabled, 0, Qt::AlignVCenter);
     root->addLayout(header);
     if (!InputCommon::IsRenHDrumLoaded()) {
@@ -607,6 +615,43 @@ QWidget* ConfigureHdRumble::CreateAdvancedRows(unsigned device) {
         AddRow(col, first, extra, -1, 2);
     }
     return host;
+}
+
+void ConfigureHdRumble::TestRumble() {
+    // The Vibration tab's test pattern, sent to every player's pad: the temporarily forced
+    // enable and strength are restored right after the call, the same way the tab does it.
+    const Core::HID::VibrationValue vibration{
+        .low_amplitude = 1.0f,
+        .low_frequency = 160.0f,
+        .high_amplitude = 1.0f,
+        .high_frequency = 320.0f,
+    };
+    auto& players = Settings::values.players.GetValue();
+    for (std::size_t i = 0; i < players.size(); ++i) {
+        auto& player = players[i];
+        auto controller = hid_core.GetEmulatedControllerByIndex(static_cast<int>(i));
+        const bool old_enabled = player.vibration_enabled;
+        const int old_strength = player.vibration_strength;
+        player.vibration_enabled = true;
+        player.vibration_strength = 100;
+        controller->SetVibration(Core::HID::DeviceIndex::Left, vibration);
+        controller->SetVibration(Core::HID::DeviceIndex::Right, vibration);
+        player.vibration_enabled = old_enabled;
+        player.vibration_strength = old_strength;
+    }
+    const int generation = ++test_generation;
+    QTimer::singleShot(1200, this, [this, generation]() {
+        if (generation != test_generation) {
+            return;
+        }
+        for (std::size_t i = 0; i < Settings::values.players.GetValue().size(); ++i) {
+            auto controller = hid_core.GetEmulatedControllerByIndex(static_cast<int>(i));
+            controller->SetVibration(Core::HID::DeviceIndex::Left,
+                                      Core::HID::DEFAULT_VIBRATION_VALUE);
+            controller->SetVibration(Core::HID::DeviceIndex::Right,
+                                      Core::HID::DEFAULT_VIBRATION_VALUE);
+        }
+    });
 }
 
 void ConfigureHdRumble::LoadConfiguration() {
