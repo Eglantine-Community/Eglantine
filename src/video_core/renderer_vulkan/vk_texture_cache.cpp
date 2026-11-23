@@ -5160,10 +5160,14 @@ void TextureCacheRuntime::TranscodeAstcToBcnFused(
             .block_height = params.block_height,
             .block_height_mask = params.block_height_mask,
             .native_tiling = params.native_tiling,
-            .mode = bc3 ? 1U : 0U, // MODE_BC3 : MODE_BC1 of bc_encoder.comp
             .out_offset = static_cast<u32>(copies[level].buffer_offset / 8),
         };
-        astc_bc_pass->Run(constants, layers, map.buffer, map.offset + swizzle.buffer_offset,
+        // MODE_BC3 : MODE_BC1 of bc_encoder.comp, and the box fit: the kind and the refined fit are
+        // specialisation constants, so this picks which pipeline the level runs (AstcBcPass).
+        constexpr bool refine = false;
+        const u32 kind = bc3 ? 1U : 0U;
+        astc_bc_pass->Run(constants, kind, refine, layers, map.buffer,
+                          map.offset + swizzle.buffer_offset,
                           image.guest_size_bytes - swizzle.buffer_offset, output.buffer,
                           output.offset, total);
     }

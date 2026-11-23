@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 /* The fused pass's body, included by astc_bc.comp: ASTC blocks straight into BC1, BC3, BC4 or BC5
-   blocks (mode's kind), in one dispatch, with no RGBA8 image in between.
+   blocks (a specialisation constant, ASTC_BC_KIND), in one dispatch, with no RGBA8 image in
+   between.
 
    The two-pass path (TranscodeAstcToBcn with astc_decoder.comp and bc_encoder.comp) decodes a
    level into a temporary RGBA8 image and reads it back to compress it: every texel leaves the
@@ -72,11 +73,19 @@ uint InsideMask(uint bx, uint by) {
     return row * (((1u << (4u * inside.y)) - 1u) / 15u); // the row in each nibble
 }
 
+/* The output kind and whether the refined fit runs, fixed when the pipeline is made (AstcBcPass
+   gives the driver both as specialisation constants): a kind a level does not use and the refined
+   path leave its shader entirely rather than sitting behind a branch, which is most of its size
+   and a good part of what keeps it out of the SIMD's register budget. bc_encoder.comp's MODE_*. */
+layout(constant_id = 0) const uint ASTC_BC_KIND = MODE_BC1;
+/* REFINE, as bc_encoder.comp: the encoder searches for the fit instead of taking the box fit */
+layout(constant_id = 1) const uint ASTC_BC_REFINE = 0u;
+
 /* The block at (bx, by) of slice z, its words written where the level's blocks go, cx to a row. */
 void Store(uint cx, uint cy, uint bx, uint by, uint z) {
     const uint at = (z * cy + by) * cx + bx;
-    const uint kind = mode & MODE_MASK;
-    const bool refine = (mode & REFINE) != 0u;
+    const uint kind = ASTC_BC_KIND;
+    const bool refine = ASTC_BC_REFINE != 0u;
     const uint real = InsideMask(bx, by);
     if (kind == MODE_BC3) {
         out_blocks[out_offset + at * 2u] = EncodeAlpha();

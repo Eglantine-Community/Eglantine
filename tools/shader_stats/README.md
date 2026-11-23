@@ -42,21 +42,28 @@ Measured on a Navi 23 (RX 6600, Mesa 26.3.0), `astc_bc.comp` as shipped:
 
 | variant | VGPR | waves/SIMD | code bytes | instructions |
 |---|---|---|---|---|
-| fused, `mode` kind at run time (as shipped) | 168 | 6 | 322,344 | 56,179 |
+| fused, `mode` kind at run time (before specialisation) | 168 | 6 | 322,344 | 56,179 |
 | fused, texels as `vec4 px[16]` (pre-packing) | 168 | 6 | 317,956 | 55,235 |
-| fused, kind fixed per pipeline (BC1 opaque) | 168 | 6 | 241,384 | 41,356 |
-| fused, `REFINE` compiled out | 128 | 8 | 213,628 | 36,616 |
-| fused, kind fixed + `REFINE` out (BC1/BC4) | 120–128 | 8 | 181,000–187,000 | 30,235–31,565 |
+| **BC1, REFINE off — the pipeline the fused path runs** | **120** | **8** | **195,104** | **32,620** |
+| **BC3, REFINE off** | **128** | **8** | **189,532** | **32,086** |
+| BC3, REFINE on (quality knob, unused today) | 168 | 6 | 235,368 | 40,019 |
+| BC4 / BC5, REFINE off (smart stand-ins) | 120 | 8 | 180,976 / 183,512 | 30,235 / 30,754 |
 | two-pass decoder alone (`astc_decoder.comp`) | 168 | 6 | 102,908 | 17,996 |
 | two-pass encoder alone (`bc_encoder.comp`) | 128 | 8 | 69,456 | 12,614 |
 
-Two things follow. Packing the texels into RGBA8 words changed nothing the
+The last five rows are one module with the kind and `REFINE` as specialisation constants
+(`constant_id 0` and `1`, see `astc_bc.glsl`), each row a pipeline the driver folded; pass the
+values as `vkcompile <spv> -1 128 <kind> <refine>`.
+
+Three things follow. Packing the texels into RGBA8 words changed nothing the
 allocator cares about — 168 VGPRs either way — so the register bill is the
-decoder's 39-word block state, not the texels. And the shipped shader is bigger
-than the two passes it replaced *plus* half again (56,179 against 30,610), with
-four encoder bodies and a refined fit all live at once because `mode` chooses
-between them at run time; at 322 KB against a 32 KB instruction cache that is
-what thrashes it.
+decoder's 39-word block state, not the texels. The unspecialised shader was
+bigger than the two passes it replaced *plus* half again (56,179 against
+30,610), with four encoder bodies and a refined fit all live at once because
+`mode` chose between them at run time; at 322 KB against a 32 KB instruction
+cache that is what thrashed it. And fixing the kind per pipeline gets that back:
+39% less code, 42% fewer instructions, and 8 waves per SIMD instead of 6, with
+the same decoder and the same arithmetic.
 
 `spirv-opt -O` and `-Os` before compilation changed nothing measurable
 (322,344 → 321,868 bytes), so this has to be won in the source, by making the

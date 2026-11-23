@@ -3,7 +3,7 @@
  * pipeline is created and thrown away. Used to read a shader's VGPR/SGPR/
  * scratch/occupancy numbers offline, without booting a game.
  *
- *   vkcompile <shader.spv> [image-binding] [push-constant-bytes] [wg-size]
+ *   vkcompile <shader.spv> [image-binding] [push-constant-bytes] [spec-kind] [spec-refine]
  *
  * image-binding: which binding is a storage image, -1 (default) for none.
  * The second and third arguments only need to match the module's layout well
@@ -49,6 +49,19 @@ int main(int argc, char** argv) {
     const char* path = argv[1];
     const int image_binding = argc > 2 ? atoi(argv[2]) : -1;
     const int push_bytes = argc > 3 ? atoi(argv[3]) : 128;
+    const bool have_spec = argc > 4;
+    unsigned spec_values[2] = {argc > 4 ? (unsigned)atoi(argv[4]) : 0u,
+                               argc > 5 ? (unsigned)atoi(argv[5]) : 0u};
+    const VkSpecializationMapEntry spec_entries[2] = {
+        {0u, 0u, sizeof(unsigned)},
+        {1u, sizeof(unsigned), sizeof(unsigned)},
+    };
+    const VkSpecializationInfo spec = {
+        .mapEntryCount = 2,
+        .pMapEntries = spec_entries,
+        .dataSize = sizeof(spec_values),
+        .pData = spec_values,
+    };
 
     VkApplicationInfo app = {
         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
@@ -163,6 +176,7 @@ int main(int argc, char** argv) {
                 .stage = VK_SHADER_STAGE_COMPUTE_BIT,
                 .module = mod,
                 .pName = "main",
+                .pSpecializationInfo = have_spec ? &spec : NULL,
             },
         .layout = layout,
     };

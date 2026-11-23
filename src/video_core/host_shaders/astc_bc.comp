@@ -28,7 +28,6 @@ layout (push_constant) uniform PushConstants {
     uint block_height;
     uint block_height_mask;
     uint native_tiling;    /* nonzero: Switch 2 GOBs, which swap offset bits 5 and 6 */
-    uint mode;             /* MODE_* | REFINE, as bc_encoder.comp */
     uint out_offset;       /* the level's first output word, in 8-byte units */
 };
 

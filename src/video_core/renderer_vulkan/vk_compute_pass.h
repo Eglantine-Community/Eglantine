@@ -10,6 +10,7 @@
 #pragma once
 
 #include <functional>
+#include <array>
 #include <optional>
 #include <span>
 #include <utility>
@@ -49,6 +50,10 @@ public:
     ~ComputePass();
 
 protected:
+    /// A compute pipeline over this pass's module. `spec` fixes the module's specialisation
+    /// constants; the pipeline the constructor builds passes none.
+    vk::Pipeline CreatePipeline(const VkSpecializationInfo* spec = nullptr);
+
     const Device& device;
     vk::DescriptorUpdateTemplate descriptor_template;
     vk::PipelineLayout layout;
@@ -57,6 +62,7 @@ protected:
     DescriptorAllocator descriptor_allocator;
 
 private:
+    std::optional<u32> required_subgroup_size;
     vk::ShaderModule module;
 };
 
@@ -229,7 +235,6 @@ struct AstcBcPushConstants {
     u32 block_height;
     u32 block_height_mask;
     u32 native_tiling;
-    u32 mode;             ///< MODE_* | REFINE of bc_encoder.comp
     u32 out_offset;       ///< the level's first output word, in 8-byte units
 };
 static_assert(sizeof(AstcBcPushConstants) <= 128);
@@ -245,14 +250,22 @@ public:
     ~AstcBcPass();
 
     /// Every layer of one level: `layers` layers of the block-linear ASTC data at `input` into
-    /// the level's BC blocks at `output`, `params.out_offset` words past its start.
-    void Run(const AstcBcPushConstants& params, u32 layers, VkBuffer input,
+    /// the level's BC blocks at `output`, `params.out_offset` words past its start. `kind` is the
+    /// bc_encoder.comp MODE_* the blocks take and `refine` whether the refined fit runs; both are
+    /// specialisation constants, so each pair is a pipeline of its own and the kinds a level does
+    /// not use are not in its shader.
+    void Run(const AstcBcPushConstants& params, u32 kind, bool refine, u32 layers, VkBuffer input,
              VkDeviceSize input_offset, VkDeviceSize input_size, VkBuffer output,
              VkDeviceSize output_offset, VkDeviceSize output_size);
 
 private:
+    /// The pipeline for a (kind, refine) pair, compiled on first use.
+    VkPipeline PipelineFor(u32 kind, bool refine);
+
     Scheduler& scheduler;
     ComputePassDescriptorQueue& compute_pass_descriptor_queue;
+    /// MODE_BC1 to MODE_BC1_OPAQUE with refine off, then the same with refine on.
+    std::array<VkPipeline, 10> pipelines{};
 };
 
 class BlockLinearUnswizzle3DPass final : public ComputePass {
