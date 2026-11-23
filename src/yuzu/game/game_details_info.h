@@ -21,6 +21,7 @@ struct GameDetailsInfo {
     QString play_time;
     QPixmap icon;
     bool favorite = false;
+    bool switch2 = false;
 };
 
 struct GameAddOn {

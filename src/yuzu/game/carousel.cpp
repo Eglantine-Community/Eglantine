@@ -40,6 +40,8 @@ constexpr int InfoReserve = 24;
 /// The gap above the line when no title is shown, and below the hub.
 constexpr int SmallGap = 6;
 constexpr int HubMargin = 16;
+/// The details band never grows wider than this, so its facts stay near the card.
+constexpr int HubMaxWidth = 1180;
 constexpr int MinCenterSize = 160;
 /// The narrowest a stacked card may peek past the one in front of it. Below this the stack
 /// shows fewer cards instead of slivers nobody can recognise.
@@ -263,11 +265,13 @@ struct CarouselMetrics {
     bool names = false;
 };
 
-/// `hub` is the height the action tiles and their panel take under the info line.
-CarouselMetrics MetricsFor(const QSize& area, int hub) {
+/// `hub` is the height the details band takes under the strip. `title_line` is whether the
+/// carousel draws the title and info line itself, which it does only while the band is off.
+CarouselMetrics MetricsFor(const QSize& area, int hub, bool title_line) {
     CarouselMetrics m;
-    m.names = UISettings::values.show_game_name.GetValue();
-    const qreal title = (m.names ? TitleReserve : SmallGap) + InfoReserve + hub;
+    m.names = title_line && UISettings::values.show_game_name.GetValue();
+    const qreal title =
+        (title_line ? (m.names ? TitleReserve : SmallGap) + InfoReserve : SmallGap) + hub;
     // The stored index picks a share of the available height; anything out of range reads as
     // full, so a stale value can never shrink the card away.
     const auto fractions = GameCarousel::CardSizeFractions;
@@ -282,7 +286,7 @@ CarouselMetrics MetricsFor(const QSize& area, int hub) {
     const bool cartridge = UISettings::values.game_icon_borders.GetValue() &&
                            UISettings::values.game_cartridge_kind.GetValue() == 1;
     m.card_w = cartridge ? m.card_h * GameCard::CartridgeAspect : m.card_h;
-    // The card floats centered in the available height at every size.
+    // The card floats centered in the height the details band, pinned to the bottom, leaves.
     m.center = QPointF(area.width() / 2.0, SideGap + available / 2.0);
     // The stacks share the width beside the center card, so a wide window shows more of each
     // neighbour instead of empty space. A narrow one shows fewer neighbours, not thinner ones.
@@ -296,6 +300,12 @@ CarouselMetrics MetricsFor(const QSize& area, int hub) {
                           (1.0 - TiltSqueeze);
     m.peek = std::clamp(room / m.side_count, MinPeek, std::max(MinPeek, deepest));
     return m;
+}
+
+CarouselMetrics MetricsFor(const QSize& area, const CarouselHub& hub) {
+    // The band sits HubMargin above the bottom edge; a hidden band takes no room.
+    const int band = hub.ReservedHeight();
+    return MetricsFor(area, band > 0 ? band + HubMargin : 0, hub.CarouselDrawsTitle());
 }
 
 /// The card's untilted rectangle at `depth`: 0 is the centered card, and the card `k` steps away
@@ -780,7 +790,7 @@ void GameCarousel::MoveTo(int position, int duration_ms) {
     // The card settling into the center slot swaps to the center-sized icon; warm it now so
     // the last frame of the slide does not hitch on its first resample.
     if (model() && position >= 0 && position < int(m_visible.size())) {
-        const CarouselMetrics metrics = MetricsFor(viewport()->size(), HubReserve());
+        const CarouselMetrics metrics = MetricsFor(viewport()->size(), *m_hub);
         ScaledCardIcon(model()->index(m_visible[position], 0), SizeBucketOf(metrics.card_w),
                        devicePixelRatioF(), MaxCenterSourcePx);
     }
@@ -826,7 +836,7 @@ void GameCarousel::paintEvent(QPaintEvent*) {
     p.setRenderHint(QPainter::Antialiasing);
     p.setRenderHint(QPainter::SmoothPixmapTransform);
 
-    const CarouselMetrics m = MetricsFor(viewport()->size(), HubReserve());
+    const CarouselMetrics m = MetricsFor(viewport()->size(), *m_hub);
     // Every change that moves the hub repaints the strip, so it follows here. Its geometry is
     // only set when it changed, so this does not repaint in a loop.
     SyncHub();
@@ -884,7 +894,8 @@ void GameCarousel::paintEvent(QPaintEvent*) {
         std::min_element(cards.begin(), cards.end(), [](const Card& a, const Card& b) {
             return std::abs(a.depth) < std::abs(b.depth);
         });
-    if (nearest != cards.end() && std::abs(nearest->depth) < 0.5) {
+    if (m_hub->CarouselDrawsTitle() && nearest != cards.end() &&
+        std::abs(nearest->depth) < 0.5) {
         const QModelIndex index = model()->index(m_visible[nearest->position], 0);
         p.setOpacity(std::max<qreal>(0.0, 1.0 - 2.0 * std::abs(nearest->depth)));
         if (m.names) {
@@ -899,7 +910,7 @@ QModelIndex GameCarousel::indexAt(const QPoint& point) const {
     if (m_visible.empty() || !model()) {
         return {};
     }
-    const CarouselMetrics m = MetricsFor(viewport()->size(), HubReserve());
+    const CarouselMetrics m = MetricsFor(viewport()->size(), *m_hub);
     // The cartridge slot carries a transparent margin around the solid body, and the next
     // card's art shows through it: hit-test the body, or a click on what looks like the
     // neighbour's cartridge lands on the centered card's empty margin and selects nothing.
@@ -933,7 +944,7 @@ QRect GameCarousel::visualRect(const QModelIndex& index) const {
     if (position < 0) {
         return {};
     }
-    const CarouselMetrics m = MetricsFor(viewport()->size(), HubReserve());
+    const CarouselMetrics m = MetricsFor(viewport()->size(), *m_hub);
     return CardRect(position - m_position, m).toAlignedRect();
 }
 
@@ -1108,6 +1119,16 @@ bool GameCarousel::viewportEvent(QEvent* event) {
     return QListView::viewportEvent(event);
 }
 
+bool GameCarousel::event(QEvent* event) {
+    // The window's Escape shortcut would take the key that closes an open band page.
+    if (event->type() == QEvent::ShortcutOverride &&
+        static_cast<QKeyEvent*>(event)->key() == Qt::Key_Escape && m_hub->PanelOpen()) {
+        event->accept();
+        return true;
+    }
+    return QListView::event(event);
+}
+
 CarouselHub* GameCarousel::Hub() const {
     return m_hub;
 }
@@ -1119,21 +1140,17 @@ QModelIndex GameCarousel::CenteredIndex() const {
     return model()->index(m_visible[CurrentPosition()], 0);
 }
 
-int GameCarousel::HubReserve() const {
-    return m_hub->ReservedHeight() + SmallGap;
-}
-
 void GameCarousel::SyncHub() {
     if (m_visible.empty() || !model()) {
         m_hub->hide();
         return;
     }
     m_hub->SetAvailableHeight(viewport()->height());
-    const CarouselMetrics m = MetricsFor(viewport()->size(), HubReserve());
-    const QRectF slot = CardRect(0.0, m);
-    const int top = qRound(slot.bottom() + (m.names ? TitleReserve : SmallGap) + InfoReserve);
-    const QRect geometry(HubMargin, top, std::max(0, viewport()->width() - 2 * HubMargin),
-                         m_hub->ReservedHeight());
+    m_hub->SetPosition(CurrentPosition(), int(m_visible.size()));
+    // Pinned to the bottom edge: the band grows upward and the card recenters above it.
+    const int top = viewport()->height() - HubMargin - m_hub->ReservedHeight();
+    const int width = std::min(HubMaxWidth, std::max(0, viewport()->width() - 2 * HubMargin));
+    const QRect geometry((viewport()->width() - width) / 2, top, width, m_hub->ReservedHeight());
     if (m_hub->geometry() != geometry) {
         m_hub->setGeometry(geometry);
     }
@@ -1141,9 +1158,15 @@ void GameCarousel::SyncHub() {
 }
 
 void GameCarousel::keyPressEvent(QKeyEvent* event) {
-    // Down leaves the cards for the game's action tiles below them; nothing sits above.
+    // Down leaves the cards for the game's details band below them; nothing sits above.
     if (event->key() == Qt::Key_Down && m_hub->isVisible()) {
-        m_hub->FocusTiles();
+        m_hub->FocusActions();
+        return;
+    }
+    // Controller L and R page through the band from the cards too.
+    if ((event->key() == Qt::Key_Back || event->key() == Qt::Key_Forward) &&
+        m_hub->isVisible()) {
+        m_hub->CyclePage(event->key() == Qt::Key_Back ? -1 : 1);
         return;
     }
     if (event->key() == Qt::Key_Up) {
@@ -1186,7 +1209,7 @@ void GameCarousel::mouseMoveEvent(QMouseEvent* event) {
         UpdateHover(pos);
         return;
     }
-    const CarouselMetrics m = MetricsFor(viewport()->size(), HubReserve());
+    const CarouselMetrics m = MetricsFor(viewport()->size(), *m_hub);
     if (!m_dragging) {
         if (std::abs(pos.x() - m_press_pos.x()) < QApplication::startDragDistance()) {
             return;
@@ -1288,8 +1311,17 @@ void GameCarousel::mouseReleaseEvent(QMouseEvent* event) {
         setCurrentIndex(index);
         UpdateHover(pos);
     }
-    // The centered card is already the selection: a click on it does nothing more. Options
-    // opens its page, a double-click or Play starts it.
+    // The centered card is already the selection: a click on it only shows the details band
+    // when it is off. A double-click or Play starts it.
+    if (m_last_click_center) {
+        m_hub->Reveal();
+    }
+}
+
+void GameCarousel::focusInEvent(QFocusEvent* event) {
+    // Back on the cards: a band the details setting keeps off goes away again.
+    m_hub->Conceal();
+    QListView::focusInEvent(event);
 }
 
 void GameCarousel::mouseDoubleClickEvent(QMouseEvent* event) {

@@ -9,8 +9,10 @@
 #include <QApplication>
 #include <QDir>
 #include <QEasingCurve>
+#include <QFileInfo>
 #include <QFormLayout>
 #include <QFrame>
+#include <QGridLayout>
 #include <QHBoxLayout>
 #include <QKeyEvent>
 #include <QLabel>
@@ -20,30 +22,35 @@
 #include <QPainterPath>
 #include <QPushButton>
 #include <QScrollArea>
-#include <QStackedWidget>
 #include <QToolButton>
 #include <QVBoxLayout>
 #include <QVariantAnimation>
 
+#include "qt_common/config/uisettings.h"
 #include "yuzu/game/add_on_list.h"
 #include "yuzu/game/carousel_hub.h"
 #include "yuzu/game/game_artwork.h"
 
 namespace {
 
-constexpr int TileWidth = 96;
-constexpr int TileHeight = 78;
-constexpr int TileIconSize = 28;
+constexpr int BandRadius = 14;
+constexpr int BandPadding = 18;
 constexpr int Spacing = 10;
-constexpr int PanelMaxWidth = 720;
-constexpr int PanelAnimationMs = 180;
+constexpr int ActionHeight = 46;
+constexpr int PlayWidth = 168;
+constexpr int ActionIconSize = 22;
+constexpr int TabIconSize = 16;
+constexpr int TitlePixelSize = 24;
+constexpr int HeightAnimationMs = 180;
+constexpr int ChipPadX = 10;
+constexpr int ChipPadY = 3;
+constexpr int ChipGap = 6;
 
-enum class Glyph { Play, Star, StarFilled, Gear, AddOns, Shaders, Info };
+enum class Glyph { Play, Star, StarFilled, Gear, Overview, AddOns, Shaders, Info };
 
-/// Tile icons, drawn in the button text colour so they read on every style and theme; the
+/// Action and tab icons, drawn in a palette colour so they read on every style and theme; the
 /// icon theme has no reliable set for these on Windows and macOS.
-QIcon MakeGlyph(Glyph glyph, const QColor& color, qreal dpr) {
-    constexpr int size = TileIconSize;
+QIcon MakeGlyph(Glyph glyph, const QColor& color, qreal dpr, int size) {
     QPixmap pixmap(QSize(size, size) * dpr);
     pixmap.setDevicePixelRatio(dpr);
     pixmap.fill(Qt::transparent);
@@ -100,6 +107,14 @@ QIcon MakeGlyph(Glyph glyph, const QColor& color, qreal dpr) {
         p.drawPath(gear);
         break;
     }
+    case Glyph::Overview:
+        p.setPen(outline);
+        p.setBrush(Qt::NoBrush);
+        for (const QPointF& corner :
+             {QPointF(3, 3), QPointF(11, 3), QPointF(3, 11), QPointF(11, 11)}) {
+            p.drawRoundedRect(QRectF(corner, QSizeF(6, 6)), 1.5, 1.5);
+        }
+        break;
     case Glyph::AddOns:
         p.setPen(outline);
         p.setBrush(Qt::NoBrush);
@@ -112,7 +127,8 @@ QIcon MakeGlyph(Glyph glyph, const QColor& color, qreal dpr) {
         p.setBrush(Qt::NoBrush);
         const QPointF top(10, 2.5), right(17, 6.3), bottom(10, 10.1), left(3, 6.3);
         p.drawPolygon(QPolygonF{top, right, bottom, left});
-        p.drawPolyline(QPolygonF{left, QPointF(3, 13.7), QPointF(10, 17.5), QPointF(17, 13.7), right});
+        p.drawPolyline(
+            QPolygonF{left, QPointF(3, 13.7), QPointF(10, 17.5), QPointF(17, 13.7), right});
         p.drawLine(bottom, QPointF(10, 17.5));
         break;
     }
@@ -145,82 +161,196 @@ std::vector<QWidget*> FocusableIn(QWidget* root) {
     return out;
 }
 
+void SetMuted(QWidget* widget, const QPalette& base) {
+    QPalette pal = widget->palette();
+    QColor color = base.color(QPalette::WindowText);
+    color.setAlpha(160);
+    pal.setColor(QPalette::WindowText, color);
+    widget->setPalette(pal);
+}
+
+void SetPixelSize(QWidget* widget, int size, bool bold) {
+    QFont font = widget->font();
+    font.setPixelSize(size);
+    font.setBold(bold);
+    widget->setFont(font);
+}
+
+/// A one-line label that elides to the width the layout gives it instead of asking for its full
+/// text: long game titles must not push the actions off the band.
+class ElidedLabel : public QLabel {
+public:
+    explicit ElidedLabel(QWidget* parent) : QLabel{parent} {
+        setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+        setTextFormat(Qt::PlainText);
+    }
+
+    void SetFullText(const QString& text) {
+        full_text = text;
+        setToolTip(text);
+        Elide();
+    }
+
+protected:
+    void resizeEvent(QResizeEvent* event) override {
+        QLabel::resizeEvent(event);
+        Elide();
+    }
+    void changeEvent(QEvent* event) override {
+        QLabel::changeEvent(event);
+        if (event->type() == QEvent::FontChange) {
+            Elide();
+        }
+    }
+
+private:
+    void Elide() {
+        setText(fontMetrics().elidedText(full_text, Qt::ElideRight, std::max(0, width())));
+    }
+
+    QString full_text;
+};
+
+struct Chip {
+    QString text;
+    bool accent = false;
+};
+
+/// The game's facts as a row of pills. Pills that do not fit the width are left out rather than
+/// squeezed.
+class ChipRow : public QWidget {
+public:
+    explicit ChipRow(QWidget* parent) : QWidget{parent} {
+        setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
+    }
+
+    void SetChips(std::vector<Chip> chips_) {
+        chips = std::move(chips_);
+        update();
+    }
+
+    QSize sizeHint() const override {
+        return {0, fontMetrics().height() + 2 * ChipPadY + 2};
+    }
+    QSize minimumSizeHint() const override {
+        return sizeHint();
+    }
+
+protected:
+    void paintEvent(QPaintEvent*) override {
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing);
+        const QFontMetrics fm = fontMetrics();
+        const QPalette& pal = palette();
+        const qreal h = height() - 1.0;
+        qreal x = 0.5;
+        for (const Chip& chip : chips) {
+            const qreal w = fm.horizontalAdvance(chip.text) + 2 * ChipPadX;
+            if (x + w > width()) {
+                break;
+            }
+            const QRectF rect(x, 0.5, w, h);
+            QColor fill = pal.color(chip.accent ? QPalette::Highlight : QPalette::Button);
+            fill.setAlpha(chip.accent ? 70 : 160);
+            QColor border = pal.color(chip.accent ? QPalette::Highlight : QPalette::Mid);
+            border.setAlpha(chip.accent ? 170 : 120);
+            p.setPen(QPen(border, 1.0));
+            p.setBrush(fill);
+            p.drawRoundedRect(rect, h / 2, h / 2);
+            p.setPen(pal.color(QPalette::WindowText));
+            p.drawText(rect, Qt::AlignCenter, chip.text);
+            x += w + ChipGap;
+        }
+    }
+
+private:
+    std::vector<Chip> chips;
+};
+
+/// The band's surface: a rounded, nearly opaque panel in the window colour, so the details stay
+/// readable over any backdrop or banner.
+class BandFrame : public QFrame {
+public:
+    explicit BandFrame(QWidget* parent) : QFrame{parent} {}
+
+protected:
+    void paintEvent(QPaintEvent*) override {
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing);
+        QColor fill = palette().color(QPalette::Window);
+        fill.setAlpha(235);
+        QColor border = palette().color(QPalette::Mid);
+        border.setAlpha(110);
+        p.setPen(QPen(border, 1.0));
+        p.setBrush(fill);
+        p.drawRoundedRect(QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5), BandRadius, BandRadius);
+    }
+};
+
+/// One fact on the Overview page, on a faint raised tile.
+class StatTile : public QWidget {
+public:
+    explicit StatTile(QWidget* parent) : QWidget{parent} {}
+
+protected:
+    void paintEvent(QPaintEvent*) override {
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing);
+        QColor fill = palette().color(QPalette::Button);
+        fill.setAlpha(120);
+        p.setPen(Qt::NoPen);
+        p.setBrush(fill);
+        p.drawRoundedRect(QRectF(rect()), 10, 10);
+    }
+};
+
 } // namespace
 
 CarouselHub::CarouselHub(QWidget* parent) : QWidget{parent} {
-    // Presses between the tiles must not reach the carousel underneath and start a drag.
+    // Presses on the band must not reach the carousel underneath and start a drag.
     setAttribute(Qt::WA_NoMousePropagation);
-    auto* layout = new QVBoxLayout(this);
-    layout->setContentsMargins(0, 0, 0, 0);
-    layout->setSpacing(Spacing);
 
-    tile_row = new QWidget(this);
-    auto* row = new QHBoxLayout(tile_row);
-    row->setContentsMargins(0, 0, 0, 0);
-    row->setSpacing(Spacing);
-    row->addStretch(1);
-    for (int i = 0; i < TileCount; ++i) {
-        auto* tile = new QToolButton(tile_row);
-        tile->setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
-        tile->setIconSize(QSize(TileIconSize, TileIconSize));
-        tile->setFixedSize(TileWidth, TileHeight);
-        tile->setFocusPolicy(Qt::TabFocus);
-        tile->setCursor(Qt::PointingHandCursor);
-        tiles[i] = tile;
-        row->addWidget(tile);
+    band = new BandFrame(this);
+    band_layout = new QVBoxLayout(band);
+    band_layout->setContentsMargins(BandPadding, BandPadding - 4, BandPadding, BandPadding - 4);
+    band_layout->setSpacing(Spacing);
+    band_layout->addWidget(BuildHeader());
+    band_layout->addWidget(BuildTabs());
+
+    content_scroll = new QScrollArea(band);
+    content_scroll->setWidgetResizable(true);
+    content_scroll->setFrameShape(QFrame::NoFrame);
+    content_scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    content_scroll->viewport()->setAutoFillBackground(false);
+    // The scroll area takes the arrow keys for scrolling; the band wants them to move focus.
+    content_scroll->installEventFilter(this);
+    // The pages share one layout and only the current one is shown: a stacked widget would
+    // size every page by the tallest, so the Overview would scroll by the Info page's height.
+    content_pages = new QWidget(content_scroll);
+    auto* pages_layout = new QVBoxLayout(content_pages);
+    pages_layout->setContentsMargins(0, 0, 0, 0);
+    pages[int(Page::Overview)] = BuildOverview();
+    pages[int(Page::AddOns)] = BuildAddOns();
+    pages[int(Page::Shaders)] = BuildShaders();
+    pages[int(Page::Info)] = BuildInfo();
+    for (QWidget* page_widget : pages) {
+        pages_layout->addWidget(page_widget);
     }
-    row->addStretch(1);
-    layout->addWidget(tile_row);
-    tiles[FavoriteTile]->setCheckable(true);
-    for (const int i : {AddOnsTile, ShadersTile, InfoTile}) {
-        tiles[i]->setCheckable(true);
-    }
+    content_scroll->setWidget(content_pages);
+    // setWidget turns the widget's background fill on; the band paints the surface.
+    content_pages->setAutoFillBackground(false);
+    ShowPage(page);
+    band_layout->addWidget(content_scroll, 1);
 
-    connect(tiles[PlayTile], &QToolButton::clicked, this, &CarouselHub::PlayRequested);
-    connect(tiles[FavoriteTile], &QToolButton::clicked, this, &CarouselHub::FavoriteToggled);
-    connect(tiles[SettingsTile], &QToolButton::clicked, this, &CarouselHub::ConfigureRequested);
-    connect(tiles[AddOnsTile], &QToolButton::clicked, this, [this] { TogglePanel(Panel::AddOns); });
-    connect(tiles[ShadersTile], &QToolButton::clicked, this,
-            [this] { TogglePanel(Panel::Shaders); });
-    connect(tiles[InfoTile], &QToolButton::clicked, this, [this] { TogglePanel(Panel::Info); });
-
-    // The panel: a plain, solid surface the platform style draws.
-    panel_frame = new QFrame(this);
-    panel_frame->setFrameShape(QFrame::StyledPanel);
-    panel_frame->setAutoFillBackground(true);
-    panel_frame->setBackgroundRole(QPalette::Window);
-    panel_frame->setMaximumWidth(PanelMaxWidth);
-    panel_frame->setFixedHeight(0);
-    panel_frame->hide();
-    auto* frame_layout = new QVBoxLayout(panel_frame);
-    frame_layout->setContentsMargins(16, 12, 16, 12);
-    panel_scroll = new QScrollArea(panel_frame);
-    panel_scroll->setWidgetResizable(true);
-    panel_scroll->setFrameShape(QFrame::NoFrame);
-    panel_scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-    // The scroll area takes the arrow keys for scrolling; the hub wants them to move focus.
-    panel_scroll->installEventFilter(this);
-    frame_layout->addWidget(panel_scroll);
-    panel_stack = new QStackedWidget(panel_scroll);
-    add_ons_page = BuildAddOns();
-    shaders_page = BuildShaders();
-    info_page = BuildInfo();
-    for (QWidget* page : {add_ons_page, shaders_page, info_page}) {
-        panel_stack->addWidget(page);
-    }
-    panel_scroll->setWidget(panel_stack);
-    layout->addWidget(panel_frame, 0, Qt::AlignHCenter);
-    layout->addStretch(1);
-
-    panel_animation = new QVariantAnimation(this);
-    panel_animation->setDuration(PanelAnimationMs);
-    panel_animation->setEasingCurve(QEasingCurve::OutCubic);
-    connect(panel_animation, &QVariantAnimation::valueChanged, this, [this](const QVariant& v) {
-        panel_progress = v.toReal();
-        panel_frame->setFixedHeight(qRound(panel_progress * panel_height));
-        panel_frame->setVisible(panel_progress > 0.0);
+    height_animation = new QVariantAnimation(this);
+    height_animation->setDuration(HeightAnimationMs);
+    height_animation->setEasingCurve(QEasingCurve::OutCubic);
+    connect(height_animation, &QVariantAnimation::valueChanged, this, [this](const QVariant& v) {
+        shown_height = v.toReal();
+        LayoutBand();
         emit HeightChanged();
     });
+    connect(height_animation, &QVariantAnimation::finished, this, [this] { LayoutBand(); });
 
     artwork = new GameArtwork(this);
     connect(artwork, &GameArtwork::IconChanged, this, &CarouselHub::IconChanged);
@@ -230,61 +360,164 @@ CarouselHub::CarouselHub(QWidget* parent) : QWidget{parent} {
         icon_button->setEnabled(!busy);
     });
 
+    style = static_cast<Style>(
+        std::min<int>(UISettings::values.carousel_details.GetValue(), int(Style::Off)));
     RetranslateUI();
+    RefreshPalette();
+
+    // Focused buttons turn Up and Down into Tab and Backtab, which loses the row the key meant;
+    // whichever control in the band has the focus hands those keys to the band instead.
+    connect(qApp, &QApplication::focusChanged, this, [this](QWidget*, QWidget* now) {
+        if (now && isAncestorOf(now)) {
+            now->installEventFilter(this);
+        }
+    });
+}
+
+QWidget* CarouselHub::BuildHeader() {
+    header = new QWidget(band);
+    auto* row = new QHBoxLayout(header);
+    row->setContentsMargins(0, 0, 0, 0);
+    row->setSpacing(16);
+
+    auto* text = new QVBoxLayout;
+    text->setSpacing(4);
+    auto* title = new ElidedLabel(header);
+    SetPixelSize(title, TitlePixelSize, true);
+    title_label = title;
+    subtitle_label = new ElidedLabel(header);
+    chips = new ChipRow(header);
+    text->addWidget(title_label);
+    text->addWidget(subtitle_label);
+    text->addSpacing(2);
+    text->addWidget(chips);
+    row->addLayout(text, 1);
+
+    play_button = new QPushButton(header);
+    play_button->setMinimumSize(PlayWidth, ActionHeight);
+    play_button->setIconSize(QSize(ActionIconSize, ActionIconSize));
+    SetPixelSize(play_button, 16, true);
+    favorite_button = new QToolButton(header);
+    favorite_button->setCheckable(true);
+    settings_button = new QToolButton(header);
+    for (QToolButton* button : {favorite_button, settings_button}) {
+        button->setFixedSize(ActionHeight, ActionHeight);
+        button->setIconSize(QSize(ActionIconSize, ActionIconSize));
+    }
+    for (QAbstractButton* button :
+         std::initializer_list<QAbstractButton*>{play_button, favorite_button, settings_button}) {
+        // Keyboard and controller reach the actions; a click leaves the focus on the cards.
+        button->setFocusPolicy(Qt::TabFocus);
+        button->setCursor(Qt::PointingHandCursor);
+        row->addWidget(button, 0, Qt::AlignVCenter);
+    }
+    connect(play_button, &QPushButton::clicked, this, &CarouselHub::PlayRequested);
+    connect(favorite_button, &QToolButton::clicked, this, &CarouselHub::FavoriteToggled);
+    connect(settings_button, &QToolButton::clicked, this, &CarouselHub::ConfigureRequested);
+    return header;
+}
+
+QWidget* CarouselHub::BuildTabs() {
+    tab_row = new QWidget(band);
+    auto* row = new QHBoxLayout(tab_row);
+    row->setContentsMargins(0, 0, 0, 0);
+    row->setSpacing(4);
+    for (int i = 0; i < PageCount; ++i) {
+        auto* tab = new QToolButton(tab_row);
+        tab->setCheckable(true);
+        tab->setAutoRaise(true);
+        tab->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+        tab->setIconSize(QSize(TabIconSize, TabIconSize));
+        tab->setFocusPolicy(Qt::TabFocus);
+        tab->setCursor(Qt::PointingHandCursor);
+        tab->installEventFilter(this);
+        connect(tab, &QToolButton::clicked, this, [this, i] { TogglePage(Page(i)); });
+        tabs[i] = tab;
+        row->addWidget(tab);
+    }
+    row->addStretch(1);
+    position_label = new QLabel(tab_row);
+    row->addWidget(position_label);
+    return tab_row;
+}
+
+QWidget* CarouselHub::BuildOverview() {
+    auto* page_widget = new QWidget(content_pages);
+    auto* layout = new QVBoxLayout(page_widget);
+    layout->setContentsMargins(0, 0, 0, 0);
+    auto* row = new QHBoxLayout;
+    row->setSpacing(Spacing);
+    for (size_t i = 0; i < stat_values.size(); ++i) {
+        auto* tile = new StatTile(page_widget);
+        auto* tile_layout = new QVBoxLayout(tile);
+        tile_layout->setContentsMargins(12, 8, 12, 10);
+        tile_layout->setSpacing(2);
+        stat_captions[i] = new QLabel(tile);
+        SetPixelSize(stat_captions[i], 12, false);
+        stat_values[i] = new QLabel(tile);
+        stat_values[i]->setWordWrap(true);
+        SetPixelSize(stat_values[i], 15, true);
+        tile_layout->addWidget(stat_captions[i]);
+        tile_layout->addWidget(stat_values[i]);
+        tile_layout->addStretch(1);
+        row->addWidget(tile, 1);
+    }
+    layout->addLayout(row, 1);
+    return page_widget;
 }
 
 QWidget* CarouselHub::BuildAddOns() {
-    auto* page = new QWidget(panel_stack);
-    auto* layout = new QVBoxLayout(page);
+    auto* page_widget = new QWidget(content_pages);
+    auto* layout = new QVBoxLayout(page_widget);
     layout->setContentsMargins(0, 0, 0, 0);
-    add_on_list = new AddOnList(page);
+    add_on_list = new AddOnList(page_widget);
     connect(add_on_list, &AddOnList::DisabledChanged, this, [this](const QStringList& disabled) {
         extras.add_ons = add_on_list->AddOns();
+        RefreshOverview();
         emit DisabledAddOnsChanged(disabled);
     });
     layout->addWidget(add_on_list);
     layout->addStretch(1);
-    return page;
+    return page_widget;
 }
 
 QWidget* CarouselHub::BuildShaders() {
-    auto* page = new QWidget(panel_stack);
-    auto* layout = new QVBoxLayout(page);
+    auto* page_widget = new QWidget(content_pages);
+    auto* layout = new QVBoxLayout(page_widget);
     layout->setContentsMargins(0, 0, 0, 0);
     auto* form = new QFormLayout;
-    pipeline_cache = new QLabel(page);
-    precompiled = new QLabel(page);
+    pipeline_cache = new QLabel(page_widget);
+    precompiled = new QLabel(page_widget);
     form->addRow(tr("Pipeline cache"), pipeline_cache);
     form->addRow(tr("Pre-compiled"), precompiled);
-    precompile_button = new QPushButton(page);
+    precompile_button = new QPushButton(page_widget);
     precompile_button->setCursor(Qt::PointingHandCursor);
     connect(precompile_button, &QPushButton::clicked, this,
             &CarouselHub::PrecompileShadersRequested);
     layout->addLayout(form);
     layout->addWidget(precompile_button, 0, Qt::AlignLeft);
     layout->addStretch(1);
-    return page;
+    return page_widget;
 }
 
 QWidget* CarouselHub::BuildInfo() {
-    auto* page = new QWidget(panel_stack);
-    auto* layout = new QVBoxLayout(page);
+    auto* page_widget = new QWidget(content_pages);
+    auto* layout = new QVBoxLayout(page_widget);
     layout->setContentsMargins(0, 0, 0, 0);
     info_form = new QFormLayout;
     layout->addLayout(info_form);
 
     // Kept apart from the form, which is rebuilt per game, so the focus survives a refresh.
     auto* buttons = new QHBoxLayout;
-    location_button = new QPushButton(page);
-    banner_button = new QPushButton(page);
-    icon_button = new QPushButton(page);
+    location_button = new QPushButton(page_widget);
+    banner_button = new QPushButton(page_widget);
+    icon_button = new QPushButton(page_widget);
     banner_menu = new QMenu(this);
     icon_menu = new QMenu(this);
     for (QMenu* menu : {banner_menu, icon_menu}) {
         const bool hero = menu == banner_menu;
-        connect(menu, &QMenu::aboutToShow, this, [this, menu, hero] {
-            artwork->FillMenu(menu, hero, game.program_id, game.title);
-        });
+        connect(menu, &QMenu::aboutToShow, this,
+                [this, menu, hero] { artwork->FillMenu(menu, hero, game.program_id, game.title); });
     }
     banner_button->setMenu(banner_menu);
     icon_button->setMenu(icon_menu);
@@ -296,7 +529,7 @@ QWidget* CarouselHub::BuildInfo() {
     connect(location_button, &QPushButton::clicked, this, &CarouselHub::OpenLocationRequested);
     layout->addLayout(buttons);
     layout->addStretch(1);
-    return page;
+    return page_widget;
 }
 
 void CarouselHub::SetGame(const GameDetailsInfo& info) {
@@ -305,12 +538,27 @@ void CarouselHub::SetGame(const GameDetailsInfo& info) {
     if (changed) {
         extras = GameDetailsExtras{.program_id = info.program_id, .path = info.path};
         extras_loaded = false;
+        extras_requested = false;
         RefreshInfo();
+        // Add-ons and shaders belong to a title ID.
+        if (game.program_id == 0 && (page == Page::AddOns || page == Page::Shaders)) {
+            page = Page::Overview;
+            content_open = false;
+            ShowPage(page);
+            UpdateHeight();
+        }
+        // Browsing with the mouse hides a band revealed by a click.
+        if (revealed && !isAncestorOf(QApplication::focusWidget())) {
+            Conceal();
+        }
     }
-    RefreshTiles();
+    RefreshHeader();
+    RefreshActions();
+    RefreshTabs();
+    RefreshOverview();
     RefreshPanels();
-    if (changed && PanelOpen()) {
-        emit ExtrasNeeded();
+    if (changed && ContentShown()) {
+        NeedExtras();
     }
 }
 
@@ -321,8 +569,11 @@ void CarouselHub::SetExtras(const GameDetailsExtras& extras_) {
     const bool focus_in_list = add_on_list->isAncestorOf(QApplication::focusWidget());
     extras = extras_;
     extras_loaded = true;
+    RefreshOverview();
     RefreshPanels();
-    // A rebuilt add-on list drops the focus it held; keep it in the panel.
+    // The add-on list's length decides an open compact page's height.
+    UpdateHeight();
+    // A rebuilt add-on list drops the focus it held; keep it in the page.
     if (focus_in_list) {
         MoveInPanel(true);
     }
@@ -330,85 +581,277 @@ void CarouselHub::SetExtras(const GameDetailsExtras& extras_) {
 
 void CarouselHub::SetFavorite(bool favorite) {
     game.favorite = favorite;
-    RefreshTiles();
+    RefreshHeader();
+    RefreshActions();
+}
+
+void CarouselHub::SetPosition(int position_, int count_) {
+    if (position_ == position && count_ == count) {
+        return;
+    }
+    position = position_;
+    count = count_;
+    position_label->setText(tr("%1 of %2").arg(position + 1).arg(count));
+}
+
+void CarouselHub::ApplyStyle() {
+    const auto next = static_cast<Style>(
+        std::min<int>(UISettings::values.carousel_details.GetValue(), int(Style::Off)));
+    if (next == style) {
+        return;
+    }
+    style = next;
+    revealed = false;
+    if (style == Style::Compact && page == Page::Overview) {
+        content_open = false;
+    }
+    RefreshTabs();
+    UpdateHeight();
+    if (ContentShown()) {
+        NeedExtras();
+    }
+}
+
+CarouselHub::Style CarouselHub::EffectiveStyle() const {
+    return style == Style::Off && revealed ? Style::Compact : style;
+}
+
+std::vector<CarouselHub::Page> CarouselHub::VisiblePages() const {
+    std::vector<Page> out;
+    if (EffectiveStyle() == Style::Full) {
+        out.push_back(Page::Overview);
+    }
+    if (game.program_id != 0) {
+        out.push_back(Page::AddOns);
+        out.push_back(Page::Shaders);
+    }
+    out.push_back(Page::Info);
+    return out;
+}
+
+bool CarouselHub::ContentShown() const {
+    switch (EffectiveStyle()) {
+    case Style::Full:
+        return true;
+    case Style::Compact:
+        return content_open && page != Page::Overview;
+    case Style::Off:
+        break;
+    }
+    return false;
+}
+
+bool CarouselHub::PanelOpen() const {
+    return EffectiveStyle() == Style::Compact && ContentShown();
 }
 
 void CarouselHub::SetAvailableHeight(int height) {
-    const int wanted = std::clamp(height * 36 / 100, 180, 340);
-    if (wanted == panel_height) {
+    if (height == available_height) {
         return;
     }
-    panel_height = wanted;
-    if (panel_progress > 0.0) {
-        panel_frame->setFixedHeight(qRound(panel_progress * panel_height));
-        emit HeightChanged();
+    available_height = height;
+    UpdateHeight(height_animation->state() == QAbstractAnimation::Running);
+}
+
+int CarouselHub::ChromeHeight() const {
+    const QMargins margins = band_layout->contentsMargins();
+    return margins.top() + margins.bottom() + header->sizeHint().height() + Spacing +
+           tab_row->sizeHint().height();
+}
+
+int CarouselHub::ContentHeight() const {
+    if (!ContentShown()) {
+        return 0;
     }
+    const int available = std::max(0, available_height);
+    if (EffectiveStyle() == Style::Full) {
+        return std::clamp(available * 12 / 100, 76, 180);
+    }
+    // A compact page opens only as far as its content needs.
+    const int wanted = pages[int(page)]->sizeHint().height();
+    return std::clamp(wanted, 72, std::clamp(available * 30 / 100, 150, 320));
+}
+
+int CarouselHub::TargetHeight() const {
+    if (style == Style::Off && !revealed) {
+        return 0;
+    }
+    const int content = ContentHeight();
+    return ChromeHeight() + (content > 0 ? Spacing + content : 0);
 }
 
 int CarouselHub::ReservedHeight() const {
-    return TileHeight + (panel_progress > 0.0 ? Spacing + qRound(panel_progress * panel_height) : 0);
+    return qRound(shown_height);
 }
 
-void CarouselHub::FocusTiles() {
-    tiles[PlayTile]->setFocus(Qt::TabFocusReason);
+void CarouselHub::UpdateHeight(bool animate) {
+    const int target = TargetHeight();
+    height_animation->stop();
+    if (!animate || !isVisible() || available_height < 0) {
+        shown_height = target;
+        LayoutBand();
+        emit HeightChanged();
+        return;
+    }
+    if (qRound(shown_height) == target) {
+        LayoutBand();
+        return;
+    }
+    height_animation->setStartValue(shown_height);
+    height_animation->setEndValue(qreal(target));
+    height_animation->start();
+}
+
+void CarouselHub::LayoutBand() {
+    // The band is laid out at its full height and the hub clips it. The hub is pinned to the
+    // bottom of the carousel, so the band is anchored to the hub's bottom and slides up into
+    // view instead of being squeezed.
+    const int height = std::max(TargetHeight(), qRound(shown_height));
+    content_scroll->setVisible(height > ChromeHeight() + Spacing);
+    const QRect geometry(0, this->height() - height, width(), height);
+    if (band->geometry() != geometry) {
+        band->setGeometry(geometry);
+    }
+}
+
+void CarouselHub::resizeEvent(QResizeEvent* event) {
+    QWidget::resizeEvent(event);
+    LayoutBand();
+}
+
+void CarouselHub::FocusActions() {
+    Reveal();
+    play_button->setFocus(Qt::TabFocusReason);
+}
+
+void CarouselHub::Reveal() {
+    if (style != Style::Off || revealed) {
+        return;
+    }
+    revealed = true;
+    show();
+    RefreshTabs();
+    UpdateHeight();
+}
+
+void CarouselHub::Conceal() {
+    if (style != Style::Off || !revealed) {
+        return;
+    }
+    revealed = false;
+    content_open = false;
+    RefreshTabs();
+    UpdateHeight();
 }
 
 void CarouselHub::ClosePanel() {
     if (!PanelOpen()) {
         return;
     }
-    QToolButton* tile = PanelTile(panel);
-    const bool focus_in_panel = panel_frame->isAncestorOf(QApplication::focusWidget());
-    panel = Panel::None;
-    RefreshTiles();
-    AnimatePanel(false);
+    const bool focus_in_panel = content_scroll->isAncestorOf(QApplication::focusWidget());
+    content_open = false;
+    RefreshTabs();
+    UpdateHeight();
     if (focus_in_panel) {
-        tile->setFocus(Qt::TabFocusReason);
+        TabFor(page)->setFocus(Qt::BacktabFocusReason);
     }
 }
 
-void CarouselHub::TogglePanel(Panel which) {
-    if (panel == which) {
+void CarouselHub::ShowPage(Page which) {
+    for (int i = 0; i < PageCount; ++i) {
+        pages[i]->setVisible(i == int(which));
+    }
+}
+
+void CarouselHub::SelectPage(Page which, bool open) {
+    page = which;
+    ShowPage(which);
+    if (EffectiveStyle() == Style::Compact) {
+        content_open = open && which != Page::Overview;
+    }
+    RefreshTabs();
+    UpdateHeight();
+    if (ContentShown()) {
+        NeedExtras();
+    }
+}
+
+void CarouselHub::TogglePage(Page which) {
+    if (EffectiveStyle() == Style::Compact && content_open && page == which) {
         ClosePanel();
         return;
     }
-    const bool was_open = PanelOpen();
-    panel = which;
-    panel_stack->setCurrentWidget(which == Panel::AddOns   ? add_ons_page
-                                  : which == Panel::Shaders ? shaders_page
-                                                            : info_page);
-    RefreshTiles();
-    if (!was_open) {
-        AnimatePanel(true);
+    SelectPage(which, true);
+}
+
+void CarouselHub::CyclePage(int direction) {
+    Reveal();
+    const std::vector<Page> visible = VisiblePages();
+    const int n = int(visible.size());
+    const auto it = std::find(visible.begin(), visible.end(), page);
+    Page next;
+    if (!ContentShown() || it == visible.end()) {
+        next = direction > 0 ? visible.front() : visible.back();
+    } else {
+        next = visible[((it - visible.begin()) + direction + n) % n];
     }
-    if (!extras_loaded) {
-        emit ExtrasNeeded();
+    const Row row = RowOf(QApplication::focusWidget());
+    SelectPage(next, true);
+    if (row == Row::Tabs || row == Row::Content) {
+        TabFor(next)->setFocus(Qt::TabFocusReason);
     }
 }
 
-void CarouselHub::AnimatePanel(bool open) {
-    panel_animation->stop();
-    panel_animation->setStartValue(panel_progress);
-    panel_animation->setEndValue(open ? 1.0 : 0.0);
-    panel_animation->start();
+QToolButton* CarouselHub::TabFor(Page which) const {
+    return tabs[int(which)];
 }
 
-QToolButton* CarouselHub::PanelTile(Panel which) const {
-    switch (which) {
-    case Panel::AddOns:
-        return tiles[AddOnsTile];
-    case Panel::Shaders:
-        return tiles[ShadersTile];
-    case Panel::Info:
-        return tiles[InfoTile];
-    case Panel::None:
-        break;
+void CarouselHub::FocusCurrentTab() {
+    const std::vector<Page> visible = VisiblePages();
+    const bool current_visible = std::find(visible.begin(), visible.end(), page) != visible.end();
+    TabFor(current_visible ? page : visible.front())->setFocus(Qt::TabFocusReason);
+}
+
+void CarouselHub::NeedExtras() {
+    if (extras_loaded || extras_requested) {
+        return;
     }
-    return tiles[PlayTile];
+    extras_requested = true;
+    emit ExtrasNeeded();
+}
+
+CarouselHub::Row CarouselHub::RowOf(QWidget* widget) const {
+    if (!widget || !isAncestorOf(widget)) {
+        return Row::None;
+    }
+    if (header->isAncestorOf(widget)) {
+        return Row::Actions;
+    }
+    if (tab_row->isAncestorOf(widget)) {
+        return Row::Tabs;
+    }
+    if (content_scroll->isAncestorOf(widget)) {
+        return Row::Content;
+    }
+    return Row::None;
+}
+
+std::vector<QWidget*> CarouselHub::ActionButtons() const {
+    std::vector<QWidget*> out;
+    for (QWidget* button :
+         std::initializer_list<QWidget*>{play_button, favorite_button, settings_button}) {
+        if (button->isEnabled()) {
+            out.push_back(button);
+        }
+    }
+    return out;
 }
 
 bool CarouselHub::MoveInPanel(bool forward) {
-    const std::vector<QWidget*> controls = FocusableIn(panel_stack->currentWidget());
+    if (!ContentShown()) {
+        return false;
+    }
+    const std::vector<QWidget*> controls = FocusableIn(pages[int(page)]);
     if (controls.empty()) {
         return false;
     }
@@ -423,48 +866,68 @@ bool CarouselHub::MoveInPanel(bool forward) {
         return false;
     }
     controls[index]->setFocus(forward ? Qt::TabFocusReason : Qt::BacktabFocusReason);
-    panel_scroll->ensureWidgetVisible(controls[index], 0, 24);
+    content_scroll->ensureWidgetVisible(controls[index], 0, 24);
     return true;
 }
 
 bool CarouselHub::focusNextPrevChild(bool next) {
     QWidget* focus = QApplication::focusWidget();
-    if (tile_row->isAncestorOf(focus)) {
-        // Left and Right walk the row and stop at its ends.
-        const auto it = std::find(tiles.begin(), tiles.end(), focus);
-        const int index = std::clamp(int(it - tiles.begin()) + (next ? 1 : -1), 0, TileCount - 1);
-        tiles[index]->setFocus(next ? Qt::TabFocusReason : Qt::BacktabFocusReason);
+    const auto step = [&](const std::vector<QWidget*>& row) {
+        const auto it = std::find(row.begin(), row.end(), focus);
+        if (it == row.end() || row.empty()) {
+            return;
+        }
+        const int index =
+            std::clamp(int(it - row.begin()) + (next ? 1 : -1), 0, int(row.size()) - 1);
+        row[index]->setFocus(next ? Qt::TabFocusReason : Qt::BacktabFocusReason);
+    };
+    switch (RowOf(focus)) {
+    case Row::Actions:
+        // Left and Right walk a row and stop at its ends.
+        step(ActionButtons());
+        return true;
+    case Row::Tabs: {
+        std::vector<QWidget*> row;
+        for (const Page visible : VisiblePages()) {
+            row.push_back(TabFor(visible));
+        }
+        step(row);
         return true;
     }
-    if (panel_frame->isAncestorOf(focus)) {
+    case Row::Content:
         MoveInPanel(next);
         return true;
+    case Row::None:
+        break;
     }
     return QWidget::focusNextPrevChild(next);
 }
 
 void CarouselHub::keyPressEvent(QKeyEvent* event) {
     QWidget* focus = QApplication::focusWidget();
-    const bool in_tiles = tile_row->isAncestorOf(focus);
-    const bool in_panel = panel_frame->isAncestorOf(focus);
+    const Row row = RowOf(focus);
     switch (event->key()) {
     case Qt::Key_Up:
-        if (in_panel) {
+        if (row == Row::Content) {
             if (!MoveInPanel(false)) {
-                PanelTile(panel)->setFocus(Qt::BacktabFocusReason);
+                FocusCurrentTab();
             }
+        } else if (row == Row::Tabs) {
+            play_button->setFocus(Qt::BacktabFocusReason);
         } else {
             emit ExitRequested();
         }
         return;
     case Qt::Key_Down:
-        if ((in_tiles && PanelOpen()) || in_panel) {
+        if (row == Row::Actions) {
+            FocusCurrentTab();
+        } else if (row == Row::Tabs || row == Row::Content) {
             MoveInPanel(true);
         }
         return;
     case Qt::Key_Escape:
-        // Closing moves a focus that was inside the panel onto its tile.
-        if (PanelOpen()) {
+        // Closing moves a focus that was inside the page onto its tab.
+        if (PanelOpen() && row != Row::Actions) {
             ClosePanel();
         } else {
             emit ExitRequested();
@@ -483,6 +946,13 @@ void CarouselHub::keyPressEvent(QKeyEvent* event) {
         }
         return;
     }
+    // Sent by controller L and R.
+    case Qt::Key_Back:
+        CyclePage(-1);
+        return;
+    case Qt::Key_Forward:
+        CyclePage(1);
+        return;
     // Sent by controller Y and X.
     case Qt::Key_Favorites:
         emit FavoriteToggled();
@@ -499,7 +969,16 @@ void CarouselHub::keyPressEvent(QKeyEvent* event) {
 }
 
 bool CarouselHub::eventFilter(QObject* watched, QEvent* event) {
-    if (watched == panel_scroll && event->type() == QEvent::KeyPress) {
+    // The window's Escape shortcut (Exit Fullscreen) would take the key before the band sees
+    // it; inside the band Escape means back.
+    if (event->type() == QEvent::ShortcutOverride && watched->isWidgetType() &&
+        isAncestorOf(static_cast<QWidget*>(watched)) &&
+        static_cast<QKeyEvent*>(event)->key() == Qt::Key_Escape) {
+        event->accept();
+        return true;
+    }
+    if (event->type() == QEvent::KeyPress && watched->isWidgetType() &&
+        isAncestorOf(static_cast<QWidget*>(watched))) {
         const int key = static_cast<QKeyEvent*>(event)->key();
         if (key == Qt::Key_Up || key == Qt::Key_Down) {
             QKeyEvent forwarded(QEvent::KeyPress, key, Qt::NoModifier);
@@ -507,30 +986,117 @@ bool CarouselHub::eventFilter(QObject* watched, QEvent* event) {
             return true;
         }
     }
+    // Walking the tabs with the keyboard or a controller shows each page, unless a compact
+    // band's page is closed: then Enter opens it.
+    if (event->type() == QEvent::FocusIn) {
+        for (int i = 0; i < PageCount; ++i) {
+            if (watched == tabs[i] && page != Page(i) &&
+                (EffectiveStyle() == Style::Full || PanelOpen())) {
+                SelectPage(Page(i), true);
+                break;
+            }
+        }
+    }
     return QWidget::eventFilter(watched, event);
 }
 
-void CarouselHub::RefreshTiles() {
-    const QColor ink = palette().color(QPalette::ButtonText);
+void CarouselHub::RefreshHeader() {
+    static_cast<ElidedLabel*>(title_label)->SetFullText(game.title);
+    static_cast<ElidedLabel*>(subtitle_label)
+        ->SetFullText(game.developer.isEmpty() ? QFileInfo(game.path).fileName() : game.developer);
+
+    std::vector<Chip> facts;
+    if (game.program_id != 0) {
+        facts.push_back({game.switch2 ? tr("Switch 2") : tr("Switch"), game.switch2});
+    }
+    if (!game.version.trimmed().isEmpty()) {
+        facts.push_back({tr("v%1").arg(game.version.trimmed())});
+    }
+    if (!game.file_type.isEmpty()) {
+        facts.push_back({game.file_type});
+    }
+    if (!game.size.isEmpty()) {
+        facts.push_back({game.size});
+    }
+    if (game.favorite) {
+        facts.push_back({tr("Favorite")});
+    }
+    static_cast<ChipRow*>(chips)->SetChips(std::move(facts));
+}
+
+void CarouselHub::RefreshActions() {
     const qreal dpr = devicePixelRatioF();
-    tiles[PlayTile]->setIcon(MakeGlyph(Glyph::Play, ink, dpr));
-    tiles[FavoriteTile]->setIcon(
-        MakeGlyph(game.favorite ? Glyph::StarFilled : Glyph::Star, ink, dpr));
-    tiles[FavoriteTile]->setChecked(game.favorite);
-    tiles[FavoriteTile]->setToolTip(game.favorite ? tr("Remove from Favorites")
-                                                  : tr("Add to Favorites"));
-    tiles[SettingsTile]->setIcon(MakeGlyph(Glyph::Gear, ink, dpr));
-    tiles[AddOnsTile]->setIcon(MakeGlyph(Glyph::AddOns, ink, dpr));
-    tiles[ShadersTile]->setIcon(MakeGlyph(Glyph::Shaders, ink, dpr));
-    tiles[InfoTile]->setIcon(MakeGlyph(Glyph::Info, ink, dpr));
-    tiles[AddOnsTile]->setChecked(panel == Panel::AddOns);
-    tiles[ShadersTile]->setChecked(panel == Panel::Shaders);
-    tiles[InfoTile]->setChecked(panel == Panel::Info);
-    // Add-ons and shaders belong to a title ID.
-    const bool has_id = game.program_id != 0;
-    tiles[AddOnsTile]->setEnabled(has_id);
-    tiles[ShadersTile]->setEnabled(has_id);
-    tiles[FavoriteTile]->setEnabled(has_id);
+    const QColor ink = palette().color(QPalette::ButtonText);
+    play_button->setIcon(MakeGlyph(Glyph::Play, play_button->palette().color(QPalette::ButtonText),
+                                   dpr, ActionIconSize));
+    favorite_button->setIcon(
+        MakeGlyph(game.favorite ? Glyph::StarFilled : Glyph::Star, ink, dpr, ActionIconSize));
+    favorite_button->setChecked(game.favorite);
+    favorite_button->setToolTip(game.favorite ? tr("Remove from Favorites")
+                                              : tr("Add to Favorites"));
+    favorite_button->setEnabled(game.program_id != 0);
+    settings_button->setIcon(MakeGlyph(Glyph::Gear, ink, dpr, ActionIconSize));
+}
+
+void CarouselHub::RefreshTabs() {
+    const qreal dpr = devicePixelRatioF();
+    const QColor ink = palette().color(QPalette::ButtonText);
+    constexpr std::array<Glyph, PageCount> glyphs{Glyph::Overview, Glyph::AddOns, Glyph::Shaders,
+                                                  Glyph::Info};
+    const std::vector<Page> visible = VisiblePages();
+    for (int i = 0; i < PageCount; ++i) {
+        tabs[i]->setIcon(MakeGlyph(glyphs[i], ink, dpr, TabIconSize));
+        tabs[i]->setVisible(std::find(visible.begin(), visible.end(), Page(i)) != visible.end());
+        tabs[i]->setChecked(ContentShown() && page == Page(i));
+    }
+}
+
+void CarouselHub::RefreshOverview() {
+    enum { PlayTime, Update, AddOns, Shaders, Settings };
+    stat_values[PlayTime]->setText(game.play_time.isEmpty() ? tr("Not played yet")
+                                                            : game.play_time);
+    if (!extras_loaded) {
+        for (const int i : {int(Update), int(AddOns), int(Shaders), int(Settings)}) {
+            stat_values[i]->setText(tr("..."));
+        }
+        return;
+    }
+
+    const GameAddOn* update = nullptr;
+    bool has_updates = false;
+    int add_ons = 0;
+    int enabled = 0;
+    for (const GameAddOn& add_on : extras.add_ons) {
+        if (add_on.is_update) {
+            has_updates = true;
+            if (add_on.enabled) {
+                update = &add_on;
+            }
+        } else {
+            ++add_ons;
+            enabled += add_on.enabled ? 1 : 0;
+        }
+    }
+    if (update) {
+        stat_values[Update]->setText(update->version.isEmpty() ? update->name
+                                                               : tr("v%1").arg(update->version));
+    } else {
+        stat_values[Update]->setText(has_updates ? tr("Base game") : tr("None"));
+    }
+    stat_values[AddOns]->setText(add_ons == 0 ? tr("None")
+                                              : tr("%1 of %2 on").arg(enabled).arg(add_ons));
+
+    const QString cache =
+        QLocale().formattedDataSize(static_cast<qint64>(extras.pipeline_cache_bytes));
+    if (extras.shaders_precompiled) {
+        stat_values[Shaders]->setText(extras.pipeline_cache_bytes == 0
+                                          ? tr("Pre-compiled")
+                                          : tr("Pre-compiled, %1").arg(cache));
+    } else {
+        stat_values[Shaders]->setText(
+            extras.pipeline_cache_bytes == 0 ? tr("None yet") : tr("%1 cached").arg(cache));
+    }
+    stat_values[Settings]->setText(extras.custom_config ? tr("Custom") : tr("Global"));
 }
 
 void CarouselHub::RefreshPanels() {
@@ -554,12 +1120,12 @@ void CarouselHub::RefreshInfo() {
     while (info_form->rowCount() > 0) {
         info_form->removeRow(0);
     }
-    QWidget* page = info_page;
+    QWidget* page_widget = pages[int(Page::Info)];
     const auto add_text = [&](const QString& key, const QString& value) {
         if (value.trimmed().isEmpty()) {
             return;
         }
-        auto* label = new QLabel(value, page);
+        auto* label = new QLabel(value, page_widget);
         label->setTextInteractionFlags(Qt::TextSelectableByMouse);
         label->setWordWrap(true);
         info_form->addRow(key, label);
@@ -572,28 +1138,57 @@ void CarouselHub::RefreshInfo() {
     add_text(tr("Format"), game.file_type);
     add_text(tr("Size"), game.size);
     add_text(tr("Developer"), game.developer);
-    location_button->setToolTip(QDir::toNativeSeparators(game.path));
+    add_text(tr("Location"), QDir::toNativeSeparators(game.path));
     location_button->setVisible(!game.path.isEmpty());
     banner_button->setVisible(game.program_id != 0);
     icon_button->setVisible(game.program_id != 0);
 }
 
+void CarouselHub::RefreshPalette() {
+    const QPalette& base = palette();
+    SetMuted(subtitle_label, base);
+    SetMuted(position_label, base);
+    for (QLabel* caption : stat_captions) {
+        SetMuted(caption, base);
+    }
+    // Play is the band's primary action and wears the accent colour, unless a theme style sheet
+    // draws the buttons and would ignore it.
+    QPalette accent = base;
+    if (qApp->styleSheet().isEmpty()) {
+        accent.setColor(QPalette::Button, base.color(QPalette::Highlight));
+        accent.setColor(QPalette::ButtonText, base.color(QPalette::HighlightedText));
+    }
+    play_button->setPalette(accent);
+    RefreshActions();
+    RefreshTabs();
+}
+
 void CarouselHub::RetranslateUI() {
-    tiles[PlayTile]->setText(tr("Play"));
-    tiles[FavoriteTile]->setText(tr("Favorite"));
-    tiles[SettingsTile]->setText(tr("Settings"));
-    tiles[SettingsTile]->setToolTip(tr("Game settings"));
-    tiles[AddOnsTile]->setText(tr("Add-ons"));
-    tiles[AddOnsTile]->setToolTip(tr("Updates, DLC and mods"));
-    tiles[ShadersTile]->setText(tr("Shaders"));
-    tiles[InfoTile]->setText(tr("Info"));
-    tiles[InfoTile]->setToolTip(tr("Details and artwork"));
+    play_button->setText(tr("Play"));
+    settings_button->setToolTip(tr("Game settings"));
+    tabs[int(Page::Overview)]->setText(tr("Overview"));
+    tabs[int(Page::AddOns)]->setText(tr("Add-ons"));
+    tabs[int(Page::AddOns)]->setToolTip(tr("Updates, DLC and mods"));
+    tabs[int(Page::Shaders)]->setText(tr("Shaders"));
+    tabs[int(Page::Info)]->setText(tr("Info"));
+    tabs[int(Page::Info)]->setToolTip(tr("Details and artwork"));
+    stat_captions[0]->setText(tr("Play time"));
+    stat_captions[1]->setText(tr("Update"));
+    stat_captions[2]->setText(tr("DLC and mods"));
+    stat_captions[3]->setText(tr("Shaders"));
+    stat_captions[4]->setText(tr("Settings"));
     precompile_button->setToolTip(
         tr("Compile this game's shaders ahead of time to reduce stutter while playing"));
     location_button->setText(tr("Open Game Folder"));
     banner_button->setText(tr("Change Banner"));
     icon_button->setText(tr("Change Icon"));
-    RefreshTiles();
+    if (count > 0) {
+        position_label->setText(tr("%1 of %2").arg(position + 1).arg(count));
+    }
+    RefreshHeader();
+    RefreshActions();
+    RefreshTabs();
+    RefreshOverview();
     RefreshPanels();
     RefreshInfo();
 }
@@ -602,8 +1197,8 @@ void CarouselHub::changeEvent(QEvent* event) {
     if (event->type() == QEvent::LanguageChange) {
         RetranslateUI();
     } else if (event->type() == QEvent::PaletteChange) {
-        // The tile glyphs are drawn in the palette's button text colour.
-        QMetaObject::invokeMethod(this, [this] { RefreshTiles(); }, Qt::QueuedConnection);
+        // The glyphs and muted labels are derived from the palette.
+        QMetaObject::invokeMethod(this, [this] { RefreshPalette(); }, Qt::QueuedConnection);
     }
     QWidget::changeEvent(event);
 }

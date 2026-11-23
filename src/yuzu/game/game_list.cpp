@@ -620,6 +620,13 @@ void GameList::SetupCustomization() {
                 carousel_view->viewport()->update();
                 emit SaveConfig();
             });
+    connect(customize_panel, &HomeCustomizePanel::CarouselDetailsRequested, this,
+            [this](u8 style) {
+                UISettings::values.carousel_details = style;
+                carousel_view->Hub()->ApplyStyle();
+                carousel_view->viewport()->update();
+                emit SaveConfig();
+            });
     connect(customize_panel, &HomeCustomizePanel::CarouselBannerBackgroundRequested, this,
             [this](bool show) {
                 UISettings::values.carousel_banner_background = show;
@@ -661,8 +668,11 @@ void GameList::UpdateControllerHints() {
     }
     QStringList hints;
     if (carousel_view->Hub()->isAncestorOf(QApplication::focusWidget())) {
-        hints << tr("\u24B6 Select") << tr("\u24B7 Back") << tr("\u24CE Favorite")
-              << tr("\u24CD Settings");
+        hints << tr("\u24B6 Select") << tr("\u24B7 Back") << tr("\u24C1\u24C7 Pages")
+              << tr("\u24CE Favorite") << tr("\u24CD Settings");
+    } else if (m_currentView == carousel_view) {
+        hints << tr("\u24B6 Play") << tr("\u2295 Details") << tr("\u24C1\u24C7 Pages")
+              << tr("\u24CE Favorite") << tr("\u24CD Settings");
     } else {
         hints << tr("\u24B6 Play") << tr("\u2295 Options") << tr("\u24CE Favorite")
               << tr("\u24CD Settings");
@@ -1056,6 +1066,7 @@ GameDetailsInfo GameList::MakeDetailsInfo(const QModelIndex& selected, bool with
     info.size = column_text(GameListModel::COLUMN_SIZE);
     info.play_time = column_text(GameListModel::COLUMN_PLAY_TIME);
     info.favorite = UISettings::values.favorited_ids.contains(info.program_id);
+    info.switch2 = selected.data(GameListItemPath::Switch2Role).toBool();
     if (!with_icon) {
         return info;
     }
@@ -1074,9 +1085,9 @@ void GameList::ShowGameDetails(const QModelIndex& index) {
     if (selected.data(GameListItem::TypeRole).value<GameListItemType>() != GameListItemType::Game) {
         return;
     }
-    // The carousel shows its game's actions under the card instead of the sidebar.
+    // The carousel shows its game's details under the strip instead of the sidebar.
     if (m_currentView == carousel_view) {
-        carousel_view->Hub()->FocusTiles();
+        carousel_view->Hub()->FocusActions();
         return;
     }
     const GameDetailsInfo info = MakeDetailsInfo(selected);

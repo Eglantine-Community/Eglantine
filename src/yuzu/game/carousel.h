@@ -66,7 +66,9 @@ protected:
     void mouseReleaseEvent(QMouseEvent* event) override;
     void mouseDoubleClickEvent(QMouseEvent* event) override;
     bool viewportEvent(QEvent* event) override;
+    bool event(QEvent* event) override;
     void keyPressEvent(QKeyEvent* event) override;
+    void focusInEvent(QFocusEvent* event) override;
 
 private:
     int PositionOf(int row) const;
@@ -77,10 +79,8 @@ private:
     /// Nudges the strip toward `direction` and back: the end of the list was reached.
     void Bounce(int direction);
     void UpdateHover(const QPoint& pos);
-    /// Places the action tiles under the title, following the card and the open panel.
+    /// Places the details band under the strip, following the card and the band's height.
     void SyncHub();
-    /// The height the hub takes under the info line.
-    int HubReserve() const;
     /// Tells screen readers which game is centered and where it sits in the list.
     void Announce();
     /// Re-applies the stored filter once the model has changed shape.
@@ -125,7 +125,7 @@ private:
     std::vector<DragSample> m_drag_samples;
     int m_hover_position = -1;
 
-    /// The centered game's action tiles and their panel, under the title.
+    /// The centered game's details band, under the strip.
     CarouselHub* m_hub = nullptr;
 
 signals:
