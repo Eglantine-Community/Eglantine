@@ -885,6 +885,52 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
     }
 }
 
+constexpr std::array<VkDescriptorSetLayoutBinding, 2> ASTC_BC_DESCRIPTOR_SET_BINDINGS{{
+    {
+        .binding = 0,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .descriptorCount = 1,
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        .pImmutableSamplers = nullptr,
+    },
+    {
+        .binding = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .descriptorCount = 1,
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        .pImmutableSamplers = nullptr,
+    },
+}};
+
+constexpr std::array<VkDescriptorUpdateTemplateEntry, 2> ASTC_BC_DESCRIPTOR_UPDATE_TEMPLATE{{
+    {
+        .dstBinding = 0,
+        .dstArrayElement = 0,
+        .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .offset = 0,
+        .stride = sizeof(DescriptorUpdateEntry),
+    },
+    {
+        .dstBinding = 1,
+        .dstArrayElement = 0,
+        .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        .offset = sizeof(DescriptorUpdateEntry),
+        .stride = sizeof(DescriptorUpdateEntry),
+    },
+}};
+
+constexpr DescriptorBankInfo ASTC_BC_BANK_INFO{
+    .uniform_buffers = 0,
+    .storage_buffers = 2,
+    .texture_buffers = 0,
+    .image_buffers = 0,
+    .textures = 0,
+    .images = 0,
+    .score = 2,
+};
+
 BcEncoderPass::BcEncoderPass(const Device& device_, Scheduler& scheduler_,
                              DescriptorPool& descriptor_pool_,
                              ComputePassDescriptorQueue& compute_pass_descriptor_queue_)
@@ -920,6 +966,41 @@ void BcEncoderPass::Encode(VkImageView source, u32 width, u32 height, u32 layers
         cmdbuf.PushConstants(*layout, VK_SHADER_STAGE_COMPUTE_BIT, uniforms);
         cmdbuf.Dispatch(Common::DivCeil(uniforms.blocks_x, 8U), Common::DivCeil(uniforms.blocks_y, 8U),
                         layers);
+    });
+    scheduler.InvalidateDescriptorBuffer();
+}
+
+AstcBcPass::AstcBcPass(const Device& device_, Scheduler& scheduler_,
+                       DescriptorPool& descriptor_pool_,
+                       ComputePassDescriptorQueue& compute_pass_descriptor_queue_)
+    : ComputePass(device_, scheduler_, descriptor_pool_, ASTC_BC_DESCRIPTOR_SET_BINDINGS,
+                  ASTC_BC_DESCRIPTOR_UPDATE_TEMPLATE, ASTC_BC_BANK_INFO,
+                  COMPUTE_PUSH_CONSTANT_RANGE<sizeof(AstcBcPushConstants)>, ASTC_BC_COMP_SPV),
+      scheduler{scheduler_}, compute_pass_descriptor_queue{compute_pass_descriptor_queue_} {}
+
+AstcBcPass::~AstcBcPass() = default;
+
+void AstcBcPass::Run(const AstcBcPushConstants& params, u32 layers, VkBuffer input,
+                     VkDeviceSize input_offset, VkDeviceSize input_size, VkBuffer output,
+                     VkDeviceSize output_offset, VkDeviceSize output_size) {
+    scheduler.RequestOutsideRenderPassOperationContext();
+    compute_pass_descriptor_queue.Acquire(scheduler, 2);
+    compute_pass_descriptor_queue.AddBuffer(input, input_offset, input_size);
+    compute_pass_descriptor_queue.AddBuffer(output, output_offset, output_size);
+    const void* const descriptor_data{compute_pass_descriptor_queue.UpdateData()};
+    const VkPipeline vk_pipeline = *pipeline;
+    // One invocation a 4x4 block (64 to a workgroup), a workgroup row a 256-texel row of the
+    // level, and the z dispatch the layer: the shader reads gl_WorkGroupID.z.
+    const u32 blocks_x = Common::DivCeil(params.width, 4U);
+    const u32 blocks_y = Common::DivCeil(params.height, 4U);
+    scheduler.Record([this, vk_pipeline, params, layers, blocks_x, blocks_y,
+                      descriptor_data](vk::CommandBuffer cmdbuf) {
+        const VkDescriptorSet set = descriptor_allocator.Commit();
+        device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptor_data);
+        cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, vk_pipeline);
+        cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
+        cmdbuf.PushConstants(*layout, VK_SHADER_STAGE_COMPUTE_BIT, params);
+        cmdbuf.Dispatch(Common::DivCeil(blocks_x, 64U), blocks_y, layers);
     });
     scheduler.InvalidateDescriptorBuffer();
 }
