@@ -685,20 +685,20 @@ void ConfigureHdRumble::TestRumble() {
     const int generation = ++test_generation;
     const auto alive = [this, generation]() { return generation == test_generation; };
     for (const Step& step : steps) {
-        QTimer::singleShot(step.at_ms, this, [this, alive, send, value = step.value]() {
+        QTimer::singleShot(step.at_ms, this, [alive, send, value = step.value]() {
             if (!alive()) {
                 return;
             }
             send(value);
         });
-        QTimer::singleShot(step.at_ms + step.hold_ms, this, [this, alive, silence]() {
+        QTimer::singleShot(step.at_ms + step.hold_ms, this, [alive, silence]() {
             if (!alive()) {
                 return;
             }
             silence();
         });
     }
-    QTimer::singleShot(2000, this, [this, alive, silence]() {
+    QTimer::singleShot(2000, this, [alive, silence]() {
         if (alive()) {
             silence();
         }

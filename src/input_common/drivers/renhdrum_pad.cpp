@@ -1574,7 +1574,7 @@ bool RenHDrumPad::Vibrate(std::int64_t now_us, bool is_right,
         // pending so the next sample retries.
         bool ok = false;
         {
-            std::scoped_lock send{impl->send_mutex};
+            std::scoped_lock send_lock{impl->send_mutex};
             ok = SDL_RumbleJoystick(joystick, direct[0], direct[1], 2000);
         }
         std::scoped_lock lock{impl->mutex};
@@ -1590,7 +1590,7 @@ bool RenHDrumPad::Vibrate(std::int64_t now_us, bool is_right,
     if (send_trigger) {
         bool ok = false;
         {
-            std::scoped_lock send{impl->send_mutex};
+            std::scoped_lock send_lock{impl->send_mutex};
             ok = SDL_RumbleJoystickTriggers(joystick, trigger[0], trigger[1], 2000);
         }
         std::scoped_lock lock{impl->mutex};
@@ -1664,7 +1664,7 @@ void RenHDrumPad::Tick(std::int64_t now_us) {
     if (send_settle) {
         // A Direct write that happened while this settle was captured supersedes it: drop
         // the stale level instead of laying it over the newer one
-        std::scoped_lock send{impl->send_mutex};
+        std::scoped_lock send_lock{impl->send_mutex};
         bool superseded = false;
         {
             std::scoped_lock lock{impl->mutex};
@@ -1682,7 +1682,7 @@ void RenHDrumPad::Tick(std::int64_t now_us) {
         }
     }
     if (send_settle_trigger) {
-        std::scoped_lock send{impl->send_mutex};
+        std::scoped_lock send_lock{impl->send_mutex};
         bool superseded = false;
         {
             std::scoped_lock lock{impl->mutex};
