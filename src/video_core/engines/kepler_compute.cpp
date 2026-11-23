@@ -1422,6 +1422,19 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
         return from_width >= 64 && valid_scale && to_width <= from_width * 4 &&
                (cross_a > cross_b ? cross_a - cross_b : cross_b - cross_a) * 32 <= cross_a;
     };
+    using RTFormat = Tegra::RenderTargetFormat;
+    const auto blit_format = [](const Texture::TICEntry& tic) -> std::optional<RTFormat> {
+        switch (tic.format) {
+        case Texture::TextureFormat::A2B10G10R10: return RTFormat::A2B10G10R10_UNORM;
+        case Texture::TextureFormat::A8B8G8R8:
+            return tic.r_type == Texture::ComponentType::UNORM && tic.srgb_conversion
+                       ? RTFormat::A8B8G8R8_SRGB
+                       : RTFormat::A8B8G8R8_UNORM;
+        case Texture::TextureFormat::B10G11R11: return RTFormat::B10G11R11_FLOAT;
+        case Texture::TextureFormat::R16G16B16A16: return RTFormat::R16G16B16A16_FLOAT;
+        default: return std::nullopt;
+        }
+    };
     std::optional<Texture::TICEntry> input = image(0x90), output = image(0xa0);
     const bool starfox_conversion = Settings::GetCurrentProgramID() == 0x0400E88025B1A000ULL &&
         input && output && input->format == Texture::TextureFormat::R16G16B16A16 &&
@@ -1430,6 +1443,7 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
         output->Width() == 1920 && output->Height() == 1080;
     bool have_pair = upscale_pair(input, output, !starfox_conversion);
     bool fortunes_weave = false;
+    std::optional<NativeUpscaleRegions> compact_regions;
     if (!have_pair) {
         input = image(0x328);
         output = image(0x348);
@@ -1437,6 +1451,20 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
         have_pair = fortunes_weave;
     }
     bool has_program_handles = false;
+    if (!have_pair && launch_description.block_dim_y == 1 && launch_description.block_dim_z == 1) {
+        input = image(0x60);
+        output = image(0x70);
+        if (upscale_pair(input, output) && blit_format(*input) && blit_format(*output)) {
+            std::array<u32, 12> parameters{};
+            memory_manager.ReadBlock(cbuf_address, parameters.data(), sizeof(parameters));
+            compact_regions = DecodeNativeUpscaleRegions(
+                parameters,
+                {launch_description.block_dim_x.Value(), launch_description.grid_dim_x.Value(),
+                 launch_description.grid_dim_y.Value(), launch_description.grid_dim_z.Value()},
+                {input->Width(), input->Height()}, {output->Width(), output->Height()});
+            have_pair = compact_regions.has_value();
+        }
+    }
     if (!have_pair) {
         // The images the program itself uses: textures it reads and the surface it stores to
         // through cbuf0 handles (Ocarina of Time's gameplay network reads +0xc0, writes +0xd0).
@@ -1464,10 +1492,12 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
     if (!have_pair && !has_program_handles && !upscale_pair(input, output, false)) {
         input.reset();
         output.reset();
-        for (u32 first = 0x80; first < 0x120 && !input; first += 4) {
+        for (u32 first = 0x80; first < 0x120 && first + sizeof(u32) <= cbuf.size.Value() && !input;
+             first += 4) {
             const auto from = memory_manager.Read<u32>(cbuf_address + first) != 0 ? image(first)
                                                                                     : std::nullopt;
-            for (u32 second = first + 4; from && second < 0x120; second += 4) {
+            for (u32 second = first + 4;
+                 from && second < 0x120 && second + sizeof(u32) <= cbuf.size.Value(); second += 4) {
                 if (memory_manager.Read<u32>(cbuf_address + second) == 0) continue;
                 const auto to = image(second);
                 if (to && to->Width() >= 1024 && upscale_pair(from, to)) {
@@ -1488,19 +1518,6 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
     };
     if (!input || !output)
         return skip("no input/output image pair in the program's handles or cbuf0+0x80..0x11c");
-    using RTFormat = Tegra::RenderTargetFormat;
-    const auto blit_format = [](const Texture::TICEntry& tic) -> std::optional<RTFormat> {
-        switch (tic.format) {
-        case Texture::TextureFormat::A2B10G10R10: return RTFormat::A2B10G10R10_UNORM;
-        case Texture::TextureFormat::A8B8G8R8:
-            return tic.r_type == Texture::ComponentType::UNORM && tic.srgb_conversion
-                       ? RTFormat::A8B8G8R8_SRGB
-                       : RTFormat::A8B8G8R8_UNORM;
-        case Texture::TextureFormat::B10G11R11: return RTFormat::B10G11R11_FLOAT;
-        case Texture::TextureFormat::R16G16B16A16: return RTFormat::R16G16B16A16_FLOAT;
-        default: return std::nullopt;
-        }
-    };
     // E5B9G9R9 (Ocarina of Time's gameplay frame) has no 2D surface format: the blit reads it as a
     // 32-bit placeholder surface and the texture cache samples it as E5B9G9R9.
     const bool shared_exponent_input = input->format == Texture::TextureFormat::E5B9G9R9;
@@ -1545,7 +1562,7 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
         LOG_INFO(HW_GPU, "Upscale fallback for program {:#x}: {}", program,
                  known->second ? "decodes sRGB like the program" : "plain copy");
     }
-    const Fermi2D::Config config{
+    Fermi2D::Config config{
         .operation = (shared_exponent_input && output->format == Texture::TextureFormat::B10G11R11)
                          ? Fermi2D::Operation::SrcCopySquare
                      : known->second ? Fermi2D::Operation::SrcCopySrgbToLinear
@@ -1561,6 +1578,16 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
         .src_x1 = static_cast<s32>(input->Width()),
         .src_y1 = static_cast<s32>(input->Height()),
     };
+    if (compact_regions) {
+        config.src_x0 = static_cast<s32>(compact_regions->source[0]);
+        config.src_y0 = static_cast<s32>(compact_regions->source[1]);
+        config.src_x1 = static_cast<s32>(compact_regions->source[2]);
+        config.src_y1 = static_cast<s32>(compact_regions->source[3]);
+        config.dst_x0 = static_cast<s32>(compact_regions->destination[0]);
+        config.dst_y0 = static_cast<s32>(compact_regions->destination[1]);
+        config.dst_x1 = static_cast<s32>(compact_regions->destination[2]);
+        config.dst_y1 = static_cast<s32>(compact_regions->destination[3]);
+    }
     // Debug: does the input hold anything? Download it once and count non-zero words.
     static const u32 sample_at = [] {
         const char* value = std::getenv("EDEN_NX2_SAMPLE_AT");
