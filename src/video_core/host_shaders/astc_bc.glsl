@@ -1,23 +1,32 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-/* The fused pass's body, included by astc_bc.comp: an invocation makes one 4x4 BC block straight
-   from the ASTC blocks its sixteen texels lie in.
+/* The fused pass's body, included by astc_bc.comp: ASTC blocks straight into BC1, BC3, BC4 or BC5
+   blocks (mode's kind), in one dispatch, with no RGBA8 image in between.
 
    The two-pass path (TranscodeAstcToBcn with astc_decoder.comp and bc_encoder.comp) decodes a
    level into a temporary RGBA8 image and reads it back to compress it: every texel leaves the
    shader and comes back, four bytes each way, and the image holds four times the bytes of the
    BC3 blocks it exists to make (measured on MKW: 236-851 MiB resident, 74-657 MiB/s through it).
-   Here the texels stay in registers.
 
    A block's sixteen texels lie in one ASTC block where the footprint is 4, 8 or 12 a side, else
-   in up to two each way; a block decodes once for each 4x4 block over it, at worst nine times for
-   12x12. ScarletNX measured that cheaper than a shared-memory tile on a GT 1030: the tile's
-   shared memory keeps workgroups out of the encoder, where nearly all the time goes. */
+   in up to two each way. A block decodes once for each 4x4 block over it, at worst nine times for
+   12x12, where a decoder shared by the workgroup would decode it once: ScarletNX measured the
+   sharing, and its shared memory kept workgroups out of the encoder, which is nearly all of this
+   shader's time (7 to 26% slower than the two dispatches on a GT 1030). For a footprint of whole
+   4x4 blocks the decode is not repeated at all: PerAstcBlock makes an invocation an ASTC block and
+   the blocks inside it one after another, a 1024x1024 level of 8x8 in 2.1 ms against 5.2.
+
+   A block past the level's edge repeats its last texels, as the two-pass encoder does: padding
+   adds no colour to the line. */
+
+/* the invocation's texels, and whether any of them has alpha below a half (for punch-through) */
+vec4 px[16];
+bool any_transparent;
 
 /* The byte offset of block (ax, ay) of layer z in the upload's block-linear staging buffer: the
    same arithmetic astc_decoder.comp's main() does for the block it was dispatched for. */
-uvec4 LoadBlock(uint ax, uint ay, uint z) {
+uvec4 AstcBlock(uint ax, uint ay, uint z) {
     const uvec2 pos = uvec2(ax << 4u, ay);
     uint swizzle = ((pos.x & 32u) << 3u) | ((pos.y & 6u) << 5u) | ((pos.x & 16u) << 1u) |
                    ((pos.y & 1u) << 4u) | (pos.x & 15u);
@@ -41,89 +50,141 @@ vec4 UnpackTexel(uint word) {
            255.0;
 }
 
-void main() {
-    const uint bx = gl_GlobalInvocationID.x;
-    const uint by = gl_GlobalInvocationID.y;
-    const uint z = gl_WorkGroupID.z;
-    const uint cx = (width + 3u) >> 2u;
-    const uint cy = (height + 3u) >> 2u;
-    if (bx >= cx || by >= cy) {
-        return;
+/* the texel coordinates of block (bx, by) inside the level, its last row and column repeated */
+void Bounds(uint bx, uint by, out uint x0, out uint y0, out uint x1, out uint y1) {
+    x0 = bx * 4u;
+    y0 = by * 4u;
+    x1 = min(x0 + 3u, width - 1u);
+    y1 = min(y0 + 3u, height - 1u);
+}
+
+/* the texels inside the level, a bit a texel, which the refined fit measures its error on */
+uint InsideMask(uint bx, uint by) {
+    const uvec2 inside =
+        uvec2(clamp(ivec2(width, height) - ivec2(bx * 4u, by * 4u), ivec2(0), ivec2(4)));
+    const uint row = (1u << inside.x) - 1u;
+    return row * (((1u << (4u * inside.y)) - 1u) / 15u); // the row in each nibble
+}
+
+/* The block at (bx, by) of slice z, its words written where the level's blocks go, cx to a row. */
+void Store(uint cx, uint cy, uint bx, uint by, uint z) {
+    const uint at = (z * cy + by) * cx + bx;
+    const uint kind = mode & MODE_MASK;
+    const bool refine = (mode & REFINE) != 0u;
+    const uint real = InsideMask(bx, by);
+    if (kind == MODE_BC3) {
+        out_blocks[out_offset + at * 2u] = EncodeAlpha(px);
+        out_blocks[out_offset + at * 2u + 1u] =
+            refine ? EncodeColorRefined(px, real) : EncodeColor(px, false);
+    } else if (kind == MODE_BC4) {
+        out_blocks[out_offset + at] = EncodeRed(px);
+    } else if (kind == MODE_BC5) {
+        out_blocks[out_offset + at * 2u] = EncodeRed(px);
+        out_blocks[out_offset + at * 2u + 1u] = EncodeAlpha(px);
+    } else {
+        const bool punch_through = kind != MODE_BC1_OPAQUE && any_transparent;
+        out_blocks[out_offset + at] = refine && !punch_through
+                                          ? EncodeColorRefined(px, real)
+                                          : EncodeColor(px, punch_through);
     }
+}
 
-    const uint x0 = bx * 4u;
-    const uint y0 = by * 4u;
-    /* an edge block repeats the level's last texels, as the two-pass encoder does */
-    const uint x1 = min(x0 + 3u, width - 1u);
-    const uint y1 = min(y0 + 3u, height - 1u);
-
-    vec4 px[16];
-    for (uint k = 0u; k < 16u; k++) {
-        px[k] = vec4(0.0);
-    }
-    bool any_transparent = false;
-
+/* Every texel of block (bx, by) from the ASTC blocks they lie in, and whether any is transparent:
+   one ASTC block covers it where the footprint is a multiple of four, else up to two each way,
+   each decoded once and giving the texels that lie inside it. */
+void LoadBlock(uint bx, uint by, uint z) {
+    uint x0, y0, x1, y1;
+    Bounds(bx, by, x0, y0, x1, y1);
+    any_transparent = false;
     if (((block_w | block_h) & 3u) == 0u) {
-        /* the footprint is whole 4x4 blocks each way: every texel of this block is in one ASTC
-           block, which decodes once */
         const uint ax = (x0 * recip_w) >> 18u;
         const uint ay = (y0 * recip_h) >> 18u;
         const uint left = ax * block_w;
         const uint top = ay * block_h;
-        blk = LoadBlock(ax, ay, z);
+        blk = AstcBlock(ax, ay, z);
         DecodeBlock();
         for (uint k = 0u; k < 16u; k++) {
             const uint i = min(x0 + (k & 3u), x1) - left;
             const uint j = min(y0 + (k >> 2u), y1) - top;
             px[k] = UnpackTexel(SlotTexel(0u, i, j, infill_ds, infill_dt));
+            any_transparent = any_transparent || px[k].a < 0.5;
         }
-    } else {
-        /* a 4x4 block straddles up to two ASTC blocks each way (5, 6, 10 and their widths): each
-           one decodes once and hands over the texels of this block that lie inside it */
-        const uint ax0 = (x0 * recip_w) >> 18u;
-        const uint ax1 = (x1 * recip_w) >> 18u;
-        const uint ay0 = (y0 * recip_h) >> 18u;
-        const uint ay1 = (y1 * recip_h) >> 18u;
-        for (uint ay = ay0; ay <= ay1; ay++) {
-            for (uint ax = ax0; ax <= ax1; ax++) {
-                blk = LoadBlock(ax, ay, z);
-                DecodeBlock();
-                const uint left = ax * block_w;
-                const uint top = ay * block_h;
-                for (uint k = 0u; k < 16u; k++) {
-                    const uint i = min(x0 + (k & 3u), x1) - left;
-                    const uint j = min(y0 + (k >> 2u), y1) - top;
-                    if (i < block_w && j < block_h) {
-                        px[k] = UnpackTexel(SlotTexel(0u, i, j, infill_ds, infill_dt));
-                    }
+        return;
+    }
+    const uint ax0 = (x0 * recip_w) >> 18u;
+    const uint ax1 = (x1 * recip_w) >> 18u;
+    const uint ay0 = (y0 * recip_h) >> 18u;
+    const uint ay1 = (y1 * recip_h) >> 18u;
+    for (uint ay = ay0; ay <= ay1; ay++) {
+        for (uint ax = ax0; ax <= ax1; ax++) {
+            blk = AstcBlock(ax, ay, z);
+            DecodeBlock();
+            const uint left = ax * block_w;
+            const uint top = ay * block_h;
+            for (uint k = 0u; k < 16u; k++) {
+                const uint i = min(x0 + (k & 3u), x1) - left;
+                const uint j = min(y0 + (k >> 2u), y1) - top;
+                if (i < block_w && j < block_h) {
+                    px[k] = UnpackTexel(SlotTexel(0u, i, j, infill_ds, infill_dt));
+                    any_transparent = any_transparent || px[k].a < 0.5;
                 }
             }
         }
     }
-    for (uint k = 0u; k < 16u; k++) {
-        any_transparent = any_transparent || px[k].a < 0.5;
-    }
+}
 
-    /* the texels inside the level, for the refined fit's error */
-    const uvec2 inside = uvec2(clamp(ivec2(width, height) - ivec2(x0, y0), ivec2(0), ivec2(4)));
-    const uint row = (1u << inside.x) - 1u;
-    const uint real = row * (((1u << (4u * inside.y)) - 1u) / 15u);
-
-    const uint block = (z * cy + by) * cx + bx;
-    const uint kind = mode & MODE_MASK;
-    const bool refine = (mode & REFINE) != 0u;
-    if (kind == MODE_BC3) {
-        out_blocks[out_offset + block * 2u] = EncodeAlpha(px);
-        out_blocks[out_offset + block * 2u + 1u] =
-            refine ? EncodeColorRefined(px, real) : EncodeColor(px, false);
-    } else if (kind == MODE_BC4) {
-        out_blocks[out_offset + block] = EncodeRed(px);
-    } else if (kind == MODE_BC5) {
-        out_blocks[out_offset + block * 2u] = EncodeRed(px);
-        out_blocks[out_offset + block * 2u + 1u] = EncodeAlpha(px);
-    } else {
-        const bool punch_through = kind != MODE_BC1_OPAQUE && any_transparent;
-        out_blocks[out_offset + block] = refine && !punch_through ? EncodeColorRefined(px, real)
-                                                                  : EncodeColor(px, punch_through);
+/* A footprint of whole 4x4 blocks each way (4, 8 or 12 a side): an invocation an ASTC block,
+   decoded once, and the blocks inside it made one after another from it, where an invocation a
+   block would decode it once for each of them (four times for 8x8, nine for 12x12). The host
+   dispatches an invocation an ASTC block for these, which is the common case: the titles here
+   ship 8x8. */
+void PerAstcBlock(uint cx, uint cy) {
+    const uint ax = gl_GlobalInvocationID.x;
+    const uint ay = gl_GlobalInvocationID.y;
+    const uint z = gl_WorkGroupID.z;
+    if (ax >= blocks_x || ay >= blocks_y) {
+        return;
     }
+    blk = AstcBlock(ax, ay, z);
+    DecodeBlock();
+    const uint sw = block_w >> 2u;
+    const uint sh = block_h >> 2u;
+    const uint left = ax * block_w;
+    const uint top = ay * block_h;
+    for (uint sy = 0u; sy < sh; sy++) {
+        for (uint sx = 0u; sx < sw; sx++) {
+            const uint bx = ax * sw + sx;
+            const uint by = ay * sh + sy;
+            if (bx >= cx || by >= cy) {
+                continue;
+            }
+            uint x0, y0, x1, y1;
+            Bounds(bx, by, x0, y0, x1, y1);
+            any_transparent = false;
+            for (uint k = 0u; k < 16u; k++) {
+                const uint i = min(x0 + (k & 3u), x1) - left;
+                const uint j = min(y0 + (k >> 2u), y1) - top;
+                px[k] = UnpackTexel(SlotTexel(0u, i, j, infill_ds, infill_dt));
+                any_transparent = any_transparent || px[k].a < 0.5;
+            }
+            Store(cx, cy, bx, by, z);
+        }
+    }
+}
+
+void main() {
+    const uint cx = (width + 3u) >> 2u;
+    const uint cy = (height + 3u) >> 2u;
+    if (((block_w | block_h) & 3u) == 0u) {
+        PerAstcBlock(cx, cy);
+        return;
+    }
+    const uint bx = gl_GlobalInvocationID.x;
+    const uint by = gl_GlobalInvocationID.y;
+    const uint z = gl_WorkGroupID.z;
+    if (bx >= cx || by >= cy) {
+        return;
+    }
+    LoadBlock(bx, by, z);
+    Store(cx, cy, bx, by, z);
 }

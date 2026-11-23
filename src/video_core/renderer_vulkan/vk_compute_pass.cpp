@@ -990,18 +990,20 @@ void AstcBcPass::Run(const AstcBcPushConstants& params, u32 layers, VkBuffer inp
     compute_pass_descriptor_queue.AddBuffer(output, output_offset, output_size);
     const void* const descriptor_data{compute_pass_descriptor_queue.UpdateData()};
     const VkPipeline vk_pipeline = *pipeline;
-    // One invocation a 4x4 block (64 to a workgroup), a workgroup row a 256-texel row of the
-    // level, and the z dispatch the layer: the shader reads gl_WorkGroupID.z.
-    const u32 blocks_x = Common::DivCeil(params.width, 4U);
-    const u32 blocks_y = Common::DivCeil(params.height, 4U);
-    scheduler.Record([this, vk_pipeline, params, layers, blocks_x, blocks_y,
+    // A footprint of whole 4x4 blocks makes an invocation an ASTC block, which walks the blocks
+    // inside it (astc_bc.glsl's PerAstcBlock); anything else makes an invocation one 4x4 block.
+    // 64 invocations to a workgroup row, a workgroup row a 256-texel row, z the layer.
+    const bool aligned = ((params.block_w | params.block_h) & 3U) == 0U;
+    const u32 invocation_columns = aligned ? params.blocks_x : Common::DivCeil(params.width, 4U);
+    const u32 invocation_rows = aligned ? params.blocks_y : Common::DivCeil(params.height, 4U);
+    scheduler.Record([this, vk_pipeline, params, layers, invocation_columns, invocation_rows,
                       descriptor_data](vk::CommandBuffer cmdbuf) {
         const VkDescriptorSet set = descriptor_allocator.Commit();
         device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptor_data);
         cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, vk_pipeline);
         cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
         cmdbuf.PushConstants(*layout, VK_SHADER_STAGE_COMPUTE_BIT, params);
-        cmdbuf.Dispatch(Common::DivCeil(blocks_x, 64U), blocks_y, layers);
+        cmdbuf.Dispatch(Common::DivCeil(invocation_columns, 64U), invocation_rows, layers);
     });
     scheduler.InvalidateDescriptorBuffer();
 }
