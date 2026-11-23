@@ -323,12 +323,16 @@ QList<QStandardItem*> MakeGameListEntry(const std::string& path, const std::stri
                            GameListItemPath::DeveloperRole);
     }
     path_item->setData(version, GameListItemPath::VersionRole);
+    const QString native_path = QDir::toNativeSeparators(QString::fromStdString(path));
+    auto* path_column_item = new GameListItem(native_path);
+    path_column_item->setToolTip(native_path);
     return QList<QStandardItem*>{
         path_item,
         new GameListItem(file_type_string),
         new GameListItemSize(size),
         new GameListItemPlayTime(play_time),
         new GameListItem(patch_versions),
+        path_column_item,
     };
 }
 } // Anonymous namespace

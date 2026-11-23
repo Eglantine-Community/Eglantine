@@ -271,6 +271,8 @@ struct Values {
     // Play time
     Setting<bool> show_play_time{linkage, true, "show_play_time", Category::UiGameList};
 
+    Setting<bool> show_path{linkage, true, "show_path", Category::UiGameList};
+
     // misc
     Setting<bool> show_fw_warning{linkage, true, "show_fw_warning", Category::Miscellaneous};
     Setting<bool> check_legacy_paths{linkage, true, "check_legacy_paths", Category::UiGeneral};
