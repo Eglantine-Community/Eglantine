@@ -1275,7 +1275,7 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
             const size_t first = scratch_buffers.size();
             for (u32 i = 0; i < count; ++i) {
                 switch (binding.role) {
-                case VC::DescriptorRole::DriverBank: {
+                case VC::DescriptorRole::DriverTable: {
                     BufferRef& ref = driver_bank[stage];
                     if (!ref.buffer) {
                         if (binding.stage == VC::ShaderStage::Compute) {
