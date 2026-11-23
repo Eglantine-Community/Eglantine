@@ -2189,6 +2189,12 @@ void PipelineCache::StopBackgroundPipelines() {
 }
 
 void PipelineCache::StartShaderPrecache(u64 title_id) {
+    if (const char* const value = std::getenv("EDEN_NX2_COMPUTE_PRECACHE");
+        value && std::string_view{value} == "0") {
+        LOG_INFO(Render_Vulkan, "Shader precache: deferred until first use");
+        return;
+    }
+
     namespace ShaderWarm = VideoCommon::ShaderWarm;
     const std::filesystem::path warm_file = ShaderWarm::ComputeWarmPath(title_id);
     std::error_code ec;
