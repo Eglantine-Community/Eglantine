@@ -569,14 +569,21 @@ void DrawContext::BindlessBind(PipelineBase& pipe, VkPipelineBindPoint bind_poin
     if (!pipe.layout || bindless.set == VK_NULL_HANDLE) {
         return;
     }
+    const bool track =
+        bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS && pass_open && !Debug::Get().no_state_elide;
     if (bindless.dirty) {
         // The plan created images before this draw recorded: their entries are written before
         // the set is bound (update after bind), so this very draw reads them.
         bindless.dirty = false;
         BindlessSync(true);
+    } else if (track && bound_state.TakeBindlessSet(pipe.layout, bindless.set)) {
+        return;
+    }
+    if (track) {
+        static_cast<void>(bound_state.TakeBindlessSet(pipe.layout, bindless.set));
     }
     const VkDescriptorSet set = bindless.set;
-    host->HostCmd().BindDescriptorSets(bind_point, *pipe.layout, Shader::BINDLESS_SET,
+    host->HostCmd().BindDescriptorSets(bind_point, pipe.layout, Shader::BINDLESS_SET,
                                        std::span{&set, 1}, {});
 }
 
