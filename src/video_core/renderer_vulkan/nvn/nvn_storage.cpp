@@ -839,7 +839,7 @@ void Context::Impl::MapVirtualNow(u64 pool_serial, const std::vector<VC::Virtual
         return;
     }
     Pool& pool = *found->second;
-    if (mario_kart_world && !mappings.empty()) {
+    if (!mappings.empty()) {
         ++mkw_mapping_generation;
     }
     PoolIndex* const index = [&]() -> PoolIndex* {
