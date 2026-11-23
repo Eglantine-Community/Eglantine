@@ -1,9 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2026 Orchid Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <thread>
+#include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 #include <cubeb/cubeb.h>
@@ -17,10 +19,12 @@ using namespace std::chrono_literals;
 
 struct Device {
     std::atomic<unsigned> opens{};
+    std::atomic<unsigned> successful_opens{};
     std::atomic<unsigned> starts{};
     std::atomic<unsigned> destroys{};
     std::atomic<bool> available{true};
     cubeb_state_callback callback{};
+    cubeb_data_callback data_callback{};
     void* user{};
 };
 
@@ -104,8 +108,10 @@ int __wrap_cubeb_stream_init(cubeb* context, cubeb_stream** stream, const char* 
         return CUBEB_ERROR_DEVICE_UNAVAILABLE;
     }
     device->callback = state;
+    device->data_callback = data;
     device->user = user;
     *stream = fake_stream;
+    ++device->successful_opens;
     return CUBEB_OK;
 }
 
@@ -155,7 +161,7 @@ TEST_CASE("Cubeb retries a lost sink and honors pause and resume during reopen",
         expected_starts = 2;
     }
     fixture.mock.available = true;
-    REQUIRE(WaitFor([&] { return fixture.mock.opens >= 3; }));
+    REQUIRE(WaitFor([&] { return fixture.mock.successful_opens >= 2; }));
     if (expected_starts == 2) {
         REQUIRE(WaitFor([&] { return fixture.mock.starts >= expected_starts; }));
     }
@@ -182,4 +188,34 @@ TEST_CASE("Cubeb reopens a started stream whose callbacks stop for more than fiv
     CHECK(stalled_for >= 6s);
     CHECK(fixture.mock.destroys == 1);
     stream->Finalize();
+}
+
+
+TEST_CASE("Cubeb preroll preserves paused output and ignores paused capture",
+          "[audio_core][cubeb_recovery]") {
+    Fixture fixture;
+    Core::System system;
+    AudioCore::Sink::CubebSink sink("auto");
+    std::array<s16, 2> pcm{12000, -12000};
+
+    SECTION("output") {
+        auto* stream = sink.AcquireSinkStream(system, 2, "preroll", AudioCore::Sink::StreamType::Out);
+        REQUIRE(stream);
+        REQUIRE(fixture.mock.data_callback);
+        AudioCore::Sink::SinkBuffer buffer{.frames = 1};
+        stream->AppendBuffer(buffer, pcm);
+        std::array<s16, 2> output{1, 1};
+        CHECK(fixture.mock.data_callback(fake_stream, fixture.mock.user, nullptr, output.data(), 1) == 1);
+        CHECK(output == std::array<s16, 2>{0, 0});
+        stream->Start();
+        CHECK(fixture.mock.data_callback(fake_stream, fixture.mock.user, nullptr, output.data(), 1) == 1);
+        CHECK(output == pcm);
+    }
+    SECTION("capture") {
+        auto* stream = sink.AcquireSinkStream(system, 2, "preroll", AudioCore::Sink::StreamType::In);
+        REQUIRE(stream);
+        REQUIRE(fixture.mock.data_callback);
+        CHECK(fixture.mock.data_callback(fake_stream, fixture.mock.user, pcm.data(), nullptr, 1) == 1);
+        CHECK(stream->PopSamples(2) == std::vector<s16>{0, 0});
+    }
 }

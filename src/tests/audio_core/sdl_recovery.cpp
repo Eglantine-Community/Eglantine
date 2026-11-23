@@ -20,6 +20,9 @@ struct SdlDevice {
     std::atomic<SDL_AudioDeviceID> opened{};
     std::atomic<unsigned> resumes{};
     std::atomic<unsigned> closes{};
+    std::atomic<unsigned> failed_opens{};
+    std::atomic<bool> available{true};
+    std::atomic<SDL_AudioDeviceID> add_while_closing{};
     SDL_EventFilter watch{};
     void* watch_data{};
 };
@@ -95,6 +98,10 @@ SDL_AudioStream* __wrap_SDL_OpenAudioDeviceStream(SDL_AudioDeviceID id, const SD
     if (!device) {
         return __real_SDL_OpenAudioDeviceStream(id, spec, callback, user);
     }
+    if (!device->available) {
+        ++device->failed_opens;
+        return nullptr;
+    }
     device->opened = id;
     return fake_stream;
 }
@@ -121,6 +128,13 @@ void __wrap_SDL_DestroyAudioStream(SDL_AudioStream* stream) {
         __real_SDL_DestroyAudioStream(stream);
     } else {
         ++device->closes;
+        if (const auto named = device->add_while_closing.exchange(0)) {
+            device->named = named;
+            SDL_Event event{};
+            event.adevice.type = SDL_EVENT_AUDIO_DEVICE_ADDED;
+            event.adevice.which = named;
+            device->watch(device->watch_data, &event);
+        }
     }
 }
 
@@ -198,4 +212,39 @@ TEST_CASE("SDL ignores removal of other devices and of its own default device",
         CHECK(fixture.mock.closes == 0);
         sink.CloseStream(stream);
     }
+}
+
+
+TEST_CASE("SDL retries an unavailable playback device without a new device event",
+          "[audio_core][sdl_recovery]") {
+    Fixture fixture;
+    Core::System system;
+    AudioCore::Sink::SDLSink sink("fixture device");
+    auto* stream = sink.AcquireSinkStream(system, 2, "recovery-fixture",
+                                          AudioCore::Sink::StreamType::Out);
+    stream->Start();
+    REQUIRE(fixture.mock.resumes == 1);
+    fixture.mock.available = false;
+    fixture.mock.named = 0;
+    fixture.Event(SDL_EVENT_AUDIO_DEVICE_REMOVED, 2);
+    REQUIRE(WaitFor([&] { return fixture.mock.failed_opens >= 1; }));
+
+    fixture.mock.available = true;
+    REQUIRE(WaitFor([&] { return fixture.mock.resumes == 2; }));
+    CHECK(fixture.mock.opened == SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK);
+}
+
+TEST_CASE("SDL notices a configured device returning during backend replacement",
+          "[audio_core][sdl_recovery]") {
+    Fixture fixture;
+    Core::System system;
+    AudioCore::Sink::SDLSink sink("fixture device");
+    auto* stream = sink.AcquireSinkStream(system, 2, "recovery-fixture",
+                                          AudioCore::Sink::StreamType::Out);
+    REQUIRE(stream);
+    REQUIRE(fixture.mock.opened == 2);
+    fixture.mock.named = 0;
+    fixture.mock.add_while_closing = 4;
+    fixture.Event(SDL_EVENT_AUDIO_DEVICE_REMOVED, 2);
+    REQUIRE(WaitFor([&] { return fixture.mock.opened == 4; }));
 }

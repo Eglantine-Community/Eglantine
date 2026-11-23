@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <span>
@@ -234,10 +235,16 @@ private:
         if (impl->type == StreamType::In) {
             std::span<const s16> input_buffer{reinterpret_cast<const s16*>(in_buff),
                                               num_frames * frame_size};
-            impl->ProcessAudioIn(input_buffer, num_frames);
+            if (!impl->IsPaused()) {
+                impl->ProcessAudioIn(input_buffer, num_frames);
+            }
         } else {
             std::span<s16> output_buffer{reinterpret_cast<s16*>(out_buff), num_frames * frame_size};
-            impl->ProcessAudioOutAndRender(output_buffer, num_frames);
+            if (impl->IsPaused()) {
+                std::ranges::fill(output_buffer, s16{0});
+            } else {
+                impl->ProcessAudioOutAndRender(output_buffer, num_frames);
+            }
         }
 
         return num_frames_;
