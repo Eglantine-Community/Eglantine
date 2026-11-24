@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <optional>
 #include <span>
+#include <utility>
 
 #include "common/logging.h"
 #include "video_core/renderer_vulkan/nvn/nvn_bindless.h"
@@ -557,9 +558,9 @@ void DrawContext::BindlessSync(bool force, DrawPlan* plan) {
     thread_local std::vector<std::pair<u32, u32>> sampler_runs;
     thread_local std::vector<std::pair<u32, u32>> sampler_writes;
     if (full_scan || !samplers_same) {
-        const u32 sampler_count = static_cast<u32>(
-            std::min<size_t>(std::max(sampler_ids.size(), size_t{state.synced_sampler_count}),
-                             Shader::BINDLESS_SAMPLER_CAPACITY));
+        const u32 sampler_count = static_cast<u32>((std::min<size_t>)(
+            (std::max)(sampler_ids.size(), size_t{state.synced_sampler_count}),
+            Shader::BINDLESS_SAMPLER_CAPACITY));
         sampler_infos.clear();
         sampler_runs.clear();
         for (u32 id = 0; id < sampler_count; ++id) {
@@ -604,7 +605,7 @@ void DrawContext::BindlessSync(bool force, DrawPlan* plan) {
         state.synced_sampler_size = sampler_ids.size();
         state.synced_samplers_epoch = resources.samplers_epoch;
         state.synced_sampler_count = static_cast<u32>(
-            std::min<size_t>(sampler_ids.size(), Shader::BINDLESS_SAMPLER_CAPACITY));
+            (std::min<size_t>)(sampler_ids.size(), Shader::BINDLESS_SAMPLER_CAPACITY));
     }
     if (!writes.empty()) {
         impl.device.GetLogical().UpdateDescriptorSets(writes, {});

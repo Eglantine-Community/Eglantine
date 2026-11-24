@@ -16,7 +16,7 @@ namespace Vulkan::Nvn {
         if (pass_us == 0) {
             return false;
         }
-        normal_us = std::max(normal_us, pass_us);
+        normal_us = (std::max)(normal_us, pass_us);
     }
     return elapsed_us >= normal_us;
 }

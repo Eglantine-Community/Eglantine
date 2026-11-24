@@ -9,6 +9,8 @@
 #include <cstring>
 #include <limits>
 #include <optional>
+#include <span>
+#include <tuple>
 #include <unordered_set>
 #include <utility>
 
@@ -1369,9 +1371,11 @@ void Recorder::MemoryBarrier(bool defer) {
 
 void Recorder::EmitDeferredBarrier() {
     const VkPipelineStageFlags src_stages =
-        deferred_barrier.src_stages ? deferred_barrier.src_stages : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        deferred_barrier.src_stages ? deferred_barrier.src_stages
+                                    : VkPipelineStageFlags{VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT};
     const VkPipelineStageFlags dst_stages =
-        deferred_barrier.dst_stages ? deferred_barrier.dst_stages : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+        deferred_barrier.dst_stages ? deferred_barrier.dst_stages
+                                    : VkPipelineStageFlags{VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT};
     const bool needs_memory = deferred_barrier.needs_memory;
     const VkAccessFlags src_access = deferred_barrier.src_access;
     const VkAccessFlags dst_access = deferred_barrier.dst_access;
@@ -1522,11 +1526,13 @@ void Recorder::PrepareImagesSpan(std::span<const std::pair<Storage*, VkImageLayo
         }
     } else {
         const VkPipelineStageFlags call_src =
-            (img_src_stages | mem_src_stages) ? (img_src_stages | mem_src_stages)
-                                              : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+            (img_src_stages | mem_src_stages)
+                ? (img_src_stages | mem_src_stages)
+                : VkPipelineStageFlags{VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT};
         const VkPipelineStageFlags call_dst =
-            (img_dst_stages | mem_dst_stages) ? (img_dst_stages | mem_dst_stages)
-                                              : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+            (img_dst_stages | mem_dst_stages)
+                ? (img_dst_stages | mem_dst_stages)
+                : VkPipelineStageFlags{VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT};
         if (consume_mem) {
             const VkMemoryBarrier memory_barrier{
                 .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
