@@ -51,6 +51,8 @@
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/physical_core.h"
+#include "core/hle/nvn/bridge.h"
+#include "core/hle/nvn/hle_runtime.h"
 #include "core/hle/service/acc/profile_manager.h"
 #include "core/hle/service/am/applet_manager.h"
 #include "core/hle/service/am/frontend/applets.h"
@@ -506,6 +508,8 @@ struct System::Impl {
         VideoCommon::Nx2Spikes::SetGuestThreadSource({});
         debug_service.reset();
         SetShuttingDown(true);
+        Core::NvnHle::Bridge::Shutdown();
+        Core::NvnHle::Hle::Runtime::Instance().Shutdown();
         Common::ADPF::Shutdown();
 
         // Reset per-game flags
@@ -526,6 +530,7 @@ struct System::Impl {
         services.reset();
         service_manager.reset();
         fs_controller.Reset();
+        FileSys::SetLooseAOC({});
         cheat_engine.reset();
         core_timing.ClearPendingEvents();
         app_loader.reset();
@@ -534,6 +539,9 @@ struct System::Impl {
         host1x_core.reset();
         perf_stats.reset();
         cpu_manager.Shutdown();
+        // No guest thread can be inside an NVN call any more, and the renderer is gone: the
+        // Recorder (disconnected from the sink by Shutdown) and the guest memory can be freed.
+        Core::NvnHle::Hle::Runtime::Instance().Release();
         debugger.reset();
         kernel.Shutdown();
         stop_event = {};
@@ -718,6 +726,7 @@ void System::InitializeDebugger() {
 
 SystemResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::string& filepath,
                                 Service::AM::FrontendAppletParameters& params) {
+    FileSys::SetLooseAOC({});
     return impl->Load(*this, emu_window, filepath, params);
 }
 

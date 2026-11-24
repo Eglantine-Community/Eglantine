@@ -230,6 +230,9 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
         info.previous_stage_stores.mask.set();
     }
     if (previous_program && previous_program->stage == Shader::Stage::Mesh) {
+        if (!device.IsExtMeshShaderSupported()) {
+            info.mesh_as_compute = true;
+        }
         for (const u32 line : previous_program->mesh.primitive_lines) {
             const auto attribute{static_cast<Shader::IR::Attribute>(line)};
             if (Shader::IR::IsGeneric(attribute)) {
@@ -2509,8 +2512,8 @@ void PipelineCache::StartShaderPrecache(u64 title_id) {
     precache_stop.store(false, std::memory_order_relaxed);
     precache_workers.reset(new Common::ThreadWorker(threads, "VkShaderPrecache", {},
                                                     Common::ThreadPlacement::Background));
-    for (auto& [key, env] : programs) {
-        precache_workers->QueueWork([this, key, env = std::move(env), write_marker]() mutable {
+    for (auto& [key, env2] : programs) {
+        precache_workers->QueueWork([this, key, env = std::move(env2), write_marker]() mutable {
             WaitForIdleRuntimeBuilds(precache_stop, true, precache_paused_us);
             if (precache_stop.load(std::memory_order_relaxed)) {
                 return;
