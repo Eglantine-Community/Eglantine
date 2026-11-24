@@ -1752,26 +1752,12 @@ void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
                 continue;
             }
             Storage& s = *it->second;
-            const u64 fb_epoch_before =
-                draw_resources ? draw_resources->framebuffer_views_epoch : 0;
             std::vector<vk::ImageView> views = draw_resources
                                                    ? draw_resources->TakeStorageViews(s)
                                                    : std::vector<vk::ImageView>{};
-            const bool had_fb_view =
-                draw_resources && draw_resources->framebuffer_views_epoch != fb_epoch_before;
-            if (had_fb_view) {
-                auto old_image = std::make_shared<vk::Image>(std::move(s.image));
-                auto old_views = std::make_shared<std::vector<vk::ImageView>>(std::move(views));
-                const u64 after_seq = retire_seq != 0 ? retire_seq : s.last_used_seq;
-                retired.push_back({after_seq, [old_image, old_views]() mutable {
-                                       old_views->clear();
-                                       *old_image = vk::Image{};
-                                   }});
-            } else {
-                // GPU already completed every submission touching `s` and no framebuffer holds it:
-                // drop views before the image right now to release device memory immediately.
-                views.clear();
-            }
+            // GPU already completed every submission touching `s` and framebuffers are per-flight:
+            // drop views before the image right now to release device memory immediately.
+            views.clear();
             s.image = vk::Image{};
             s.current_layout = VK_IMAGE_LAYOUT_UNDEFINED;
             s.contents_valid = false;
