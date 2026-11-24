@@ -147,6 +147,7 @@
     <addaction name="action_Enable_Overlay_Applet"/>
     <addaction name="action_Show_Filter_Bar"/>
     <addaction name="action_Show_Status_Bar"/>
+    <addaction name="action_Customize_Home_Screen"/>
     <addaction name="action_Show_Performance_Overlay"/>
     <addaction name="action_Post_Processing_Shaders"/>
     <addaction name="separator"/>
@@ -330,6 +331,11 @@
    </property>
    <property name="text">
     <string>Show &amp;Filter Bar</string>
+   </property>
+  </action>
+  <action name="action_Customize_Home_Screen">
+   <property name="text">
+    <string>&amp;Customize Home Screen...</string>
    </property>
   </action>
   <action name="action_Show_Status_Bar">

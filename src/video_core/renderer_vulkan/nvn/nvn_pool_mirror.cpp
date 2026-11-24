@@ -395,6 +395,17 @@ void Context::Impl::MirrorTakeStale(Pool& pool, u64 offset, u64 size,
     MirrorArmRuns(pool, *mirror, memory, first_new, runs);
 }
 
+void Context::Impl::MirrorMarkPrefetch(Pool& pool, u64 offset, u64 size) {
+    PoolMirror* const mirror = pool.vram_mirror.get();
+    if (mirror == nullptr) {
+        return;
+    }
+    if (!mirror->prefetch) {
+        vram_prefetch_mirrors.push_back({&pool, mirror, mirror->write_epoch.get()});
+    }
+    mirror->MarkWanted(pool.size, offset, size);
+}
+
 void Context::Impl::MirrorTakeStaleWanted(Pool& pool, std::vector<std::pair<u64, u64>>& runs) {
     PoolMirror* const mirror = pool.vram_mirror.get();
     if (mirror == nullptr || !mirror->wanted) {
@@ -411,6 +422,7 @@ void Context::Impl::MirrorTakeStaleWanted(Pool& pool, std::vector<std::pair<u64,
     }
     const size_t first_new = runs.size();
     mirror->pages.TakeInvalidWithin(*mirror->wanted, runs);
+    mirror->wanted_dirty = false;
     MirrorArmRuns(pool, *mirror, memory, first_new, runs);
     mirror->wanted_dirty = false;
 }
@@ -486,6 +498,8 @@ void Context::Impl::ReleaseVramMirror(Pool& pool) {
         memory->Untrack(pool.vram_mirror->track_id);
     }
     std::erase(vram_mirrored, &pool);
+    std::erase_if(vram_prefetch_mirrors,
+                  [&](const PrefetchMirrorEntry& e) { return e.pool == &pool; });
     ++ro_alias_generation; // the alias table loses this mirror
     vram_mirror_bytes -= pool.size;
     // The buffer goes with the pool, after the last submission that used it completed.

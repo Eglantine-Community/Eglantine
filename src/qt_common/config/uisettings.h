@@ -172,7 +172,7 @@ struct Values {
     Setting<bool> show_console{linkage, false, "showConsole", Category::Ui};
 
     // Screenshots
-    Setting<bool> enable_screenshot_save_as{linkage, true, "enable_screenshot_save_as",
+    Setting<bool> enable_screenshot_save_as{linkage, false, "enable_screenshot_save_as",
                                             Category::Screenshots};
     Setting<u32> screenshot_height{linkage, 0, "screenshot_height", Category::Screenshots};
 
@@ -239,6 +239,11 @@ struct Values {
                                              Category::UiGameList};
     /// How many stacked cards the carousel shows on each side of the centered one.
     Setting<u8> carousel_side_count{linkage, 6, "carousel_side_count", Category::UiGameList};
+    /// Widths the home screen sidebars were dragged to, in logical pixels.
+    Setting<u32, true> home_details_panel_width{
+        linkage, 340, 280, 800, "home_details_panel_width", Category::UiGameList};
+    Setting<u32, true> home_customize_panel_width{
+        linkage, 340, 280, 800, "home_customize_panel_width", Category::UiGameList};
     Setting<std::string> home_background{linkage, {}, "home_background", Category::UiGameList};
     QStringList recent_home_backgrounds;
     /// The home screen background's fill: 0 picture, 1 solid color, 2 two-color gradient.
@@ -265,6 +270,8 @@ struct Values {
 
     // Play time
     Setting<bool> show_play_time{linkage, true, "show_play_time", Category::UiGameList};
+
+    Setting<bool> show_path{linkage, true, "show_path", Category::UiGameList};
 
     // misc
     Setting<bool> show_fw_warning{linkage, true, "show_fw_warning", Category::Miscellaneous};

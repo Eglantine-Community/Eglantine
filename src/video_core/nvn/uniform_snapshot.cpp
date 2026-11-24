@@ -157,7 +157,7 @@ void MarkWrittenRuns(const std::vector<std::pair<u64, u64>>& runs, UniformSnapsh
                      u64 stamp) {
     for (const auto& [begin, end] : runs) {
         for (u64 page = begin >> PAGE_BITS; page < (end >> PAGE_BITS); ++page) {
-            cpu.written[page] = stamp;
+            cpu.written[page].written = stamp;
         }
     }
 }
@@ -203,7 +203,8 @@ u64 KeepCpuWritten(std::vector<Range>& ranges, UniformSnapshotPools& pools,
         RearmUniformSnapshotPools(pools, cpu, memory, runs, cpu.last_rearm_presents + 1);
         cpu.last_rearm_presents = cpu.presents;
     }
-    const u64 current_stamp = cpu.presents + 1;
+    const u64 current_present = cpu.presents + 1;
+    const u64 recent = cpu.presents;
     // One pass per run of touched pages of one pool: the tracker is asked once per run.
     size_t i = 0;
     while (i < ranges.size()) {
@@ -214,9 +215,8 @@ u64 KeepCpuWritten(std::vector<Range>& ranges, UniformSnapshotPools& pools,
             pool.track_id = memory.Track(pool_begin, pool.end - pool_begin);
             if (pool.track_id != 0) {
                 pool.write_epoch = memory.WriteEpoch(pool.track_id);
-                if (pool.write_epoch) {
-                    pool.epoch_clean = pool.write_epoch->load(std::memory_order_acquire);
-                }
+                pool.epoch_clean =
+                    pool.write_epoch ? pool.write_epoch->load(std::memory_order_acquire) : 0;
             }
         }
         const u64 first = ranges[i].begin >> PAGE_BITS;
@@ -228,6 +228,9 @@ u64 KeepCpuWritten(std::vector<Range>& ranges, UniformSnapshotPools& pools,
             ++j;
         }
         if (pool.track_id != 0) {
+            const u64 cur_epoch =
+                pool.write_epoch ? pool.write_epoch->load(std::memory_order_acquire) : 0;
+            const bool epoch_unchanged = pool.write_epoch && cur_epoch == pool.epoch_clean;
             u64 arm_from = 0;
             u64 arm_count = 0;
             u64 need_first = ~u64{0};
@@ -239,46 +242,52 @@ u64 KeepCpuWritten(std::vector<Range>& ranges, UniformSnapshotPools& pools,
                 }
             };
             for (u64 page = first; page <= last; ++page) {
-                const auto [it, inserted] = cpu.written.try_emplace(page, 0);
+                const auto [it, inserted] =
+                    cpu.written.try_emplace(page, UniformSnapshotPageState{});
                 if (inserted) {
+                    if (pool.write_epoch) {
+                        it->second.checked = cur_epoch;
+                    }
                     if (arm_count == 0 || arm_from + arm_count != page) {
                         flush_arm();
                         arm_from = page;
                     }
                     ++arm_count;
-                } else if (it->second < current_stamp) {
+                } else if (it->second.written < current_present && !epoch_unchanged &&
+                           (!pool.write_epoch || it->second.checked != cur_epoch)) {
+                    if (pool.write_epoch) {
+                        it->second.checked = cur_epoch;
+                    }
                     need_first = (std::min)(need_first, page);
                     need_last = page;
                 }
             }
             flush_arm();
-            if (need_first <= need_last &&
-                (!pool.write_epoch ||
-                 pool.write_epoch->load(std::memory_order_acquire) != pool.epoch_clean)) {
+            if (need_first <= need_last) {
                 runs.clear();
                 memory.PeekWritten(pool.track_id, need_first << PAGE_BITS,
                                    (need_last - need_first + 1) << PAGE_BITS, runs);
-                MarkWrittenRuns(runs, cpu, current_stamp);
+                MarkWrittenRuns(runs, cpu, current_present);
             }
         }
         i = j;
     }
     // Written in this frame (presents + 1) or the previous one (presents).
-    const u64 recent = cpu.presents;
     size_t kept = 0;
-    u64 cached_pool = ~u64{0};
-    u64 cached_track = 0;
+    u64 last_pool_begin = ~u64{0};
+    bool last_tracked = false;
     for (const Range& range : ranges) {
-        if (range.offset != cached_pool) {
-            cached_pool = range.offset;
-            cached_track = pools.find(cached_pool)->second.track_id;
+        if (range.offset != last_pool_begin) {
+            last_pool_begin = range.offset;
+            last_tracked = pools.find(last_pool_begin)->second.track_id != 0;
         }
-        if (cached_track != 0) {
+        if (last_tracked) {
             bool written = true;
             for (u64 page = range.begin >> PAGE_BITS; page <= (range.end - 1) >> PAGE_BITS;
                  ++page) {
                 const auto it = cpu.written.find(page);
-                if (it == cpu.written.end() || it->second == 0 || it->second < recent) {
+                if (it == cpu.written.end() || it->second.written == 0 ||
+                    it->second.written < recent) {
                     written = false;
                     break;
                 }

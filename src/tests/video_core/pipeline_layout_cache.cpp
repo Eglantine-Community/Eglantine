@@ -16,11 +16,11 @@
 // entry, so the next pipeline tries again.
 TEST_CASE("Pipeline layout cache: one make per key, none kept after a throw",
           "[pipeline_layout_cache]") {
-    Vulkan::PipelineLayoutCache cache;
+    Vulkan::ComputePipelineLayoutCache cache;
     int makes = 0;
     const auto make = [&] {
         ++makes;
-        return Vulkan::PipelineLayoutCache::Entry{};
+        return Vulkan::ComputePipelineLayoutCache::Entry{};
     };
     const auto& first = cache.Get({1, 0, 6, 1, 16}, make);
     CHECK(&cache.Get({1, 0, 6, 1, 16}, make) == &first);
@@ -28,7 +28,7 @@ TEST_CASE("Pipeline layout cache: one make per key, none kept after a throw",
     CHECK(&cache.Get({1, 0, 6, 2, 16}, make) != &first);
     CHECK(makes == 2);
 
-    CHECK_THROWS_AS(cache.Get({3}, [&]() -> Vulkan::PipelineLayoutCache::Entry {
+    CHECK_THROWS_AS(cache.Get({3}, [&]() -> Vulkan::ComputePipelineLayoutCache::Entry {
         throw std::runtime_error("no memory");
     }),
                     std::runtime_error);
@@ -40,7 +40,7 @@ TEST_CASE("Pipeline layout cache: one make per key, none kept after a throw",
 // own layouts.
 TEST_CASE("Pipeline layout cache: the key covers every input of layout creation",
           "[pipeline_layout_cache]") {
-    using Vulkan::PipelineLayoutCache;
+    using Vulkan::ComputePipelineLayoutCache;
     struct Inputs {
         bool push{};
         bool descriptor_buffer{};
@@ -55,9 +55,9 @@ TEST_CASE("Pipeline layout cache: the key covers every input of layout creation"
         size_t num_bindings{2};
     };
     const auto key = [](const Inputs& in) {
-        return PipelineLayoutCache::MakeKey(in.push, in.descriptor_buffer, in.compute, in.mesh,
-                                            in.mesh_emulation,
-                                            std::span(in.bindings.data(), in.num_bindings));
+        return ComputePipelineLayoutCache::MakeKey(
+            in.push, in.descriptor_buffer, in.compute, in.mesh, in.mesh_emulation,
+            std::span(in.bindings.data(), in.num_bindings));
     };
     const Inputs base;
     CHECK(key(base) == key(Inputs{}));

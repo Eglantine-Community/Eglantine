@@ -68,8 +68,8 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
 
     uses_push_descriptor = builder.CanUsePushDescriptor();
     uses_descriptor_buffer = builder.CanUseDescriptorBuffer() && descriptor_buffer_ring.IsValid();
-    PipelineLayoutCache& layouts{descriptor_pool.LayoutCache()};
-    const PipelineLayoutCache::Entry* layout{
+    ComputePipelineLayoutCache& layouts{descriptor_pool.ComputeLayoutCache()};
+    const ComputePipelineLayoutCache::Entry* layout{
         &builder.GetLayouts(layouts, uses_push_descriptor, uses_descriptor_buffer)};
     if (uses_descriptor_buffer) {
         descriptor_buffer_layout = builder.MakeDescriptorBufferLayout(*layout->set);

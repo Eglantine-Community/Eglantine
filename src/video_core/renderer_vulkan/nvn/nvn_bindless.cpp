@@ -188,7 +188,9 @@ bool DrawContext::BindlessReady() {
             const VkImageView dummy =
                 resources.DummyView(BindlessViewType(TypeOfBinding(binding)));
             state.dummy[binding] = dummy;
-            state.written[binding].assign(Shader::BINDLESS_TEXTURE_CAPACITY, dummy);
+            state.written[binding].assign(
+                Shader::BINDLESS_TEXTURE_CAPACITY,
+                BindlessState::WrittenEntry{dummy, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
         }
         // One binding at a time: the infos are a copy of the binding's stand-in.
         for (u32 binding = 1; binding < Shader::BINDLESS_BINDING_COUNT; ++binding) {
@@ -411,10 +413,15 @@ void DrawContext::BindlessSync(bool force, DrawPlan* plan) {
         bool ready = false;
         bool any = false;
         if (serial != 0) {
-            const std::shared_ptr<Texture>& texture = TextureOfId(id);
-            if (texture) {
-                // (TextureOfId returns the node of Impl::textures)
-                texture_node = &texture;
+            const auto tex_it = impl.textures.find(serial);
+            const std::shared_ptr<Texture>* const texture_ptr =
+                tex_it != impl.textures.end() ? &tex_it->second : nullptr;
+            static const std::shared_ptr<Texture> no_texture;
+            const std::shared_ptr<Texture>& texture =
+                texture_ptr != nullptr ? *texture_ptr : no_texture;
+            if (texture_ptr != nullptr && texture) {
+                // Stable pointer to the Impl::textures map node (never a replaceable cache slot).
+                texture_node = texture_ptr;
                 storage_sp = texture->storage;
             }
             if (texture && texture->storage) {
@@ -484,10 +491,11 @@ void DrawContext::BindlessSync(bool force, DrawPlan* plan) {
             impl.NoteBindlessLayoutDirty(*storage_sp);
         }
         for (u32 binding = 1; binding <= TEXTURE_BINDINGS; ++binding) {
-            if (state.written[binding][id] == want[binding]) {
+            const BindlessState::WrittenEntry desired{want[binding], want_layout[binding]};
+            if (state.written[binding][id] == desired) {
                 continue;
             }
-            state.written[binding][id] = want[binding];
+            state.written[binding][id] = desired;
             infos.push_back({VK_NULL_HANDLE, want[binding], want_layout[binding]});
             runs.push_back({binding, id, static_cast<u32>(infos.size() - 1), 1});
         }
@@ -541,8 +549,8 @@ void DrawContext::BindlessSync(bool force, DrawPlan* plan) {
         for (u32 id = 0; id < state.synced_count; ++id) {
             const u32 cube_binding = Shader::BindlessTextureBinding(Shader::TextureType::ColorCube, 0);
             const u32 d2_binding = Shader::BindlessTextureBinding(Shader::TextureType::Color2D, 0);
-            cube += state.written[cube_binding][id] != state.dummy[cube_binding];
-            d2 += state.written[d2_binding][id] != state.dummy[d2_binding];
+            cube += state.written[cube_binding][id].view != state.dummy[cube_binding];
+            d2 += state.written[d2_binding][id].view != state.dummy[d2_binding];
         }
         LOG_INFO(Render_Vulkan,
                  "[nvn] bindless table: {} textures registered, {} 2D and {} cube entries hold an "

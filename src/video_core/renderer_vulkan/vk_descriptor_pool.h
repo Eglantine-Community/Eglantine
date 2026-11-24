@@ -74,7 +74,7 @@ private:
 /// Descriptor set and pipeline layouts shared by every pipeline with the same bindings. They live
 /// until the device goes; pipelines only hold their handles (one layout per pipeline cost ~28 KiB
 /// of driver memory each, with ~90% duplicates in Ocarina of Time).
-class PipelineLayoutCache {
+class ComputePipelineLayoutCache {
 public:
     struct Entry {
         vk::DescriptorSetLayout set;
@@ -132,12 +132,12 @@ public:
     DescriptorAllocator Allocator(const Device& device, Scheduler& scheduler, VkDescriptorSetLayout layout, const Shader::Info& info);
     DescriptorAllocator Allocator(const Device& device, Scheduler& scheduler, VkDescriptorSetLayout layout, const DescriptorBankInfo& info);
 
-    PipelineLayoutCache& LayoutCache() noexcept {
+    ComputePipelineLayoutCache& ComputeLayoutCache() noexcept {
         return layout_cache;
     }
 
 private:
-    PipelineLayoutCache layout_cache;
+    ComputePipelineLayoutCache layout_cache;
     DescriptorBank& Bank(const Device& device, const DescriptorBankInfo& reqs);
     std::shared_mutex banks_mutex;
     std::vector<DescriptorBankInfo> bank_infos;
