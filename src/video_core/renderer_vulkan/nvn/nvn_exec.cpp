@@ -5525,7 +5525,7 @@ bool Recorder::DecodeBufferToTexture(Storage& s, u32 level, u32 layer,
         const std::vector<BcChunk> chunks =
             SplitBcLayers(level, first_layer, slices, width, height, x, y);
         const bool recorded =
-            RecordBcUpload(s, chunks, false, [&](const BcChunk& chunk, BcScratch& scratch) {
+            RecordBcUpload(s, chunks, false, [&](const BcChunk& chunk, BcScratch& bc_scratch) {
                 const VkBufferImageCopy region{
                     .bufferOffset =
                         staging.offset + u64{chunk.first_layer - first_layer} * layer_bytes,
@@ -5535,7 +5535,7 @@ bool Recorder::DecodeBufferToTexture(Storage& s, u32 level, u32 layer,
                     .imageOffset = {0, 0, 0},
                     .imageExtent = {width, height, 1},
                 };
-                Cmd().CopyBufferToImage(staging.buffer, *scratch.image, VK_IMAGE_LAYOUT_GENERAL,
+                Cmd().CopyBufferToImage(staging.buffer, *bc_scratch.image, VK_IMAGE_LAYOUT_GENERAL,
                                         region);
             });
         if (!recorded) {
