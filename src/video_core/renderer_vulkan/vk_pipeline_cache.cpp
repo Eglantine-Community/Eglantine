@@ -2223,8 +2223,8 @@ void PipelineCache::StartShaderPrecache(u64 title_id) {
     }
     precache_workers.reset(new Common::ThreadWorker(threads, "VkShaderPrecache", {},
                                                     Common::ThreadPlacement::Background));
-    for (auto& [key, env] : programs) {
-        precache_workers->QueueWork([this, key, env = std::move(env), write_marker]() mutable {
+    for (auto& [key, env2] : programs) {
+        precache_workers->QueueWork([this, key, env = std::move(env2), write_marker]() mutable {
             WaitForIdleRuntimeBuilds();
             if (precache_stop.load(std::memory_order_relaxed)) {
                 return;
