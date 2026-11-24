@@ -933,11 +933,14 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
         depth_attachment->host.format == VK_FORMAT_D32_SFLOAT &&
         depth_attachment->aspect == VK_IMAGE_ASPECT_DEPTH_BIT &&
         depth_attachment->samples == VK_SAMPLE_COUNT_1_BIT && depth_attachment->levels == 1 &&
-        depth_attachment->layers == 1 && !layout.uses_bindless_table &&
-        !layout.stores_raw_global_memory && !MakeDynamicFixedState(fixed).depth_write_enable &&
+        depth_attachment->layers == 1 && !layout.stores_raw_global_memory &&
+        !MakeDynamicFixedState(fixed).depth_write_enable &&
         std::ranges::none_of(layout.bindings, [](const VC::DescriptorBinding& binding) {
             return binding.is_written;
         });
+    if (pass_open && pass_read_only_depth && allow_read_only_depth) {
+        plan.read_only_depth = true;
+    }
     scratch_writes.clear();
     scratch_buffers.clear();
     scratch_images.clear();
@@ -2125,11 +2128,16 @@ bool DrawContext::PrepareOutsidePass(DrawPlan& plan) {
             use.needs_upgrade_storage = false;
             use.needs_upgrade_formats = false;
         }
-        use.needs_contents = host->HostNeedsCommands(s, use.will_overwrite);
+        const bool layout_only_ready =
+            use.layout_only && s.image && s.contents_valid && !s.force_upload;
+        use.needs_contents =
+            layout_only_ready ? false : host->HostNeedsCommands(s, use.will_overwrite);
         use.skip = !s.image;
         if (!use.skip && s.current_layout != use.layout &&
             (s.current_layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL ||
-             s.current_layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL) &&
+             s.current_layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL ||
+             s.current_layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL ||
+             s.current_layout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) &&
             (use.layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL ||
              use.layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL)) {
             NoteFlipTarget(use.owner, use.layout);
@@ -2223,8 +2231,12 @@ bool DrawContext::PrepareOutsidePass(DrawPlan& plan) {
                 }
             }
             if (use.needs_contents || use.will_overwrite) {
-                host->HostEnsureContents(s, use.will_overwrite);
+                const char* const caller = use.from_bindless_prime
+                                               ? "BindlessPrime"
+                                               : (plan.graphics ? "Draw" : "Compute");
+                host->HostEnsureContents(s, use.will_overwrite, caller);
             }
+            bool need_transition = true;
             if (use.sample_only) {
                 // Sampled in GENERAL only where the image is (BuildDescriptors): when loading the
                 // contents moved it out, it is sampled read-only.
@@ -2232,11 +2244,19 @@ bool DrawContext::PrepareOutsidePass(DrawPlan& plan) {
                     s.current_layout != VK_IMAGE_LAYOUT_GENERAL) {
                     use.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
                 }
-                if (s.current_layout == use.layout) {
-                    continue;
-                }
+                need_transition = s.current_layout != use.layout;
             }
-            transition_scratch.emplace_back(&s, use.layout);
+            if (need_transition) {
+                transition_scratch.emplace_back(&s, use.layout);
+            }
+            if (use.from_bindless_prime && (use.needs_contents || use.will_overwrite) &&
+                host->HostUploadEarlySubmitDue()) {
+                if (!transition_scratch.empty()) {
+                    host->HostTransitionMany(transition_scratch, false);
+                    transition_scratch.clear();
+                }
+                host->HostSubmitUploadPiece();
+            }
         }
         host->HostTransitionMany(transition_scratch, false);
         mirror_upload_scratch.clear();

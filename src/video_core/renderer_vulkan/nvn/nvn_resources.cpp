@@ -869,6 +869,7 @@ std::shared_ptr<Texture> Context::Impl::BuildTexture(const VC::TextureDesc& d) {
                         texture->storage->view_format_count = 0;
                     } else {
                         texture->storage->pending_unrestricted_formats = true;
+                        NoteBindlessStorageChanged(*texture->storage);
                     }
                 }
                 // An ASTC view of a BC stand-in reads it as that BC format (its own sRGB-ness).

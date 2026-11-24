@@ -13,6 +13,7 @@
 #include <numeric>
 #include <optional>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <fmt/format.h>
@@ -103,18 +104,23 @@ bool Context::Impl::TakePoolCpuWrites(Pool& pool) {
             pool.raw_write_gen = ++pool.cpu_write_gen;
         }
     }
-    std::vector<std::pair<u64, u64>> writebacks;
-    {
-        std::scoped_lock lock{pool.dirty_mutex};
-        writebacks.swap(pool.landed_writebacks);
-    }
-    if (!writebacks.empty()) {
-        ++pool.cpu_write_gen;
-        for (const auto& [offset, end] : writebacks) {
-            for (u64 page = offset / Pool::MIRROR_PAGE; page * Pool::MIRROR_PAGE < end; ++page) {
-                const size_t index = static_cast<size_t>(page);
-                if (index < pool.page_write_gen.size()) {
-                    pool.page_write_gen[index] = pool.cpu_write_gen;
+    if (pool.has_landed_writebacks.load(std::memory_order_acquire)) {
+        thread_local std::vector<std::pair<u64, u64>> writebacks;
+        writebacks.clear();
+        {
+            std::scoped_lock lock{pool.dirty_mutex};
+            writebacks.swap(pool.landed_writebacks);
+            pool.has_landed_writebacks.store(false, std::memory_order_relaxed);
+        }
+        if (!writebacks.empty()) {
+            ++pool.cpu_write_gen;
+            for (const auto& [offset, end] : writebacks) {
+                for (u64 page = offset / Pool::MIRROR_PAGE; page * Pool::MIRROR_PAGE < end;
+                     ++page) {
+                    const size_t index = static_cast<size_t>(page);
+                    if (index < pool.page_write_gen.size()) {
+                        pool.page_write_gen[index] = pool.cpu_write_gen;
+                    }
                 }
             }
         }
@@ -576,6 +582,7 @@ void Context::Impl::SetStandin(Storage& s, AstcStandin standin) {
                               (std::max)(s.extent.height >> level, 1u), 1, block_bytes);
     }
     s.vram_bytes = bytes * s.layers;
+    NoteBindlessStorageChanged(s);
 }
 
 bool Context::Impl::EnsureImage(Storage& s) {
@@ -624,6 +631,8 @@ bool Context::Impl::EnsureImage(Storage& s) {
             ++s.image_gen;
             if (s.image && s.sparse->Attach(*this, s, reason)) {
                 s.current_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+                NoteBindlessLayoutDirty(s);
+                NoteBindlessStorageChanged(s);
                 stats.storages_created.fetch_add(1, std::memory_order_relaxed);
                 return true;
             }
@@ -636,11 +645,13 @@ bool Context::Impl::EnsureImage(Storage& s) {
             // The whole-storage paths start from scratch.
             s.contents_valid = false;
             s.origin = StorageOrigin::None;
+            NoteBindlessStorageChanged(s);
         }
         s.image = allocator->CreateImage(image_info, false, AllocationKind::StorageImage);
         ++s.image_gen;
     } catch (const vk::Exception& exception) {
         s.image_failed = true;
+        NoteBindlessStorageChanged(s);
         stats.textures_failed.fetch_add(1, std::memory_order_relaxed);
         LOG_ERROR(Render_Vulkan, "[nvn] texture storage ({}x{}x{}, {} levels, format {:#x}) image failed: {}",
                   s.extent.width, s.extent.height, s.extent.depth, s.levels, s.desc.format,
@@ -648,6 +659,8 @@ bool Context::Impl::EnsureImage(Storage& s) {
         return false;
     }
     s.current_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    NoteBindlessLayoutDirty(s);
+    NoteBindlessStorageChanged(s);
     s.last_used_present = stats.presents.load(std::memory_order_relaxed);
     stats.storages_created.fetch_add(1, std::memory_order_relaxed);
     if (s.cached) {
@@ -918,7 +931,9 @@ void Context::Impl::MapVirtualNow(u64 pool_serial, const std::vector<VC::Virtual
                 });
                 continue;
             }
-            storage.contents_valid = false;
+            if (std::exchange(storage.contents_valid, false)) {
+                NoteBindlessStorageChanged(storage);
+            }
             storage.origin = StorageOrigin::None;
             storage.gpu_write_gen = 0; // no longer a source for overlapping textures
             storage.linear_writeback_seq = 0;

@@ -416,21 +416,23 @@ BcGpuEncoder* Context::Impl::BcEncoder() {
     return bc_encoder.get();
 }
 
-std::shared_ptr<BcScratch> Context::Impl::AcquireBcScratch(u32 width, u32 height, u32 layers) {
+std::shared_ptr<BcScratch> Context::Impl::AcquireBcScratchFrom(std::shared_ptr<BcScratch>& slot,
+                                                               u64 budget, u32 width, u32 height,
+                                                               u32 layers) {
     const bool bc7 = astc_standin == AstcStandin::Bc7;
-    if (bc_scratch && bc_scratch->Fits(width, height, layers, bc7)) {
-        return bc_scratch;
+    if (slot && slot->Fits(width, height, layers, bc7)) {
+        return slot;
     }
     const auto texel_bytes = [](u32 w, u32 h, u32 l) { return u64{w} * h * l * 4; };
     u32 w = width;
     u32 h = height;
     u32 l = layers;
-    if (bc_scratch) {
+    if (slot) {
         // Grow to cover both shapes while that stays in the budget, else take the new shape.
-        const u32 grown_w = (std::max)(bc_scratch->width, width);
-        const u32 grown_h = (std::max)(bc_scratch->height, height);
-        const u32 grown_l = (std::max)(bc_scratch->layers, layers);
-        if (texel_bytes(grown_w, grown_h, grown_l) <= BC_SCRATCH_BUDGET) {
+        const u32 grown_w = (std::max)(slot->width, width);
+        const u32 grown_h = (std::max)(slot->height, height);
+        const u32 grown_l = (std::max)(slot->layers, layers);
+        if (texel_bytes(grown_w, grown_h, grown_l) <= budget) {
             w = grown_w;
             h = grown_h;
             l = grown_l;
@@ -438,8 +440,8 @@ std::shared_ptr<BcScratch> Context::Impl::AcquireBcScratch(u32 width, u32 height
     }
     try {
         auto scratch = MakeBcScratch(device, *allocator, w, h, l, bc7);
-        if (texel_bytes(w, h, l) <= BC_SCRATCH_BUDGET) {
-            bc_scratch = scratch;
+        if (texel_bytes(w, h, l) <= budget) {
+            slot = scratch;
         }
         return scratch;
     } catch (const vk::Exception& exception) {
@@ -450,6 +452,16 @@ std::shared_ptr<BcScratch> Context::Impl::AcquireBcScratch(u32 width, u32 height
         }
         return nullptr;
     }
+}
+
+std::shared_ptr<BcScratch> Context::Impl::AcquireBcScratch(u32 width, u32 height, u32 layers) {
+    return AcquireBcScratchFrom(bc_scratch, BC_SCRATCH_BUDGET, width, height, layers);
+}
+
+std::shared_ptr<BcScratch> Context::Impl::AcquireBcScratchSlot(size_t slot, u32 width, u32 height,
+                                                               u32 layers) {
+    return AcquireBcScratchFrom(bc_scratch_ring[slot], BC_SMALL_SCRATCH_MAX_BYTES, width, height,
+                                layers);
 }
 
 void Context::Impl::CompleteBcTimes(const BcUploadTimes& times) {
@@ -636,6 +648,7 @@ Context::Impl::~Impl() {
     commands.clear();
     inflight.clear();
     draw_contexts.clear();
+    bindless_layout_dirty.clear();
     draw_resources.reset();
     storage_index.clear();
     storage_cache.clear();
@@ -671,7 +684,9 @@ Context::Impl::~Impl() {
     upscaler_fsr.reset();
     mirror_merge_stats = {}; // allocator-owned, like the pool buffers above
     bc_scratch.reset();
+    bc_scratch_ring = {};
     staging_cache = {};
+    large_staging_cache = {};
     download_cache = {};
     quad_indirect.reset();
     allocator.reset();
@@ -1191,6 +1206,24 @@ vk::Buffer Context::Impl::AcquireStaging(u64 size) {
                 return std::move(buffer);
             }
         }
+    } else if (size > STAGING_CHUNK && size <= (u64{128} << 20)) {
+        std::scoped_lock lock{staging_cache_mutex};
+        size_t best = large_staging_cache.size();
+        u64 best_size = ~u64{0};
+        for (size_t i = 0; i < large_staging_cache.size(); ++i) {
+            if (!large_staging_cache[i]) {
+                continue;
+            }
+            const u64 buf_size = large_staging_cache[i].Mapped().size();
+            if (buf_size >= size && buf_size <= size * 2 && buf_size < best_size) {
+                best = i;
+                best_size = buf_size;
+            }
+        }
+        if (best < large_staging_cache.size()) {
+            stats.staging_chunks_reused.fetch_add(1, std::memory_order_relaxed);
+            return std::move(large_staging_cache[best]);
+        }
     }
     // GPU untile and ASTC decode can read the staged GOBs directly.
     return CreateHostBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
@@ -1308,6 +1341,7 @@ void Context::Impl::CompleteMain() {
                     } else {
                         landed.assign(1, {0, readback.pool->size}); // not taken for long: all
                     }
+                    readback.pool->has_landed_writebacks.store(true, std::memory_order_release);
                 }
             }
         }
@@ -1395,14 +1429,32 @@ void Context::Impl::CompleteMain() {
             std::scoped_lock lock{staging_cache_mutex};
             auto free = staging_cache.begin();
             for (auto& buffer : flight->staging) {
-                if (buffer.Mapped().size() != STAGING_CHUNK) {
-                    continue;
+                const u64 buf_size = buffer.Mapped().size();
+                if (buf_size == STAGING_CHUNK) {
+                    free = std::find_if(free, staging_cache.end(),
+                                        [](const auto& slot) { return !slot; });
+                    if (free != staging_cache.end()) {
+                        *free++ = std::move(buffer);
+                    }
+                } else if (buf_size > STAGING_CHUNK && buf_size <= (u64{128} << 20)) {
+                    size_t target = large_staging_cache.size();
+                    u64 smallest = ~u64{0};
+                    for (size_t i = 0; i < large_staging_cache.size(); ++i) {
+                        if (!large_staging_cache[i]) {
+                            target = i;
+                            break;
+                        }
+                        const u64 cur_size = large_staging_cache[i].Mapped().size();
+                        if (cur_size < smallest) {
+                            smallest = cur_size;
+                            target = i;
+                        }
+                    }
+                    if (target < large_staging_cache.size() &&
+                        (!large_staging_cache[target] || buf_size > smallest)) {
+                        large_staging_cache[target] = std::move(buffer);
+                    }
                 }
-                free = std::find_if(free, staging_cache.end(), [](const auto& slot) { return !slot; });
-                if (free == staging_cache.end()) {
-                    break;
-                }
-                *free++ = std::move(buffer);
             }
         }
         flight->staging.clear();

@@ -159,7 +159,8 @@ public:
     virtual void HostNoteTouched(const std::shared_ptr<Storage>& storage) = 0;
     /// Creates the image and loads the guest contents on first use (outside a render pass only).
     /// False: the image could not be created (the op must be dropped).
-    virtual bool HostEnsureContents(Storage& storage, bool will_overwrite) = 0;
+    virtual bool HostEnsureContents(Storage& storage, bool will_overwrite,
+                                    const char* caller = "DrawOrDispatch") = 0;
     virtual bool HostEnsureAttachmentContents(Storage& storage) = 0;
     virtual bool HostUpgradeImageCaps(Storage& storage, bool need_storage,
                                       bool need_unrestricted_formats) = 0;
@@ -279,6 +280,12 @@ public:
         static_cast<void>(storage);
         static_cast<void>(job);
     }
+    /// Mid-batch upload submission: true when enough piece time has elapsed outside passes and
+    /// shadows to flush completed uploads to the GPU while subsequent uploads are recorded.
+    [[nodiscard]] virtual bool HostUploadEarlySubmitDue() const {
+        return false;
+    }
+    virtual void HostSubmitUploadPiece() {}
 };
 
 /// Where a buffer range ended up.
@@ -794,8 +801,6 @@ private:
         std::array<VkImageView, Shader::BINDLESS_BINDING_COUNT> dummy{};
         std::array<std::vector<VkImageView>, Shader::BINDLESS_BINDING_COUNT> written;
         std::vector<VkSampler> written_samplers;
-        /// The storages of the entries that hold an image (their layouts are checked per draw).
-        std::vector<std::shared_ptr<Storage>> storages;
         /// What entry `id` was last written from. While the registration, the texture, its
         /// storage and that storage's image are the same, the entry holds what it should and the
         /// sync leaves it (the pool has tens of thousands of registrations; walking each one's
@@ -805,6 +810,7 @@ private:
             /// The texture's node of Impl::textures (null: none); dies when the serial is erased.
             const std::shared_ptr<Texture>* texture{};
             const Storage* storage{};
+            std::weak_ptr<Storage> storage_ref;
             u32 image_gen{};
             VkFormat format{};
             VkImageLayout layout{};
@@ -812,13 +818,64 @@ private:
             bool any{};   ///< the entry holds a view of it
         };
         std::vector<Entry> entries;
+        std::vector<u64> synced_serials;
+        VC::IdSnapshot synced_texture_snapshot;
+        VC::IdSnapshot synced_sampler_snapshot;
+        size_t synced_texture_size{0};
+        size_t synced_sampler_size{0};
         u64 entries_epoch{}; ///< Impl::texture_epoch the node pointers were checked at
+        u64 storage_change_epoch{1};
+        u64 synced_samplers_epoch{0};
         u64 synced_seq{~u64{0}};
         const void* synced_textures{};
         const void* synced_samplers{};
         u32 synced_count{};
         u32 synced_sampler_count{};
         u32 sync_logs{};
+        struct SlotList {
+            static constexpr u32 EMPTY = ~u32{0};
+            u32 single{EMPTY};
+            std::vector<u32> extra;
+            void Add(u32 id) {
+                if (single == EMPTY) {
+                    single = id;
+                } else {
+                    extra.push_back(id);
+                }
+            }
+            void Remove(u32 id) {
+                if (single == id) {
+                    if (!extra.empty()) {
+                        single = extra.back();
+                        extra.pop_back();
+                    } else {
+                        single = EMPTY;
+                    }
+                    return;
+                }
+                for (size_t i = 0; i < extra.size(); ++i) {
+                    if (extra[i] == id) {
+                        extra[i] = extra.back();
+                        extra.pop_back();
+                        return;
+                    }
+                }
+            }
+            [[nodiscard]] bool Empty() const noexcept {
+                return single == EMPTY;
+            }
+            void AppendTo(std::vector<u32>& out) const {
+                if (single != EMPTY) {
+                    out.push_back(single);
+                    if (!extra.empty()) {
+                        out.insert(out.end(), extra.begin(), extra.end());
+                    }
+                }
+            }
+        };
+        std::unordered_map<const Storage*, SlotList> storage_slots;
+        std::unordered_map<u64, SlotList> serial_slots;
+        std::vector<u32> retry_slots;
         /// Textures registered without an image yet are created (and their data loaded) as draws
         /// need the table, within a budget per submission; a change makes the entries refresh
         /// before the set is bound.
@@ -826,9 +883,9 @@ private:
         u64 prime_seq{~u64{0}};
         u64 prime_bytes{};
         u32 prime_count{};
-        u32 prime_cursor{1};
-        /// Submission whose walk of the pool found nothing left to create (BindlessPrime).
-        u64 prime_exhausted_seq{~u64{0}};
+        std::vector<u32> unprimed_slots;
+        std::vector<u8> unprimed_queued;
+        size_t unprimed_head{0};
         u32 primed_total{};
     } bindless;
     /// Creates the table on first use; false when the device cannot hold it.
@@ -842,6 +899,11 @@ private:
     bool BindlessPrepare(DrawPlan& plan);
     /// Binds the table's set for the pipeline's layout.
     void BindlessBind(PipelineBase& pipeline, VkPipelineBindPoint bind_point);
+    static void BindlessDetachEntry(BindlessState& state, u32 id);
+    static void BindlessAttachEntry(BindlessState& state, u32 id, u64 serial,
+                                    const std::shared_ptr<Texture>* texture_node,
+                                    const std::shared_ptr<Storage>& storage_sp, u32 image_gen,
+                                    VkFormat format, VkImageLayout layout, bool ready, bool any);
     /// Phase B of the descriptors: creates the image views the plan resolved and patches the
     /// image infos (the images exist and are in layout by now).
     void FinishImages(DrawPlan& plan);
@@ -952,7 +1014,44 @@ private:
         VkExtent2D extent{};
         u32 layers{};
         std::array<VkImageView, MAX_COLOR_TARGETS + 1> views{};
+        u32 count{};
+        u64 epoch{};
+        u64 retained_seq{~u64{0}};
     } last_framebuffer;
+    struct FramebufferKey {
+        VkRenderPass pass{};
+        VkExtent2D extent{};
+        u32 layers{};
+        u32 count{};
+        std::array<VkImageView, MAX_COLOR_TARGETS + 1> views{};
+        [[nodiscard]] bool operator==(const FramebufferKey& o) const noexcept {
+            return pass == o.pass && extent.width == o.extent.width &&
+                   extent.height == o.extent.height && layers == o.layers && count == o.count &&
+                   views == o.views;
+        }
+    };
+    struct FramebufferKeyHash {
+        size_t operator()(const FramebufferKey& k) const noexcept {
+            u64 h = static_cast<u64>(std::hash<VkRenderPass>{}(k.pass));
+            auto mix = [&](u64 v) {
+                h ^= v + 0x9E3779B97F4A7C15ULL + (h << 6) + (h >> 2);
+            };
+            mix((static_cast<u64>(k.extent.width) << 32) | k.extent.height);
+            mix((static_cast<u64>(k.layers) << 32) | k.count);
+            for (u32 i = 0; i < k.count; ++i) {
+                mix(static_cast<u64>(std::hash<VkImageView>{}(k.views[i])));
+            }
+            return static_cast<size_t>(h);
+        }
+    };
+    struct CachedFramebuffer {
+        std::shared_ptr<vk::Framebuffer> fb;
+        u64 last_used_seq{};
+        u64 last_retained_seq{~u64{0}};
+    };
+    static constexpr size_t FRAMEBUFFER_CACHE_MAX = 128;
+    u64 framebuffer_cache_epoch{0};
+    std::unordered_map<FramebufferKey, CachedFramebuffer, FramebufferKeyHash> framebuffer_cache;
     mutable bool pass_key_valid{false};
     mutable RenderPassKey cached_pass_key{};
     bool pass_open{false};

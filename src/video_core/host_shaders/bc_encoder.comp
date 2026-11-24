@@ -15,6 +15,8 @@
 
 layout (local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
+layout (constant_id = 0) const uint SPEC_REFINE = 0u;
+
 layout (set = 0, binding = 0, rgba8) uniform readonly image2DArray source;
 
 layout (std430, set = 0, binding = 1) writeonly buffer Output {
@@ -330,9 +332,10 @@ uvec2 EncodeChannel(in float values[16]) {
     if (a0 == a1) {
         return uvec2(bits_lo, bits_hi);
     }
+    const float inv_range = 7.0 / float(a0 - a1);
+    const float f_a1 = float(a1);
     for (uint i = 0u; i < 16u; ++i) {
-        const float t = (values[i] * 255.0 - float(a1)) / float(a0 - a1);
-        const uint q = uint(clamp(round(t * 7.0), 0.0, 7.0));
+        const uint q = uint(clamp(round((values[i] * 255.0 - f_a1) * inv_range), 0.0, 7.0));
         const uint index = q == 7u ? 0u : (q == 0u ? 1u : 8u - q);
         const uint bit = 16u + 3u * i;
         if (bit < 32u) {
@@ -382,7 +385,7 @@ void main() {
     }
     const uint block = (id.z * blocks_y + id.y) * blocks_x + id.x;
     const uint kind = mode & MODE_MASK;
-    const bool refine = (mode & REFINE) != 0u;
+    const bool refine = SPEC_REFINE != 0u && (mode & REFINE) != 0u;
     // The texels inside the level: the refined fit measures its error on them alone.
     const uvec2 inside = uvec2(clamp(ivec2(width, height) - base, ivec2(0), ivec2(4)));
     const uint row = (1u << inside.x) - 1u;
