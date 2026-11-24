@@ -95,7 +95,7 @@ private:
 /// images written by every compute dispatch and the presented image. EDEN_NX2_FRAME_DUMP_AT picks
 /// the frame, in seconds after boot ("45") or as a frame number ("2700f").
 /// EDEN_NX2_FRAME_DUMP_SAMPLED=1 also reads back every texture a pass samples (3D and depth
-/// included), once per pass, as the first draw sampling it sees it, and the textures each compute
+/// included; block-compressed ones as the host's raw blocks, "host_format"), once per pass, as the first draw sampling it sees it, and the textures each compute
 /// shader samples, once per shader, before its first dispatch, with each texture's sampler state,
 /// and the uniform and storage buffers of every draw and dispatch, once per shader and binding,
 /// with each dispatch's group counts. Readbacks are encoded and written on a worker thread so the
@@ -239,6 +239,10 @@ private:
         bool rescaled;
         bool msaa;
         DepthEncoding depth_encoding;
+        /// A block-compressed host image (BCn, or ASTC the host re-compressed): bytes per 4x4
+        /// block, read back raw. 0 otherwise.
+        u32 block_bytes{};
+        const char* host_format{};
     };
 
     /// An image readback, or a buffer one (`raw`) of `bytes` bytes.
@@ -269,6 +273,7 @@ private:
     /// The native program key of a shader hash as 16 hex digits, or "" when unknown.
     std::string KeyOf(u64 shader_hash) const;
     static u32 TexelBytes(const Target& target);
+    static size_t ImageBytes(const Target& target);
     static int Decode(const Target& target, const u8* pixel, std::array<float, 4>& out);
     bool Record(const Target& target, std::string name, std::string tags);
     bool RecordSampled(const Sampled& texture, u32 index, std::string name, std::string tags);

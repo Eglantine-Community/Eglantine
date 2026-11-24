@@ -315,9 +315,79 @@ std::optional<FrameDump::Target> FrameDump::MakeTarget(ImageView& view, u32 slot
     const SurfaceType type = GetFormatType(info.format);
     if (info.type == VideoCommon::ImageType::Buffer ||
         (type != SurfaceType::ColorTexture && type != SurfaceType::Depth &&
-         type != SurfaceType::DepthStencil) ||
-        DefaultBlockWidth(info.format) != 1 || DefaultBlockHeight(info.format) != 1) {
+         type != SurfaceType::DepthStencil)) {
         return std::nullopt;
+    }
+    PixelFormat format = info.format;
+    u32 block_bytes = 0;
+    const char* host_format = nullptr;
+    if (DefaultBlockWidth(info.format) != 1 || DefaultBlockHeight(info.format) != 1) {
+        // Compressed: read back what the host holds. ASTC without native support is decoded to
+        // RGBA8 or re-compressed to BC1/BC3; BCn is kept as is.
+        if (True(image->flags & VideoCommon::ImageFlagBits::TrimmedLevels)) {
+            return std::nullopt;
+        }
+        VkFormat host =
+            MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, true, info.format).format;
+        if (IsPixelFormatASTC(info.format) && !device.IsOptimalAstcSupported() &&
+            info.astc_opaque) {
+            host = IsPixelFormatSRGB(info.format) ? VK_FORMAT_BC1_RGBA_SRGB_BLOCK
+                                                  : VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+        }
+        switch (host) {
+        case VK_FORMAT_A8B8G8R8_UNORM_PACK32:
+            format = PixelFormat::A8B8G8R8_UNORM;
+            break;
+        case VK_FORMAT_A8B8G8R8_SRGB_PACK32:
+            format = PixelFormat::A8B8G8R8_SRGB;
+            break;
+        case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+        case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+            block_bytes = 8;
+            host_format = "BC1";
+            break;
+        case VK_FORMAT_BC2_UNORM_BLOCK:
+        case VK_FORMAT_BC2_SRGB_BLOCK:
+            block_bytes = 16;
+            host_format = "BC2";
+            break;
+        case VK_FORMAT_BC3_UNORM_BLOCK:
+        case VK_FORMAT_BC3_SRGB_BLOCK:
+            block_bytes = 16;
+            host_format = "BC3";
+            break;
+        case VK_FORMAT_BC4_UNORM_BLOCK:
+            block_bytes = 8;
+            host_format = "BC4";
+            break;
+        case VK_FORMAT_BC4_SNORM_BLOCK:
+            block_bytes = 8;
+            host_format = "BC4S";
+            break;
+        case VK_FORMAT_BC5_UNORM_BLOCK:
+            block_bytes = 16;
+            host_format = "BC5";
+            break;
+        case VK_FORMAT_BC5_SNORM_BLOCK:
+            block_bytes = 16;
+            host_format = "BC5S";
+            break;
+        case VK_FORMAT_BC6H_UFLOAT_BLOCK:
+            block_bytes = 16;
+            host_format = "BC6HU";
+            break;
+        case VK_FORMAT_BC6H_SFLOAT_BLOCK:
+            block_bytes = 16;
+            host_format = "BC6HS";
+            break;
+        case VK_FORMAT_BC7_UNORM_BLOCK:
+        case VK_FORMAT_BC7_SRGB_BLOCK:
+            block_bytes = 16;
+            host_format = "BC7";
+            break;
+        default:
+            return std::nullopt;
+        }
     }
     DepthEncoding depth_encoding = DepthEncoding::None;
     if (type != SurfaceType::ColorTexture) {
@@ -348,8 +418,9 @@ std::optional<FrameDump::Target> FrameDump::MakeTarget(ImageView& view, u32 slot
     return Target{
         .slot = slot,
         .image = image->Handle(),
-        .format =
-            BytesPerBlock(view.format) == BytesPerBlock(info.format) ? view.format : info.format,
+        .format = format != info.format || block_bytes != 0 ? format
+                  : BytesPerBlock(view.format) == BytesPerBlock(info.format) ? view.format
+                                                                            : info.format,
         .width = std::max(1U, width >> level),
         .height = std::max(1U, height >> level),
         .depth =
@@ -360,7 +431,17 @@ std::optional<FrameDump::Target> FrameDump::MakeTarget(ImageView& view, u32 slot
         .rescaled = rescaled,
         .msaa = info.num_samples > 1,
         .depth_encoding = depth_encoding,
+        .block_bytes = block_bytes,
+        .host_format = host_format,
     };
+}
+
+size_t FrameDump::ImageBytes(const Target& target) {
+    if (target.block_bytes != 0) {
+        return size_t{(target.width + 3) / 4} * ((target.height + 3) / 4) * target.depth *
+               target.block_bytes;
+    }
+    return size_t{target.width} * target.height * target.depth * TexelBytes(target);
 }
 
 u32 FrameDump::TexelBytes(const Target& target) {
@@ -428,8 +509,7 @@ bool FrameDump::RecordSampled(const Sampled& texture, u32 index, std::string nam
                               std::string tags) {
     tags += SamplerJson(texture.sampler);
     if (const auto target = MakeTarget(*texture.view, index)) {
-        const size_t size =
-            size_t{target->width} * target->height * target->depth * TexelBytes(*target);
+        const size_t size = ImageBytes(*target);
         if (sampled_max_bytes != 0 && size > sampled_max_bytes) {
             Enqueue({.tags = fmt::format(
                          R"({{"name":"{}",{},"format":"{}","width":{},"height":{},"depth":{},)"
@@ -695,7 +775,7 @@ bool FrameDump::Record(const Target& target, std::string name, std::string tags)
         Enqueue({.tags = fmt::format(R"({{"name":"{}",{},"skipped":"msaa"}})", name, tags)});
         return false;
     }
-    const size_t size = size_t{target.width} * target.height * target.depth * TexelBytes(target);
+    const size_t size = ImageBytes(target);
     if (recorded_bytes + size > SIZE_CAP) {
         truncated = true;
         return false;
@@ -809,9 +889,7 @@ void FrameDump::Drain() {
         readback.buffer.Invalidate();
         const Target& target = readback.target;
         const auto mapped =
-            readback.buffer.Mapped().first(readback.raw ? readback.bytes
-                                                        : size_t{target.width} * target.height *
-                                                              target.depth * TexelBytes(target));
+            readback.buffer.Mapped().first(readback.raw ? readback.bytes : ImageBytes(target));
         Enqueue({.target = target,
                  .name = std::move(readback.name),
                  .tags = std::move(readback.tags),
@@ -876,6 +954,18 @@ void FrameDump::Write(const Job& job) {
     WriteFile(job.name + ".raw.zst",
               Common::Compression::CompressDataZSTDDefault(data.data(), data.size()));
     ++images;
+    if (target.block_bytes != 0) {
+        // Blocks as the host holds them; tools/nx2/frame_dump_bc.py decodes them.
+        manifest << fmt::format(
+                        R"({{"name":"{}",{},"format":"{}","host_format":"{}","width":{},)"
+                        R"("height":{},"depth":{},"level":{},"layer":{},"gpu_addr":"{:#x}",)"
+                        R"("raw":"{}.raw.zst","png":null}})",
+                        job.name, job.tags, target.format, target.host_format, target.width,
+                        target.height, target.depth, target.level, target.layer, target.gpu_addr,
+                        job.name)
+                 << '\n';
+        return;
+    }
 
     std::array<float, 4> pixel;
     const int channels = Decode(target, data.data(), pixel);
