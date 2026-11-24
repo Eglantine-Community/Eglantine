@@ -1865,8 +1865,13 @@ private:
         // a freeze or crash; rubberbanding while moving). Title 1 runs ahead without either.
         // Ocarina of Time a frame ahead rewrote data the GPU thread still read for this frame, and
         // the frame rendered with the next one's (one-frame white or overexposed flashes).
+        // Splatoon Raiders' channels also wait on each other every frame, on per-frame counters
+        // in small acquire packets it rewrites for the next frame. With the frame limit off it
+        // got far enough ahead that a channel read a later frame's acquire value and waited
+        // forever, or misread a refilled command list and crashed; shrubs flickered.
         constexpr u64 DonkeyKongBananzaProgramId = 0x040074A01BF12000ULL;
         constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
+        constexpr u64 SplatoonRaidersProgramId = 0x0400380020056000ULL;
         // Debug knob 1 (debug_knobs) inverts EDEN_NX2_FRAMES_AHEAD=1 while the game runs.
         const bool ahead_start = frames_ahead_setting == 1;
         int frames_ahead = Settings::GetDebugKnobAt(1) != ahead_start
@@ -1874,7 +1879,8 @@ private:
                                : (ahead_start ? -1 : frames_ahead_setting);
         const u64 app_program_id = system.GetApplicationProcessProgramID();
         if (frames_ahead == -1 && (app_program_id == DonkeyKongBananzaProgramId ||
-                                   app_program_id == OcarinaOfTimeProgramId)) {
+                                   app_program_id == OcarinaOfTimeProgramId ||
+                                   app_program_id == SplatoonRaidersProgramId)) {
             frames_ahead = 0;
         }
         const auto entered = std::chrono::steady_clock::now();
