@@ -44,6 +44,14 @@ on:
 permissions:
   contents: read
 
+# HD Rumble is not linked in: it is a prebuilt library shipped beside the executable. Pin the
+# upstream release so every Windows build carries the same one, and check the hash against the
+# release's own SHA256SUMS.txt — a supported feature should not depend on whatever a tester has
+# lying around. Users can still drop a different renhdrum.dll next to eglantine.exe, or point
+# RENHDRUM_LIBRARY at one.
+env:
+  RENHDRUM_VERSION: v0.5.0
+
 jobs:
   msvc:
     name: windows-x86_64
@@ -114,6 +122,24 @@ jobs:
         shell: pwsh
         run: glslangValidator --version
 
+      - name: Bundle the RenHDrum library
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'renhdrum'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $base = "https://github.com/trzz1214/RenHDrum/releases/download/$env:RENHDRUM_VERSION"
+          $dll = Join-Path $dir 'renhdrum.dll'
+          $sums = Join-Path $dir 'SHA256SUMS.txt'
+          Invoke-WebRequest -OutFile $dll "$base/renhdrum.dll"
+          Invoke-WebRequest -OutFile $sums "$base/SHA256SUMS.txt"
+          $entry = Get-Content $sums | Where-Object { $_ -match 'renhdrum\.dll$' }
+          if (-not $entry) { throw 'SHA256SUMS.txt lists no renhdrum.dll' }
+          $expected = ($entry -split '\s+')[0].ToLower()
+          $actual = (Get-FileHash $dll -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $expected) { throw "renhdrum.dll hash mismatch: $actual != $expected" }
+          # CMake is driven from bash/msys2 below, so hand it a forward-slash path.
+          "RENHDRUM_DLL=$(($dll -replace '\\', '/'))" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
       - name: Configure
         shell: bash
         run: >-
@@ -132,6 +158,7 @@ jobs:
           -DEGLANTINE_RELEASE_PLATFORM=windows-x86_64
           -DUSE_DISCORD_PRESENCE=ON
           -DNIGHTLY_BUILD=${{ inputs.nightly && 'ON' || 'OFF' }}
+          -DRENHDRUM_DLL="$RENHDRUM_DLL"
           -DCMAKE_C_COMPILER_LAUNCHER=sccache
           -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
 
@@ -234,6 +261,24 @@ jobs:
             libusb:p unordered_dense:p jbigkit:p xz:p libdeflate:p bzip2:p
             lerc:p graphite2:p libwebp:p libtiff:p brotli:p ccache:p
 
+      - name: Bundle the RenHDrum library
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'renhdrum'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $base = "https://github.com/trzz1214/RenHDrum/releases/download/$env:RENHDRUM_VERSION"
+          $dll = Join-Path $dir 'renhdrum.dll'
+          $sums = Join-Path $dir 'SHA256SUMS.txt'
+          Invoke-WebRequest -OutFile $dll "$base/renhdrum.dll"
+          Invoke-WebRequest -OutFile $sums "$base/SHA256SUMS.txt"
+          $entry = Get-Content $sums | Where-Object { $_ -match 'renhdrum\.dll$' }
+          if (-not $entry) { throw 'SHA256SUMS.txt lists no renhdrum.dll' }
+          $expected = ($entry -split '\s+')[0].ToLower()
+          $actual = (Get-FileHash $dll -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $expected) { throw "renhdrum.dll hash mismatch: $actual != $expected" }
+          # CMake is driven from bash/msys2 below, so hand it a forward-slash path.
+          "RENHDRUM_DLL=$(($dll -replace '\\', '/'))" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
       # MinGW build: system Qt and libraries from MSYS2, clang plus the repo's PGO profile. The profile
       # path is converted to its Windows form because clang runs with the MSYS mount underneath.
       - name: Configure
@@ -261,6 +306,7 @@ jobs:
             -DUSE_DISCORD_PRESENCE=ON \
             -DUSE_CCACHE=ON \
             -DNIGHTLY_BUILD=${{ inputs.nightly && 'ON' || 'OFF' }} \
+            -DRENHDRUM_DLL="$RENHDRUM_DLL" \
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++ \
             -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld \

@@ -327,6 +327,14 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "shaders, and the GPU's own stages elsewhere.\n"
               "GPUs without VK_EXT_mesh_shader always use the compute fallback.\n"
               "Takes effect when a game starts."));
+    INSERT(Settings, graphics_pipeline_library, tr("Link pipelines from shared parts (experimental)"),
+           tr("Uses VK_EXT_graphics_pipeline_library: a new pipeline whose shaders another "
+              "pipeline already compiled as parts is linked from them in a few milliseconds. "
+              "Others compile whole, as with this off, and their parts compile in the background "
+              "for the next one.\n"
+              "Experimental: the gain is limited to pipelines new to the driver's cache, and "
+              "shader modules are kept in memory for reuse.\n"
+              "Needs fast linking support from the driver. Takes effect when a game starts."));
     INSERT(Settings, use_vulkan_driver_pipeline_cache, tr("Use Vulkan pipeline cache"),
            tr("Enables GPU vendor-specific pipeline cache.\nThis option can improve shader loading "
               "time significantly in cases where the Vulkan driver does not store pipeline cache "
@@ -341,9 +349,9 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "hundreds of milliseconds each time."));
 #if defined(__linux__)
     INSERT(Settings, driver_shader_cache_size, tr("Separate driver shader cache (Linux only)"),
-           tr("Keeps the NVIDIA driver's shader cache for this emulator in its own folder, up to "
-              "this size, so other applications can't evict it.\nTurn it off to use the "
-              "driver's shared cache instead.\nTakes effect at the next start."));
+           tr("Keeps the NVIDIA or Mesa driver's shader cache for this emulator in its own "
+              "folder, up to this size, so other applications can't evict it.\nTurn it off to "
+              "use the driver's shared cache instead.\nTakes effect at the next start."));
 #else
     INSERT(Settings, driver_shader_cache_size, QString(), QString());
 #endif
