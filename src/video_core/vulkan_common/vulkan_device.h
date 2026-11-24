@@ -285,7 +285,14 @@ public:
     static constexpr VkDeviceSize TransientImageBlockSize = 128ULL << 20;
 
     /// The pool of that kind for a memory type, created on first use (null if that failed).
-    VmaPool GetSeparatePool(SeparatePool kind, u32 memory_type) const;
+    /// Null for any allocator `user` but the device's own (externally synchronized) one: a VmaPool
+    /// is used only through the allocator that created it.
+    VmaPool GetSeparatePool(SeparatePool kind, u32 memory_type, VmaAllocator user) const;
+
+    /// Creates another VMA allocator over this device. Unlike GetAllocator(), which is externally
+    /// synchronized, it can be used from any thread (VTX-HLE's replay). The caller destroys it with
+    /// vmaDestroyAllocator() after every allocation made from it has been freed.
+    VmaAllocator CreateThreadSafeAllocator() const;
 
     /// Returns the logical device.
     const vk::Device& GetLogical() const {
@@ -361,6 +368,21 @@ public:
     }
 
     /// 2D images whose memory can be bound in parts, on the graphics queue.
+    /// Images of `type` whose memory can be bound in parts, on the graphics queue.
+    bool IsSparseResidencyImageSupported(VkImageType type) const {
+        if (!IsSparseBindingSupported()) {
+            return false;
+        }
+        switch (type) {
+        case VK_IMAGE_TYPE_2D:
+            return features.features.sparseResidencyImage2D;
+        case VK_IMAGE_TYPE_3D:
+            return features.features.sparseResidencyImage3D;
+        default:
+            return false;
+        }
+    }
+
     bool IsSparseResidencyImage2DSupported() const {
         return IsSparseBindingSupported() && features.features.sparseResidencyImage2D;
     }
@@ -655,6 +677,30 @@ FN_MAX_LIMIT_LIST
         return extensions.uniform_buffer_standard_layout;
     }
 
+    /// Returns true if the device supports VK_EXT_external_memory_host (enabled for VTX-HLE only).
+    bool IsExtExternalMemoryHostSupported() const {
+        return extensions.external_memory_host;
+    }
+
+    /// Returns true if vkCmdDrawIndirect may draw more than one command (multiDrawIndirect).
+    bool IsMultiDrawIndirectSupported() const {
+        return features.features.multiDrawIndirect;
+    }
+
+    /// Returns true if vkCmdDrawIndirectCount / vkCmdDrawIndexedIndirectCount are usable
+    /// (VK_KHR_draw_indirect_count is enabled).
+    bool IsKhrDrawIndirectCountSupported() const {
+        return extensions.draw_indirect_count;
+    }
+
+    /// Returns true if graphics pipelines can be fast-linked from VK_EXT_graphics_pipeline_library
+    /// libraries: the extension, fast linking and independent interpolation decorations are all
+    /// supported, and the graphics_pipeline_library setting (or EDEN_NX2_GPL=1), or the
+    /// nvn_pipeline_library setting on VTX-HLE, asked for it.
+    bool IsExtGraphicsPipelineLibrarySupported() const {
+        return extensions.graphics_pipeline_library;
+    }
+
     /// Returns true if the device supports VK_KHR_push_descriptor.
     bool IsKhrPushDescriptorSupported() const {
         return extensions.push_descriptor;
@@ -713,11 +759,9 @@ FN_MAX_LIMIT_LIST
         return properties.properties.limits.maxTessellationPatchSize;
     }
 
-    /// Returns true if graphics pipelines can be fast-linked from VK_EXT_graphics_pipeline_library
-    /// libraries: the extension, fast linking and independent interpolation decorations are all
-    /// supported, and the graphics_pipeline_library setting (or EDEN_NX2_GPL=1) asked for it.
-    bool IsExtGraphicsPipelineLibrarySupported() const {
-        return extensions.graphics_pipeline_library;
+    /// VK_EXT_mesh_shader limits (zero without the extension).
+    const VkPhysicalDeviceMeshShaderPropertiesEXT& MeshShaderProperties() const {
+        return properties.mesh_shader;
     }
 
     /// Returns true if the device supports task and mesh shaders (VK_EXT_mesh_shader).
@@ -1025,6 +1069,11 @@ FN_MAX_LIMIT_LIST
         return extensions.astc_decode_mode;
     }
 
+    /// VTX-HLE's bindless texture table (shader_recompiler/bindless_table.h): the device updates
+    /// sampled-image and sampler descriptors after binding while unused, indexes them with
+    /// non-uniform values, and holds the table's descriptors in one set.
+    bool IsBindlessTableSupported() const;
+
     /// Returns true if descriptor bindings is partially bound.
     bool IsDescriptorBindingPartiallyBoundSupported() const {
         return features.descriptor_indexing.descriptorBindingPartiallyBound;
@@ -1255,6 +1304,8 @@ FN_MAX_LIMIT_LIST
     void ShutdownGPULogging();
 
 private:
+    VmaAllocator CreateAllocator(bool externally_synchronized) const;
+
     /// Checks if the physical device is suitable and configures the object state
     /// with all necessary info about its properties.
     bool GetSuitability(bool requires_swapchain);
@@ -1353,9 +1404,11 @@ private:
         VkPhysicalDeviceTransformFeedbackPropertiesEXT transform_feedback{};
         VkPhysicalDeviceMaintenance5PropertiesKHR maintenance5{};
         VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT graphics_pipeline_library{};
+        VkPhysicalDeviceMeshShaderPropertiesEXT mesh_shader{};
         VkPhysicalDeviceDepthStencilResolveProperties depth_stencil_resolve{};
         VkPhysicalDeviceCustomBorderColorPropertiesEXT custom_border_color{};
         VkPhysicalDeviceCooperativeMatrixPropertiesKHR cooperative_matrix{};
+        VkPhysicalDeviceDescriptorIndexingProperties descriptor_indexing{};
 
         VkPhysicalDeviceProperties properties{};
     };
