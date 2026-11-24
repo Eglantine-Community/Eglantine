@@ -613,6 +613,21 @@ inline void Wake(std::atomic<u64>& seq, u32 reason) {
 }
 } // namespace Nx2PendingWake
 
+/// EDEN_NX2_SEM_WATCH_DEVICE=<device address>: whether `device_address` is in the 16 bytes
+/// there. Unlike EDEN_NX2_SEM_WATCH (a GPU address), it stays the same between runs.
+inline u64 Nx2SemaphoreWatchDevice() {
+    static const u64 watch = [] {
+        const char* value = std::getenv("EDEN_NX2_SEM_WATCH_DEVICE");
+        return value ? u64{std::strtoull(value, nullptr, 16)} & ~u64{0xf} : u64{};
+    }();
+    return watch;
+}
+
+inline bool Nx2SemaphoreWatched(u64 device_address) {
+    const u64 watch = Nx2SemaphoreWatchDevice();
+    return watch != 0 && (device_address & ~u64{0xf}) == watch;
+}
+
 /// Channels suspended on a semaphore acquire. A console channel polls and sees every release;
 /// Eden writes releases in bursts when fences signal and resumes waiters only between command
 /// lists, so an acquire-equal could miss its value. Writes latch the waiters they satisfy.
@@ -658,6 +673,9 @@ public:
 
     /// Records a release queued behind a fence, or one dropped before its write.
     void Note(u64 device_address, u32 value, Event event) {
+        if (Nx2SemaphoreWatched(device_address)) [[unlikely]] {
+            LogWatched(device_address, value, event);
+        }
         const u64 index = history_head.fetch_add(1, std::memory_order_relaxed) % history.size();
         auto& slot = history[index];
         slot.address.store(device_address, std::memory_order_relaxed);
@@ -671,6 +689,9 @@ public:
 
     /// The recent events on the 16 bytes around `device_address`, newest first.
     [[nodiscard]] std::string Describe(u64 device_address) const;
+
+    /// Logs an event on the EDEN_NX2_SEM_WATCH_DEVICE block.
+    static void LogWatched(u64 device_address, u32 value, Event event);
 
     /// A GPU write of `value` to the u32 at `device_address`.
     void OnWrite(u64 device_address, u32 value) {

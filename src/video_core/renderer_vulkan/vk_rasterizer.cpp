@@ -3062,7 +3062,10 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
             const char* value = std::getenv("EDEN_NX2_SEM_WATCH");
             return value ? GPUVAddr{std::strtoull(value, nullptr, 16)} : GPUVAddr{};
         }();
-        if (watch != 0 && address < watch + 16 && address + copy_size > watch) {
+        const u64 watch_device = Tegra::Nx2SemaphoreWatchDevice();
+        if ((watch != 0 && address < watch + 16 && address + copy_size > watch) ||
+            (watch_device != 0 && cpu_addr && *cpu_addr < watch_device + 16 &&
+             *cpu_addr + copy_size > watch_device)) {
             LOG_INFO(Render_Vulkan, "Semaphore watch: inline write {:#x} size {} first word {:#x}",
                      address, copy_size, first_word);
         }

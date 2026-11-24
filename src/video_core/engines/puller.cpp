@@ -60,6 +60,12 @@ std::string Nx2SemaphoreWaiters::Describe(u64 device_address) const {
     return text.empty() ? std::string{"none in the last 512 releases"} : text;
 }
 
+void Nx2SemaphoreWaiters::LogWatched(u64 device_address, u32 value, Event event) {
+    static constexpr std::array<const char*, 3> names{"queued", "written", "dropped"};
+    LOG_INFO(HW_GPU, "Semaphore watch: device {:#x} {} {:#x}", device_address,
+             names[static_cast<u32>(event)], value);
+}
+
 } // namespace Tegra
 
 namespace Tegra::Engines {
@@ -446,7 +452,11 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         const char* value = std::getenv("EDEN_NX2_SEM_WATCH");
         return value ? GPUVAddr{std::strtoull(value, nullptr, 16)} : GPUVAddr{};
     }();
-    if (watch != 0 && (regs.semaphore_address.SemaphoreAddress() & ~GPUVAddr{0xf}) == watch) {
+    if ((watch != 0 && (regs.semaphore_address.SemaphoreAddress() & ~GPUVAddr{0xf}) == watch) ||
+        (Nx2SemaphoreWatchDevice() != 0 &&
+         Nx2SemaphoreWatched(dma_pusher.memory_manager
+                                .GpuToCpuAddress(regs.semaphore_address.SemaphoreAddress())
+                                .value_or(0)))) {
         LOG_INFO(HW_GPU, "Semaphore watch: channel {} as {} device {:#x} op {} {:#x} value {:#x} (now {:#x})",
                  dma_pusher.channel_state.bind_id, dma_pusher.memory_manager.GetID(),
                  dma_pusher.memory_manager.GpuToCpuAddress(regs.semaphore_address.SemaphoreAddress()).value_or(0),
