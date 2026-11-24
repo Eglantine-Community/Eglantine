@@ -93,9 +93,7 @@ bool Context::Impl::TakePoolCpuWrites(Pool& pool) {
         if (raw_epoch != pool.split_raw_epoch_seen) {
             pool.split_raw_epoch_seen = raw_epoch;
             if (!mario_kart_world) {
-                for (Pool::MirrorPage& page : pool.mirror_pages) {
-                    page.trusted = false;
-                }
+                pool.ClearAllMirrorTrusted();
             }
             // Textures of the pool must see raw writes even in Mario Kart World; only the mirror
             // page exception is Mario Kart World specific. The store names no page: the textures
@@ -160,7 +158,7 @@ bool Context::Impl::TakePoolCpuWrites(Pool& pool) {
         for (u64 page = from / Pool::MIRROR_PAGE; page * Pool::MIRROR_PAGE < to; ++page) {
             const size_t index = static_cast<size_t>(page);
             if (index < pool.mirror_pages.size()) {
-                pool.mirror_pages[index].trusted = false;
+                pool.SetMirrorPageTrusted(index, false);
             }
             if (index < pool.page_write_gen.size()) {
                 pool.page_write_gen[index] = pool.cpu_write_gen;
@@ -592,9 +590,17 @@ bool Context::Impl::EnsureImage(Storage& s) {
         ChooseSmartStandin(s);
     }
     try {
+        const bool use_format_list =
+            s.view_format_count != 0 && device.IsKhrImageFormatListSupported();
+        const VkImageFormatListCreateInfo format_list{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
+            .pNext = nullptr,
+            .viewFormatCount = s.view_format_count,
+            .pViewFormats = s.view_formats.data(),
+        };
         const VkImageCreateInfo image_info{
             .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-            .pNext = nullptr,
+            .pNext = use_format_list ? &format_list : nullptr,
             .flags = s.create_flags,
             .imageType = s.type,
             .format = s.host.format,
@@ -1092,7 +1098,7 @@ void Context::Impl::NotifyCpuWriteNow(u64 address, u64 size, bool host_write) {
             Pool::MirrorPage& mirror_page = pool.mirror_pages[static_cast<size_t>(page)];
             mirror_page.checked = 0;
             if (untrust) {
-                mirror_page.trusted = false;
+                pool.SetMirrorPageTrusted(static_cast<size_t>(page), false);
             }
         }
     }
@@ -2035,7 +2041,9 @@ void Context::Impl::FlushTextureNow(CmdFlushTexture& command) {
     if (!pool.mirror_pages.empty()) {
         const u64 end = s.pool_offset + storage_size;
         for (u64 page = s.pool_offset / Pool::MIRROR_PAGE; page * Pool::MIRROR_PAGE < end; ++page) {
-            pool.mirror_pages[static_cast<size_t>(page)].trusted = false;
+            Pool::MirrorPage& mirror_page = pool.mirror_pages[static_cast<size_t>(page)];
+            pool.SetMirrorPageTrusted(static_cast<size_t>(page), false);
+            mirror_page.checked = 0;
         }
     }
     // The guest bytes are the texture's contents now: from here on it is a CPU-sourced storage.

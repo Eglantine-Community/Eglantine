@@ -38,6 +38,7 @@
 #include "video_core/renderer_vulkan/nvn/nvn_context.h"
 #include "video_core/renderer_vulkan/nvn/nvn_counters.h"
 #include "video_core/renderer_vulkan/nvn/nvn_sparse_layout.h"
+#include "video_core/renderer_vulkan/nvn/nvn_texture_layout.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_instance.h"
 #include "video_core/vulkan_common/vulkan_library.h"
@@ -834,8 +835,8 @@ TEST_CASE("NVN storage shadow: guest writes between submissions reach the next s
     }
     // The game rewrites some of the bytes (and fills the rest of the range) after the fence.
     const u32 guest_word = 0x12345678;
-    std::memcpy(rig.data + 0x1000 + 4 * 8, &guest_word, sizeof(guest_word));
-    std::memcpy(rig.data + 0x1000 + 4 * 2, &guest_word, sizeof(guest_word));
+    rig.memory.CpuWrite(STORAGE_VA + 4 * 8, &guest_word, sizeof(guest_word));
+    rig.memory.CpuWrite(STORAGE_VA + 4 * 2, &guest_word, sizeof(guest_word));
     std::vector<u64> second;
     Dispatch(second, PROGRAM_2, STORAGE_VA, 4096, 2);
     rig.Run(2, std::move(second));
@@ -2524,9 +2525,9 @@ TEST_CASE("NVN occlusion: SAMPLES_PASSED reports and resets keep the render pass
                 CHECK(report_breaks == 1);
                 CHECK(reset_breaks == 0);
                 CHECK(read_breaks == 1);
-                // The full batch, the report that found it full (no pass open then: written right
-                // away), the reports at the store draw, its query at the command buffer end.
-                CHECK(stats.counter_occlusion_folds == 4);
+                // The full batch, the combined remaining passes' reports resolved at the store draw,
+                // and its query at the command buffer end.
+                CHECK(stats.counter_occlusion_folds == 3);
             } else {
                 CHECK(StatRow(context, "render_pass_begins") == MANY + 4);
                 CHECK(report_breaks == MANY + 3);
@@ -3189,18 +3190,11 @@ TEST_CASE("NVN render conditions: predicates computed ahead keep the pass open a
         CHECK(WordAt(data, STORES + 0x500) == 0x1337);
         CHECK(stats.render_conditions_cpu == 0);
         const u64 condition_breaks = StatRow(context, "render_pass_break: render condition");
-        if (stats.pools_imported != 0) {
-            // One batch at the first condition computes all five predicates; the store drops the
-            // last one, which ends the pass once more.
-            CHECK(condition_breaks == 2);
-            CHECK(stats.render_conditions_gpu == 6);
-            CHECK(stats.render_conditions_prefetched == 3);
-        } else {
-            // Mirrored pools: every condition at its own point.
-            CHECK(condition_breaks == 5);
-            CHECK(stats.render_conditions_gpu == 5);
-            CHECK(stats.render_conditions_prefetched == 0);
-        }
+        // One batch at the first condition computes all five predicates; the store drops the
+        // last one, which ends the pass once more (imported and mirrored pools alike).
+        CHECK(condition_breaks == 2);
+        CHECK(stats.render_conditions_gpu == 6);
+        CHECK(stats.render_conditions_prefetched == 3);
     }
 }
 
@@ -3779,10 +3773,10 @@ TEST_CASE("NVN mirror pool: a page the GPU wrote is hashed again after its write
 
     rig.Run(STORAGE_VA, 6);
     REQUIRE(WordAt(data, 0x1000) == 100);
-    // The write-back is not a tracked write, but the page is not trusted: the guest putting the
-    // old word back (also untracked here) is still seen, and the GPU adds to it.
+    // After the write-back, a guest CPU store (via the page tracker) un-trusts the page even when
+    // writing back the pre-GPU value, so the mirror uploads the guest value and the GPU adds to it.
     const u32 zero = 0;
-    std::memcpy(data + 0x1000, &zero, sizeof(zero));
+    rig.memory.CpuWrite(STORAGE_VA, &zero, sizeof(zero));
     rig.Run(STORAGE_VA, 6);
     REQUIRE(WordAt(data, 0x1000) == 100);
     REQUIRE(WordAt(data, 0x1004) == 200);
@@ -3813,7 +3807,7 @@ TEST_CASE("NVN mirror pool: a guest write between two uses reaches the GPU",
     // The guest replaces word 2 and the GPU adds 100 to what the guest holds now; the other words
     // carry on from what the GPU wrote before.
     const u32 replaced = 5000;
-    std::memcpy(data + 0x1000 + 2 * 4, &replaced, sizeof(replaced));
+    rig.memory.CpuWrite(STORAGE_VA + 2 * 4, &replaced, sizeof(replaced));
     rig.Run(STORAGE_VA, 6);
     for (u32 i = 0; i < 6; ++i) {
         INFO("word " << i);
@@ -4898,4 +4892,174 @@ TEST_CASE("NVN inline uniform: misaligned DeviceLocal UBO preserves GPU writes p
 
     CHECK(rig.context.Stats().ops_failed == 0);
     CHECK(rig.context.Stats().ops_unsupported == 0);
+}
+
+TEST_CASE("NVN compute: lazy storage upgrade and write-only GPU-only overwrite",
+          "[nvn][compute][alias]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    constexpr Inst SustP2D{{0x00007b9b, 0x60000402, 0x00100f00, 0x000fe200}};
+    const std::array<Inst, 5> writer_program{
+        {S2R(0, SR_CTAID_X), AddImm(1, 255, 0), AddImm(2, 0, 0x88000000), SustP2D, Exit}};
+    constexpr u32 NVN_FORMAT_RGBA8 = 0x25;
+    constexpr u16 NVN_FORMAT_R32UI = 0x0B;
+    constexpr u32 IMAGE_ID = 5;
+
+    SECTION("lazy STORAGE_BIT and format-list upgrade preserves existing pixels") {
+        FakeMemory memory;
+        u8* data = memory.Add(POOL_VA, 64_KiB);
+        std::memset(data, 0xCD, 64_KiB);
+        memory.Add(TEXTURE_POOL_VA, 1_MiB);
+
+        Vulkan::Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr, {});
+        context.SetGuestMemory(&memory);
+        context.CreatePool(
+            {.serial = 1, .guest_address = POOL_VA, .size = 64_KiB, .flags = POOL_CPU_CACHED});
+        context.CreatePool({.serial = 2,
+                            .guest_address = TEXTURE_POOL_VA,
+                            .size = 1_MiB,
+                            .flags = 1u /* CPU_NO_ACCESS */});
+
+        VC::TextureDesc texture{};
+        texture.target = 1;
+        texture.format = NVN_FORMAT_RGBA8;
+        texture.flags = Vulkan::Nvn::TexFlag::Compressible;
+        texture.width = 4;
+        texture.height = 1;
+        texture.depth = 1;
+        texture.levels = 1;
+        texture.serial = 10;
+        texture.pool_serial = 2;
+        texture.pool_offset = 0;
+        context.CreateTexture(texture);
+        context.CreateProgram(MakeProgram(PROGRAM, writer_program, {.images = 1}));
+
+        {
+            std::vector<u64> list;
+            VC::ClearTexturePayload clear{};
+            clear.texture = {.serial = 10, .level = 0, .layer = 0};
+            clear.region = {0, 0, 0, 4, 1, 1};
+            clear.layer_count = 1;
+            const f32 red[4]{1.0f, 0.0f, 0.0f, 1.0f};
+            std::memcpy(clear.color, red, sizeof(red));
+            Push(list, VC::Op::ClearTexture, clear, {}, 0xF);
+            PushEnd(list);
+            context.Submit(MakeSubmission(1, std::move(list), {10, 2}));
+            REQUIRE(context.Wait(1, 60s));
+        }
+
+        VC::TextureDesc view = texture;
+        view.serial = 11;
+        view.view_of = 10;
+        view.view.set_format = 1;
+        view.view.format = NVN_FORMAT_R32UI;
+        context.CreateTexture(view);
+
+        {
+            std::vector<u64> list;
+            Push(list, VC::Op::BindProgram,
+                 VC::BindProgramPayload{.program_serial = PROGRAM, .stages = 1u << 5});
+            const u64 handle = IMAGE_ID;
+            Push(list, VC::Op::BindImages,
+                 VC::BindHandlesPayload{.stage = 5, .first = 0, .count = 1},
+                 {reinterpret_cast<const u8*>(&handle), sizeof(handle)});
+            Push(list, VC::Op::Dispatch, VC::DispatchPayload{.x = 3, .y = 1, .z = 1});
+            VC::CopyBufferTexturePayload copy{};
+            copy.buffer = POOL_VA + 0x1000;
+            copy.texture = {.serial = 10, .level = 0, .layer = 0};
+            copy.region = {0, 0, 0, 4, 1, 1};
+            Push(list, VC::Op::CopyTextureToBuffer, copy);
+            PushEnd(list);
+            VC::Submission submission =
+                MakeSubmission(2, std::move(list), {PROGRAM, 10, 11, 1, 2});
+            std::vector<u64> ids(IMAGE_ID + 1, 0);
+            ids[IMAGE_ID] = 11;
+            submission.texture_pool_snapshot =
+                VC::IdSnapshot{std::make_shared<const std::vector<u64>>(std::move(ids))};
+            context.Submit(std::move(submission));
+            REQUIRE(context.Wait(2, 60s));
+        }
+
+        const Vulkan::Nvn::ContextStats stats = context.Stats();
+        CHECK(stats.ops_failed == 0);
+        CHECK(stats.ops_unsupported == 0);
+        CHECK(stats.alias_byte_transfers == 0);
+        for (u32 x = 0; x < 3; ++x) {
+            CHECK(WordAt(data, 0x1000 + x * 4) == 0x88000000u + x);
+        }
+        CHECK(WordAt(data, 0x1000 + 3 * 4) == 0xFF0000FFu);
+    }
+
+    SECTION("write-only full-dispatch compute overwrite skips alias resolution on GPU-only pool") {
+        FakeMemory memory;
+        u8* data = memory.Add(POOL_VA, 64_KiB);
+        std::memset(data, 0xCD, 64_KiB);
+        memory.Add(TEXTURE_POOL_VA, 1_MiB);
+
+        Vulkan::Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr, {});
+        context.SetGuestMemory(&memory);
+        context.CreatePool(
+            {.serial = 1, .guest_address = POOL_VA, .size = 64_KiB, .flags = POOL_CPU_CACHED});
+        context.CreatePool({.serial = 2,
+                            .guest_address = TEXTURE_POOL_VA,
+                            .size = 1_MiB,
+                            .flags = 1u /* CPU_NO_ACCESS */});
+
+        VC::TextureDesc src{};
+        src.target = 1;
+        src.format = NVN_FORMAT_R32UI;
+        src.width = 4;
+        src.height = 1;
+        src.depth = 1;
+        src.levels = 1;
+        src.serial = 10;
+        src.pool_serial = 2;
+        src.pool_offset = 0;
+        context.CreateTexture(src);
+
+        VC::TextureDesc dst = src;
+        dst.serial = 11;
+        dst.flags = Vulkan::Nvn::TexFlag::Linear;
+        dst.stride = 16;
+        context.CreateTexture(dst);
+        context.CreateProgram(MakeProgram(PROGRAM, writer_program, {.images = 1}));
+
+        std::vector<u64> list;
+        VC::ClearTexturePayload clear{};
+        clear.texture = {.serial = 10, .level = 0, .layer = 0};
+        clear.region = {0, 0, 0, 4, 1, 1};
+        clear.layer_count = 1;
+        clear.is_integer = 1;
+        clear.color[0] = 0x11111111u;
+        Push(list, VC::Op::ClearTexture, clear, {}, 0xF);
+        Push(list, VC::Op::BindProgram,
+             VC::BindProgramPayload{.program_serial = PROGRAM, .stages = 1u << 5});
+        const u64 handle = IMAGE_ID;
+        Push(list, VC::Op::BindImages, VC::BindHandlesPayload{.stage = 5, .first = 0, .count = 1},
+             {reinterpret_cast<const u8*>(&handle), sizeof(handle)});
+        Push(list, VC::Op::Dispatch, VC::DispatchPayload{.x = 4, .y = 1, .z = 1});
+        VC::CopyBufferTexturePayload copy{};
+        copy.buffer = POOL_VA + 0x1000;
+        copy.texture = {.serial = 11, .level = 0, .layer = 0};
+        copy.region = {0, 0, 0, 4, 1, 1};
+        Push(list, VC::Op::CopyTextureToBuffer, copy);
+        PushEnd(list);
+        VC::Submission submission = MakeSubmission(1, std::move(list), {PROGRAM, 10, 11, 1, 2});
+        std::vector<u64> ids(IMAGE_ID + 1, 0);
+        ids[IMAGE_ID] = 11;
+        submission.texture_pool_snapshot =
+            VC::IdSnapshot{std::make_shared<const std::vector<u64>>(std::move(ids))};
+        context.Submit(std::move(submission));
+        REQUIRE(context.Wait(1, 60s));
+
+        const Vulkan::Nvn::ContextStats stats = context.Stats();
+        CHECK(stats.ops_failed == 0);
+        CHECK(stats.ops_unsupported == 0);
+        CHECK(stats.alias_byte_transfers == 0);
+        for (u32 x = 0; x < 4; ++x) {
+            CHECK(WordAt(data, 0x1000 + x * 4) == 0x88000000u + x);
+        }
+    }
 }

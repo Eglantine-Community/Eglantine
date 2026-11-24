@@ -88,6 +88,12 @@ struct TargetBinding {
     std::shared_ptr<Texture> native;
 };
 
+struct MirrorUploadSpan {
+    Pool* pool;
+    u64 offset;
+    u64 size;
+};
+
 /// Services the draw path needs from the recorder that owns the command buffer.
 class DrawHost {
 public:
@@ -104,6 +110,14 @@ public:
     virtual void HostBarrierBeforePass() = 0;
     /// GPU writes happened: the next op outside a pass starts with a memory barrier.
     virtual void HostMarkWritten() = 0;
+    virtual void HostMarkPassWritten(bool has_color, bool has_depth, bool shader_writes) {
+        if (has_color || has_depth || shader_writes) {
+            HostMarkWritten();
+        }
+    }
+    virtual void HostMarkTransferWritten() {
+        HostMarkWritten();
+    }
     /// EDEN_NX2_TRY_BARRIER_MERGE: which parts are on (BARRIER_MERGE_* bits, 0 = off). With
     /// BARRIER_MERGE_BUFFERS the replay's own commands whose buffer ranges it knows (the guest ->
     /// mirror and mirror -> snapshot copies, the shadow copies, the write-back merges) skip their
@@ -147,6 +161,9 @@ public:
     /// False: the image could not be created (the op must be dropped).
     virtual bool HostEnsureContents(Storage& storage, bool will_overwrite) = 0;
     virtual bool HostEnsureAttachmentContents(Storage& storage) = 0;
+    virtual bool HostUpgradeImageCaps(Storage& storage, bool need_storage,
+                                      bool need_unrestricted_formats) = 0;
+    [[nodiscard]] virtual bool HostIsCpuReadablePool(const Storage& storage) const = 0;
     /// True when HostEnsureContents(storage, false) would record commands (first upload, CPU
     /// change, overlapping writes); creates the image. Safe inside a render pass.
     virtual bool HostNeedsCommands(Storage& storage, bool will_overwrite) = 0;
@@ -164,9 +181,22 @@ public:
     /// Mirror pools: copies the guest pages of the range that changed since the mirror last saw
     /// them (nothing when none did) into the mirror, before the GPU reads them (outside a pass).
     virtual void HostUploadRange(Pool& pool, u64 offset, u64 size) = 0;
+    virtual void HostUploadRanges(std::span<const MirrorUploadSpan> ranges) {
+        for (const MirrorUploadSpan& range : ranges) {
+            HostUploadRange(*range.pool, range.offset, range.size);
+        }
+    }
     /// Mirror pools: true when HostUploadRange(pool, offset, size) would record a copy (a guest
     /// page of the range changed). Safe inside a render pass: records nothing.
     virtual bool HostMirrorNeedsUpload(Pool& pool, u64 offset, u64 size) = 0;
+    /// Mirror pools: true when this submission still has uncompleted GPU writes overlapping
+    /// [offset, offset + size) (including pending linear writebacks).
+    virtual bool HostMirrorHasPendingGpuWrites(Pool& pool, u64 offset, u64 size) {
+        static_cast<void>(pool);
+        static_cast<void>(offset);
+        static_cast<void>(size);
+        return true;
+    }
     virtual void HostNotePoolWrite(Pool& pool, u64 offset, u64 size) = 0;
     /// A pool mirror entry was written back into the pool's guest bytes (they equal the mirror
     /// there now): as HostNotePoolWrite, but the mirror's pages stay valid.
@@ -204,19 +234,26 @@ public:
     /// A masked clear is about to draw through a pass of its own: its samples are not counted (a
     /// clear does not count; a query spanning passes ends here).
     virtual void HostPauseCounting() {}
-    /// A counter report of the open pass that is not written yet lands in
-    /// [offset, offset + size) of `pool`: a draw of this pass that reads or writes the range
-    /// must start a new pass.
-    [[nodiscard]] virtual bool HostReportPending(const Pool& pool, u64 offset, u64 size) {
+    /// A counter report not written yet lands in [offset, offset + size) of `pool`. When
+    /// `ordered_only` is true, only reports already ordered by an earlier pass end or game
+    /// barrier are checked.
+    [[nodiscard]] virtual bool HostReportPending(const Pool& pool, u64 offset, u64 size,
+                                                 bool ordered_only = false) {
         static_cast<void>(pool);
         static_cast<void>(offset);
         static_cast<void>(size);
+        static_cast<void>(ordered_only);
         return false;
     }
-    /// Some counter report of the open pass is not written yet.
+    /// Some counter report is still batched in the recorder's CounterBatch.
     [[nodiscard]] virtual bool HostReportsPending() {
         return false;
     }
+    [[nodiscard]] virtual bool HostOrderedReportsPending() {
+        return false;
+    }
+    virtual void HostMarkReportsOrdered() {}
+    virtual void HostResolveCounterBatch() {}
     /// The records after the one being replayed, to the end of its command list (lookahead only;
     /// empty when unknown).
     [[nodiscard]] virtual std::span<const u64> HostRecordsAhead() {
@@ -363,6 +400,10 @@ public:
     /// Host buffer space for this submission (host visible; uniform/storage/index/vertex/transfer
     /// source). Valid until the submission completes.
     [[nodiscard]] BufferRef AllocArena(u64 size, u64 alignment, u8** pointer);
+    /// Copies a small read-only dirty mirrored pool range straight into the submission arena while
+    /// a render pass is open, avoiding a mid-pass `BreakCause::MirrorUpload` split.
+    [[nodiscard]] BufferRef TryCopyMirrorRangeToArena(Pool& pool, u64 pool_offset, u64 address,
+                                                      u64 size, u64 alignment);
 
     /// What a pool range the draw path resolves means for the storage shadows (nvn_draw_shadow.cpp):
     /// Flush: the live shadows that overlap the range are copied back first (the pass ends when
@@ -384,6 +425,12 @@ public:
     }
     [[nodiscard]] bool HasInlineUpdates() const noexcept {
         return !inline_updates.empty();
+    }
+    [[nodiscard]] bool HasPendingClears() const noexcept {
+        return pending_clears.Any();
+    }
+    void DiscardPendingClears() noexcept {
+        pending_clears.Reset();
     }
     /// UpdateUniformBuffer writes recorded but not copied yet (they land when the pass ends): true
     /// when one overlaps guest bytes [address, address + size).
@@ -631,6 +678,9 @@ private:
     /// auxiliary images before its real output.
     bool UpscaleNetwork(const VideoCore::Upscaler::Rect& input_rect,
                         const VideoCore::Upscaler::Rect& output_rect, u32 output_id);
+    /// Replaces a multi-dispatch movie tensor upscale chain (detected structurally in
+    /// `Dispatch`) with the selected HLE upscale stage.
+    bool UpscaleMovieNetwork(Texture& input, Texture& output);
     /// The backend the setting selects for a game's upscale stage (SelectBackend with the
     /// device's tensor-core support, as the compute dispatch decides it).
     [[nodiscard]] VideoCore::Upscaler::Backend SelectedUpscaleBackend(
@@ -700,6 +750,9 @@ private:
     UniformSnapshotView usnap;
 
     [[nodiscard]] VkRect2D ClearRect() const;
+    [[nodiscard]] bool TargetNativeExtent(VkExtent2D& out) const;
+    [[nodiscard]] bool ScissorCoversFullTarget(VkExtent2D native_extent) const;
+    void FlushPendingClears(BreakCause cause);
     bool MaskedColorClear(const VC::ClearColorPayload& p, VkRect2D rect, bool gated);
     bool MaskedStencilClear(const VC::ClearDepthStencilPayload& p, VkRect2D rect, bool gated);
     [[nodiscard]] RenderPassKey MakePassKey() const;
@@ -781,7 +834,7 @@ private:
     /// Creates the table on first use; false when the device cannot hold it.
     bool BindlessReady();
     /// Brings the table up to the submission's pool registrations (once per submission).
-    void BindlessSync(bool force = false);
+    void BindlessSync(bool force = false, DrawPlan* plan = nullptr);
     /// Adds to `plan` the registered textures that have no image yet, up to the submission's
     /// budget (creating one needs a pass break, and its memory counts).
     void BindlessPrime(DrawPlan& plan);
@@ -869,8 +922,27 @@ private:
     f32 line_width{1.0f};
     std::array<std::array<u8, PUSH_CONSTANT_BLOCK_SIZE>, 2> push_constants{};
     std::vector<InlineUpdate> inline_updates;
-    /// Group counts of the compute dispatch being bound (c0+4..0xc of its driver bank).
+    struct PendingClears {
+        u8 color_mask{};
+        bool clear_depth{};
+        bool clear_stencil{};
+        std::array<VkClearColorValue, MAX_COLOR_TARGETS> color{};
+        f32 depth{};
+        u32 stencil{};
+        [[nodiscard]] bool Any() const noexcept {
+            return color_mask != 0 || clear_depth || clear_stencil;
+        }
+        void Reset() noexcept {
+            color_mask = 0;
+            clear_depth = false;
+            clear_stencil = false;
+        }
+    } pending_clears;
+    /// Group counts and workgroup size of the compute dispatch being bound (c0+4..0xc of its driver bank).
     std::array<u32, 3> compute_groups{};
+    std::array<u32, 3> compute_thread_group{};
+    std::shared_ptr<Texture> movie_network_input;
+    u32 movie_network_skip{};
 
     // ---- per command buffer / pass state ----
     // The flight owns this framebuffer and its attachments until execution completes.
@@ -885,6 +957,8 @@ private:
     mutable RenderPassKey cached_pass_key{};
     bool pass_open{false};
     bool pass_read_only_depth{};
+    bool pass_has_color{false};
+    bool pass_has_depth{false};
     void NoteFlipTarget(const std::shared_ptr<Storage>& storage, VkImageLayout sampled_layout);
     /// Storages that flip between attachment and sampled use, with the layout they are sampled in:
     /// a pass that begins moves them to it before its first draw, so a draw that samples one
@@ -898,9 +972,6 @@ private:
     /// memory): a game barrier that orders draws must end the pass.
     bool pass_shader_writes{false};
     bool pass_buffer_writes{false};
-    /// A game barrier that orders draws (NVN barrier bits 0xF) came after a counter report of the
-    /// open pass: later draws that read the report's bytes must see it (PrepareOutsidePass).
-    bool pass_reports_ordered{false};
     bool targets_dirty{true};
     bool pipeline_dirty{true};
     bool vertex_dirty{true};
@@ -1134,6 +1205,7 @@ private:
     std::vector<VkDescriptorImageInfo> scratch_images;
     std::vector<VkBufferView> scratch_views;
     std::vector<DescriptorTemplateEntry> scratch_template_entries;
+    std::vector<MirrorUploadSpan> mirror_upload_scratch;
     bool scratch_template_ok{false};
     /// Texture buffers bound in the current submission: a view over an arena copy of the guest
     /// bytes each, made once per submission (TexelBufferView).

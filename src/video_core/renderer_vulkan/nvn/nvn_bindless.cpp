@@ -221,7 +221,7 @@ bool DrawContext::BindlessReady() {
     }
 }
 
-void DrawContext::BindlessSync(bool force) {
+void DrawContext::BindlessSync(bool force, DrawPlan* plan) {
     BindlessState& state = bindless;
     const u64 seq = host->HostFlight().seq;
     const std::vector<u64>& texture_ids = submission->texture_pool_snapshot.Values();
@@ -337,6 +337,18 @@ void DrawContext::BindlessSync(bool force) {
                         ViewKey key{};
                         if (!ViewKeyOf(*texture, s, *type, false, key)) {
                             continue;
+                        }
+                        if (s.pending_unrestricted_formats || !s.FormatListAllows(key.format)) {
+                            if (!pass_open) {
+                                host->HostUpgradeImageCaps(s, false, true);
+                                entry.image_gen = s.image_gen;
+                            } else if (plan != nullptr) {
+                                plan->UseImage(texture->storage, entry.layout, true, false, false,
+                                               false, key.format);
+                                state.dirty = true;
+                                entry.texture = nullptr;
+                                continue;
+                            }
                         }
                         const VkImageView view = resources.GetView(*texture, key);
                         if (!view) {
@@ -546,7 +558,7 @@ bool DrawContext::BindlessPrepare(DrawPlan& plan) {
     if (!BindlessReady()) {
         return false;
     }
-    BindlessSync();
+    BindlessSync(false, &plan);
     BindlessPrime(plan);
     // A shader may read any entry: the images of the table must be in the layout the descriptors
     // name. Those a render pass or a copy left in another layout are moved like any sampled image
