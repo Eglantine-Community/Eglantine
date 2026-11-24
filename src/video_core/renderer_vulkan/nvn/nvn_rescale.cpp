@@ -180,6 +180,8 @@ bool Context::Impl::DownscaleNow(Storage& s) {
     }
     twin.current_layout = VK_IMAGE_LAYOUT_GENERAL;
     s.current_layout = VK_IMAGE_LAYOUT_GENERAL;
+    NoteBindlessLayoutDirty(twin);
+    NoteBindlessLayoutDirty(s);
     s.scale_state = Rescale::AfterBlit();
     return true;
 }

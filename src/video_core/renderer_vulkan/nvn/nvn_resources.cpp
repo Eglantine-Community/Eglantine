@@ -705,7 +705,7 @@ bool Context::Impl::UploadPoolRanges(std::span<const PoolUpload> ranges, bool in
                 const VkPipelineStageFlags user_stages =
                     vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER |
                     (device.IsExtConditionalRendering()
-                         ? VK_PIPELINE_STAGE_CONDITIONAL_RENDERING_BIT_EXT
+                         ? VkPipelineStageFlags{VK_PIPELINE_STAGE_CONDITIONAL_RENDERING_BIT_EXT}
                          : VkPipelineStageFlags{0});
                 // A pool the replay already uses: earlier submissions may still read or write the
                 // range, later ones read the new bytes.
@@ -869,6 +869,7 @@ std::shared_ptr<Texture> Context::Impl::BuildTexture(const VC::TextureDesc& d) {
                         texture->storage->view_format_count = 0;
                     } else {
                         texture->storage->pending_unrestricted_formats = true;
+                        NoteBindlessStorageChanged(*texture->storage);
                     }
                 }
                 // An ASTC view of a BC stand-in reads it as that BC format (its own sRGB-ness).

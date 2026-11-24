@@ -153,6 +153,7 @@ struct Pool {
     /// Write-backs that reached guest memory, {offset, end}: added at completion, taken by
     /// Impl::TakePoolCpuWrites (texture trust). Guarded by dirty_mutex.
     std::vector<std::pair<u64, u64>> landed_writebacks;
+    std::atomic<bool> has_landed_writebacks{false};
     /// Mirror pools: what the mirror holds, per MIRROR_PAGE bytes of the pool. Replay thread
     /// only once `pending` is false (sized before that).
     struct MirrorPage {
@@ -358,6 +359,9 @@ struct Storage : std::enable_shared_from_this<Storage> {
     VkImageLayout current_layout{VK_IMAGE_LAYOUT_UNDEFINED};
     /// The image holds meaningful data: uploaded from the guest pool, or written by the GPU.
     bool contents_valid{false};
+    u32 bindless_tracked_count{0}; ///< BindlessState entries referencing this storage
+    u32 bindless_active_count{0};  ///< BindlessState entries with active image views of this storage
+    bool bindless_layout_queued{false};
 
     // Creation parameters (the image is created on first use).
     VkImageCreateFlags create_flags{};
@@ -1058,7 +1062,8 @@ struct Context::Impl {
     // The completion thread returns ordinary upload and download buffers after their final timeline signal.
     static constexpr u64 STAGING_CHUNK = u64{8} << 20;
     std::mutex staging_cache_mutex;
-    std::array<vk::Buffer, 2> staging_cache;
+    std::array<vk::Buffer, 12> staging_cache;
+    std::array<vk::Buffer, 2> large_staging_cache;
     [[nodiscard]] vk::Buffer AcquireStaging(u64 size);
     std::mutex download_cache_mutex;
     std::array<vk::Buffer, 6> download_cache;
@@ -1556,9 +1561,37 @@ struct Context::Impl {
     /// Replay thread: the scratch BC stand-in uploads reuse (grown up to BC_SCRATCH_BUDGET).
     /// AcquireBcScratch returns it, a bigger one, or a one-off for a single layer above the
     /// budget; null when no image could be created (logged once).
+    static constexpr size_t BC_SMALL_SCRATCH_COUNT = 4;
+    static constexpr u64 BC_SMALL_SCRATCH_MAX_BYTES = u64{4} << 20;
     std::shared_ptr<BcScratch> bc_scratch;
+    std::array<std::shared_ptr<BcScratch>, BC_SMALL_SCRATCH_COUNT> bc_scratch_ring;
     bool bc_scratch_failed_logged{false};
+    [[nodiscard]] std::shared_ptr<BcScratch> AcquireBcScratchFrom(std::shared_ptr<BcScratch>& slot,
+                                                                   u64 budget, u32 width,
+                                                                   u32 height, u32 layers);
     [[nodiscard]] std::shared_ptr<BcScratch> AcquireBcScratch(u32 width, u32 height, u32 layers);
+    [[nodiscard]] std::shared_ptr<BcScratch> AcquireBcScratchSlot(size_t slot, u32 width,
+                                                                   u32 height, u32 layers);
+    /// Bumped whenever a storage tracked by a bindless table changes image/validity/format/caps.
+    u64 bindless_storage_change_epoch{1};
+    std::array<const Storage*, 4096> bindless_storage_changed{};
+    void NoteBindlessStorageChanged(const Storage& s) noexcept {
+        if (s.bindless_tracked_count == 0) {
+            return;
+        }
+        bindless_storage_changed[(bindless_storage_change_epoch - 1) %
+                                 bindless_storage_changed.size()] = &s;
+        ++bindless_storage_change_epoch;
+    }
+    std::vector<std::shared_ptr<Storage>> bindless_layout_dirty;
+    void NoteBindlessLayoutDirty(Storage& s) {
+        if (s.bindless_active_count != 0 && !s.bindless_layout_queued && s.image &&
+            s.current_layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL &&
+            s.current_layout != VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL) {
+            s.bindless_layout_queued = true;
+            bindless_layout_dirty.push_back(s.shared_from_this());
+        }
+    }
     /// EDEN_NX2_NVN_BC7_QUALITY (nvn_bc_encode.h) for BC7 stand-ins.
     u32 bc7_quality{BC7_QUALITY_DEFAULT};
     /// The smart BC stand-in selection (EDEN_NX2_NVN_SMART_BC*, nvn_format.h SmartBc).

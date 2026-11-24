@@ -156,7 +156,7 @@ public:
         Global, ///< the minimum over the whole run (the earlier behaviour, A/B only)
     };
 
-    explicit GpuClockMap(Policy policy = Policy::Window) : policy{policy} {}
+    explicit GpuClockMap(Policy map_policy = Policy::Window) : policy{map_policy} {}
 
     /// `gpu_ns`: report time on the GPU clock; `now_ns`: guest clock when the report is read.
     /// Returns the report time on the guest clock; never later than `now_ns`.

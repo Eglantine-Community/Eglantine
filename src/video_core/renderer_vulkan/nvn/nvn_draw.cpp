@@ -118,6 +118,17 @@ DrawContext::DrawContext(Context::Impl& impl_, u32 queue_)
 
 DrawContext::~DrawContext() {
     impl.uniform_snapshots.Deactivate(usnap);
+    for (const BindlessState::Entry& entry : bindless.entries) {
+        if (const std::shared_ptr<Storage> s = entry.storage_ref.lock()) {
+            --s->bindless_tracked_count;
+            if (entry.any) {
+                --s->bindless_active_count;
+            }
+        }
+    }
+    bindless.entries.clear();
+    bindless.storage_slots.clear();
+    bindless.serial_slots.clear();
 }
 
 void DrawContext::BeginSubmission(DrawHost& host_, const VC::Submission& submission_) {
@@ -1239,10 +1250,12 @@ bool DrawContext::BeginPass(bool read_only_depth) {
             continue;
         }
         const size_t index = i++;
-        const bool attached =
+        const bool needs_flip =
             flip->current_layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL ||
-            flip->current_layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-        if (!flip->image || !attached) {
+            flip->current_layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL ||
+            flip->current_layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL ||
+            flip->current_layout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        if (!flip->image || !needs_flip) {
             continue;
         }
         // Rendered to since it was last sampled: still in use.
@@ -1269,7 +1282,7 @@ bool DrawContext::BeginPass(bool read_only_depth) {
     // The views need the images, which exist now.
     for (u32 i = 0; i < attachment_count; ++i) {
         Attachment& attachment = attachments[i];
-        attachment.view = resources.GetView(*attachment.texture, attachment.shape.key);
+        attachment.view = resources.GetView(*attachment.texture, attachment.shape.key, true);
         if (!attachment.view) {
             host->HostFailed("SetRenderTargets",
                              fmt::format("no image view for {:#x}", attachment.texture->serial));
@@ -1298,25 +1311,57 @@ bool DrawContext::BeginPass(bool read_only_depth) {
         views[i] = attachments[i].view;
     }
     try {
+        const u64 fb_epoch = resources.framebuffer_views_epoch;
+        if (framebuffer_cache_epoch != fb_epoch) {
+            framebuffer_cache.clear();
+            framebuffer_cache_epoch = fb_epoch;
+            last_framebuffer.handle = VK_NULL_HANDLE;
+        }
+        const u64 seq = host->HostFlight().seq;
         VkFramebuffer framebuffer = last_framebuffer.handle;
-        if (!framebuffer || last_framebuffer.pass != base_render_pass ||
+        if (!framebuffer || last_framebuffer.epoch != fb_epoch ||
+            last_framebuffer.retained_seq != seq || last_framebuffer.pass != base_render_pass ||
             last_framebuffer.extent.width != extent.width ||
             last_framebuffer.extent.height != extent.height || last_framebuffer.layers != layers ||
-            last_framebuffer.views != views) {
-            auto created = std::make_shared<vk::Framebuffer>(device.GetLogical().CreateFramebuffer({
-                .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-                .pNext = nullptr,
-                .flags = 0,
-                .renderPass = base_render_pass,
-                .attachmentCount = attachment_count,
-                .pAttachments = views.data(),
-                .width = extent.width,
-                .height = extent.height,
-                .layers = layers,
-            }));
-            framebuffer = **created;
-            host->HostFlight().keepalive.push_back(std::move(created));
-            last_framebuffer = {base_render_pass, framebuffer, extent, layers, views};
+            last_framebuffer.count != attachment_count || last_framebuffer.views != views) {
+            const FramebufferKey fb_key{base_render_pass, extent, layers, attachment_count, views};
+            auto it = framebuffer_cache.find(fb_key);
+            if (it != framebuffer_cache.end()) {
+                CachedFramebuffer& cached = it->second;
+                cached.last_used_seq = seq;
+                if (cached.last_retained_seq != seq) {
+                    host->HostFlight().keepalive.push_back(cached.fb);
+                    cached.last_retained_seq = seq;
+                }
+                framebuffer = **cached.fb;
+            } else {
+                if (framebuffer_cache.size() >= FRAMEBUFFER_CACHE_MAX) {
+                    auto victim = framebuffer_cache.begin();
+                    for (auto iter = std::next(victim); iter != framebuffer_cache.end(); ++iter) {
+                        if (iter->second.last_used_seq < victim->second.last_used_seq) {
+                            victim = iter;
+                        }
+                    }
+                    framebuffer_cache.erase(victim);
+                }
+                auto created =
+                    std::make_shared<vk::Framebuffer>(device.GetLogical().CreateFramebuffer({
+                        .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+                        .pNext = nullptr,
+                        .flags = 0,
+                        .renderPass = base_render_pass,
+                        .attachmentCount = attachment_count,
+                        .pAttachments = views.data(),
+                        .width = extent.width,
+                        .height = extent.height,
+                        .layers = layers,
+                    }));
+                framebuffer = **created;
+                host->HostFlight().keepalive.push_back(created);
+                framebuffer_cache.emplace(fb_key, CachedFramebuffer{std::move(created), seq, seq});
+            }
+            last_framebuffer = {base_render_pass, framebuffer, extent,           layers,
+                                views,            attachment_count, fb_epoch, seq};
         }
         const VkRenderPassBeginInfo begin{
             .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,

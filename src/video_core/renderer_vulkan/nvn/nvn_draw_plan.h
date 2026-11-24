@@ -34,6 +34,8 @@ struct DrawPlan {
         bool needs_upgrade_storage{false};
         bool needs_upgrade_formats{false};
         VkFormat view_format{VK_FORMAT_UNDEFINED};
+        bool layout_only{false};
+        bool from_bindless_prime{false};
     };
     /// A buffer range the draw (or dispatch) uses. Descriptor bindings carry the index of their
     /// VkDescriptorBufferInfo (`DrawContext::scratch_buffers`), which a storage shadow patches.
@@ -144,7 +146,8 @@ struct DrawPlan {
     }
     void UseImage(const std::shared_ptr<Storage>& storage, VkImageLayout layout,
                   bool sample_only = false, bool write = false, bool write_only_image = false,
-                  bool is_storage_img = false, VkFormat view_fmt = VK_FORMAT_UNDEFINED) {
+                  bool is_storage_img = false, VkFormat view_fmt = VK_FORMAT_UNDEFINED,
+                  bool layout_only = false, bool from_bindless_prime = false) {
         image_writes |= write;
         for (ImageUse& use : images) {
             if (use.owner == storage) {
@@ -155,6 +158,8 @@ struct DrawPlan {
                 use.write |= write;
                 use.write_only = use.write_only && write_only_image;
                 use.is_storage_image |= is_storage_img;
+                use.layout_only &= layout_only;
+                use.from_bindless_prime &= from_bindless_prime;
                 if (view_fmt != VK_FORMAT_UNDEFINED) {
                     if (use.view_format == VK_FORMAT_UNDEFINED) {
                         use.view_format = view_fmt;
@@ -174,6 +179,8 @@ struct DrawPlan {
             .write_only = write_only_image,
             .is_storage_image = is_storage_img,
             .view_format = view_fmt,
+            .layout_only = layout_only,
+            .from_bindless_prime = from_bindless_prime,
         });
     }
     /// The layout the plan puts `storage` in (`fallback` when the plan does not use it).
