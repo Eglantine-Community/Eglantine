@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <optional>
 #include <span>
+#include <utility>
 
 #include "common/logging.h"
 #include "video_core/renderer_vulkan/nvn/nvn_bindless.h"
@@ -35,6 +36,25 @@ constexpr u32 TEXTURE_BINDINGS = Shader::BINDLESS_BINDING_COUNT - 1;
     return depth && (s.usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0
                ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
                : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+}
+
+[[nodiscard]] bool NeedsBindlessPrime(const Storage& s) noexcept {
+    constexpr VkImageUsageFlags attachment = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                             VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    return !s.image && !s.image_failed && (s.usage & attachment) == 0 &&
+           s.samples == VK_SAMPLE_COUNT_1_BIT && s.scale_owner == nullptr;
+}
+
+template <typename Key, typename SlotListT>
+void EraseSlotId(std::unordered_map<Key, SlotListT>& map, const Key& key, u32 id) {
+    const auto it = map.find(key);
+    if (it == map.end()) {
+        return;
+    }
+    it->second.Remove(id);
+    if (it->second.Empty()) {
+        map.erase(it);
+    }
 }
 
 /// The shader image types a texture registered with `target` is sampled as (what a shader declares
@@ -221,20 +241,71 @@ bool DrawContext::BindlessReady() {
     }
 }
 
-void DrawContext::BindlessSync(bool force) {
+void DrawContext::BindlessDetachEntry(BindlessState& state, u32 id) {
+    BindlessState::Entry& entry = state.entries[id];
+    if (entry.serial != 0 && entry.texture != nullptr) {
+        EraseSlotId(state.serial_slots, entry.serial, id);
+    }
+    if (entry.storage != nullptr) {
+        EraseSlotId(state.storage_slots, entry.storage, id);
+    }
+    if (const std::shared_ptr<Storage> s = entry.storage_ref.lock()) {
+        --s->bindless_tracked_count;
+        if (entry.any) {
+            --s->bindless_active_count;
+        }
+    }
+    entry = {};
+    state.synced_serials[id] = 0;
+}
+
+void DrawContext::BindlessAttachEntry(BindlessState& state, u32 id, u64 serial,
+                                      const std::shared_ptr<Texture>* texture_node,
+                                      const std::shared_ptr<Storage>& storage_sp, u32 image_gen,
+                                      VkFormat format, VkImageLayout layout, bool ready, bool any) {
+    BindlessState::Entry& entry = state.entries[id];
+    entry.serial = serial;
+    entry.texture = texture_node;
+    entry.image_gen = image_gen;
+    entry.format = format;
+    entry.layout = layout;
+    entry.ready = ready;
+    entry.any = any;
+    state.synced_serials[id] = serial;
+    if (serial != 0 && texture_node != nullptr) {
+        state.serial_slots[serial].Add(id);
+    }
+    if (storage_sp) {
+        entry.storage = storage_sp.get();
+        entry.storage_ref = storage_sp;
+        state.storage_slots[storage_sp.get()].Add(id);
+        ++storage_sp->bindless_tracked_count;
+        if (any) {
+            ++storage_sp->bindless_active_count;
+        }
+    }
+}
+
+void DrawContext::BindlessSync(bool force, DrawPlan* plan) {
     BindlessState& state = bindless;
     const u64 seq = host->HostFlight().seq;
     const std::vector<u64>& texture_ids = submission->texture_pool_snapshot.Values();
     const std::vector<u64>& sampler_ids = submission->sampler_pool_snapshot.Values();
+    const bool textures_same = !state.entries.empty() && state.synced_textures == texture_ids.data() &&
+                               state.synced_texture_size == texture_ids.size();
+    const bool samplers_same = !state.entries.empty() && state.synced_samplers == sampler_ids.data() &&
+                               state.synced_sampler_size == sampler_ids.size() &&
+                               state.synced_samplers_epoch == resources.samplers_epoch;
+    const u64 cur_tex_epoch = impl.texture_epoch;
+    const u64 cur_storage_epoch = impl.bindless_storage_change_epoch;
     // The registrations only change between submissions; what the table holds follows them (and
-    // the images the replay created meanwhile) once per submission.
-    if (!force && state.synced_seq == seq && state.synced_textures == texture_ids.data() &&
-        state.synced_samplers == sampler_ids.data()) {
+    // the images/storages the replay updated meanwhile) without walking unchanged entries.
+    if (!force && state.synced_seq == seq && textures_same && samplers_same &&
+        state.entries_epoch == cur_tex_epoch && state.storage_change_epoch == cur_storage_epoch &&
+        state.retry_slots.empty()) {
         return;
     }
     state.synced_seq = seq;
-    state.synced_textures = texture_ids.data();
-    state.synced_samplers = sampler_ids.data();
 
     const u32 count = static_cast<u32>(
         std::min<size_t>(std::max(texture_ids.size(), size_t{state.synced_count}),
@@ -245,91 +316,118 @@ void DrawContext::BindlessSync(bool force) {
         u32 first_info;
         u32 count;
     };
-    std::vector<Run> runs;
-    std::vector<VkDescriptorImageInfo> infos;
-    std::vector<std::shared_ptr<Storage>> storages;
-    storages.reserve(state.storages.size());
+    thread_local std::vector<Run> runs;
+    thread_local std::vector<VkDescriptorImageInfo> infos;
+    runs.clear();
+    infos.clear();
     std::array<VkImageView, TEXTURE_BINDINGS + 1> want{};
     std::array<VkImageLayout, TEXTURE_BINDINGS + 1> want_layout{};
-    // The textures erased since the last sync: their node pointers are dead. With more erased
-    // than the ring holds, every entry is looked up again.
-    bool lookup_all = state.entries.empty();
-    if (lookup_all) {
+    bool full_scan = state.entries.empty();
+    if (full_scan) {
         state.entries.resize(Shader::BINDLESS_TEXTURE_CAPACITY);
+        state.synced_serials.assign(Shader::BINDLESS_TEXTURE_CAPACITY, 0);
+        state.unprimed_queued.assign(Shader::BINDLESS_TEXTURE_CAPACITY, 0);
+        state.unprimed_slots.clear();
+        state.unprimed_head = 0;
+        state.entries_epoch = cur_tex_epoch;
+        state.storage_change_epoch = cur_storage_epoch;
+    } else if ((cur_tex_epoch - state.entries_epoch) > impl.texture_erased.size() ||
+               (cur_storage_epoch - state.storage_change_epoch) >
+                   impl.bindless_storage_changed.size()) {
+        full_scan = true;
     }
-    thread_local std::vector<u64> erased;
-    erased.clear();
-    if (!lookup_all) {
-        const u64 erases = impl.texture_epoch - state.entries_epoch;
-        if (erases > impl.texture_erased.size()) {
-            lookup_all = true;
-        } else {
-            for (u64 n = state.entries_epoch - 1; n != impl.texture_epoch - 1; ++n) {
-                erased.push_back(impl.texture_erased[n % impl.texture_erased.size()]);
+
+    thread_local std::vector<u32> dirty_ids;
+    dirty_ids.clear();
+    if (full_scan) {
+        dirty_ids.reserve(count);
+        for (u32 id = 0; id < count; ++id) {
+            dirty_ids.push_back(id);
+        }
+    } else {
+        if (!state.retry_slots.empty()) {
+            dirty_ids.insert(dirty_ids.end(), state.retry_slots.begin(), state.retry_slots.end());
+            state.retry_slots.clear();
+        }
+        for (u64 n = state.entries_epoch - 1; n != cur_tex_epoch - 1; ++n) {
+            const u64 erased_serial = impl.texture_erased[n % impl.texture_erased.size()];
+            if (const auto it = state.serial_slots.find(erased_serial);
+                it != state.serial_slots.end()) {
+                it->second.AppendTo(dirty_ids);
             }
-            std::ranges::sort(erased);
+        }
+        for (u64 n = state.storage_change_epoch - 1; n != cur_storage_epoch - 1; ++n) {
+            const Storage* changed_storage =
+                impl.bindless_storage_changed[n % impl.bindless_storage_changed.size()];
+            if (const auto it = state.storage_slots.find(changed_storage);
+                it != state.storage_slots.end()) {
+                it->second.AppendTo(dirty_ids);
+            }
+        }
+        if (!textures_same) {
+            for (u32 id = 0; id < count; ++id) {
+                const u64 serial = id != 0 && id < texture_ids.size() ? texture_ids[id] : 0;
+                if (serial != state.synced_serials[id]) {
+                    dirty_ids.push_back(id);
+                }
+            }
+        }
+        if (dirty_ids.size() > 1) {
+            std::ranges::sort(dirty_ids);
+            dirty_ids.erase(std::unique(dirty_ids.begin(), dirty_ids.end()), dirty_ids.end());
         }
     }
-    state.entries_epoch = impl.texture_epoch;
-    const u64 erased_min = erased.empty() ? ~u64{0} : erased.front();
-    const u64 erased_max = erased.empty() ? 0 : erased.back();
+    state.entries_epoch = cur_tex_epoch;
+    state.storage_change_epoch = cur_storage_epoch;
+    state.synced_texture_snapshot = submission->texture_pool_snapshot;
+    state.synced_textures = texture_ids.data();
+    state.synced_texture_size = texture_ids.size();
+
     const auto has_data = [](const Storage& s) {
         // Only what has an image holding the game's data: the table never creates one (a texture
         // the game registers and never uses would cost its memory).
         return s.image && !s.image_failed && s.contents_valid && s.samples == VK_SAMPLE_COUNT_1_BIT;
     };
-    for (u32 id = 0; id < count; ++id) {
+    for (const u32 id : dirty_ids) {
+        if (id >= Shader::BINDLESS_TEXTURE_CAPACITY) {
+            continue;
+        }
         // Pool slot 0 is "no texture" (the rebased handle keeps id 0 at 0).
         const u64 serial = id != 0 && id < texture_ids.size() ? texture_ids[id] : 0;
-        BindlessState::Entry& entry = state.entries[id];
-        if (!lookup_all && serial == entry.serial) {
-            if (serial == 0) {
-                continue; // (written as the stand-ins when the registration went)
-            }
-            const bool alive =
-                entry.texture != nullptr &&
-                (serial < erased_min || serial > erased_max ||
-                 !std::ranges::binary_search(erased, serial));
-            if (alive) {
-                const Texture& texture = **entry.texture;
-                const Storage* const s = texture.storage.get();
-                if (s == entry.storage &&
-                    (s == nullptr || (s->image_gen == entry.image_gen &&
-                                      s->host.format == entry.format &&
-                                      has_data(*s) == entry.ready &&
-                                      (!entry.ready || ReadLayoutOf(*s) == entry.layout)))) {
-                    if (entry.any) {
-                        storages.push_back(texture.storage);
-                    }
-                    continue;
-                }
-            }
+        if (full_scan && serial == 0 && state.entries[id].serial == 0) {
+            continue;
         }
+        BindlessDetachEntry(state, id);
         for (u32 binding = 1; binding <= TEXTURE_BINDINGS; ++binding) {
             want[binding] = state.dummy[binding];
             want_layout[binding] = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         }
-        entry = {};
-        entry.serial = serial;
+        const std::shared_ptr<Texture>* texture_node = nullptr;
+        std::shared_ptr<Storage> storage_sp;
+        bool retry = false;
+        u32 image_gen = 0;
+        VkFormat format = VK_FORMAT_UNDEFINED;
+        VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        bool ready = false;
+        bool any = false;
         if (serial != 0) {
             const std::shared_ptr<Texture>& texture = TextureOfId(id);
             if (texture) {
                 // (TextureOfId returns the node of Impl::textures)
-                entry.texture = &texture;
-                entry.storage = texture->storage.get();
+                texture_node = &texture;
+                storage_sp = texture->storage;
             }
             if (texture && texture->storage) {
                 Storage& s = *texture->storage;
-                entry.image_gen = s.image_gen;
-                entry.format = s.host.format;
-                entry.ready = has_data(s);
-                if (entry.ready) {
-                    entry.layout = ReadLayoutOf(s);
+                image_gen = s.image_gen;
+                format = s.host.format;
+                ready = has_data(s);
+                if (ready) {
+                    layout = ReadLayoutOf(s);
                     const s32 target = texture->desc.view.set_target ? texture->desc.view.target
                                                                      : texture->desc.target;
                     const bool is_integer =
                         VideoCore::Surface::IsPixelFormatInteger(texture->host.pixel_format);
-                    bool any = false;
                     for (const std::optional<Shader::TextureType>& type : TypesOfTarget(target)) {
                         if (!type) {
                             continue;
@@ -338,13 +436,26 @@ void DrawContext::BindlessSync(bool force) {
                         if (!ViewKeyOf(*texture, s, *type, false, key)) {
                             continue;
                         }
+                        if (s.pending_unrestricted_formats || !s.FormatListAllows(key.format)) {
+                            if (!pass_open) {
+                                host->HostUpgradeImageCaps(s, false, true);
+                                image_gen = s.image_gen;
+                                if (const auto it = state.storage_slots.find(&s);
+                                    it != state.storage_slots.end() && !it->second.Empty()) {
+                                    state.dirty = true;
+                                }
+                            } else if (plan != nullptr) {
+                                plan->UseImage(texture->storage, layout, true, false, false, false,
+                                               key.format);
+                                state.dirty = true;
+                                retry = true;
+                                continue;
+                            }
+                        }
                         const VkImageView view = resources.GetView(*texture, key);
                         if (!view) {
-                            // (not remembered: the next sync asks for the view again)
-                            entry.texture = nullptr;
                             continue;
                         }
-                        const VkImageLayout layout = entry.layout;
                         for (const u32 klass : {0u, 1u, 2u}) {
                             // Float and depth-compare samplers share the views; an integer
                             // sampler takes only an integer format.
@@ -357,12 +468,20 @@ void DrawContext::BindlessSync(bool force) {
                         }
                         any = true;
                     }
-                    if (any) {
-                        entry.any = true;
-                        storages.push_back(texture->storage);
-                    }
                 }
             }
+        }
+        BindlessAttachEntry(state, id, serial, texture_node, storage_sp, image_gen, format, layout,
+                            ready, any);
+        if (storage_sp && NeedsBindlessPrime(*storage_sp) && !state.unprimed_queued[id]) {
+            state.unprimed_queued[id] = 1;
+            state.unprimed_slots.push_back(id);
+        }
+        if (retry) {
+            state.retry_slots.push_back(id);
+        }
+        if (any && storage_sp && storage_sp->current_layout != ReadLayoutOf(*storage_sp)) {
+            impl.NoteBindlessLayoutDirty(*storage_sp);
         }
         for (u32 binding = 1; binding <= TEXTURE_BINDINGS; ++binding) {
             if (state.written[binding][id] == want[binding]) {
@@ -373,40 +492,45 @@ void DrawContext::BindlessSync(bool force) {
             runs.push_back({binding, id, static_cast<u32>(infos.size() - 1), 1});
         }
     }
-    // Merge consecutive entries of one binding into one write each.
-    std::stable_sort(runs.begin(), runs.end(), [](const Run& a, const Run& b) {
-        return a.binding != b.binding ? a.binding < b.binding : a.first_id < b.first_id;
-    });
-    std::vector<VkDescriptorImageInfo> sorted;
-    sorted.reserve(infos.size());
-    std::vector<VkWriteDescriptorSet> writes;
-    std::vector<Run> merged;
-    for (const Run& run : runs) {
-        if (!merged.empty() && merged.back().binding == run.binding &&
-            merged.back().first_id + merged.back().count == run.first_id) {
-            ++merged.back().count;
-        } else {
-            merged.push_back({run.binding, run.first_id, static_cast<u32>(sorted.size()), 1});
-        }
-        sorted.push_back(infos[run.first_info]);
-    }
-    for (const Run& run : merged) {
-        writes.push_back({
-            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .pNext = nullptr,
-            .dstSet = state.set,
-            .dstBinding = run.binding,
-            .dstArrayElement = run.first_id,
-            .descriptorCount = run.count,
-            .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
-            .pImageInfo = sorted.data() + run.first_info,
-            .pBufferInfo = nullptr,
-            .pTexelBufferView = nullptr,
+    thread_local std::vector<VkDescriptorImageInfo> sorted;
+    thread_local std::vector<Run> merged;
+    thread_local std::vector<VkWriteDescriptorSet> writes;
+    writes.clear();
+    if (!runs.empty()) {
+        // Merge consecutive entries of one binding into one write each.
+        std::stable_sort(runs.begin(), runs.end(), [](const Run& a, const Run& b) {
+            return a.binding != b.binding ? a.binding < b.binding : a.first_id < b.first_id;
         });
+        sorted.clear();
+        sorted.reserve(infos.size());
+        merged.clear();
+        for (const Run& run : runs) {
+            if (!merged.empty() && merged.back().binding == run.binding &&
+                merged.back().first_id + merged.back().count == run.first_id) {
+                ++merged.back().count;
+            } else {
+                merged.push_back(
+                    {run.binding, run.first_id, static_cast<u32>(sorted.size()), 1});
+            }
+            sorted.push_back(infos[run.first_info]);
+        }
+        for (const Run& run : merged) {
+            writes.push_back({
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .pNext = nullptr,
+                .dstSet = state.set,
+                .dstBinding = run.binding,
+                .dstArrayElement = run.first_id,
+                .descriptorCount = run.count,
+                .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                .pImageInfo = sorted.data() + run.first_info,
+                .pBufferInfo = nullptr,
+                .pTexelBufferView = nullptr,
+            });
+        }
     }
     state.synced_count = static_cast<u32>(std::min<size_t>(texture_ids.size(),
                                                             Shader::BINDLESS_TEXTURE_CAPACITY));
-    state.storages = std::move(storages);
     if (state.sync_logs++ % 600 == 0) {
         u32 registered = 0;
         for (u32 id = 1; id < texture_ids.size() && id < Shader::BINDLESS_TEXTURE_CAPACITY; ++id) {
@@ -430,50 +554,59 @@ void DrawContext::BindlessSync(bool force) {
     }
 
     // Samplers: entry `id` is the sampler the game registered at that slot.
-    const u32 sampler_count = static_cast<u32>(
-        std::min<size_t>(std::max(sampler_ids.size(), size_t{state.synced_sampler_count}),
-                         Shader::BINDLESS_SAMPLER_CAPACITY));
-    std::vector<VkDescriptorImageInfo> sampler_infos;
-    std::vector<std::pair<u32, u32>> sampler_runs; // first id, info index
-    for (u32 id = 0; id < sampler_count; ++id) {
-        VkSampler sampler = *resources.fallback_sampler;
-        if (id != 0 && id < sampler_ids.size() && sampler_ids[id] != 0) {
-            sampler = resources.GetSampler(sampler_ids[id], false);
+    thread_local std::vector<VkDescriptorImageInfo> sampler_infos;
+    thread_local std::vector<std::pair<u32, u32>> sampler_runs;
+    thread_local std::vector<std::pair<u32, u32>> sampler_writes;
+    if (full_scan || !samplers_same) {
+        const u32 sampler_count = static_cast<u32>((std::min<size_t>)(
+            (std::max)(sampler_ids.size(), size_t{state.synced_sampler_count}),
+            Shader::BINDLESS_SAMPLER_CAPACITY));
+        sampler_infos.clear();
+        sampler_runs.clear();
+        for (u32 id = 0; id < sampler_count; ++id) {
+            VkSampler sampler = *resources.fallback_sampler;
+            if (id != 0 && id < sampler_ids.size() && sampler_ids[id] != 0) {
+                sampler = resources.GetSampler(sampler_ids[id], false);
+            }
+            if (state.written_samplers[id] == sampler) {
+                continue;
+            }
+            state.written_samplers[id] = sampler;
+            sampler_infos.push_back({sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED});
+            sampler_runs.emplace_back(id, static_cast<u32>(sampler_infos.size() - 1));
         }
-        if (state.written_samplers[id] == sampler) {
-            continue;
+        sampler_writes.clear();
+        for (size_t i = 0; i < sampler_runs.size(); ++i) {
+            if (!sampler_writes.empty() &&
+                sampler_writes.back().first + sampler_writes.back().second == sampler_runs[i].first) {
+                ++sampler_writes.back().second;
+            } else {
+                sampler_writes.emplace_back(sampler_runs[i].first, 1u);
+            }
         }
-        state.written_samplers[id] = sampler;
-        sampler_infos.push_back({sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED});
-        sampler_runs.emplace_back(id, static_cast<u32>(sampler_infos.size() - 1));
-    }
-    std::vector<std::pair<u32, u32>> sampler_writes; // first id, count
-    for (size_t i = 0; i < sampler_runs.size(); ++i) {
-        if (!sampler_writes.empty() &&
-            sampler_writes.back().first + sampler_writes.back().second == sampler_runs[i].first) {
-            ++sampler_writes.back().second;
-        } else {
-            sampler_writes.emplace_back(sampler_runs[i].first, 1u);
+        size_t info_index = 0;
+        for (const auto& [first, run_count] : sampler_writes) {
+            writes.push_back({
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .pNext = nullptr,
+                .dstSet = state.set,
+                .dstBinding = Shader::BINDLESS_SAMPLER_BINDING,
+                .dstArrayElement = first,
+                .descriptorCount = run_count,
+                .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER,
+                .pImageInfo = sampler_infos.data() + info_index,
+                .pBufferInfo = nullptr,
+                .pTexelBufferView = nullptr,
+            });
+            info_index += run_count;
         }
+        state.synced_sampler_snapshot = submission->sampler_pool_snapshot;
+        state.synced_samplers = sampler_ids.data();
+        state.synced_sampler_size = sampler_ids.size();
+        state.synced_samplers_epoch = resources.samplers_epoch;
+        state.synced_sampler_count = static_cast<u32>(
+            (std::min<size_t>)(sampler_ids.size(), Shader::BINDLESS_SAMPLER_CAPACITY));
     }
-    size_t info_index = 0;
-    for (const auto& [first, run_count] : sampler_writes) {
-        writes.push_back({
-            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .pNext = nullptr,
-            .dstSet = state.set,
-            .dstBinding = Shader::BINDLESS_SAMPLER_BINDING,
-            .dstArrayElement = first,
-            .descriptorCount = run_count,
-            .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER,
-            .pImageInfo = sampler_infos.data() + info_index,
-            .pBufferInfo = nullptr,
-            .pTexelBufferView = nullptr,
-        });
-        info_index += run_count;
-    }
-    state.synced_sampler_count = static_cast<u32>(
-        std::min<size_t>(sampler_ids.size(), Shader::BINDLESS_SAMPLER_CAPACITY));
     if (!writes.empty()) {
         impl.device.GetLogical().UpdateDescriptorSets(writes, {});
     }
@@ -485,9 +618,9 @@ void DrawContext::BindlessPrime(DrawPlan& plan) {
     // and an upload), so a pool of thousands of textures fills over a few frames, not at once.
     static const u64 budget_bytes = [] {
         const char* text = std::getenv("EDEN_NX2_NVN_BINDLESS_PRIME_MB");
-        return (text ? std::strtoull(text, nullptr, 10) : 64ull) << 20;
+        return (text ? std::strtoull(text, nullptr, 10) : 128ull) << 20;
     }();
-    constexpr u32 BUDGET_COUNT = 96;
+    constexpr u32 BUDGET_COUNT = 256;
     const u64 seq = host->HostFlight().seq;
     if (state.prime_seq != seq) {
         state.prime_seq = seq;
@@ -495,73 +628,79 @@ void DrawContext::BindlessPrime(DrawPlan& plan) {
         state.prime_count = 0;
     }
     if (budget_bytes == 0 || state.prime_count >= BUDGET_COUNT || state.prime_bytes >= budget_bytes ||
-        state.prime_exhausted_seq == seq) {
+        state.unprimed_head >= state.unprimed_slots.size()) {
         return;
     }
     const std::vector<u64>& texture_ids = submission->texture_pool_snapshot.Values();
-    const u32 count = static_cast<u32>(
-        std::min<size_t>(texture_ids.size(), Shader::BINDLESS_TEXTURE_CAPACITY));
-    if (count < 2) {
-        return;
-    }
-    u32 id = state.prime_cursor < count ? state.prime_cursor : 1;
-    for (u32 visited = 1; visited < count; ++visited, id = id + 1 < count ? id + 1 : 1) {
-        if (texture_ids[id] == 0) {
+    while (state.unprimed_head < state.unprimed_slots.size()) {
+        const u32 id = state.unprimed_slots[state.unprimed_head];
+        std::shared_ptr<Storage> storage;
+        if (id != 0 && id < texture_ids.size() && texture_ids[id] != 0 &&
+            state.entries[id].serial == texture_ids[id]) {
+            storage = state.entries[id].storage_ref.lock();
+        }
+        if (!storage || !NeedsBindlessPrime(*storage)) {
+            if (id < state.unprimed_queued.size()) {
+                state.unprimed_queued[id] = 0;
+            }
+            ++state.unprimed_head;
             continue;
         }
-        const std::shared_ptr<Texture>& texture = TextureOfId(id);
-        if (!texture || !texture->storage) {
-            continue;
+        const u64 vram_bytes = storage->vram_bytes;
+        if (state.prime_bytes + vram_bytes > budget_bytes && state.prime_count != 0) {
+            return;
         }
-        Storage& s = *texture->storage;
-        // Plain sampled textures only: what the game made as a render target gets its image and
-        // contents from rendering, and one without guest data (image failed) is not retried.
-        const VkImageUsageFlags attachment = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                                             VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-        if (s.image || s.image_failed || (s.usage & attachment) != 0 ||
-            s.samples != VK_SAMPLE_COUNT_1_BIT || s.scale_owner != nullptr) {
-            continue;
+        if (id < state.unprimed_queued.size()) {
+            state.unprimed_queued[id] = 0;
         }
-        if (state.prime_bytes + s.vram_bytes > budget_bytes && state.prime_count != 0) {
-            continue;
-        }
-        plan.UseImage(texture->storage, ReadLayoutOf(s), true);
-        state.prime_bytes += s.vram_bytes;
+        ++state.unprimed_head;
+        const VkImageLayout layout = ReadLayoutOf(*storage);
+        plan.UseImage(std::move(storage), layout, true, false, false, false, VK_FORMAT_UNDEFINED,
+                      false, true);
+        state.prime_bytes += vram_bytes;
         ++state.primed_total;
         state.dirty = true;
         if (++state.prime_count >= BUDGET_COUNT || state.prime_bytes >= budget_bytes) {
-            id = id + 1 < count ? id + 1 : 1;
-            state.prime_cursor = id;
-            return;
+            break;
         }
     }
-    state.prime_cursor = id;
-    // A whole lap found nothing more to create: the registrations change only between
-    // submissions, so the rest of this one skips the walk. Every bindless draw walked the whole
-    // pool once each texture had its image (Ocarina of Time: ~13% of the replay thread).
-    state.prime_exhausted_seq = seq;
+    if (state.unprimed_head >= state.unprimed_slots.size()) {
+        state.unprimed_slots.clear();
+        state.unprimed_head = 0;
+    }
 }
 
 bool DrawContext::BindlessPrepare(DrawPlan& plan) {
     if (!BindlessReady()) {
         return false;
     }
-    BindlessSync();
+    BindlessSync(false, &plan);
     BindlessPrime(plan);
     // A shader may read any entry: the images of the table must be in the layout the descriptors
     // name. Those a render pass or a copy left in another layout are moved like any sampled image
     // (a render target of this very draw stays: it cannot be both).
-    for (const std::shared_ptr<Storage>& storage : bindless.storages) {
+    size_t out = 0;
+    for (size_t i = 0; i < impl.bindless_layout_dirty.size(); ++i) {
+        std::shared_ptr<Storage>& storage = impl.bindless_layout_dirty[i];
         Storage& s = *storage;
-        if (!s.image) {
+        if (s.bindless_active_count == 0 || !s.image) {
+            s.bindless_layout_queued = false;
             continue;
         }
         const VkImageLayout wanted = ReadLayoutOf(s);
-        if (s.current_layout == wanted || IsBoundTarget(&s)) {
+        if (s.current_layout == wanted) {
+            s.bindless_layout_queued = false;
             continue;
         }
-        plan.UseImage(storage, wanted, true);
+        if (!IsBoundTarget(&s)) {
+            plan.UseImage(storage, wanted, true, false, false, false, VK_FORMAT_UNDEFINED, true);
+        }
+        if (out != i) {
+            impl.bindless_layout_dirty[out] = std::move(storage);
+        }
+        ++out;
     }
+    impl.bindless_layout_dirty.resize(out);
     return true;
 }
 

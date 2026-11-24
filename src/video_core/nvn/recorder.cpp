@@ -1095,8 +1095,13 @@ u64 Recorder::QueuePresentTexture(u64 queue_va, u64 window_va, u32 slot) {
     queue->last_seq.store(seq);
     window->slot_seq[slot].store(seq);
     ++impl->stats.presents;
-    // The uniform snapshot's "written lately" is this frame or the last.
+    // The uniform snapshot's "written lately" is this frame or the last; re-arm once per present.
+    if (impl->uniform_snapshot.load(std::memory_order_relaxed) != UniformSnapshotMode::Off) {
+        RearmUniformSnapshotPools(impl->snapshot_pools, impl->snapshot_cpu, impl->memory,
+                                  impl->snapshot_scratch.runs, impl->snapshot_cpu.presents + 1);
+    }
     ++impl->snapshot_cpu.presents;
+    impl->snapshot_cpu.last_rearm_presents = impl->snapshot_cpu.presents;
     impl->sink.Present(PresentRequest{seq, queue->index, window->textures[slot], slot,
                                       window->interval, window->crop});
     return seq;
@@ -1596,10 +1601,11 @@ bool Recorder::BufferInitialize(u64 buffer_va, u64 memory_pool_va, u64 offset, u
         impl->Release(ObjectKind::Buffer, buffer_va, buffer->serial);
         return false;
     }
-    {
+    if (size != 0) {
         const std::scoped_lock lock{impl->buffer_spans_mutex};
         const u64 begin = pool->address + offset;
-        impl->buffer_spans.push_back({begin, begin + size, buffer->serial});
+        impl->buffer_spans.insert_or_assign(buffer->serial, Impl::BufferSpan{begin, begin + size});
+        impl->buffer_spans_dirty = true;
     }
     return true;
 }
@@ -1609,9 +1615,9 @@ void Recorder::BufferFinalize(u64 buffer_va) {
             impl->Lookup(impl->buffers, ObjectKind::Buffer, buffer_va, __func__)) {
         {
             const std::scoped_lock lock{impl->buffer_spans_mutex};
-            std::erase_if(impl->buffer_spans, [&](const Impl::BufferSpan& span) {
-                return span.serial == buffer->serial;
-            });
+            if (impl->buffer_spans.erase(buffer->serial) != 0) {
+                impl->buffer_spans_dirty = true;
+            }
         }
         impl->Release(ObjectKind::Buffer, buffer_va, buffer->serial);
     }
@@ -1619,13 +1625,35 @@ void Recorder::BufferFinalize(u64 buffer_va) {
 
 u32 Recorder::Impl::BufferBytesFrom(u64 address) {
     const std::scoped_lock lock{buffer_spans_mutex};
-    u64 end = 0;
-    for (const BufferSpan& span : buffer_spans) {
-        if (span.begin <= address && address < span.end) {
-            end = (std::max)(end, span.end);
+    if (buffer_spans_dirty) {
+        buffer_spans_index.clear();
+        buffer_spans_index.reserve(buffer_spans.size());
+        for (const auto& [serial, span] : buffer_spans) {
+            static_cast<void>(serial);
+            buffer_spans_index.push_back({span.begin, span.end});
         }
+        std::sort(buffer_spans_index.begin(), buffer_spans_index.end(),
+                  [](const IndexedBufferSpan& a, const IndexedBufferSpan& b) {
+                      return a.begin < b.begin || (a.begin == b.begin && a.max_end > b.max_end);
+                  });
+        u64 running_max = 0;
+        for (IndexedBufferSpan& entry : buffer_spans_index) {
+            running_max = (std::max)(running_max, entry.max_end);
+            entry.max_end = running_max;
+        }
+        buffer_spans_dirty = false;
     }
-    return static_cast<u32>((std::min<u64>)(end != 0 ? end - address : 0, 0xFFFF'FFFFu));
+    const auto it = std::upper_bound(
+        buffer_spans_index.begin(), buffer_spans_index.end(), address,
+        [](u64 addr, const IndexedBufferSpan& entry) { return addr < entry.begin; });
+    if (it == buffer_spans_index.begin()) {
+        return 0;
+    }
+    const u64 max_end = std::prev(it)->max_end;
+    if (max_end <= address) {
+        return 0;
+    }
+    return static_cast<u32>((std::min<u64>)(max_end - address, 0xFFFF'FFFFu));
 }
 
 std::optional<BufferInfo> Recorder::GetBuffer(u64 buffer_va) {

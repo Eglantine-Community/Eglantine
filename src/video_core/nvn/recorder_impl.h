@@ -431,10 +431,15 @@ struct Recorder::Impl {
     struct BufferSpan {
         u64 begin;
         u64 end;
-        u64 serial;
+    };
+    struct IndexedBufferSpan {
+        u64 begin;
+        u64 max_end;
     };
     std::mutex buffer_spans_mutex;
-    std::vector<BufferSpan> buffer_spans;
+    std::unordered_map<u64, BufferSpan> buffer_spans;
+    std::vector<IndexedBufferSpan> buffer_spans_index;
+    bool buffer_spans_dirty{false};
     /// Bytes from `address` to the end of the largest live buffer object that holds it, saturated
     /// to 32 bits; 0 when none does.
     [[nodiscard]] u32 BufferBytesFrom(u64 address);

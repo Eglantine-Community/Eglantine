@@ -153,14 +153,57 @@ void AssignPools(std::vector<Range>& ranges, const UniformSnapshotPools& pools) 
     ranges.resize(kept);
 }
 
+void MarkWrittenRuns(const std::vector<std::pair<u64, u64>>& runs, UniformSnapshotCpuPages& cpu,
+                     u64 stamp) {
+    for (const auto& [begin, end] : runs) {
+        for (u64 page = begin >> PAGE_BITS; page < (end >> PAGE_BITS); ++page) {
+            cpu.written[page] = stamp;
+        }
+    }
+}
+
+} // namespace
+
+void RearmUniformSnapshotPools(UniformSnapshotPools& pools, UniformSnapshotCpuPages& cpu,
+                               GuestMemory& memory, std::vector<std::pair<u64, u64>>& runs,
+                               u64 stamp_presents) {
+    for (auto& [pool_begin, pool] : pools) {
+        if (pool.track_id == 0) {
+            continue;
+        }
+        u64 ep = 0;
+        if (pool.write_epoch) {
+            ep = pool.write_epoch->load(std::memory_order_acquire);
+            if (ep == pool.epoch_clean) {
+                continue;
+            }
+        }
+        runs.clear();
+        memory.TakeWritten(pool.track_id, pool_begin, pool.end - pool_begin, runs);
+        MarkWrittenRuns(runs, cpu, stamp_presents);
+        if (pool.write_epoch) {
+            pool.epoch_clean = ep;
+        }
+    }
+}
+
+namespace {
+
 /// Keeps the ranges whose every page the guest CPU wrote in this frame or the previous one.
-/// Takes the pages written since the last capture from the page tracker (which arms them again)
-/// and arms the pages seen for the first time (they qualify from their next write on). A pool the
-/// tracker cannot follow keeps its ranges (nothing tells its CPU writes from its GPU writes there;
-/// the GPU history still applies).
+/// Peeks written pages during a frame without re-arming (`QueuePresentTexture` calls
+/// `RearmUniformSnapshotPools` once per frame), and arms pages seen for the first time (they
+/// qualify from their next write on). A pool the tracker cannot follow keeps its ranges (nothing
+/// tells its CPU writes from its GPU writes there; the GPU history still applies).
 u64 KeepCpuWritten(std::vector<Range>& ranges, UniformSnapshotPools& pools,
                    UniformSnapshotCpuPages& cpu, GuestMemory& memory,
                    std::vector<std::pair<u64, u64>>& runs) {
+    if (cpu.last_rearm_presents != cpu.presents) {
+        // Callers (such as tests) that bump `cpu.presents` directly get the same once-per-frame
+        // collect+rearm as QueuePresentTexture.
+        RearmUniformSnapshotPools(pools, cpu, memory, runs, cpu.last_rearm_presents + 1);
+        cpu.last_rearm_presents = cpu.presents;
+    }
+    const u64 current_stamp = cpu.presents + 1;
     // One pass per run of touched pages of one pool: the tracker is asked once per run.
     size_t i = 0;
     while (i < ranges.size()) {
@@ -169,6 +212,12 @@ u64 KeepCpuWritten(std::vector<Range>& ranges, UniformSnapshotPools& pools,
         if (!pool.track_tried) {
             pool.track_tried = true;
             pool.track_id = memory.Track(pool_begin, pool.end - pool_begin);
+            if (pool.track_id != 0) {
+                pool.write_epoch = memory.WriteEpoch(pool.track_id);
+                if (pool.write_epoch) {
+                    pool.epoch_clean = pool.write_epoch->load(std::memory_order_acquire);
+                }
+            }
         }
         const u64 first = ranges[i].begin >> PAGE_BITS;
         u64 last = (ranges[i].end - 1) >> PAGE_BITS;
@@ -179,16 +228,10 @@ u64 KeepCpuWritten(std::vector<Range>& ranges, UniformSnapshotPools& pools,
             ++j;
         }
         if (pool.track_id != 0) {
-            runs.clear();
-            memory.TakeWritten(pool.track_id, first << PAGE_BITS, (last - first + 1) << PAGE_BITS,
-                               runs);
-            for (const auto& [begin, end] : runs) {
-                for (u64 page = begin >> PAGE_BITS; page < (end >> PAGE_BITS); ++page) {
-                    cpu.written[page] = cpu.presents + 1;
-                }
-            }
             u64 arm_from = 0;
             u64 arm_count = 0;
+            u64 need_first = ~u64{0};
+            u64 need_last = 0;
             const auto flush_arm = [&] {
                 if (arm_count != 0) {
                     memory.Arm(pool.track_id, arm_from << PAGE_BITS, arm_count << PAGE_BITS);
@@ -196,23 +239,41 @@ u64 KeepCpuWritten(std::vector<Range>& ranges, UniformSnapshotPools& pools,
                 }
             };
             for (u64 page = first; page <= last; ++page) {
-                if (cpu.written.try_emplace(page, 0).second) {
+                const auto [it, inserted] = cpu.written.try_emplace(page, 0);
+                if (inserted) {
                     if (arm_count == 0 || arm_from + arm_count != page) {
                         flush_arm();
                         arm_from = page;
                     }
                     ++arm_count;
+                } else if (it->second < current_stamp) {
+                    need_first = (std::min)(need_first, page);
+                    need_last = page;
                 }
             }
             flush_arm();
+            if (need_first <= need_last &&
+                (!pool.write_epoch ||
+                 pool.write_epoch->load(std::memory_order_acquire) != pool.epoch_clean)) {
+                runs.clear();
+                memory.PeekWritten(pool.track_id, need_first << PAGE_BITS,
+                                   (need_last - need_first + 1) << PAGE_BITS, runs);
+                MarkWrittenRuns(runs, cpu, current_stamp);
+            }
         }
         i = j;
     }
     // Written in this frame (presents + 1) or the previous one (presents).
     const u64 recent = cpu.presents;
     size_t kept = 0;
+    u64 cached_pool = ~u64{0};
+    u64 cached_track = 0;
     for (const Range& range : ranges) {
-        if (pools.find(range.offset)->second.track_id != 0) {
+        if (range.offset != cached_pool) {
+            cached_pool = range.offset;
+            cached_track = pools.find(cached_pool)->second.track_id;
+        }
+        if (cached_track != 0) {
             bool written = true;
             for (u64 page = range.begin >> PAGE_BITS; page <= (range.end - 1) >> PAGE_BITS;
                  ++page) {
