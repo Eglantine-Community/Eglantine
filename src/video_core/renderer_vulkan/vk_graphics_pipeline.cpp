@@ -450,6 +450,7 @@ GraphicsPipeline::GraphicsPipeline(
                          spv_modules[3] ? 1 : 0, key.state.patch_control_points_minus_one.Value() + 1,
                          device.GetMaxTessellationPatchSize());
             std::scoped_lock lock{build_mutex};
+            build_failed = true;
             is_built = true;
             build_condvar.notify_one();
             if (shader_notify) {
