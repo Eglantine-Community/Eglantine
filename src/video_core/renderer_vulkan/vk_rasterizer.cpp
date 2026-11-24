@@ -1312,6 +1312,21 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
             return;
         }
     }
+    // A direct draw with no vertices, or no instances outside task/mesh pipelines, records
+    // nothing. Skip it before the pipeline, buffer and descriptor work: dirty state, deferred
+    // clears and query counter toggles stay pending for the next recorded draw, clear or render
+    // pass end, which apply them before anything can observe them. With transform feedback on
+    // the draw goes through, since its counters are begun and closed around draws.
+    if (maxwell3d->regs.transform_feedback_enabled == 0 &&
+        (MakeDrawParams(maxwell3d->draw_manager.draw_state, instance_count, is_indexed)
+                 .num_vertices == 0 ||
+         (instance_count == 0 && [this] {
+             const GraphicsPipeline* const pipeline = pipeline_cache.CurrentGraphicsPipeline();
+             return pipeline != nullptr && !pipeline->IsMeshPipeline();
+         }()))) {
+        gpu.TickWork();
+        return;
+    }
     TraceWindowTarget(*maxwell3d, *gpu_memory, is_indexed ? "draw-indexed" : "draw",
                       is_indexed ? maxwell3d->draw_manager.draw_state.index_buffer.count
                                  : maxwell3d->draw_manager.draw_state.vertex_buffer.count);
