@@ -54,6 +54,106 @@ namespace {
 constexpr VkPipelineStageFlags ALL_STAGES = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
 constexpr VkAccessFlags ALL_WRITES = VK_ACCESS_MEMORY_WRITE_BIT;
 constexpr VkAccessFlags ALL_ACCESS = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+
+VkPipelineStageFlags ImageLayoutStages(VkImageLayout layout) noexcept {
+    switch (layout) {
+    case VK_IMAGE_LAYOUT_UNDEFINED:
+        return VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
+        return VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+        return VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+               VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:
+    case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+        return VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+    case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+        return VK_PIPELINE_STAGE_TRANSFER_BIT;
+    default:
+        return ALL_STAGES;
+    }
+}
+
+VkAccessFlags ImageLayoutSrcAccess(VkImageLayout layout) noexcept {
+    switch (layout) {
+    case VK_IMAGE_LAYOUT_UNDEFINED:
+    case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:
+    case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+        return 0;
+    case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
+        return VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+        return VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+        return VK_ACCESS_TRANSFER_WRITE_BIT;
+    default:
+        return ALL_WRITES;
+    }
+}
+
+VkAccessFlags ImageLayoutDstAccess(VkImageLayout layout) noexcept {
+    switch (layout) {
+    case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
+        return VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+        return VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+               VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:
+        return VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+    case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+        return VK_ACCESS_SHADER_READ_BIT;
+    case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+        return VK_ACCESS_TRANSFER_READ_BIT;
+    case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+        return VK_ACCESS_TRANSFER_WRITE_BIT;
+    default:
+        return ALL_ACCESS;
+    }
+}
+
+void ConsumerForSrc(VkPipelineStageFlags src_stages, VkAccessFlags src_access,
+                    VkPipelineStageFlags& dst_stages, VkAccessFlags& dst_access) noexcept {
+    constexpr VkPipelineStageFlags DEPTH_STAGES =
+        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    if (src_stages == VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT &&
+        src_access == VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT) {
+        dst_stages = VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                     VK_PIPELINE_STAGE_TRANSFER_BIT;
+        dst_access = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                     VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                     VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        return;
+    }
+    if ((src_stages & ~DEPTH_STAGES) == 0 && src_stages != 0 &&
+        src_access == VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT) {
+        dst_stages = VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                     VK_PIPELINE_STAGE_TRANSFER_BIT;
+        dst_access = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                     VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT |
+                     VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT |
+                     VK_ACCESS_TRANSFER_WRITE_BIT;
+        return;
+    }
+    constexpr VkPipelineStageFlags ATTACHMENT_STAGES =
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | DEPTH_STAGES;
+    constexpr VkAccessFlags ATTACHMENT_WRITES =
+        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    if ((src_stages & ~ATTACHMENT_STAGES) == 0 && src_stages != 0 &&
+        (src_access & ~ATTACHMENT_WRITES) == 0) {
+        dst_stages = VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                     VK_PIPELINE_STAGE_TRANSFER_BIT;
+        dst_access = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                     VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                     VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT |
+                     VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT |
+                     VK_ACCESS_TRANSFER_WRITE_BIT;
+        return;
+    }
+    dst_stages = ALL_STAGES;
+    dst_access = ALL_ACCESS;
+}
 /// Tiled uploads below this many linear bytes untile on the CPU: a few dozen microseconds there,
 /// less than a buffer allocation, a dispatch and a barrier more (switch2-recomp's GPU untile uses
 /// the same 64 KiB floor).
@@ -235,7 +335,30 @@ public:
         }
     }
     void HostMarkWritten() override {
-        barrier_pending = true;
+        MarkWritten(ALL_STAGES, ALL_WRITES);
+    }
+    void HostMarkPassWritten(bool has_color, bool has_depth, bool shader_writes) override {
+        VkPipelineStageFlags stages = 0;
+        VkAccessFlags access = 0;
+        if (has_color) {
+            stages |= VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+            access |= VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        }
+        if (has_depth) {
+            stages |= VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                      VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+            access |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        }
+        if (shader_writes) {
+            stages |= VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
+            access |= VK_ACCESS_SHADER_WRITE_BIT;
+        }
+        if (stages != 0) {
+            MarkWritten(stages, access);
+        }
+    }
+    void HostMarkTransferWritten() override {
+        MarkWritten(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
     }
     void HostMarkDispatchWritten() override {
         dispatch_writes_pending = true;
@@ -294,7 +417,8 @@ public:
     }
     void HostEndBufferOp() override {
         if ((impl.barrier_merge & BARRIER_MERGE_BUFFERS) == 0) {
-            barrier_pending = true;
+            MarkWritten(VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT);
         }
         // On: the ranges noted by HostBeginBufferOp are the pending writes.
     }
@@ -318,9 +442,16 @@ public:
         NoteTouched(storage);
     }
     bool HostEnsureContents(Storage& storage, bool will_overwrite) override {
-        return EnsureContents(storage, will_overwrite);
+        return EnsureContentsAs("DrawOrDispatch", storage, will_overwrite);
     }
     bool HostEnsureAttachmentContents(Storage& storage) override;
+    bool HostUpgradeImageCaps(Storage& storage, bool need_storage,
+                              bool need_unrestricted_formats) override {
+        return UpgradeImageCaps(storage, need_storage, need_unrestricted_formats);
+    }
+    [[nodiscard]] bool HostIsCpuReadablePool(const Storage& storage) const override {
+        return IsCpuReadablePool(storage);
+    }
     bool HostNeedsCommands(Storage& storage, bool will_overwrite) override {
         storage.last_used_seq = flight.seq;
         storage.last_used_present = impl.stats.presents.load(std::memory_order_relaxed);
@@ -339,7 +470,7 @@ public:
     }
     bool HostResolvePoolRange(u64 address, u64 size, Pool*& pool, u64& offset,
                               std::string_view op) override {
-        return ResolvePoolRange(address, size, pool, offset, op, false);
+        return ResolvePoolRange(address, size, pool, offset, op, false, false);
     }
     std::span<const u64> HostRecordsAhead() override {
         return next_record < current_list.size() ? current_list.subspan(next_record)
@@ -354,8 +485,14 @@ public:
     void HostUploadRange(Pool& pool, u64 offset, u64 size) override {
         UploadRange(pool, offset, size);
     }
+    void HostUploadRanges(std::span<const MirrorUploadSpan> ranges) override {
+        UploadRanges(ranges);
+    }
     bool HostMirrorNeedsUpload(Pool& pool, u64 offset, u64 size) override {
         return MirrorNeedsUpload(pool, offset, size);
+    }
+    bool HostMirrorHasPendingGpuWrites(Pool& pool, u64 offset, u64 size) override {
+        return MirrorHasPendingGpuWrites(pool, offset, size);
     }
     void HostNotePoolWrite(Pool& pool, u64 offset, u64 size) override {
         NotePoolWrite(pool, offset, size);
@@ -428,9 +565,10 @@ public:
         }
     }
     void HostPassEnded() override {
-        // Reports must be written before anything outside the pass can read them; a batch of
-        // queries and resets only (no report yet) waits for the next pass, up to half its room.
-        if (counter_batch.HasReports() || !counter_batch.Room(CounterBatch::MAX_EVENTS / 2)) {
+        // Previous passes' reports are ordered for later passes; keep them batched across passes
+        // while counter_batch has room instead of draining on every pass end.
+        ordered_reports = counter_batch.reports.size();
+        if (!counter_batch.Room(CounterBatch::MAX_EVENTS / 2)) {
             ResolveCounterBatch();
         }
     }
@@ -440,11 +578,22 @@ public:
             FoldOcclusion();
         }
     }
-    bool HostReportPending(const Pool& pool, u64 offset, u64 size) override {
-        return counter_batch.Writes(&pool, offset, size);
+    bool HostReportPending(const Pool& pool, u64 offset, u64 size,
+                           bool ordered_only = false) override {
+        return counter_batch.Writes(&pool, offset, size,
+                                    ordered_only ? ordered_reports : ~size_t{0});
     }
     bool HostReportsPending() override {
         return counter_batch.HasReports();
+    }
+    bool HostOrderedReportsPending() override {
+        return ordered_reports != 0;
+    }
+    void HostMarkReportsOrdered() override {
+        ordered_reports = counter_batch.reports.size();
+    }
+    void HostResolveCounterBatch() override {
+        ResolveCounterBatch();
     }
     void HostDumpImage(Storage& storage, u32 level, u32 layer, VkImageAspectFlags aspect,
                        Debug::PendingDump dump) override {
@@ -472,7 +621,7 @@ public:
         };
         Cmd().CopyImageToBuffer(*storage.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, *entry.buffer,
                                 region);
-        barrier_pending = true;
+        MarkWritten(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
         host_barrier_needed = true;
         entry.info = std::move(dump);
         flight.dumps.push_back(std::move(entry));
@@ -565,7 +714,7 @@ public:
         };
         Cmd().CopyImageToBuffer(*storage.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, *entry.buffer,
                                 region);
-        barrier_pending = true;
+        MarkWritten(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
         host_barrier_needed = true;
         entry.info = readback;
         flight.texture_dumps.push_back(std::move(entry));
@@ -589,6 +738,7 @@ private:
         std::unique_ptr<vk::CommandBuffer::ComputeBinding> compute_binding;
         vk::CommandBuffer cmd;
         bool ended{};
+        bool has_gpu_work{false};
         std::vector<VkSemaphore> wait_semaphores;
         std::vector<u64> wait_values;
         u64 signal_value{};
@@ -603,6 +753,9 @@ private:
     vk::CommandBuffer Cmd() {
         if (deferred_barrier.pending) {
             EmitDeferredBarrier();
+        }
+        if (!in_segment_end) {
+            segments.back().has_gpu_work = true;
         }
         return segments.back().cmd;
     }
@@ -623,6 +776,19 @@ private:
     void FlushDeferredReports();
     /// A SAMPLES_PASSED report follows in the rest of the submission before the next reset.
     [[nodiscard]] bool SamplesReportFollows() const;
+    void MarkWritten(VkPipelineStageFlags stages, VkAccessFlags access) noexcept {
+        barrier_pending = true;
+        pending_src_stages |= stages;
+        pending_src_access |= access;
+    }
+    [[nodiscard]] bool DeferredCoversFullTransfer(VkAccessFlags dst_access) const noexcept {
+        return deferred_barrier.pending && deferred_barrier.needs_memory &&
+               (deferred_barrier.src_stages & ALL_STAGES) == ALL_STAGES &&
+               (deferred_barrier.src_access & ALL_WRITES) == ALL_WRITES &&
+               (deferred_barrier.dst_stages & (ALL_STAGES | VK_PIPELINE_STAGE_TRANSFER_BIT)) != 0 &&
+               ((deferred_barrier.dst_access & dst_access) == dst_access ||
+                (deferred_barrier.dst_access & ALL_ACCESS) == ALL_ACCESS);
+    }
     /// `defer`: the barrier may wait for the next command (the draw path's requests, which
     /// re-fetch the command buffer after them); with EDEN_NX2_TRY_BARRIER_MERGE a request that
     /// finds one waiting joins it whether it defers or not (no command came between them).
@@ -647,19 +813,24 @@ private:
 
     StagingRange AllocStaging(u64 size, u64 alignment);
     void UploadRange(Pool& pool, u64 offset, u64 size);
+    void UploadRanges(std::span<const MirrorUploadSpan> ranges);
+    bool CollectMirrorUploadParts(Pool& pool, u64 offset, u64 size,
+                                  std::vector<std::pair<u64, u64>>& parts);
     bool MirrorNeedsUpload(Pool& pool, u64 offset, u64 size);
+    bool MirrorHasPendingGpuWrites(Pool& pool, u64 offset, u64 size);
     u64 GuestPageHash(const Pool& pool, u64 page) const;
     /// Mirror pools: registers the pool with the page tracker at the first call, then turns the
     /// pages the guest CPU wrote since the last call into untrusted ones. False: no tracking (every
     /// page is hashed, nothing is trusted).
     bool MirrorTakeCpuWrites(Pool& pool);
     /// Classify the page against the pending GPU writes sampled at the first page check.
-    MirrorWriteCoverage MirrorPageWrites(Pool& pool, u64 page, bool& pending_read);
+    MirrorWriteCoverage MirrorPageWrites(Pool& pool, u64 page, MirrorWriteCursor& writes);
     /// The replay wrote a pool range on the GPU (through the pool's own buffer unless
     /// `invalidate_mirror` is false: a pool mirror's write-back, after which the mirror and the
     /// guest bytes agree).
     void NotePoolWrite(Pool& pool, u64 offset, u64 size, bool invalidate_mirror = true,
-                       u64 row_bytes = 0, u64 row_stride = 0, u32 row_count = 0);
+                       u64 row_bytes = 0, u64 row_stride = 0, u32 row_count = 0,
+                       bool host_timestamp_write = false);
     void NoteTouched(const std::shared_ptr<Storage>& storage);
     [[nodiscard]] bool HasLinearWritebackOverlapping(const Pool& pool, u64 begin, u64 end) const;
     /// Writes GPU-modified linear storages in CPU-readable pools back to their pools so guest
@@ -678,7 +849,7 @@ private:
     /// `flush_shadows`: the caller reads or writes the range through host memory (draw-path callers
     /// decide for themselves, see DrawContext::ShadowPolicy).
     bool ResolvePoolRange(u64 address, u64 size, Pool*& pool, u64& offset, std::string_view op,
-                          bool flush_shadows = true);
+                          bool flush_shadows = true, bool resolve_reports = true);
     bool MakeCopyGeometry(const Storage& s, u32 level, u32 layer, const VC::CopyRegion& region,
                           u32 row_stride, u32 image_stride, u64 buffer_offset,
                           CopyGeometry& out) const;
@@ -691,6 +862,15 @@ private:
     /// the guest-sized image is only made current when guest bytes have to change it anyway.
     /// Without it a storage whose twin is newer gets its guest-sized image from the twin first.
     bool EnsureContents(Storage& s, bool will_overwrite, bool keep_scaled = false);
+    bool EnsureContentsAs(const char* caller, Storage& s, bool will_overwrite,
+                          bool keep_scaled = false) {
+        const char* const prev = std::exchange(current_overlap_caller, caller);
+        const bool ok = EnsureContents(s, will_overwrite, keep_scaled);
+        current_overlap_caller = prev;
+        return ok;
+    }
+    bool UpgradeImageCaps(Storage& s, bool need_storage, bool need_unrestricted_formats);
+    [[nodiscard]] bool IsCpuReadablePool(const Storage& s) const;
     /// Resolution scaling (nvn_rescale.h). The guest-sized image made from the twin (a downscale
     /// blit) when the twin is newer; outside a render pass.
     void MakeNativeCurrent(Storage& s);
@@ -766,6 +946,12 @@ private:
     /// through the pool's byte layout (nvn_alias_gpu.h), for textures whose layouts differ.
     /// False with `why` set when it cannot be expressed (nothing recorded).
     bool TransferOverlapBytes(Storage& source, Storage& destination, const char*& why);
+    bool TransferOverlapBytesBatch(std::span<Storage* const> sources, Storage& destination,
+                                   const char*& why);
+    /// Returns a reusable device-local scratch buffer of at least `total` bytes for alias transfers.
+    /// When `needs_reuse_barrier` is set, the caller must emit a TRANSFER_READ -> TRANSFER_WRITE
+    /// barrier before writing into the buffer.
+    VkBuffer AcquireAliasScratch(u64 total, bool& needs_reuse_barrier);
     /// CopyBufferToTexture into a decoded stand-in (ASTC/BCn): decodes the source blocks on the
     /// CPU.
     bool DecodeBufferToTexture(Storage& s, u32 level, u32 layer,
@@ -809,6 +995,7 @@ private:
     }
     /// In-pass queries: writes the reports of counter_batch (outside a render pass).
     void ResolveCounterBatch();
+    void ResolveCounterBatchIfOverlapping(const Pool& pool, u64 offset, u64 size);
     /// In-pass queries: room in counter_batch for a report or reset (its query and itself, and the
     /// query the pass end adds): a full batch is written now, ending the open pass when there is
     /// one (`cause`). Without it a run of resets outside a pass would overflow the batch.
@@ -854,6 +1041,8 @@ private:
     std::vector<CounterEngine::ConditionInput> prefetch_inputs;
     std::unordered_set<u64> prefetch_written;
     bool barrier_pending{false};
+    VkPipelineStageFlags pending_src_stages{0};
+    VkAccessFlags pending_src_access{0};
     /// Game dispatches wrote since the last memory barrier (HostMarkDispatchWritten): every flush
     /// but the one before a dispatch (HostFlushBarrierBeforeDispatch) emits the barrier for them.
     bool dispatch_writes_pending{false};
@@ -868,11 +1057,25 @@ private:
     /// request before any command joins it; EndSegment records what is left.
     struct DeferredBarrier {
         bool pending{false};
+        bool needs_memory{false};
+        VkPipelineStageFlags src_stages{0};
+        VkAccessFlags src_access{0};
+        VkPipelineStageFlags dst_stages{0};
+        VkAccessFlags dst_access{0};
         std::vector<VkImageMemoryBarrier> images;
     } deferred_barrier;
     /// Image barriers of the PrepareImages call in progress (kept to avoid a heap allocation per
     /// call).
     std::vector<VkImageMemoryBarrier> image_barriers;
+    std::vector<std::pair<u64, u64>> mirror_parts_scratch;
+    std::vector<std::pair<u64, u64>> mirror_next_parts_scratch;
+    struct MirrorBatchPart {
+        Pool* pool{};
+        u64 begin{};
+        u64 end{};
+    };
+    std::vector<MirrorBatchPart> mirror_batch_scratch;
+    std::vector<MirrorUploadSpan> condition_upload_scratch;
     bool host_barrier_needed{false};
 
     enum class RenderState { Enabled, Disabled, Conditional };
@@ -883,6 +1086,7 @@ private:
     /// In-pass queries: the counter events of the open pass (and of earlier passes without a
     /// report), written by ResolveCounterBatch.
     CounterBatch counter_batch;
+    size_t ordered_reports{0};
     size_t submitted_segments{0};
     std::chrono::steady_clock::time_point piece_start{std::chrono::steady_clock::now()};
     u32 ops_since_check{0};
@@ -923,9 +1127,14 @@ private:
     std::unordered_set<Storage*> linear_writeback_set;
     std::vector<std::shared_ptr<Storage>> touched;
     std::unordered_set<Storage*> touched_set;
+    std::shared_ptr<ShadowChunk> alias_scratch;
+    bool alias_scratch_used{false};
+    bool in_segment_end{false};
+    const char* current_overlap_caller{nullptr};
 };
 
 void Recorder::BeginSegment() {
+    in_segment_end = false;
     Segment segment;
     segment.raw = impl.AcquireCommandBuffer();
     flight.command_buffers.push_back(segment.raw);
@@ -949,7 +1158,9 @@ void Recorder::BeginSegment() {
     segments.push_back(std::move(segment));
     // The first op of a segment must be ordered after whatever earlier submissions on this
     // queue left running (same VkQueue, but no implicit dependency between submissions).
-    barrier_pending = true;
+    pending_src_stages = 0;
+    pending_src_access = 0;
+    MarkWritten(ALL_STAGES, ALL_WRITES);
     tracked_buffer_writes_pending = false;
     buffer_ops.Clear();
     condition_prefetch.Clear();
@@ -969,6 +1180,7 @@ void Recorder::EndSegment() {
     ResolveCounterBatch();
     // Predicates computed ahead live in this command buffer's slots and ordering only.
     condition_prefetch.Clear();
+    in_segment_end = true;
     if (deferred_barrier.pending) {
         EmitDeferredBarrier();
     }
@@ -993,6 +1205,7 @@ void Recorder::EndSegment() {
     }
     segment.cmd.End();
     segment.ended = true;
+    in_segment_end = false;
 }
 
 void Recorder::Abort() {
@@ -1000,6 +1213,7 @@ void Recorder::Abort() {
     deferred_barrier = {};
     try {
         EndRenderCondition();
+        draw.DiscardPendingClears();
         draw.EndPass();
     } catch (...) {
     }
@@ -1015,6 +1229,7 @@ void Recorder::Abort() {
             occlusion.reset();
         }
         counter_batch.Clear();
+        ordered_reports = 0;
     }
     for (Segment& segment : segments) {
         if (!segment.ended) {
@@ -1045,9 +1260,23 @@ void Recorder::Abort() {
     // Pool mirror pages this submission was to copy in (and GPU writes it was to make there and
     // merge back) never happened: no mirror page is known to be current.
     impl.MirrorInvalidateAll();
-    // Mirror ranges marked as GPU-written have nothing to write back.
+    // Mirror ranges marked as GPU-written have nothing to write back, and their mirror pages did
+    // not receive valid GPU bytes.
     for (Pool* pool : dirty_pool_set) {
         std::scoped_lock lock{pool->dirty_mutex};
+        for (const Pool::Dirty& d : pool->gpu_dirty) {
+            if (d.seq != flight.seq || pool->mirror_pages.empty() || d.begin >= pool->size) {
+                continue;
+            }
+            const u64 end = (std::min)(d.end, pool->size);
+            for (u64 page = d.begin / Pool::MIRROR_PAGE; page * Pool::MIRROR_PAGE < end; ++page) {
+                Pool::MirrorPage& mp = pool->mirror_pages[static_cast<size_t>(page)];
+                mp.valid = false;
+                mp.hash_valid = false;
+                pool->SetMirrorPageTrusted(static_cast<size_t>(page), false);
+                mp.checked = 0;
+            }
+        }
         std::erase_if(pool->gpu_dirty, [&](const Pool::Dirty& d) { return d.seq == flight.seq; });
     }
     for (const std::shared_ptr<Storage>& storage : linear_writebacks) {
@@ -1063,25 +1292,54 @@ void Recorder::Abort() {
 void Recorder::MemoryBarrier(bool defer) {
     // One barrier for every ordering point since the last one (game ORDER_PRIMITIVES /
     // ORDER_INDIRECT_DATA barriers: a wait for idle on the console, nvn_barrier.h; replay copies,
-    // pass ends, uploads), and every later command relies on it: all stages on both sides.
-    // Only writes need to be made available; a read in the source access mask does nothing
-    // (write-after-read needs the execution dependency alone).
+    // pass ends, uploads), narrowed by which GPU engines actually produced writes since the last
+    // barrier. Only writes need to be made available; a read in the source access mask does
+    // nothing (write-after-read needs the execution dependency alone).
+    VkPipelineStageFlags src_stages = 0;
+    VkAccessFlags src_access = 0;
+    if (barrier_pending) {
+        src_stages |= pending_src_stages;
+        src_access |= pending_src_access;
+    }
+    if (dispatch_writes_pending) {
+        src_stages |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        src_access |= VK_ACCESS_SHADER_WRITE_BIT;
+    }
+    if (tracked_buffer_writes_pending || !buffer_ops.Empty()) {
+        src_stages |= VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        src_access |= VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    }
+    if (src_stages == 0) {
+        src_stages = ALL_STAGES;
+        src_access = ALL_WRITES;
+    }
+    VkPipelineStageFlags dst_stages = 0;
+    VkAccessFlags dst_access = 0;
+    ConsumerForSrc(src_stages, src_access, dst_stages, dst_access);
+
     const bool adjacent = (impl.barrier_merge & BARRIER_MERGE_ADJACENT) != 0;
-    if (adjacent && deferred_barrier.pending) {
-        // A request is waiting for its next command and none came: it already is this barrier.
-        impl.stats.barrier_merge_folded.fetch_add(1, std::memory_order_relaxed);
-    } else if (adjacent && defer) {
+    if (adjacent && (defer || deferred_barrier.pending)) {
+        if (deferred_barrier.pending) {
+            impl.stats.barrier_merge_folded.fetch_add(1, std::memory_order_relaxed);
+        }
         deferred_barrier.pending = true;
+        deferred_barrier.needs_memory = true;
+        deferred_barrier.src_stages |= src_stages;
+        deferred_barrier.src_access |= src_access;
+        deferred_barrier.dst_stages |= dst_stages;
+        deferred_barrier.dst_access |= dst_access;
     } else {
         const VkMemoryBarrier barrier{
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
             .pNext = nullptr,
-            .srcAccessMask = ALL_WRITES,
-            .dstAccessMask = ALL_ACCESS,
+            .srcAccessMask = src_access,
+            .dstAccessMask = dst_access,
         };
-        Cmd().PipelineBarrier(ALL_STAGES, ALL_STAGES, 0, barrier);
+        Cmd().PipelineBarrier(src_stages, dst_stages, 0, barrier);
     }
     barrier_pending = false;
+    pending_src_stages = 0;
+    pending_src_access = 0;
     impl.stats.memory_barriers.fetch_add(1, std::memory_order_relaxed);
     dispatch_writes_pending = false;
     tracked_buffer_writes_pending = false;
@@ -1089,21 +1347,34 @@ void Recorder::MemoryBarrier(bool defer) {
 }
 
 void Recorder::EmitDeferredBarrier() {
-    const VkMemoryBarrier memory_barrier{
-        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-        .pNext = nullptr,
-        .srcAccessMask = ALL_WRITES,
-        .dstAccessMask = ALL_ACCESS,
-    };
+    const VkPipelineStageFlags src_stages =
+        deferred_barrier.src_stages ? deferred_barrier.src_stages : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    const VkPipelineStageFlags dst_stages =
+        deferred_barrier.dst_stages ? deferred_barrier.dst_stages : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+    const bool needs_memory = deferred_barrier.needs_memory;
+    const VkAccessFlags src_access = deferred_barrier.src_access;
+    const VkAccessFlags dst_access = deferred_barrier.dst_access;
     // Straight into the segment's command buffer: Cmd() would ask for this barrier again.
     deferred_barrier.pending = false;
-    if (deferred_barrier.images.empty()) {
-        segments.back().cmd.PipelineBarrier(ALL_STAGES, ALL_STAGES, 0, memory_barrier);
-    } else {
-        segments.back().cmd.PipelineBarrier(ALL_STAGES, ALL_STAGES, 0, memory_barrier, {},
+    deferred_barrier.needs_memory = false;
+    deferred_barrier.src_stages = 0;
+    deferred_barrier.src_access = 0;
+    deferred_barrier.dst_stages = 0;
+    deferred_barrier.dst_access = 0;
+    if (needs_memory) {
+        const VkMemoryBarrier memory_barrier{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = src_access,
+            .dstAccessMask = dst_access,
+        };
+        segments.back().cmd.PipelineBarrier(src_stages, dst_stages, 0, memory_barrier, {},
                                             deferred_barrier.images);
-        deferred_barrier.images.clear();
+    } else if (!deferred_barrier.images.empty()) {
+        segments.back().cmd.PipelineBarrier(src_stages, dst_stages, 0, {}, {},
+                                            deferred_barrier.images);
     }
+    deferred_barrier.images.clear();
     impl.stats.barrier_merge_emitted.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -1123,6 +1394,15 @@ void Recorder::PrepareImagesSpan(std::span<const std::pair<Storage*, VkImageLayo
                                  bool defer, bool note_writes) {
     std::vector<VkImageMemoryBarrier>& barriers = image_barriers;
     barriers.assign(extra.begin(), extra.end());
+    VkPipelineStageFlags img_src_stages = 0;
+    VkPipelineStageFlags img_dst_stages = 0;
+    for (const VkImageMemoryBarrier& barrier : extra) {
+        img_src_stages |= (barrier.srcAccessMask == ALL_ACCESS || barrier.srcAccessMask == ALL_WRITES)
+                              ? ALL_STAGES
+                              : ImageLayoutStages(barrier.oldLayout);
+        img_dst_stages |=
+            (barrier.dstAccessMask == ALL_ACCESS) ? ALL_STAGES : ImageLayoutStages(barrier.newLayout);
+    }
     for (const auto& [storage, layout] : images) {
         if (note_writes && track_writes && (layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL ||
                              layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL ||
@@ -1133,11 +1413,13 @@ void Recorder::PrepareImagesSpan(std::span<const std::pair<Storage*, VkImageLayo
         if (storage->current_layout == layout) {
             continue;
         }
+        img_src_stages |= ImageLayoutStages(storage->current_layout);
+        img_dst_stages |= ImageLayoutStages(layout);
         barriers.push_back(VkImageMemoryBarrier{
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .pNext = nullptr,
-            .srcAccessMask = ALL_WRITES, // see MemoryBarrier
-            .dstAccessMask = ALL_ACCESS,
+            .srcAccessMask = ImageLayoutSrcAccess(storage->current_layout),
+            .dstAccessMask = ImageLayoutDstAccess(layout),
             .oldLayout = storage->current_layout,
             .newLayout = layout,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -1160,6 +1442,33 @@ void Recorder::PrepareImagesSpan(std::span<const std::pair<Storage*, VkImageLayo
         }
         return;
     }
+    const bool consume_mem =
+        flush_if_none &&
+        (barrier_pending || dispatch_writes_pending || tracked_buffer_writes_pending ||
+         !buffer_ops.Empty());
+    VkPipelineStageFlags mem_src_stages = 0;
+    VkAccessFlags mem_src_access = 0;
+    VkPipelineStageFlags mem_dst_stages = 0;
+    VkAccessFlags mem_dst_access = 0;
+    if (consume_mem) {
+        if (barrier_pending) {
+            mem_src_stages |= pending_src_stages;
+            mem_src_access |= pending_src_access;
+        }
+        if (dispatch_writes_pending) {
+            mem_src_stages |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+            mem_src_access |= VK_ACCESS_SHADER_WRITE_BIT;
+        }
+        if (tracked_buffer_writes_pending || !buffer_ops.Empty()) {
+            mem_src_stages |= VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+            mem_src_access |= VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        }
+        if (mem_src_stages == 0) {
+            mem_src_stages = ALL_STAGES;
+            mem_src_access = ALL_WRITES;
+        }
+        ConsumerForSrc(mem_src_stages, mem_src_access, mem_dst_stages, mem_dst_access);
+    }
     const bool adjacent = (impl.barrier_merge & BARRIER_MERGE_ADJACENT) != 0;
     if (adjacent && extra.empty() && (defer || deferred_barrier.pending)) {
         // The transitions wait for the next command (or join the request that does): one barrier
@@ -1171,6 +1480,7 @@ void Recorder::PrepareImagesSpan(std::span<const std::pair<Storage*, VkImageLayo
                                                 &VkImageMemoryBarrier::image);
             if (same != deferred_barrier.images.end()) {
                 same->newLayout = barrier.newLayout;
+                same->dstAccessMask = barrier.dstAccessMask;
             } else {
                 deferred_barrier.images.push_back(barrier);
             }
@@ -1179,20 +1489,43 @@ void Recorder::PrepareImagesSpan(std::span<const std::pair<Storage*, VkImageLayo
             impl.stats.barrier_merge_folded.fetch_add(1, std::memory_order_relaxed);
         }
         deferred_barrier.pending = true;
+        deferred_barrier.src_stages |= img_src_stages;
+        deferred_barrier.dst_stages |= img_dst_stages;
+        if (consume_mem) {
+            deferred_barrier.needs_memory = true;
+            deferred_barrier.src_stages |= mem_src_stages;
+            deferred_barrier.src_access |= mem_src_access;
+            deferred_barrier.dst_stages |= mem_dst_stages;
+            deferred_barrier.dst_access |= mem_dst_access;
+        }
     } else {
-        const VkMemoryBarrier memory_barrier{
-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            .pNext = nullptr,
-            .srcAccessMask = ALL_WRITES,
-            .dstAccessMask = ALL_ACCESS,
-        };
-        Cmd().PipelineBarrier(ALL_STAGES, ALL_STAGES, 0, memory_barrier, {}, barriers);
+        const VkPipelineStageFlags call_src =
+            (img_src_stages | mem_src_stages) ? (img_src_stages | mem_src_stages)
+                                              : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        const VkPipelineStageFlags call_dst =
+            (img_dst_stages | mem_dst_stages) ? (img_dst_stages | mem_dst_stages)
+                                              : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+        if (consume_mem) {
+            const VkMemoryBarrier memory_barrier{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = mem_src_access,
+                .dstAccessMask = mem_dst_access,
+            };
+            Cmd().PipelineBarrier(call_src, call_dst, 0, memory_barrier, {}, barriers);
+        } else {
+            Cmd().PipelineBarrier(call_src, call_dst, 0, {}, {}, barriers);
+        }
     }
-    barrier_pending = false;
+    if (consume_mem) {
+        barrier_pending = false;
+        pending_src_stages = 0;
+        pending_src_access = 0;
+        dispatch_writes_pending = false;
+        tracked_buffer_writes_pending = false;
+        buffer_ops.Clear();
+    }
     impl.stats.memory_barriers.fetch_add(1, std::memory_order_relaxed);
-    dispatch_writes_pending = false;
-    tracked_buffer_writes_pending = false;
-    buffer_ops.Clear();
 }
 
 StagingRange Recorder::AllocStaging(u64 size, u64 alignment) {
@@ -1231,20 +1564,26 @@ bool Recorder::MirrorTakeCpuWrites(Pool& pool) {
     return impl.TakePoolCpuWrites(pool);
 }
 
-MirrorWriteCoverage Recorder::MirrorPageWrites(Pool& pool, u64 page, bool& pending_read) {
-    if (!pending_read) {
+MirrorWriteCoverage Recorder::MirrorPageWrites(Pool& pool, u64 page, MirrorWriteCursor& writes) {
+    if (!writes.snapshot_ready) {
         // Taken before the page is hashed: the completion writes a range back before it drops it
         // from gpu_dirty, so a range missing here is in the guest bytes the hash reads.
         mirror_pending_writes.clear();
-        std::scoped_lock lock{pool.dirty_mutex};
-        for (const Pool::Dirty& dirty : pool.gpu_dirty) {
-            mirror_pending_writes.emplace_back(dirty.begin, dirty.end);
+        {
+            std::scoped_lock lock{pool.dirty_mutex};
+            for (const Pool::Dirty& dirty : pool.gpu_dirty) {
+                mirror_pending_writes.emplace_back(dirty.begin, dirty.end);
+            }
         }
-        pending_read = true;
+        MergePendingWrites(mirror_pending_writes);
+        writes.snapshot_ready = true;
+    }
+    if (mirror_pending_writes.empty()) {
+        return MirrorWriteCoverage::None;
     }
     const u64 begin = page * Pool::MIRROR_PAGE;
     const u64 end = (std::min)(begin + Pool::MIRROR_PAGE, pool.size);
-    return ClassifyMirrorWrites(begin, end, mirror_pending_writes);
+    return ClassifyMirrorWrites(begin, end, mirror_pending_writes, writes.full_range);
 }
 
 bool Recorder::MirrorNeedsUpload(Pool& pool, u64 offset, u64 size) {
@@ -1252,18 +1591,29 @@ bool Recorder::MirrorNeedsUpload(Pool& pool, u64 offset, u64 size) {
         return false;
     }
     const bool tracked = MirrorTakeCpuWrites(pool);
-    bool pending_read = false;
+    MirrorWriteCursor writes;
     const u32 stamp = static_cast<u32>(flight.seq) + 1;
     const u64 first = offset / Pool::MIRROR_PAGE;
-    const u64 last = (std::min)(offset + size, pool.size) - 1;
+    const u64 last_page = ((std::min)(offset + size, pool.size) - 1) / Pool::MIRROR_PAGE;
+    const bool no_epoch_check = !impl.mario_kart_world || pool.split_runs.empty();
+    if (no_epoch_check && pool.MirrorRangeAllTrusted(first, last_page)) {
+        impl.stats.mirror_pages_trusted.fetch_add(last_page - first + 1,
+                                                  std::memory_order_relaxed);
+        return false;
+    }
     u64 hashed = 0;
     u64 trusted = 0;
     u64 gpu_owned = 0;
     bool dirty = false;
-    for (u64 index = first; index <= last / Pool::MIRROR_PAGE; ++index) {
+    for (u64 index = first; index <= last_page; ++index) {
+        if (no_epoch_check && (index & 63) == 0 && index + 63 <= last_page &&
+            pool.mirror_trusted_bits[static_cast<size_t>(index >> 6)] == ~u64{0}) {
+            trusted += 64;
+            index += 63;
+            continue;
+        }
         Pool::MirrorPage& page = pool.mirror_pages[static_cast<size_t>(index)];
-        const bool current_epoch = !impl.mario_kart_world || pool.split_runs.empty() ||
-                                   page.raw_epoch == pool.split_raw_epoch_seen;
+        const bool current_epoch = no_epoch_check || page.raw_epoch == pool.split_raw_epoch_seen;
         if (page.valid && page.checked == stamp && current_epoch) {
             continue;
         }
@@ -1271,18 +1621,29 @@ bool Recorder::MirrorNeedsUpload(Pool& pool, u64 offset, u64 size) {
             ++trusted;
             continue;
         }
-        const auto coverage = MirrorPageWrites(pool, index, pending_read);
+        const auto coverage = MirrorPageWrites(pool, index, writes);
         if (coverage == MirrorWriteCoverage::Full) {
-            ++gpu_owned;
+            const u64 skip_last =
+                writes.full_range.second >= pool.size
+                    ? last_page
+                    : (std::min)(last_page, writes.full_range.second / Pool::MIRROR_PAGE - 1);
+            if (skip_last >= index) {
+                gpu_owned += skip_last - index + 1;
+                index = skip_last;
+            } else {
+                ++gpu_owned;
+            }
             continue;
         }
         const bool settled = tracked && coverage == MirrorWriteCoverage::None;
-        ++hashed;
-        if (page.valid && page.hash == GuestPageHash(pool, index)) {
-            page.checked = stamp;
-            page.raw_epoch = pool.split_raw_epoch_seen;
-            page.trusted = settled;
-            continue;
+        if (page.valid && page.hash_valid) {
+            ++hashed;
+            if (page.hash == GuestPageHash(pool, index)) {
+                page.checked = stamp;
+                page.raw_epoch = pool.split_raw_epoch_seen;
+                pool.SetMirrorPageTrusted(static_cast<size_t>(index), settled);
+                continue;
+            }
         }
         dirty = true;
         break;
@@ -1299,26 +1660,53 @@ bool Recorder::MirrorNeedsUpload(Pool& pool, u64 offset, u64 size) {
     return dirty;
 }
 
-void Recorder::UploadRange(Pool& pool, u64 offset, u64 size) {
+bool Recorder::MirrorHasPendingGpuWrites(Pool& pool, u64 offset, u64 size) {
+    if (size == 0 || offset >= pool.size) {
+        return false;
+    }
+    const u64 end = offset + (std::min)(size, pool.size - offset);
+    if (HasLinearWritebackOverlapping(pool, offset, end)) {
+        return true;
+    }
+    std::scoped_lock lock{pool.dirty_mutex};
+    return std::ranges::any_of(pool.gpu_dirty, [&](const Pool::Dirty& d) {
+        return d.begin < end && offset < d.end;
+    });
+}
+
+bool Recorder::CollectMirrorUploadParts(Pool& pool, u64 offset, u64 size,
+                                        std::vector<std::pair<u64, u64>>& parts) {
+    parts.clear();
     if (pool.backing != Pool::Backing::Mirror || size == 0 || offset >= pool.size) {
-        return;
+        return false;
     }
     // The guest pages of the range that differ from what the mirror holds (all of them the first
     // time), as runs of consecutive pages. The mirror is made equal to these pages from here on,
     // so the bookkeeping is updated now.
     const bool tracked = MirrorTakeCpuWrites(pool);
-    bool pending_read = false;
+    MirrorWriteCursor writes;
     const u32 stamp = static_cast<u32>(flight.seq) + 1;
     const u64 first = offset / Pool::MIRROR_PAGE;
-    const u64 last = (std::min)(offset + size, pool.size) - 1;
+    const u64 last_page = ((std::min)(offset + size, pool.size) - 1) / Pool::MIRROR_PAGE;
+    const bool no_epoch_check = !impl.mario_kart_world || pool.split_runs.empty();
+    if (no_epoch_check && pool.MirrorRangeAllTrusted(first, last_page)) {
+        impl.stats.mirror_pages_trusted.fetch_add(last_page - first + 1,
+                                                  std::memory_order_relaxed);
+        impl.stats.mirror_ranges_clean.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
     u64 hashed = 0;
     u64 trusted = 0;
     u64 gpu_owned = 0;
-    std::vector<std::pair<u64, u64>> parts;
-    for (u64 index = first; index <= last / Pool::MIRROR_PAGE; ++index) {
+    for (u64 index = first; index <= last_page; ++index) {
+        if (no_epoch_check && (index & 63) == 0 && index + 63 <= last_page &&
+            pool.mirror_trusted_bits[static_cast<size_t>(index >> 6)] == ~u64{0}) {
+            trusted += 64;
+            index += 63;
+            continue;
+        }
         Pool::MirrorPage& page = pool.mirror_pages[static_cast<size_t>(index)];
-        const bool current_epoch = !impl.mario_kart_world || pool.split_runs.empty() ||
-                                   page.raw_epoch == pool.split_raw_epoch_seen;
+        const bool current_epoch = no_epoch_check || page.raw_epoch == pool.split_raw_epoch_seen;
         if (page.valid && page.checked == stamp && current_epoch) {
             continue;
         }
@@ -1326,27 +1714,30 @@ void Recorder::UploadRange(Pool& pool, u64 offset, u64 size) {
             ++trusted;
             continue;
         }
-        const auto coverage = MirrorPageWrites(pool, index, pending_read);
+        const auto coverage = MirrorPageWrites(pool, index, writes);
         if (coverage == MirrorWriteCoverage::Full) {
-            ++gpu_owned;
+            const u64 skip_last =
+                writes.full_range.second >= pool.size
+                    ? last_page
+                    : (std::min)(last_page, writes.full_range.second / Pool::MIRROR_PAGE - 1);
+            if (skip_last >= index) {
+                gpu_owned += skip_last - index + 1;
+                index = skip_last;
+            } else {
+                ++gpu_owned;
+            }
             continue; // UploadRange would discard this whole page while the GPU owns it.
         }
         const bool settled = tracked && coverage == MirrorWriteCoverage::None;
-        const bool partial_gpu = coverage == MirrorWriteCoverage::Partial;
         ++hashed;
         const u64 hash = GuestPageHash(pool, index);
-        const bool changed = !page.valid || page.hash != hash;
-        if (!partial_gpu) {
-            page.hash = hash;
-            page.valid = true;
-            page.checked = stamp;
-            page.raw_epoch = pool.split_raw_epoch_seen;
-            page.trusted = settled;
-        } else {
-            page.valid = false;
-            page.checked = 0;
-            page.trusted = false;
-        }
+        const bool changed = !page.valid || !page.hash_valid || page.hash != hash;
+        page.hash = hash;
+        page.hash_valid = true;
+        page.valid = true;
+        page.checked = stamp;
+        page.raw_epoch = pool.split_raw_epoch_seen;
+        pool.SetMirrorPageTrusted(static_cast<size_t>(index), settled);
         if (!changed) {
             continue;
         }
@@ -1369,60 +1760,110 @@ void Recorder::UploadRange(Pool& pool, u64 offset, u64 size) {
     }
     if (parts.empty()) {
         impl.stats.mirror_ranges_clean.fetch_add(1, std::memory_order_relaxed);
-        return;
+        return false;
     }
     // Keep the same ownership snapshot for the hashes and copies. Completion can remove a range
     // after the snapshot, but those bytes already have the GPU's value in the mirror.
-    for (const auto& [dirty_begin, dirty_end] : mirror_pending_writes) {
-        std::vector<std::pair<u64, u64>> next;
-        for (const auto& [begin, end] : parts) {
-            if (dirty_end <= begin || dirty_begin >= end) {
-                next.emplace_back(begin, end);
-                continue;
-            }
-            if (dirty_begin > begin) {
-                next.emplace_back(begin, dirty_begin);
-            }
-            if (dirty_end < end) {
-                next.emplace_back(dirty_end, end);
-            }
-        }
-        parts = std::move(next);
+    if (writes.snapshot_ready && !mirror_pending_writes.empty()) {
+        SubtractSortedRanges(parts, mirror_pending_writes, mirror_next_parts_scratch);
+        parts.swap(mirror_next_parts_scratch);
         if (parts.empty()) {
-            return;
+            return false;
         }
     }
-    u64 copied = 0;
-    for (const auto& [begin, end] : parts) {
-        copied += end - begin;
+    return true;
+}
+
+void Recorder::UploadRanges(std::span<const MirrorUploadSpan> ranges) {
+    if (ranges.empty()) {
+        return;
     }
-    // Earlier commands may still read or write these bytes.
-    GpuProf::Scope prof{flight.gpu_prof.get(), Cmd(),
+    mirror_batch_scratch.clear();
+    u64 copied = 0;
+    size_t dirty_spans = 0;
+    for (const MirrorUploadSpan& span : ranges) {
+        if (!span.pool || !CollectMirrorUploadParts(*span.pool, span.offset, span.size,
+                                                    mirror_parts_scratch)) {
+            continue;
+        }
+        ++dirty_spans;
+        for (const auto& [begin, end] : mirror_parts_scratch) {
+            copied += end - begin;
+            mirror_batch_scratch.push_back({span.pool, begin, end});
+        }
+    }
+    if (mirror_batch_scratch.empty()) {
+        return;
+    }
+    const bool had_full_deferred = DeferredCoversFullTransfer(VK_ACCESS_TRANSFER_WRITE_BIT);
+    vk::CommandBuffer cmd = Cmd();
+    GpuProf::Scope prof{flight.gpu_prof.get(), cmd,
                         flight.gpu_prof ? GpuProf::Tag{.kind = GpuProf::Kind::Upload,
                                                        .count = static_cast<u32>(copied),
                                                        .hash_a = GpuProf::SUB_MIRROR}
                                         : GpuProf::Tag{}};
-    MemoryBarrier();
+    // Earlier commands may still read or write these bytes. When no deferred full barrier was
+    // emitted by Cmd(), narrow the pre-copy wait to TRANSFER_BIT / TRANSFER_WRITE.
+    if (!had_full_deferred) {
+        const VkMemoryBarrier pre_barrier{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = ALL_WRITES,
+            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        };
+        cmd.PipelineBarrier(ALL_STAGES, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, pre_barrier);
+    }
     VC::GuestMemory* memory = impl.guest.load(std::memory_order_acquire);
-    for (const auto& [begin, end] : parts) {
-        const u64 length = end - begin;
+    for (size_t i = 0; i < mirror_batch_scratch.size(); ++i) {
+        const MirrorBatchPart& part = mirror_batch_scratch[i];
+        bool overlaps_earlier = false;
+        for (size_t prev = 0; prev < i; ++prev) {
+            const MirrorBatchPart& prior = mirror_batch_scratch[prev];
+            if (prior.pool == part.pool && prior.begin < part.end && part.begin < prior.end) {
+                overlaps_earlier = true;
+                break;
+            }
+        }
+        if (overlaps_earlier) {
+            const VkMemoryBarrier waw{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            };
+            cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                                waw);
+        }
+        const u64 length = part.end - part.begin;
         const StagingRange staging = AllocStaging(length, 64);
-        if (pool.host) {
-            std::memcpy(staging.pointer, pool.host + begin, length);
-        } else if (!memory || !memory->Read(pool.address + begin, staging.pointer, length)) {
+        if (part.pool->host) {
+            std::memcpy(staging.pointer, part.pool->host + part.begin, length);
+        } else if (!memory ||
+                   !memory->Read(part.pool->address + part.begin, staging.pointer, length)) {
             std::memset(staging.pointer, 0, length);
         }
-        const VkBufferCopy region{.srcOffset = staging.offset, .dstOffset = begin, .size = length};
-        Cmd().CopyBuffer(staging.buffer, pool.Handle(), region);
+        const VkBufferCopy region{
+            .srcOffset = staging.offset,
+            .dstOffset = part.begin,
+            .size = length,
+        };
+        cmd.CopyBuffer(staging.buffer, part.pool->Handle(), region);
+        condition_prefetch.Invalidate(*part.pool, part.begin, length);
     }
-    impl.stats.mirror_uploads.fetch_add(1, std::memory_order_relaxed);
-    impl.stats.mirror_upload_runs.fetch_add(parts.size(), std::memory_order_relaxed);
+    impl.stats.mirror_uploads.fetch_add(dirty_spans, std::memory_order_relaxed);
+    impl.stats.mirror_upload_runs.fetch_add(mirror_batch_scratch.size(), std::memory_order_relaxed);
     impl.stats.mirror_upload_bytes.fetch_add(copied, std::memory_order_relaxed);
-    barrier_pending = true;
+    MarkWritten(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+}
+
+void Recorder::UploadRange(Pool& pool, u64 offset, u64 size) {
+    const MirrorUploadSpan span{&pool, offset, size};
+    UploadRanges(std::span{&span, 1});
 }
 
 void Recorder::NotePoolWrite(Pool& pool, u64 offset, u64 size, bool invalidate_mirror,
-                             u64 row_bytes, u64 row_stride, u32 row_count) {
+                             u64 row_bytes, u64 row_stride, u32 row_count,
+                             bool host_timestamp_write) {
     impl.NoteNonInlinePoolWrite(pool.address + offset, size, flight.seq);
     if (impl.invalidate_wait_ms != 0) {
         // Where a guest invalidate has to wait for this submission (nvn_gpu_writes.h).
@@ -1444,22 +1885,85 @@ void Recorder::NotePoolWrite(Pool& pool, u64 offset, u64 size, bool invalidate_m
         }
         break;
     case Pool::Backing::Mirror: {
-        {
+        if (size != 0) {
             std::scoped_lock lock{pool.dirty_mutex};
-            pool.gpu_dirty.push_back({offset, offset + size, flight.seq});
+            u64 lo = offset;
+            u64 hi = offset + size;
+            size_t out = 0;
+            for (size_t i = 0; i < pool.gpu_dirty.size(); ++i) {
+                const Pool::Dirty& dirty = pool.gpu_dirty[i];
+                if (dirty.seq == flight.seq && dirty.begin <= hi && lo <= dirty.end) {
+                    lo = (std::min)(lo, dirty.begin);
+                    hi = (std::max)(hi, dirty.end);
+                    continue;
+                }
+                if (out != i) {
+                    pool.gpu_dirty[out] = dirty;
+                }
+                ++out;
+            }
+            pool.gpu_dirty.resize(out);
+            pool.gpu_dirty.push_back({lo, hi, flight.seq});
         }
-        // The write-back (and a report's timestamp) reaches the guest bytes untracked: the pages
-        // are hashed again once it is done (MirrorPageWrites).
-        if (size != 0 && offset < pool.size) {
+        if (!host_timestamp_write && size != 0 && offset < pool.size) {
+            const bool tracked = pool.split_runs.empty() && MirrorTakeCpuWrites(pool);
+            const u32 stamp = static_cast<u32>(flight.seq) + 1;
             const u64 end = (std::min)(offset + size, pool.size);
             for (u64 page = offset / Pool::MIRROR_PAGE; page * Pool::MIRROR_PAGE < end; ++page) {
+                const u64 page_begin = page * Pool::MIRROR_PAGE;
+                const u64 page_end = (std::min)(page_begin + Pool::MIRROR_PAGE, pool.size);
+                const bool full_page = row_count == 0 && offset <= page_begin && page_end <= end;
                 Pool::MirrorPage& mirror_page = pool.mirror_pages[static_cast<size_t>(page)];
-                mirror_page.trusted = false;
-                mirror_page.valid = false;
-                mirror_page.checked = 0;
+                mirror_page.hash_valid = false;
+                if (tracked && (full_page || (mirror_page.valid && mirror_page.trusted))) {
+                    mirror_page.valid = true;
+                    mirror_page.checked = stamp;
+                    mirror_page.raw_epoch = pool.split_raw_epoch_seen;
+                    pool.SetMirrorPageTrusted(static_cast<size_t>(page), true);
+                } else if (mirror_page.valid) {
+                    pool.SetMirrorPageTrusted(static_cast<size_t>(page), false);
+                } else {
+                    mirror_page.valid = false;
+                    mirror_page.checked = 0;
+                    pool.SetMirrorPageTrusted(static_cast<size_t>(page), false);
+                }
+            }
+        } else if (host_timestamp_write && size != 0 && offset < pool.size) {
+            // Completion writes +8 (the timestamp) directly into guest RAM without touching the
+            // mirror; keep valid/hash_valid so untouched page bytes do not re-upload in flight.
+            const u64 report_end = (std::min)(offset + 2 * sizeof(u64), pool.size);
+            for (u64 page = offset / Pool::MIRROR_PAGE; page * Pool::MIRROR_PAGE < report_end;
+                 ++page) {
+                pool.SetMirrorPageTrusted(static_cast<size_t>(page), false);
             }
         }
         dirty_pool_set.insert(&pool);
+        if (row_count == 0) {
+            if (size == 0) {
+                break;
+            }
+            u64 merged_begin = offset;
+            u64 merged_end = offset + size;
+            size_t out = 0;
+            for (size_t i = 0; i < readbacks.size(); ++i) {
+                const InFlight::Readback& existing = readbacks[i];
+                if (existing.pool.get() == &pool && existing.row_count == 0 &&
+                    existing.pool_offset <= merged_end &&
+                    merged_begin <= existing.pool_offset + existing.size) {
+                    merged_begin = (std::min)(merged_begin, existing.pool_offset);
+                    merged_end = (std::max)(merged_end, existing.pool_offset + existing.size);
+                    continue;
+                }
+                if (out != i) {
+                    readbacks[out] = std::move(readbacks[i]);
+                }
+                ++out;
+            }
+            readbacks.resize(out);
+            readbacks.push_back({impl.pools.at(pool.serial), merged_begin,
+                                 merged_end - merged_begin, 0, 0, 0, 0});
+            break;
+        }
         for (const InFlight::Readback& existing : readbacks) {
             if (existing.pool.get() == &pool && existing.pool_offset == offset &&
                 existing.size == size && existing.row_bytes == row_bytes &&
@@ -1467,9 +1971,8 @@ void Recorder::NotePoolWrite(Pool& pool, u64 offset, u64 size, bool invalidate_m
                 return;
             }
         }
-        readbacks.push_back({impl.pools.at(pool.serial), offset, size, download_size, row_bytes,
-                             row_stride, row_count});
-        download_size += (size + 15) / 16 * 16;
+        readbacks.push_back({impl.pools.at(pool.serial), offset, size, 0, row_bytes, row_stride,
+                             row_count});
         break;
     }
     default:
@@ -1481,16 +1984,67 @@ void Recorder::WriteReadbacks() {
     if (readbacks.empty()) {
         return;
     }
-    flight.download = impl.CreateHostBuffer(download_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                            MemoryUsage::Download);
-    MemoryBarrier();
-    for (const InFlight::Readback& readback : readbacks) {
-        const VkBufferCopy region{
-            .srcOffset = readback.pool_offset,
-            .dstOffset = readback.download_offset,
-            .size = readback.size,
+    download_size = 0;
+    for (InFlight::Readback& readback : readbacks) {
+        readback.download_offset = download_size;
+        download_size += (readback.size + 15) / 16 * 16;
+    }
+    if (download_size == 0) {
+        return;
+    }
+    flight.download = impl.AcquireDownload(download_size);
+    if (download_size >= (u64{1} << 20)) {
+        static std::atomic<u32> large_readback_logs{0};
+        if (large_readback_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+            std::string summary;
+            for (size_t i = 0; i < readbacks.size() && i < 6; ++i) {
+                const InFlight::Readback& rb = readbacks[i];
+                summary += fmt::format(
+                    "{}(pool={:#x},off={:#x},sz={:#x},rows={},flags={:#x})",
+                    i == 0 ? "" : ", ", rb.pool->serial, rb.pool_offset, rb.size, rb.row_count,
+                    rb.pool->flags);
+            }
+            LOG_INFO(Render_Vulkan,
+                     "[nvn] large mirror readback: seq {} total={} bytes ({:.2f} MiB) count={} [{}]",
+                     flight.seq, download_size, download_size / 1048576.0, readbacks.size(),
+                     summary);
+        }
+    }
+    const bool had_full_deferred = DeferredCoversFullTransfer(VK_ACCESS_TRANSFER_READ_BIT);
+    vk::CommandBuffer cmd = Cmd();
+    GpuProf::Scope prof{flight.gpu_prof.get(), cmd,
+                        flight.gpu_prof ? GpuProf::Tag{.kind = GpuProf::Kind::Copy,
+                                                       .count = static_cast<u32>(download_size),
+                                                       .hash_a = GpuProf::SUB_READBACK}
+                                        : GpuProf::Tag{}};
+    if (!had_full_deferred) {
+        const VkMemoryBarrier pre_barrier{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = ALL_WRITES,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
         };
-        Cmd().CopyBuffer(readback.pool->Handle(), *flight.download, region);
+        cmd.PipelineBarrier(ALL_STAGES, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, pre_barrier);
+    }
+    std::vector<std::pair<VkBuffer, VkBufferCopy>> copies;
+    copies.reserve(readbacks.size());
+    for (const InFlight::Readback& readback : readbacks) {
+        copies.emplace_back(readback.pool->Handle(),
+                            VkBufferCopy{.srcOffset = readback.pool_offset,
+                                         .dstOffset = readback.download_offset,
+                                         .size = readback.size});
+    }
+    std::ranges::stable_sort(copies, {}, [](const auto& copy) { return copy.first; });
+    std::vector<VkBufferCopy> regions;
+    regions.reserve(copies.size());
+    for (size_t i = 0; i < copies.size();) {
+        const VkBuffer src = copies[i].first;
+        regions.clear();
+        for (; i < copies.size() && copies[i].first == src; ++i) {
+            regions.push_back(copies[i].second);
+        }
+        cmd.CopyBuffer(src, *flight.download,
+                       vk::Span<VkBufferCopy>(regions.data(), regions.size()));
     }
     host_barrier_needed = true;
     flight.readbacks = readbacks;
@@ -1552,7 +2106,7 @@ bool Recorder::ResolveRef(const VC::TextureRef& ref, Storage*& storage,
 }
 
 bool Recorder::ResolvePoolRange(u64 address, u64 size, Pool*& pool, u64& offset,
-                                std::string_view op, bool flush_shadows) {
+                                std::string_view op, bool flush_shadows, bool resolve_reports) {
     if (!impl.ResolveBuffer(address, size, pool, offset)) {
         const std::string reason = impl.DescribeUnresolved(address, size);
         if (reason.find("virtual") != std::string::npos) {
@@ -1570,6 +2124,9 @@ bool Recorder::ResolvePoolRange(u64 address, u64 size, Pool*& pool, u64& offset,
     if (!linear_writebacks.empty() && !draw.PassOpen()) {
         const u64 clamped = (std::min)(pool->size - offset, (std::max<u64>)(size, 1));
         FlushLinearWritebacks(pool, offset, offset + clamped);
+    }
+    if (resolve_reports && !draw.PassOpen()) {
+        ResolveCounterBatchIfOverlapping(*pool, offset, (std::max<u64>)(size, 1));
     }
     if (flush_shadows && draw.HasShadows()) {
         // An op outside the draw path touches the bytes through host memory.
@@ -1798,11 +2355,107 @@ bool LegacyFirstUpload() {
 
 } // Anonymous namespace
 
+bool Recorder::IsCpuReadablePool(const Storage& s) const {
+    return CpuReadablePoolOf(impl, s) != nullptr;
+}
+
+bool Recorder::UpgradeImageCaps(Storage& s, bool need_storage, bool need_unrestricted_formats) {
+    const bool upgrade_storage =
+        need_storage && s.can_upgrade_storage && (s.usage & VK_IMAGE_USAGE_STORAGE_BIT) == 0;
+    const bool upgrade_formats = (need_unrestricted_formats || upgrade_storage) &&
+                                 (s.pending_unrestricted_formats || s.view_format_count != 0);
+    if (!upgrade_storage && !upgrade_formats) {
+        return !(need_storage && (s.usage & VK_IMAGE_USAGE_STORAGE_BIT) == 0);
+    }
+    const auto apply_flags = [&] {
+        if (upgrade_storage) {
+            s.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+            if (!s.host.storage &&
+                (s.host.storage_view != VK_FORMAT_UNDEFINED || s.host.storage_alias)) {
+                s.create_flags |= VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+            }
+            s.can_upgrade_storage = false;
+        }
+        if (upgrade_formats) {
+            s.view_format_count = 0;
+            s.pending_unrestricted_formats = false;
+        }
+    };
+    if (!s.image) {
+        apply_flags();
+        return true;
+    }
+    const bool preserve = s.contents_valid && s.current_layout != VK_IMAGE_LAYOUT_UNDEFINED &&
+                          !s.sparse && (s.usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0 &&
+                          (s.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) != 0;
+    if (preserve) {
+        const bool saved = std::exchange(track_writes, false);
+        PrepareImages({{&s, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL}});
+        track_writes = saved;
+    }
+    auto old_image = std::make_shared<vk::Image>(std::move(s.image));
+    auto old_views = std::make_shared<std::vector<vk::ImageView>>(
+        impl.draw_resources ? impl.draw_resources->TakeStorageViews(s)
+                            : std::vector<vk::ImageView>{});
+    s.image = vk::Image{};
+    if (s.cached) {
+        impl.storage_cache_bytes -= (std::min)(impl.storage_cache_bytes, s.vram_bytes);
+    }
+    apply_flags();
+    s.current_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    NoteTouched(s.shared_from_this());
+    const bool created = impl.EnsureImage(s);
+    if (created && preserve) {
+        const bool saved = std::exchange(track_writes, false);
+        PrepareImages({{&s, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL}});
+        track_writes = saved;
+        std::vector<VkImageCopy> copies;
+        copies.reserve(s.levels);
+        const VkImageAspectFlags aspect = CopyAspect(s);
+        for (u32 level = 0; level < s.levels; ++level) {
+            const LevelExtent ext = ExtentOfLevel(s, level);
+            copies.push_back({
+                .srcSubresource = {aspect, level, 0, s.layers},
+                .srcOffset = {0, 0, 0},
+                .dstSubresource = {aspect, level, 0, s.layers},
+                .dstOffset = {0, 0, 0},
+                .extent = {ext.width, ext.height, ext.depth},
+            });
+        }
+        Cmd().CopyImage(**old_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, *s.image,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, copies);
+        MarkWritten(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    } else if (!created) {
+        s.contents_valid = false;
+    }
+    impl.retired.push_back({flight.seq, [old_image, old_views]() mutable {
+                                old_views->clear();
+                                *old_image = vk::Image{};
+                            }});
+    if (upgrade_storage) {
+        impl.storage_image_upgrades.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (need_unrestricted_formats && upgrade_formats) {
+        impl.format_list_upgrades.fetch_add(1, std::memory_order_relaxed);
+    }
+    static std::atomic<u64> upgrade_logs{0};
+    const u64 n = upgrade_logs.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 24 || n % 100 == 0) {
+        LOG_INFO(Render_Vulkan,
+                 "[nvn] lazy image upgrade #{}: pool {:#x} +{:#x} {}x{} lv{} ly{} fmt={:#x} "
+                 "(storage={} formats={} preserve={} ok={})",
+                 n, s.pool_serial, s.pool_offset, s.extent.width, s.extent.height, s.levels,
+                 s.layers, s.desc.format, upgrade_storage ? 1 : 0, upgrade_formats ? 1 : 0,
+                 preserve ? 1 : 0, created ? 1 : 0);
+    }
+    return created;
+}
+
 bool Recorder::HostEnsureAttachmentContents(Storage& s) {
     const bool fresh_color = impl.mario_kart_world && !s.contents_valid && !s.scale_owner &&
                              !s.sparse && s.aspect == VK_IMAGE_ASPECT_COLOR_BIT &&
                              (s.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) != 0;
-    if (!EnsureContents(s, true)) {
+    if (!EnsureContentsAs("Attachment", s, true)) {
         return false;
     }
     if (!fresh_color) {
@@ -1824,7 +2477,7 @@ bool Recorder::HostEnsureAttachmentContents(Storage& s) {
         const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0,
                                             VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
         Cmd().ClearColorImage(*s.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, {}, range);
-        barrier_pending = true;
+        MarkWritten(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
     }
     ResolveOverlaps(s);
     return true;
@@ -1973,6 +2626,7 @@ void Recorder::FlushLinearWritebacks(const Pool* filter_pool, u64 filter_begin, 
         const bool saved = std::exchange(track_writes, false);
         PrepareImages({{&s, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL}});
         track_writes = saved;
+        ResolveCounterBatchIfOverlapping(*pool, s.pool_offset, geometry.span);
         Cmd().CopyImageToBuffer(*s.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, pool->Handle(),
                                 geometry.regions);
         if (geometry.padded) {
@@ -1980,7 +2634,7 @@ void Recorder::FlushLinearWritebacks(const Pool* filter_pool, u64 filter_begin, 
         } else {
             NotePoolWrite(*pool, s.pool_offset, geometry.span);
         }
-        barrier_pending = true;
+        MarkWritten(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
     }
 }
 
@@ -2002,7 +2656,7 @@ void Recorder::MakeNativeCurrent(Storage& s) {
                    {&s, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL}});
     track_writes = saved;
     impl.RecordScaleBlit(Cmd(), s, false);
-    barrier_pending = true;
+    MarkWritten(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
     s.scale_state = Rescale::AfterBlit();
     impl.stats.rescale_downscales.fetch_add(1, std::memory_order_relaxed);
 }
@@ -2023,7 +2677,7 @@ bool Recorder::PrepareScaledTarget(Storage& native) {
                        {twin, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL}});
         track_writes = saved;
         impl.RecordScaleBlit(Cmd(), native, true);
-        barrier_pending = true;
+        MarkWritten(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
         native.scale_state = Rescale::AfterBlit();
         impl.stats.rescale_upscales.fetch_add(1, std::memory_order_relaxed);
     }
@@ -2068,7 +2722,8 @@ bool Recorder::CopyTextureScaled(Storage& src, Storage& dst, u32 src_layer, u32 
     }
     // The destination keeps what the copy does not cover: its own guest-side machinery first
     // (uploads, overlapping textures), then its twin made current.
-    if (!EnsureContents(dst, dst_covered, true) || (!dst_covered && !PrepareScaledTarget(dst))) {
+    if (!EnsureContentsAs("CopyTextureScaled", dst, dst_covered, true) ||
+        (!dst_covered && !PrepareScaledTarget(dst))) {
         return false;
     }
     NoteTouched(src.scaled);
@@ -2084,7 +2739,7 @@ bool Recorder::CopyTextureScaled(Storage& src, Storage& dst, u32 src_layer, u32 
     };
     Cmd().CopyImage(*src_twin.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, *dst_twin->image,
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, copy);
-    barrier_pending = true;
+    MarkWritten(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
     impl.stats.rescale_copies.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
@@ -2207,7 +2862,7 @@ void Recorder::UploadStorage(Storage& s) {
             track_writes = saved;
             Cmd().CopyBufferToImage(staging.buffer, *s.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                     regions);
-            barrier_pending = true;
+            MarkWritten(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
         }
     }
     if (Debug::Get().upload_log) {
@@ -2304,7 +2959,7 @@ void Recorder::SyncSparse(Storage& s, bool will_overwrite) {
                 track_writes = saved;
                 Cmd().CopyBufferToImage(staging.buffer, *s.image,
                                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, regions);
-                barrier_pending = true;
+                MarkWritten(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
             }
         }
     }
@@ -2444,7 +3099,7 @@ void Recorder::SyncSparse(Storage& s, bool will_overwrite) {
             Cmd().CopyBufferToImage(staging.buffer, *s.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                     regions);
         }
-        barrier_pending = true;
+        MarkWritten(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
     }
     // From here on the contents are the guest's bytes (a texture the GPU wrote keeps its origin).
     if (s.origin == StorageOrigin::None) {
@@ -2508,12 +3163,11 @@ bool Recorder::UploadAstcOnGpu(Storage& s, const UploadPlan& plan, Pool& pool, c
             draw.FlushShadowsOverlapping(pool, s.pool_offset, s.layout.size);
         }
     } else {
-        // MKW streams ASTC 8x8 textures into its lighting atlases. Stage the compressed GOBs
-        // from mirrored pools to keep the CPU replay thread out of large RGBA8 decodes.
-        constexpr u64 MinStagedAstcBytes = u64{64} << 10;
-        constexpr u64 MaxStagedAstcBytes = u64{64} << 20;
-        if (!impl.mario_kart_world || s.sparse || !IsAstc8x8(s.host.pixel_format) ||
-            size < MinStagedAstcBytes || size > MaxStagedAstcBytes ||
+        // Stage compressed GOBs from mirrored/non-imported pools to keep the CPU replay thread
+        // out of large ASTC decodes across games and formats.
+        constexpr u64 MinStagedAstcBytes = u64{4} << 10;
+        constexpr u64 MaxStagedAstcBytes = u64{128} << 20;
+        if (s.sparse || size < MinStagedAstcBytes || size > MaxStagedAstcBytes ||
             size > impl.device.GetMaxStorageBufferRange() ||
             !AstcGpuLevels(s, plan, 0, *decoder, levels)) {
             return false;
@@ -2524,7 +3178,7 @@ bool Recorder::UploadAstcOnGpu(Storage& s, const UploadPlan& plan, Pool& pool, c
             input = staging.buffer;
             input_offset = staging.offset;
         } catch (const vk::Exception& exception) {
-            LogOnce(fmt::format("MKW ASTC staging allocation failed: {}", exception.what()));
+            LogOnce(fmt::format("ASTC staging allocation failed: {}", exception.what()));
             return false;
         }
     }
@@ -2535,7 +3189,7 @@ bool Recorder::UploadAstcOnGpu(Storage& s, const UploadPlan& plan, Pool& pool, c
     auto views = std::make_shared<std::vector<vk::ImageView>>(
         decoder->Record(Cmd(), input, input_offset, input_size, *s.image, levels));
     flight.keepalive.push_back(std::move(views));
-    barrier_pending = true;
+    MarkWritten(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
     return true;
 }
 
@@ -2548,27 +3202,27 @@ bool Recorder::UploadAstcBcOnGpu(Storage& s, const UploadPlan& plan, Pool& pool,
     }
     VkBuffer input{};
     u64 input_offset{};
-    u64 input_size{};
+    u64 input_size = size;
+    bool from_pool = false;
     if (!pool.pending.load(std::memory_order_acquire) && pool.backing == Pool::Backing::Imported &&
         AstcGpuLevels(s, plan, s.pool_offset, *decoder, levels)) {
         input = pool.Handle();
         input_offset = s.pool_offset;
         input_size = pool.size - s.pool_offset;
+        from_pool = true;
     } else {
-        // Keep MKW's streaming sources on the GPU decode path with mirrored guest pools too.
-        if (!impl.mario_kart_world || !IsAstc8x8(s.host.pixel_format) || size < (u64{64} << 10) ||
-            size > (u64{64} << 20) || size > impl.device.GetMaxStorageBufferRange() ||
+        // Stage compressed GOBs from mirrored/non-imported pools before falling back to CPU decode.
+        constexpr u64 MinStagedAstcBytes = u64{4} << 10;
+        constexpr u64 MaxStagedAstcBytes = u64{128} << 20;
+        if (s.sparse || size < MinStagedAstcBytes || size > MaxStagedAstcBytes ||
+            size > impl.device.GetMaxStorageBufferRange() ||
             !AstcGpuLevels(s, plan, 0, *decoder, levels)) {
             return false;
         }
-        const StagingRange staging = AllocStaging(size, decoder->OffsetAlignment());
-        std::memcpy(staging.pointer, data, static_cast<size_t>(size));
-        input = staging.buffer;
-        input_offset = staging.offset;
-        input_size = size;
     }
     // The decoder writes level 0 of the scratch: one dispatch per chunk of layers, each bound from
-    // its first layer's bytes.
+    // its first layer's bytes. Validate alignment before allocating staging memory.
+    const u64 base_align_offset = from_pool ? input_offset : 0;
     std::vector<BcChunk> chunks;
     std::vector<AstcGpuDecoder::Level> chunk_levels;
     for (const AstcGpuDecoder::Level& level : levels) {
@@ -2579,17 +3233,29 @@ bool Recorder::UploadAstcBcOnGpu(Storage& s, const UploadPlan& plan, Pool& pool,
             part.level = 0;
             part.layers = chunk.layers;
             part.offset += u64{chunk.first_layer} * level.layer_stride;
-            if ((input_offset + part.offset) % decoder->OffsetAlignment() != 0) {
+            if ((base_align_offset + part.offset) % decoder->OffsetAlignment() != 0) {
                 return false;
             }
             chunks.push_back(chunk);
             chunk_levels.push_back(part);
         }
     }
-    if (draw.HasShadows()) {
-        draw.FlushShadowsOverlapping(pool, s.pool_offset, s.layout.size);
+    if (!from_pool) {
+        try {
+            const StagingRange staging = AllocStaging(size, decoder->OffsetAlignment());
+            std::memcpy(staging.pointer, data, static_cast<size_t>(size));
+            input = staging.buffer;
+            input_offset = staging.offset;
+        } catch (const vk::Exception& exception) {
+            LogOnce(fmt::format("ASTC BC staging allocation failed: {}", exception.what()));
+            return false;
+        }
+    } else {
+        if (draw.HasShadows()) {
+            draw.FlushShadowsOverlapping(pool, s.pool_offset, s.layout.size);
+        }
+        FlushPending(); // earlier writes of the pool's bytes before the decoder reads them
     }
-    FlushPending(); // earlier writes of the pool's bytes before the decoder reads them
     size_t next = 0;
     return RecordBcUpload(s, chunks, true, [&](const BcChunk&, BcScratch& scratch) {
         auto views = std::make_shared<std::vector<vk::ImageView>>(
@@ -2896,7 +3562,7 @@ bool Recorder::RecordBcUpload(Storage& s, std::span<const BcChunk> chunks, bool 
         Cmd().WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *times->pool, query + 1);
     }
     if (recorded) {
-        barrier_pending = true;
+        MarkWritten(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
         impl.stats.astc_bc_encodes.fetch_add(1, std::memory_order_relaxed);
     }
     return recorded;
@@ -3077,7 +3743,8 @@ bool Recorder::UploadUntileOnGpu(Storage& s, const UploadPlan& plan, Pool& pool,
     }
     FlushPending(); // earlier writes of the pool's bytes before the shader reads them
     untile->Record(Cmd(), input, **output, pieces);
-    barrier_pending = true; // the shader's writes before the copy reads them
+    MarkWritten(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_ACCESS_SHADER_WRITE_BIT); // the shader's writes before the copy reads them
     const bool saved = track_writes;
     track_writes = false;
     PrepareImages({{&s, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL}});
@@ -3085,7 +3752,7 @@ bool Recorder::UploadUntileOnGpu(Storage& s, const UploadPlan& plan, Pool& pool,
     Cmd().CopyBufferToImage(**output, *s.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                             MakeUploadRegions(s, linear, 0));
     flight.keepalive.push_back(std::move(output));
-    barrier_pending = true;
+    MarkWritten(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
     impl.stats.untile_gpu_uploads.fetch_add(1, std::memory_order_relaxed);
     impl.stats.untile_gpu_bytes.fetch_add(linear.staging_size, std::memory_order_relaxed);
     if (direct) {
@@ -3164,6 +3831,348 @@ void Recorder::RefreshFromGuest(Storage& s) {
     }
 }
 
+namespace {
+
+struct OverlapCopyPlan {
+    enum class Kind : u8 { ImageCopy, BufferCopy };
+    Kind kind{Kind::ImageCopy};
+    bool covers_whole_destination{false};
+    VkImageAspectFlags src_aspect{};
+    VkImageAspectFlags dst_aspect{};
+    std::vector<VkImageCopy> image_copies;
+    struct BufferLevel {
+        VkBufferImageCopy src_region;
+        VkBufferImageCopy dst_region;
+    };
+    std::vector<BufferLevel> buffer_levels;
+    u64 scratch_bytes{0};
+};
+
+bool PlanOverlapCopy(const Storage& source, const Storage& destination, OverlapCopyPlan& out) {
+    if ((!source.image && !Rescale::NativeIsStale(source.scale_state)) || !destination.image ||
+        source.samples != VK_SAMPLE_COUNT_1_BIT ||
+        destination.samples != VK_SAMPLE_COUNT_1_BIT) {
+        return false;
+    }
+    const bool src_depth = source.host.depth || source.host.stencil;
+    const bool dst_depth = destination.host.depth || destination.host.stencil;
+    const BlockInfo block = FormatBlockInfo(source.desc.format);
+    const BlockInfo other_block = FormatBlockInfo(destination.desc.format);
+    if (!block.bytes || block.bytes != other_block.bytes || block.width != other_block.width ||
+        block.height != other_block.height) {
+        return false;
+    }
+    const bool linear = IsLinearStorage(source.desc);
+    if (linear != IsLinearStorage(destination.desc) ||
+        (linear && source.desc.stride != destination.desc.stride)) {
+        return false;
+    }
+    if (src_depth != dst_depth) {
+        // Same-layout depth <-> color reinterpretations (e.g., D32F <-> R32F) cannot use
+        // vkCmdCopyImage directly because their image aspects differ; copy raw texels via scratch.
+        if (source.host.needs_transcode || destination.host.needs_transcode ||
+            source.host.guest_layout_differs || destination.host.guest_layout_differs ||
+            std::popcount(static_cast<u32>(source.aspect)) != 1 ||
+            std::popcount(static_cast<u32>(destination.aspect)) != 1 ||
+            (block.bytes & (block.bytes - 1)) != 0 || block.bytes > 16 ||
+            (source.type == VK_IMAGE_TYPE_3D && destination.type != VK_IMAGE_TYPE_3D) ||
+            (destination.type == VK_IMAGE_TYPE_3D && source.type != VK_IMAGE_TYPE_3D)) {
+            return false;
+        }
+        out.kind = OverlapCopyPlan::Kind::BufferCopy;
+        out.src_aspect = source.aspect;
+        out.dst_aspect = destination.aspect;
+    } else {
+        if (src_depth ? source.host.format != destination.host.format
+                      : (source.host.format != destination.host.format &&
+                         (source.host.needs_transcode || destination.host.needs_transcode ||
+                          block.width != 1 || block.height != 1))) {
+            return false;
+        }
+        out.kind = OverlapCopyPlan::Kind::ImageCopy;
+        out.src_aspect = src_depth ? (source.aspect & destination.aspect)
+                                   : static_cast<VkImageAspectFlags>(VK_IMAGE_ASPECT_COLOR_BIT);
+        out.dst_aspect = out.src_aspect;
+        if (out.src_aspect == 0) {
+            return false;
+        }
+    }
+
+    u32 src_base_layer = 0;
+    u32 src_base_level = 0;
+    u32 dst_base_layer = 0;
+    u32 dst_base_level = 0;
+    u32 layers = 1;
+    u32 level_limit = 1;
+    if (source.pool_offset == destination.pool_offset) {
+        layers = source.layout.layer_size == destination.layout.layer_size
+                     ? (std::min)(source.layers, destination.layers)
+                     : 1u;
+        level_limit = linear ? 1u : (std::min)(source.levels, destination.levels);
+    } else if (!linear && source.type == destination.type && source.type != VK_IMAGE_TYPE_3D &&
+               destination.pool_offset > source.pool_offset && source.layout.layer_size != 0) {
+        const u64 delta = destination.pool_offset - source.pool_offset;
+        const u64 layer_idx = delta / source.layout.layer_size;
+        const u64 rem = delta % source.layout.layer_size;
+        if (layer_idx >= source.layers) {
+            return false;
+        }
+        src_base_layer = static_cast<u32>(layer_idx);
+        if (rem == 0 && (destination.layers == 1 ||
+                         source.layout.layer_size == destination.layout.layer_size)) {
+            layers = (std::min)(source.layers - src_base_layer, destination.layers);
+            level_limit = (std::min)(source.levels, destination.levels);
+            const u64 src_end =
+                source.pool_offset +
+                static_cast<u64>(src_base_layer + layers) * source.layout.layer_size;
+            if (destination.pool_offset + destination.layout.size > src_end &&
+                source.pool_offset + source.layout.size > src_end) {
+                return false;
+            }
+        } else if (destination.levels == 1 && destination.layers == 1) {
+            bool found = false;
+            for (u32 lvl = 1; lvl < source.levels; ++lvl) {
+                if (TextureLevelOffset(source.desc, lvl) == rem) {
+                    const u64 lvl_end = lvl + 1 < source.levels
+                                            ? TextureLevelOffset(source.desc, lvl + 1)
+                                            : source.layout.layer_size;
+                    if (rem + destination.layout.size <= lvl_end) {
+                        src_base_level = lvl;
+                        layers = 1;
+                        level_limit = 1;
+                        found = true;
+                    }
+                    break;
+                }
+            }
+            if (!found) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    } else if (!linear && source.type == destination.type && source.type != VK_IMAGE_TYPE_3D &&
+               source.pool_offset > destination.pool_offset &&
+               destination.layout.layer_size != 0) {
+        const u64 delta = source.pool_offset - destination.pool_offset;
+        const u64 layer_idx = delta / destination.layout.layer_size;
+        const u64 rem = delta % destination.layout.layer_size;
+        if (layer_idx >= destination.layers) {
+            return false;
+        }
+        dst_base_layer = static_cast<u32>(layer_idx);
+        if (rem == 0 && (source.layers == 1 ||
+                         source.layout.layer_size == destination.layout.layer_size)) {
+            layers = (std::min)(source.layers, destination.layers - dst_base_layer);
+            level_limit = (std::min)(source.levels, destination.levels);
+            const u64 dst_end =
+                destination.pool_offset +
+                static_cast<u64>(dst_base_layer + layers) * destination.layout.layer_size;
+            if (source.pool_offset + source.layout.size > dst_end &&
+                destination.pool_offset + destination.layout.size > dst_end) {
+                return false;
+            }
+        } else if (source.levels == 1 && source.layers == 1) {
+            bool found = false;
+            for (u32 lvl = 1; lvl < destination.levels; ++lvl) {
+                if (TextureLevelOffset(destination.desc, lvl) == rem) {
+                    const u64 lvl_end = lvl + 1 < destination.levels
+                                            ? TextureLevelOffset(destination.desc, lvl + 1)
+                                            : destination.layout.layer_size;
+                    if (rem + source.layout.size <= lvl_end) {
+                        dst_base_level = lvl;
+                        layers = 1;
+                        level_limit = 1;
+                        found = true;
+                    }
+                    break;
+                }
+            }
+            if (!found) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    } else {
+        return false;
+    }
+
+    if (out.kind == OverlapCopyPlan::Kind::BufferCopy &&
+        (source.type == VK_IMAGE_TYPE_3D || destination.type == VK_IMAGE_TYPE_3D) && layers != 1) {
+        return false;
+    }
+
+    const u64 src_base_off = linear ? 0 : TextureLevelOffset(source.desc, src_base_level);
+    const u64 dst_base_off = linear ? 0 : TextureLevelOffset(destination.desc, dst_base_level);
+    bool all_levels_full_dst = true;
+    u32 levels_copied = 0;
+    u64 cursor = 0;
+    out.image_copies.clear();
+    out.buffer_levels.clear();
+    for (u32 k = 0; k < level_limit; ++k) {
+        const u32 src_lvl = src_base_level + k;
+        const u32 dst_lvl = dst_base_level + k;
+        if (!linear) {
+            u32 source_h, source_d, destination_h, destination_d;
+            TextureLevelTiles(source.desc, src_lvl, source_h, source_d);
+            TextureLevelTiles(destination.desc, dst_lvl, destination_h, destination_d);
+            if (TextureLevelOffset(source.desc, src_lvl) - src_base_off !=
+                    TextureLevelOffset(destination.desc, dst_lvl) - dst_base_off ||
+                TextureLevelGobs(source.desc, src_lvl) !=
+                    TextureLevelGobs(destination.desc, dst_lvl) ||
+                source_h != destination_h || source_d != destination_d) {
+                break; // the levels' bytes are laid out differently from here on
+            }
+        }
+        const LevelExtent from = ExtentOfLevel(source, src_lvl);
+        const LevelExtent to = ExtentOfLevel(destination, dst_lvl);
+        const u32 width = (std::min)(from.width, to.width);
+        const u32 height = (std::min)(from.height, to.height);
+        const u32 depth = (std::min)(from.depth, to.depth);
+        if (source.host.bc_standin &&
+            (!BcRegionAligned(0, 0, width, height, from.width, from.height) ||
+             !BcRegionAligned(0, 0, width, height, to.width, to.height))) {
+            break; // the copy would end inside a 4x4 block of one of the BC stand-ins
+        }
+        if ((block.width > 1 || block.height > 1) &&
+            ((width != from.width && (width % block.width) != 0) ||
+             (width != to.width && (width % block.width) != 0) ||
+             (height != from.height && (height % block.height) != 0) ||
+             (height != to.height && (height % block.height) != 0))) {
+            break;
+        }
+        all_levels_full_dst &=
+            width == to.width && height == to.height && depth == to.depth;
+        ++levels_copied;
+        if (out.kind == OverlapCopyPlan::Kind::ImageCopy) {
+            out.image_copies.push_back({
+                .srcSubresource{.aspectMask = out.src_aspect,
+                                .mipLevel = src_lvl,
+                                .baseArrayLayer = src_base_layer,
+                                .layerCount = layers},
+                .srcOffset = {0, 0, 0},
+                .dstSubresource{.aspectMask = out.dst_aspect,
+                                .mipLevel = dst_lvl,
+                                .baseArrayLayer = dst_base_layer,
+                                .layerCount = layers},
+                .dstOffset = {0, 0, 0},
+                .extent = {width, height, depth},
+            });
+        } else {
+            cursor = (cursor + 255) / 256 * 256;
+            const u64 bytes = static_cast<u64>(CeilDiv(width, block.width)) *
+                              CeilDiv(height, block.height) * depth * layers * block.bytes;
+            out.buffer_levels.push_back({
+                .src_region{
+                    .bufferOffset = cursor,
+                    .bufferRowLength = 0,
+                    .bufferImageHeight = 0,
+                    .imageSubresource{.aspectMask = out.src_aspect,
+                                      .mipLevel = src_lvl,
+                                      .baseArrayLayer = src_base_layer,
+                                      .layerCount = layers},
+                    .imageOffset = {0, 0, 0},
+                    .imageExtent = {width, height, depth},
+                },
+                .dst_region{
+                    .bufferOffset = cursor,
+                    .bufferRowLength = 0,
+                    .bufferImageHeight = 0,
+                    .imageSubresource{.aspectMask = out.dst_aspect,
+                                      .mipLevel = dst_lvl,
+                                      .baseArrayLayer = dst_base_layer,
+                                      .layerCount = layers},
+                    .imageOffset = {0, 0, 0},
+                    .imageExtent = {width, height, depth},
+                },
+            });
+            cursor += bytes;
+        }
+    }
+    if (levels_copied == 0 ||
+        (source.pool_offset != destination.pool_offset && levels_copied < level_limit)) {
+        return false;
+    }
+    out.scratch_bytes = cursor;
+    const VkImageAspectFlags needed_dst_aspect = CopyAspect(destination);
+    out.covers_whole_destination =
+        dst_base_layer == 0 && dst_base_level == 0 && layers == destination.layers &&
+        levels_copied == destination.levels && all_levels_full_dst &&
+        (out.dst_aspect & needed_dst_aspect) == needed_dst_aspect &&
+        !(linear && destination.levels != 1);
+    return true;
+}
+
+bool DenseStorageByteSpan(const Storage& s, u64& dense_begin, u64& dense_end) {
+    if (s.samples != VK_SAMPLE_COUNT_1_BIT || s.host.needs_transcode || s.host.bc_standin ||
+        std::popcount(static_cast<u32>(s.aspect)) != 1) {
+        return false;
+    }
+    const UploadPlan plan = PlanStorageUpload(s, s.layout.size);
+    if (plan.unsupported != nullptr || plan.decode != UploadPlan::Decode::None ||
+        plan.pieces.size() != 1) {
+        return false;
+    }
+    const BlockInfo block = FormatBlockInfo(s.desc.format);
+    if (block.bytes == 0) {
+        return false;
+    }
+    const UploadPiece& piece = plan.pieces[0];
+    const u64 begin = s.pool_offset + piece.guest_offset;
+    if (plan.linear) {
+        const u64 row_bytes = s.layout.layer_size / (std::max)(piece.height, 1u);
+        if (row_bytes == 0 || static_cast<u64>(piece.cols) * block.bytes != row_bytes) {
+            return false;
+        }
+        dense_begin = begin;
+        dense_end = begin + row_bytes * piece.rows;
+        return dense_end > dense_begin;
+    }
+    const u64 gobs_in_x = (static_cast<u64>(piece.cols) * block.bytes + 63) / 64;
+    const u64 row_bytes = gobs_in_x << (9 + piece.tile_h + piece.tile_d);
+    if (row_bytes == 0 || static_cast<u64>(piece.cols) * block.bytes != gobs_in_x * 64) {
+        return false;
+    }
+    const u32 rows_per_step = 8u << piece.tile_h;
+    if (piece.slices == 1 && piece.tile_d == 0) {
+        const u64 full_steps = piece.rows / rows_per_step;
+        if (full_steps == 0) {
+            return false;
+        }
+        dense_begin = begin;
+        dense_end = begin + full_steps * row_bytes;
+        return dense_end > dense_begin;
+    }
+    if ((piece.rows % rows_per_step) == 0 && (piece.slices % (1u << piece.tile_d)) == 0) {
+        const u64 span = Tegra::Texture::CalculateSize(true, block.bytes, piece.cols, piece.rows,
+                                                       piece.slices, piece.tile_h, piece.tile_d);
+        dense_begin = begin;
+        dense_end = begin + span;
+        return dense_end > dense_begin;
+    }
+    return false;
+}
+
+} // Anonymous namespace
+
+VkBuffer Recorder::AcquireAliasScratch(u64 total, bool& needs_reuse_barrier) {
+    needs_reuse_barrier = false;
+    if (!alias_scratch || alias_scratch->size < total) {
+        std::shared_ptr<ShadowChunk> chunk = impl.draw_resources->AcquireShadow(total);
+        if (!chunk) {
+            return VK_NULL_HANDLE;
+        }
+        alias_scratch = std::move(chunk);
+        flight.shadow.push_back(alias_scratch);
+        alias_scratch_used = false;
+    } else if (alias_scratch_used) {
+        needs_reuse_barrier = true;
+    }
+    alias_scratch_used = true;
+    return *alias_scratch->buffer;
+}
+
 void Recorder::ResolveOverlaps(Storage& s) {
     const auto index_it = impl.storage_index.find(s.pool_serial);
     if (index_it == impl.storage_index.end()) {
@@ -3189,8 +4198,9 @@ void Recorder::ResolveOverlaps(Storage& s) {
     std::sort(sources.begin(), sources.end(), [](const Storage* a, const Storage* b) {
         return a->gpu_write_gen < b->gpu_write_gen;
     });
+    std::vector<Storage*> live_sources;
+    live_sources.reserve(sources.size());
     for (Storage* const other : sources) {
-        const char* why = nullptr;
         if (s.origin == StorageOrigin::Cpu && s.gpu_write_gen == 0) {
             // `s` holds only bytes uploaded from guest memory. When the CPU rewrote the source's
             // bytes after its GPU write (OoT reuses a GPU-written 260x260 target's memory for a
@@ -3249,14 +4259,61 @@ void Recorder::ResolveOverlaps(Storage& s) {
                 continue;
             }
         }
-        // The source's guest-sized image is read: it must hold its newest pixels.
-        MakeNativeCurrent(*other);
-        if (TransferOverlap(*other, s) || TransferOverlapBytes(*other, s, why)) {
-            if (s.scaled) {
-                s.scale_state = Rescale::AfterNativeWrite(); // overlapping bytes were copied in
-            }
+        live_sources.push_back(other);
+    }
+    OverlapCopyPlan plan;
+    size_t start_index = 0;
+    for (size_t i = live_sources.size(); i > 0; --i) {
+        if (PlanOverlapCopy(*live_sources[i - 1], s, plan) && plan.covers_whole_destination) {
+            start_index = i - 1;
+            break;
+        }
+    }
+    std::vector<Storage*> kept;
+    kept.reserve(live_sources.size() - start_index);
+    std::vector<std::pair<u64, u64>> covered_spans;
+    for (size_t i = live_sources.size(); i > start_index; --i) {
+        Storage* const other = live_sources[i - 1];
+        const u64 ov_begin = (std::max)(other->pool_offset, begin);
+        const u64 ov_end = (std::min)(other->pool_offset + other->layout.size, end);
+        if (ov_end <= ov_begin) {
             continue;
         }
+        if (!covered_spans.empty() && RangesCover(covered_spans, ov_begin, ov_end)) {
+            continue;
+        }
+        bool superseded_by_layout = false;
+        for (Storage* const newer : kept) {
+            OverlapCopyPlan tmp;
+            if (PlanOverlapCopy(*newer, *other, tmp) && tmp.covers_whole_destination) {
+                superseded_by_layout = true;
+                break;
+            }
+        }
+        if (superseded_by_layout) {
+            continue;
+        }
+        kept.push_back(other);
+        u64 dense_begin = 0;
+        u64 dense_end = 0;
+        if (DenseStorageByteSpan(*other, dense_begin, dense_end)) {
+            const u64 clip_lo = (std::max)(dense_begin, begin);
+            const u64 clip_hi = (std::min)(dense_end, end);
+            if (clip_hi > clip_lo) {
+                covered_spans.emplace_back(clip_lo, clip_hi);
+                std::ranges::sort(covered_spans);
+                if (RangesCover(covered_spans, begin, end)) {
+                    break;
+                }
+            }
+        }
+    }
+    std::ranges::reverse(kept);
+    for (Storage* const src : kept) {
+        // The source's guest-sized image is read: it must hold its newest pixels.
+        MakeNativeCurrent(*src);
+    }
+    const auto log_alias_failure = [&](Storage* other, const char* why) {
         // The bytes were written through a texture of another shape and no transfer expresses it.
         const std::pair<u64, u64> pair{reinterpret_cast<u64>(other), reinterpret_cast<u64>(&s)};
         impl.stats.alias_events.fetch_add(1, std::memory_order_relaxed);
@@ -3276,90 +4333,133 @@ void Recorder::ResolveOverlaps(Storage& s) {
                                 : "the reader holds the guest's initial bytes",
                 why != nullptr ? why : "no reason recorded"));
         }
+    };
+    for (size_t i = 0; i < kept.size();) {
+        Storage* const other = kept[i];
+        if (TransferOverlap(*other, s)) {
+            if (s.scaled) {
+                s.scale_state = Rescale::AfterNativeWrite(); // overlapping bytes were copied in
+            }
+            ++i;
+            continue;
+        }
+        size_t j = i + 1;
+        while (j < kept.size()) {
+            OverlapCopyPlan tmp;
+            if (PlanOverlapCopy(*kept[j], s, tmp)) {
+                break;
+            }
+            ++j;
+        }
+        const char* batch_why = nullptr;
+        if (j - i > 1 && TransferOverlapBytesBatch({kept.data() + i, j - i}, s, batch_why)) {
+            if (s.scaled) {
+                s.scale_state = Rescale::AfterNativeWrite(); // overlapping bytes were copied in
+            }
+            i = j;
+            continue;
+        }
+        for (size_t k = i; k < j; ++k) {
+            Storage* const item = kept[k];
+            const char* why = nullptr;
+            if (TransferOverlap(*item, s) || TransferOverlapBytes(*item, s, why)) {
+                if (s.scaled) {
+                    s.scale_state = Rescale::AfterNativeWrite(); // overlapping bytes were copied in
+                }
+                continue;
+            }
+            log_alias_failure(item, why);
+        }
+        i = j;
     }
     s.sync_gen = impl.write_clock;
     s.pool_gen_seen = index.write_gen;
 }
 
 bool Recorder::TransferOverlap(Storage& source, Storage& destination) {
-    if (!source.image || !destination.image || source.samples != VK_SAMPLE_COUNT_1_BIT ||
-        destination.samples != VK_SAMPLE_COUNT_1_BIT ||
-        source.pool_offset != destination.pool_offset) {
+    if (!source.image || !destination.image) {
         return false;
     }
-    const bool depth = source.host.depth || source.host.stencil;
-    if (depth != (destination.host.depth || destination.host.stencil)) {
+    OverlapCopyPlan plan;
+    if (!PlanOverlapCopy(source, destination, plan)) {
         return false;
     }
-    const BlockInfo block = FormatBlockInfo(source.desc.format);
-    const BlockInfo other_block = FormatBlockInfo(destination.desc.format);
-    if (!block.bytes || block.bytes != other_block.bytes || block.width != other_block.width ||
-        block.height != other_block.height) {
-        return false;
+    if (plan.kind == OverlapCopyPlan::Kind::ImageCopy) {
+        NoteTouched(source.shared_from_this());
+        GpuProf::Flight* const prof = flight.gpu_prof.get();
+        const GpuProf::Scope prof_scope{
+            prof, prof ? Cmd() : vk::CommandBuffer{},
+            prof ? GpuProf::Tag{.kind = GpuProf::Kind::Copy,
+                                .count = static_cast<u32>(plan.image_copies.size()),
+                                .hash_a = GpuProf::SUB_ALIAS_COPY,
+                                .format = static_cast<s32>(destination.host.format),
+                                .width = destination.extent.width,
+                                .height = destination.extent.height}
+                 : GpuProf::Tag{}};
+        const bool saved = track_writes;
+        track_writes = false;
+        PrepareImages({{&source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL},
+                       {&destination, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL}});
+        track_writes = saved;
+        Cmd().CopyImage(*source.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, *destination.image,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, plan.image_copies);
+        MarkWritten(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        impl.stats.alias_transfers.fetch_add(1, std::memory_order_relaxed);
+        return true;
     }
-    if (depth ? source.host.format != destination.host.format
-              : (source.host.format != destination.host.format &&
-                 (source.host.needs_transcode || destination.host.needs_transcode ||
-                  block.width != 1 || block.height != 1))) {
-        return false;
-    }
-    const bool linear = IsLinearStorage(source.desc);
-    if (linear != IsLinearStorage(destination.desc) ||
-        (linear && source.desc.stride != destination.desc.stride)) {
-        return false;
-    }
-    const u32 layers = source.layout.layer_size == destination.layout.layer_size
-                           ? (std::min)(source.layers, destination.layers)
-                           : 1u;
-    const u32 level_limit = linear ? 1u : (std::min)(source.levels, destination.levels);
-    const VkImageAspectFlags aspect =
-        depth ? (source.aspect & destination.aspect)
-              : static_cast<VkImageAspectFlags>(VK_IMAGE_ASPECT_COLOR_BIT);
-    std::vector<VkImageCopy> copies;
-    for (u32 level = 0; level < level_limit; ++level) {
-        if (!linear) {
-            u32 source_h, source_d, destination_h, destination_d;
-            TextureLevelTiles(source.desc, level, source_h, source_d);
-            TextureLevelTiles(destination.desc, level, destination_h, destination_d);
-            if (TextureLevelOffset(source.desc, level) !=
-                    TextureLevelOffset(destination.desc, level) ||
-                TextureLevelGobs(source.desc, level) != TextureLevelGobs(destination.desc, level) ||
-                source_h != destination_h || source_d != destination_d) {
-                break; // the levels' bytes are laid out differently from here on
-            }
-        }
-        const LevelExtent from = ExtentOfLevel(source, level);
-        const LevelExtent to = ExtentOfLevel(destination, level);
-        const u32 width = (std::min)(from.width, to.width);
-        const u32 height = (std::min)(from.height, to.height);
-        if (source.host.bc_standin &&
-            (!BcRegionAligned(0, 0, width, height, from.width, from.height) ||
-             !BcRegionAligned(0, 0, width, height, to.width, to.height))) {
-            break; // the copy would end inside a 4x4 block of one of the BC stand-ins
-        }
-        copies.push_back({
-            .srcSubresource{
-                .aspectMask = aspect, .mipLevel = level, .baseArrayLayer = 0, .layerCount = layers},
-            .srcOffset = {0, 0, 0},
-            .dstSubresource{
-                .aspectMask = aspect, .mipLevel = level, .baseArrayLayer = 0, .layerCount = layers},
-            .dstOffset = {0, 0, 0},
-            .extent = {(std::min)(from.width, to.width), (std::min)(from.height, to.height),
-                       (std::min)(from.depth, to.depth)},
-        });
-    }
-    if (copies.empty()) {
+    bool needs_reuse_barrier = false;
+    const VkBuffer scratch = AcquireAliasScratch(plan.scratch_bytes, needs_reuse_barrier);
+    if (scratch == VK_NULL_HANDLE) {
         return false;
     }
     NoteTouched(source.shared_from_this());
+    GpuProf::Flight* const prof = flight.gpu_prof.get();
+    const GpuProf::Scope prof_scope{
+        prof, prof ? Cmd() : vk::CommandBuffer{},
+        prof ? GpuProf::Tag{.kind = GpuProf::Kind::Copy,
+                            .count = static_cast<u32>(plan.buffer_levels.size()),
+                            .hash_a = GpuProf::SUB_ALIAS_COPY,
+                            .format = static_cast<s32>(destination.host.format),
+                            .width = destination.extent.width,
+                            .height = destination.extent.height}
+             : GpuProf::Tag{}};
     const bool saved = track_writes;
     track_writes = false;
     PrepareImages({{&source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL},
                    {&destination, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL}});
     track_writes = saved;
-    Cmd().CopyImage(*source.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, *destination.image,
-                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, copies);
-    barrier_pending = true;
+    vk::CommandBuffer cmd = Cmd();
+    if (needs_reuse_barrier) {
+        const VkMemoryBarrier reuse_barrier{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        };
+        cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                            reuse_barrier);
+    }
+    std::vector<VkBufferImageCopy> src_regions;
+    std::vector<VkBufferImageCopy> dst_regions;
+    src_regions.reserve(plan.buffer_levels.size());
+    dst_regions.reserve(plan.buffer_levels.size());
+    for (const OverlapCopyPlan::BufferLevel& lvl : plan.buffer_levels) {
+        src_regions.push_back(lvl.src_region);
+        dst_regions.push_back(lvl.dst_region);
+    }
+    cmd.CopyImageToBuffer(*source.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, scratch,
+                          src_regions);
+    const VkMemoryBarrier xfer_barrier{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .pNext = nullptr,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+    };
+    cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                        xfer_barrier);
+    cmd.CopyBufferToImage(scratch, *destination.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                          dst_regions);
+    MarkWritten(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
     impl.stats.alias_transfers.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
@@ -3371,6 +4471,10 @@ namespace {
 struct AliasPiece {
     AliasTransferGpu::Piece gpu;
     VkBufferImageCopy region;
+    u64 byte_begin{};
+    u64 byte_end{};
+    u64 dense_begin{};
+    u64 dense_end{};
 };
 
 /// The pieces of `s` that touch [window_begin, window_end) of its pool, each cut down to the block
@@ -3387,13 +4491,14 @@ bool CollectAliasPieces(const Storage& s, const UploadPlan& plan, u64 window_beg
         u32 rows_per_step = 1;
         u64 span = 0;
         u32 pitch = 0;
+        u64 gobs_in_x = 0;
         if (plan.linear) {
             // The pitch the upload reads the guest rows at (nvn_upload.cpp).
             row_bytes = s.layout.layer_size / (std::max)(piece.height, 1u);
             pitch = static_cast<u32>(row_bytes);
             span = row_bytes * piece.rows;
         } else {
-            const u64 gobs_in_x = (static_cast<u64>(piece.cols) * block.bytes + 63) / 64;
+            gobs_in_x = (static_cast<u64>(piece.cols) * block.bytes + 63) / 64;
             row_bytes = gobs_in_x << (9 + piece.tile_h + piece.tile_d);
             rows_per_step = 8u << piece.tile_h;
             span = Tegra::Texture::CalculateSize(true, block.bytes, piece.cols, piece.rows,
@@ -3405,6 +4510,8 @@ bool CollectAliasPieces(const Storage& s, const UploadPlan& plan, u64 window_beg
         }
         u32 first_row = 0;
         u32 rows = piece.rows;
+        u64 piece_byte_begin = begin;
+        u64 piece_byte_end = end;
         if (piece.slices == 1) {
             // Block rows follow each other at row_bytes in the pool; the other block rows keep
             // their bytes.
@@ -3416,11 +4523,33 @@ bool CollectAliasPieces(const Storage& s, const UploadPlan& plan, u64 window_beg
             if (rows == 0) {
                 continue;
             }
+            const u64 steps = (static_cast<u64>(rows) + rows_per_step - 1) / rows_per_step;
+            piece_byte_begin = begin + first_step * row_bytes;
+            piece_byte_end = piece_byte_begin + steps * row_bytes;
         }
-        const s64 base = static_cast<s64>(begin + first_row / rows_per_step * row_bytes) -
-                         static_cast<s64>(window_begin);
+        const s64 base = static_cast<s64>(piece_byte_begin) - static_cast<s64>(window_begin);
         if (base > (std::numeric_limits<s32>::max)() || base < (std::numeric_limits<s32>::min)()) {
             return false;
+        }
+        u64 dense_begin = 0;
+        u64 dense_end = 0;
+        if (plan.linear) {
+            if (static_cast<u64>(piece.cols) * block.bytes == row_bytes) {
+                dense_begin = piece_byte_begin;
+                dense_end = piece_byte_end;
+            }
+        } else if (static_cast<u64>(piece.cols) * block.bytes == gobs_in_x * 64) {
+            if (piece.slices == 1 && piece.tile_d == 0) {
+                const u64 full_steps = rows / rows_per_step;
+                if (full_steps != 0) {
+                    dense_begin = piece_byte_begin;
+                    dense_end = piece_byte_begin + full_steps * row_bytes;
+                }
+            } else if ((piece.rows % rows_per_step) == 0 &&
+                       (piece.slices % (1u << piece.tile_d)) == 0) {
+                dense_begin = piece_byte_begin;
+                dense_end = piece_byte_end;
+            }
         }
         tight = (tight + 255) / 256 * 256;
         const u32 first_texel_row = first_row * block.height;
@@ -3451,6 +4580,10 @@ bool CollectAliasPieces(const Storage& s, const UploadPlan& plan, u64 window_beg
                 .imageOffset = {0, static_cast<s32>(first_texel_row), 0},
                 .imageExtent = {piece.width, texel_rows, piece.depth},
             },
+            .byte_begin = piece_byte_begin,
+            .byte_end = piece_byte_end,
+            .dense_begin = dense_begin,
+            .dense_end = dense_end,
         });
         tight += static_cast<u64>(piece.cols) * rows * piece.slices * block.bytes;
     }
@@ -3460,11 +4593,20 @@ bool CollectAliasPieces(const Storage& s, const UploadPlan& plan, u64 window_beg
 } // Anonymous namespace
 
 bool Recorder::TransferOverlapBytes(Storage& source, Storage& destination, const char*& why) {
-    if (!source.image || !destination.image) {
+    Storage* const ptr = &source;
+    return TransferOverlapBytesBatch(std::span{&ptr, 1}, destination, why);
+}
+
+bool Recorder::TransferOverlapBytesBatch(std::span<Storage* const> sources, Storage& destination,
+                                         const char*& why) {
+    if (sources.empty()) {
+        return true;
+    }
+    if (!destination.image) {
         why = "a texture has no image";
         return false;
     }
-    if (source.samples != VK_SAMPLE_COUNT_1_BIT || destination.samples != VK_SAMPLE_COUNT_1_BIT) {
+    if (destination.samples != VK_SAMPLE_COUNT_1_BIT) {
         why = "multisampled texture";
         return false;
     }
@@ -3473,67 +4615,175 @@ bool Recorder::TransferOverlapBytes(Storage& source, Storage& destination, const
         why = "this device cannot run the alias transfer shader";
         return false;
     }
-    const UploadPlan source_plan = PlanStorageUpload(source, source.layout.size);
-    const UploadPlan destination_plan = PlanStorageUpload(destination, destination.layout.size);
-    for (const UploadPlan* plan : {&source_plan, &destination_plan}) {
-        if (plan->unsupported != nullptr) {
-            why = plan->unsupported;
+    const auto validate_plan = [&](const UploadPlan& plan) {
+        if (plan.unsupported != nullptr) {
+            why = plan.unsupported;
             return false;
         }
-        if (plan->decode != UploadPlan::Decode::None) {
+        if (plan.decode != UploadPlan::Decode::None) {
             why = "a compressed texture decoded to a stand-in format";
             return false;
         }
-        if (plan->pieces.empty()) {
+        if (plan.pieces.empty()) {
             why = "a texture with no level in its storage";
             return false;
         }
-        if (std::popcount(static_cast<u32>(plan->aspect)) != 1) {
+        if (std::popcount(static_cast<u32>(plan.aspect)) != 1) {
             why = "a texture with several aspects";
             return false;
         }
-    }
-    const u64 window_begin = (std::max)(source.pool_offset, destination.pool_offset);
-    const u64 window_end = (std::min)(source.pool_offset + source.layout.size,
-                                      destination.pool_offset + destination.layout.size);
-    if (window_end <= window_begin) {
         return true;
-    }
-    std::vector<AliasPiece> source_pieces;
-    std::vector<AliasPiece> destination_pieces;
-    u64 cursor = 0;
-    if (!CollectAliasPieces(source, source_plan, window_begin, window_end, cursor, source_pieces) ||
-        !CollectAliasPieces(destination, destination_plan, window_begin, window_end, cursor,
-                            destination_pieces)) {
-        why = "a piece lies too far from the shared bytes";
+    };
+    const UploadPlan destination_plan = PlanStorageUpload(destination, destination.layout.size);
+    if (!validate_plan(destination_plan)) {
         return false;
     }
-    if (source_pieces.empty() || destination_pieces.empty()) {
-        return true; // the shared bytes are padding of one of them
+    std::vector<UploadPlan> source_plans;
+    source_plans.reserve(sources.size());
+    for (Storage* const src : sources) {
+        if (src == nullptr || !src->image) {
+            why = "a texture has no image";
+            return false;
+        }
+        if (src->samples != VK_SAMPLE_COUNT_1_BIT) {
+            why = "multisampled texture";
+            return false;
+        }
+        source_plans.push_back(PlanStorageUpload(*src, src->layout.size));
+        if (!validate_plan(source_plans.back())) {
+            return false;
+        }
     }
-    cursor = (cursor + 255) / 256 * 256;
-    const u64 window_offset = cursor;
-    const u64 window_size = window_end - window_begin;
-    const u64 total = window_offset + window_size;
-    if (total > gpu->MaxScratchBytes() || window_size > (std::numeric_limits<u32>::max)()) {
-        why = "the shared bytes do not fit the transfer scratch buffer";
-        return false;
+
+    const u64 dst_begin = destination.pool_offset;
+    const u64 dst_end = dst_begin + destination.layout.size;
+    struct BuiltChunk {
+        size_t begin{0};
+        size_t end{0};
+        u64 win_begin{0};
+        u64 win_end{0};
+        u64 sum_overlaps{0};
+        std::vector<std::vector<AliasPiece>> per_source_pieces;
+        std::vector<AliasPiece> destination_pieces;
+        u64 window_offset{0};
+        u64 window_size{0};
+        u64 total{0};
+        size_t first_src_idx{0};
+    };
+    const auto overlap_of = [&](const Storage& src, u64& lo, u64& hi) {
+        lo = (std::max)(src.pool_offset, dst_begin);
+        hi = (std::min)(src.pool_offset + src.layout.size, dst_end);
+        return hi > lo;
+    };
+    const auto try_build = [&](size_t b, size_t e, BuiltChunk& out, const char*& err) {
+        out = {};
+        out.begin = b;
+        out.end = e;
+        out.win_begin = (std::numeric_limits<u64>::max)();
+        out.win_end = 0;
+        bool any_overlap = false;
+        for (size_t k = b; k < e; ++k) {
+            u64 lo = 0;
+            u64 hi = 0;
+            if (overlap_of(*sources[k], lo, hi)) {
+                out.win_begin = (std::min)(out.win_begin, lo);
+                out.win_end = (std::max)(out.win_end, hi);
+                out.sum_overlaps += hi - lo;
+                any_overlap = true;
+            }
+        }
+        if (!any_overlap || out.win_end <= out.win_begin) {
+            out.win_begin = 0;
+            out.win_end = 0;
+            return true;
+        }
+        out.per_source_pieces.resize(e - b);
+        u64 cursor = 0;
+        for (size_t k = b; k < e; ++k) {
+            if (!CollectAliasPieces(*sources[k], source_plans[k], out.win_begin, out.win_end,
+                                    cursor, out.per_source_pieces[k - b])) {
+                err = "a piece lies too far from the shared bytes";
+                return false;
+            }
+        }
+        if (!CollectAliasPieces(destination, destination_plan, out.win_begin, out.win_end, cursor,
+                                out.destination_pieces)) {
+            err = "a piece lies too far from the shared bytes";
+            return false;
+        }
+        cursor = (cursor + 255) / 256 * 256;
+        out.window_offset = cursor;
+        out.window_size = out.win_end - out.win_begin;
+        out.total = out.window_offset + out.window_size;
+        if (out.total > gpu->MaxScratchBytes() ||
+            out.window_size > (std::numeric_limits<u32>::max)()) {
+            err = "the shared bytes do not fit the transfer scratch buffer";
+            return false;
+        }
+        return true;
+    };
+
+    std::vector<BuiltChunk> chunks;
+    u64 max_total = 0;
+    for (size_t chunk_begin = 0; chunk_begin < sources.size();) {
+        u64 first_lo = 0;
+        u64 first_hi = 0;
+        if (!overlap_of(*sources[chunk_begin], first_lo, first_hi)) {
+            ++chunk_begin;
+            continue;
+        }
+        BuiltChunk chunk;
+        if (!try_build(chunk_begin, chunk_begin + 1, chunk, why)) {
+            return false;
+        }
+        while (chunk.end < sources.size()) {
+            u64 next_lo = 0;
+            u64 next_hi = 0;
+            u64 cand_win_begin = chunk.win_begin;
+            u64 cand_win_end = chunk.win_end;
+            u64 cand_sum = chunk.sum_overlaps;
+            if (overlap_of(*sources[chunk.end], next_lo, next_hi)) {
+                cand_win_begin = (std::min)(cand_win_begin, next_lo);
+                cand_win_end = (std::max)(cand_win_end, next_hi);
+                cand_sum += next_hi - next_lo;
+            }
+            const u64 cand_win_size = cand_win_end - cand_win_begin;
+            if (cand_win_size > cand_sum * 2 + (u64{256} << 10)) {
+                break;
+            }
+            BuiltChunk cand;
+            const char* cand_err = nullptr;
+            if (!try_build(chunk_begin, chunk.end + 1, cand, cand_err)) {
+                break;
+            }
+            chunk = std::move(cand);
+        }
+        chunk_begin = chunk.end;
+        bool any_source_pieces = false;
+        for (size_t k = 0; k < chunk.per_source_pieces.size(); ++k) {
+            if (!chunk.per_source_pieces[k].empty()) {
+                chunk.first_src_idx = chunk.begin + k;
+                any_source_pieces = true;
+                break;
+            }
+        }
+        if (!any_source_pieces || chunk.destination_pieces.empty()) {
+            continue;
+        }
+        max_total = (std::max)(max_total, chunk.total);
+        chunks.push_back(std::move(chunk));
     }
-    std::shared_ptr<ShadowChunk> scratch = impl.draw_resources->AcquireShadow(total);
-    if (!scratch) {
+    if (chunks.empty()) {
+        return true; // the shared bytes are padding
+    }
+
+    bool needs_reuse_barrier = false;
+    const VkBuffer buffer = AcquireAliasScratch(max_total, needs_reuse_barrier);
+    if (buffer == VK_NULL_HANDLE) {
         why = "no scratch memory for the transfer";
         return false;
     }
-    flight.shadow.push_back(scratch);
 
-    NoteTouched(source.shared_from_this());
-    const bool saved = track_writes;
-    track_writes = false;
-    PrepareImages({{&source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL},
-                   {&destination, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL}});
-    track_writes = saved;
-    vk::CommandBuffer cmd = Cmd();
-    const VkBuffer buffer = *scratch->buffer;
     const auto regions = [](const std::vector<AliasPiece>& pieces) {
         std::vector<VkBufferImageCopy> out;
         out.reserve(pieces.size());
@@ -3542,53 +4792,196 @@ bool Recorder::TransferOverlapBytes(Storage& source, Storage& destination, const
         }
         return out;
     };
-    const std::vector<VkBufferImageCopy> destination_regions = regions(destination_pieces);
-    cmd.CopyImageToBuffer(*source.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer,
-                          regions(source_pieces));
-    cmd.CopyImageToBuffer(*destination.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer,
-                          destination_regions);
-    const auto barrier = [&cmd](VkPipelineStageFlags from, VkAccessFlags written,
-                                VkPipelineStageFlags to, VkAccessFlags used) {
-        cmd.PipelineBarrier(from, to, 0,
-                            VkMemoryBarrier{
-                                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                                .pNext = nullptr,
-                                .srcAccessMask = written,
-                                .dstAccessMask = used,
-                            });
-    };
-    constexpr VkAccessFlags SHADER_ACCESS = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    const auto to_shader = [&] {
-        barrier(VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, SHADER_ACCESS);
-    };
-    to_shader();
-    gpu->Begin(cmd, buffer, total);
-    const auto run = [&](AliasTransferGpu::Mode mode, const std::vector<AliasPiece>& pieces) {
-        for (const AliasPiece& piece : pieces) {
-            gpu->Dispatch(cmd, mode, static_cast<u32>(window_offset), static_cast<u32>(window_size),
-                          piece.gpu);
+
+    for (size_t chunk_idx = 0; chunk_idx < chunks.size(); ++chunk_idx) {
+        const BuiltChunk& chunk = chunks[chunk_idx];
+        std::vector<std::pair<u64, u64>> dense_spans;
+        for (const auto& pieces : chunk.per_source_pieces) {
+            for (const AliasPiece& piece : pieces) {
+                if (piece.dense_end <= piece.dense_begin) {
+                    continue;
+                }
+                const u64 lo = (std::max)(piece.dense_begin, chunk.win_begin);
+                const u64 hi = (std::min)(piece.dense_end, chunk.win_end);
+                if (hi > lo) {
+                    dense_spans.emplace_back(lo, hi);
+                }
+            }
         }
-    };
-    // The destination's own bytes first (what the source did not write stays), then the source over
-    // them, then the window back into the destination's texels.
-    run(AliasTransferGpu::Mode::Scatter, destination_pieces);
-    to_shader();
-    run(AliasTransferGpu::Mode::Scatter, source_pieces);
-    to_shader();
-    run(AliasTransferGpu::Mode::Gather, destination_pieces);
-    barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-    track_writes = false;
-    PrepareImages({{&destination, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL}});
-    track_writes = saved;
-    cmd = Cmd();
-    cmd.CopyBufferToImage(buffer, *destination.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                          destination_regions);
-    barrier_pending = true;
-    impl.stats.alias_byte_transfers.fetch_add(1, std::memory_order_relaxed);
-    impl.stats.alias_byte_bytes.fetch_add(window_size, std::memory_order_relaxed);
+        bool sources_cover_window = false;
+        if (!dense_spans.empty()) {
+            std::ranges::sort(dense_spans);
+            sources_cover_window = RangesCover(dense_spans, chunk.win_begin, chunk.win_end);
+        }
+        const bool dst_inside_window =
+            std::ranges::all_of(chunk.destination_pieces, [&](const AliasPiece& p) {
+                return p.byte_begin >= chunk.win_begin && p.byte_end <= chunk.win_end;
+            });
+        const bool need_dst_scatter = !sources_cover_window;
+        const bool need_dst_copy = need_dst_scatter || !dst_inside_window;
+
+        Storage& first_src = *sources[chunk.first_src_idx];
+        {
+            using AliasPairKey = std::tuple<u64, u32, u32, s32, u64, u32, u32, s32>;
+            static std::mutex diag_mutex;
+            static std::set<AliasPairKey> seen_pairs;
+            const AliasPairKey pair_key{first_src.pool_offset,
+                                      first_src.extent.width,
+                                      first_src.extent.height,
+                                      first_src.desc.format,
+                                      destination.pool_offset,
+                                      destination.extent.width,
+                                      destination.extent.height,
+                                      destination.desc.format};
+            std::scoped_lock lock{diag_mutex};
+            if (seen_pairs.size() < 24 && seen_pairs.insert(pair_key).second) {
+                LOG_INFO(Render_Vulkan,
+                         "[nvn] alias-bytes #{}: caller={} batch={} pool {:#x} src +{:#x} {}x{} "
+                         "lv{} ly{} fmt={:#x} -> dst +{:#x} {}x{} lv{} ly{} fmt={:#x} win={}B "
+                         "(dst_copy={} dst_scatter={})",
+                         seen_pairs.size(),
+                         current_overlap_caller ? current_overlap_caller : "unknown",
+                         chunk.end - chunk.begin, first_src.pool_serial, first_src.pool_offset,
+                         first_src.extent.width, first_src.extent.height, first_src.levels,
+                         first_src.layers, first_src.desc.format, destination.pool_offset,
+                         destination.extent.width, destination.extent.height, destination.levels,
+                         destination.layers, destination.desc.format, chunk.window_size,
+                         need_dst_copy ? 1 : 0, need_dst_scatter ? 1 : 0);
+            }
+        }
+
+        std::vector<std::pair<Storage*, VkImageLayout>> prep;
+        prep.reserve(chunk.per_source_pieces.size() + 1);
+        for (size_t k = 0; k < chunk.per_source_pieces.size(); ++k) {
+            if (!chunk.per_source_pieces[k].empty()) {
+                Storage* const src = sources[chunk.begin + k];
+                NoteTouched(src->shared_from_this());
+                prep.emplace_back(src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            }
+        }
+        if (need_dst_copy) {
+            prep.emplace_back(&destination, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        }
+
+        GpuProf::Flight* const prof = flight.gpu_prof.get();
+        const GpuProf::Scope prof_scope{
+            prof, prof ? Cmd() : vk::CommandBuffer{},
+            prof ? GpuProf::Tag{.kind = GpuProf::Kind::Copy,
+                                .count = static_cast<u32>((std::min<u64>)(chunk.window_size, ~u32{0})),
+                                .hash_a = GpuProf::SUB_ALIAS_BYTES,
+                                .format = static_cast<s32>(destination.host.format),
+                                .width = destination.extent.width,
+                                .height = destination.extent.height}
+                 : GpuProf::Tag{}};
+        const bool saved = track_writes;
+        track_writes = false;
+        PrepareImagesSpan(prep);
+        track_writes = saved;
+        vk::CommandBuffer cmd = Cmd();
+        if (needs_reuse_barrier || chunk_idx > 0) {
+            const VkMemoryBarrier reuse_barrier{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+                .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            };
+            cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                                reuse_barrier);
+        }
+        const std::vector<VkBufferImageCopy> destination_regions =
+            regions(chunk.destination_pieces);
+        for (size_t k = 0; k < chunk.per_source_pieces.size(); ++k) {
+            if (chunk.per_source_pieces[k].empty()) {
+                continue;
+            }
+            cmd.CopyImageToBuffer(*sources[chunk.begin + k]->image,
+                                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer,
+                                  regions(chunk.per_source_pieces[k]));
+        }
+        if (need_dst_copy) {
+            cmd.CopyImageToBuffer(*destination.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer,
+                                  destination_regions);
+        }
+        const auto barrier = [&cmd](VkPipelineStageFlags from, VkAccessFlags written,
+                                    VkPipelineStageFlags to, VkAccessFlags used) {
+            cmd.PipelineBarrier(from, to, 0,
+                                VkMemoryBarrier{
+                                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                                    .pNext = nullptr,
+                                    .srcAccessMask = written,
+                                    .dstAccessMask = used,
+                                });
+        };
+        constexpr VkAccessFlags SHADER_ACCESS =
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        const auto to_shader = [&] {
+            barrier(VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, SHADER_ACCESS);
+        };
+        to_shader();
+        gpu->Begin(cmd, buffer, chunk.total);
+        const auto run = [&](AliasTransferGpu::Mode mode, const std::vector<AliasPiece>& pieces) {
+            for (const AliasPiece& piece : pieces) {
+                gpu->Dispatch(cmd, mode, static_cast<u32>(chunk.window_offset),
+                              static_cast<u32>(chunk.window_size), piece.gpu);
+            }
+        };
+        // The destination's own bytes first when the sources leave bytes uncovered, then each
+        // source over them (oldest -> newest), then the window back into the destination's texels.
+        if (need_dst_scatter) {
+            run(AliasTransferGpu::Mode::Scatter, chunk.destination_pieces);
+            to_shader();
+        }
+        std::vector<std::pair<u64, u64>> active_written;
+        for (const std::vector<AliasPiece>& pieces : chunk.per_source_pieces) {
+            if (pieces.empty()) {
+                continue;
+            }
+            bool overlaps_active = false;
+            for (const AliasPiece& piece : pieces) {
+                const u64 lo = (std::max)(piece.byte_begin, chunk.win_begin);
+                const u64 hi = (std::min)(piece.byte_end, chunk.win_end);
+                if (hi <= lo) {
+                    continue;
+                }
+                for (const auto& [wlo, whi] : active_written) {
+                    if (wlo < hi && lo < whi) {
+                        overlaps_active = true;
+                        break;
+                    }
+                }
+                if (overlaps_active) {
+                    break;
+                }
+            }
+            if (overlaps_active) {
+                to_shader();
+                active_written.clear();
+            }
+            run(AliasTransferGpu::Mode::Scatter, pieces);
+            for (const AliasPiece& piece : pieces) {
+                const u64 lo = (std::max)(piece.byte_begin, chunk.win_begin);
+                const u64 hi = (std::min)(piece.byte_end, chunk.win_end);
+                if (hi > lo) {
+                    active_written.emplace_back(lo, hi);
+                }
+            }
+        }
+        to_shader();
+        run(AliasTransferGpu::Mode::Gather, chunk.destination_pieces);
+        barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        track_writes = false;
+        PrepareImages({{&destination, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL}});
+        track_writes = saved;
+        cmd = Cmd();
+        cmd.CopyBufferToImage(buffer, *destination.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                              destination_regions);
+        MarkWritten(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        impl.stats.alias_byte_transfers.fetch_add(1, std::memory_order_relaxed);
+        impl.stats.alias_byte_bytes.fetch_add(chunk.window_size, std::memory_order_relaxed);
+    }
     return true;
 }
 
@@ -3655,7 +5048,7 @@ void Recorder::ClearTexture(const VC::ClearTexturePayload& p) {
     const bool full_level = x == 0 && y == 0 && width == extent.width && height == extent.height &&
                             (!is_3d || (z == 0 && depth == extent.depth));
     const bool everything = full_level && s.levels == 1 && layer_count == s.layers;
-    EnsureContents(s, everything);
+    EnsureContentsAs("ClearTexture", s, everything);
     if (full_level) {
         PrepareImages({{&s, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL}});
         VkClearColorValue color{};
@@ -3684,7 +5077,7 @@ void Recorder::ClearTexture(const VC::ClearTexturePayload& p) {
             Cmd().ClearColorImage(*twin.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, color, range);
             s.scale_state = Rescale::AfterBlit(); // both hold the cleared colour
         }
-        barrier_pending = true;
+        MarkWritten(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
         return;
     }
     if (is_3d) {
@@ -3699,6 +5092,11 @@ void Recorder::ClearTexturePartial(Storage& s, u32 level, u32 layer, u32 layer_c
     if (!s.host.attachable) {
         Unsupported("ClearTexture", "partial clear of a texture that cannot be a render target");
         return;
+    }
+    if (s.pending_unrestricted_formats || !s.FormatListAllows(s.host.format)) {
+        if (!UpgradeImageCaps(s, false, true)) {
+            return;
+        }
     }
     auto pass_it = impl.clear_render_passes.find(s.host.format);
     if (pass_it == impl.clear_render_passes.end()) {
@@ -3813,7 +5211,8 @@ void Recorder::ClearTexturePartial(Storage& s, u32 level, u32 layer, u32 layer_c
     };
     Cmd().ClearAttachments(attachment, rect);
     Cmd().EndRenderPass();
-    barrier_pending = true;
+    MarkWritten(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
 }
 
 void Recorder::ClearBuffer(const VC::ClearBufferPayload& p) {
@@ -3833,7 +5232,7 @@ void Recorder::ClearBuffer(const VC::ClearBufferPayload& p) {
     FlushPending();
     Cmd().FillBuffer(pool->Handle(), offset, p.size, p.value);
     NotePoolWrite(*pool, offset, p.size);
-    barrier_pending = true;
+    MarkWritten(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
 }
 
 void Recorder::CopyBufferToBuffer(const VC::CopyBufferToBufferPayload& p) {
@@ -3857,7 +5256,7 @@ void Recorder::CopyBufferToBuffer(const VC::CopyBufferToBufferPayload& p) {
     const VkBufferCopy region{.srcOffset = src_offset, .dstOffset = dst_offset, .size = p.size};
     Cmd().CopyBuffer(src->Handle(), dst->Handle(), region);
     NotePoolWrite(*dst, dst_offset, p.size);
-    barrier_pending = true;
+    MarkWritten(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
 }
 
 void Recorder::CopyBufferToTexture(const VC::CopyBufferTexturePayload& p) {
@@ -3894,6 +5293,7 @@ void Recorder::CopyBufferToTexture(const VC::CopyBufferTexturePayload& p) {
         Failed("CopyBufferToTexture", "source range leaves the memory pool");
         return;
     }
+    ResolveCounterBatchIfOverlapping(*pool, offset, geometry.span);
     if (HasLinearWritebackOverlapping(*pool, offset, offset + geometry.span)) {
         EndDrawPass();
         FlushLinearWritebacks(pool, offset, offset + geometry.span);
@@ -3903,12 +5303,13 @@ void Recorder::CopyBufferToTexture(const VC::CopyBufferTexturePayload& p) {
         p.region.x <= 0 && p.region.y <= 0 &&
         (p.region.width <= 0 || static_cast<u32>(p.region.width) >= extent.width) &&
         (p.region.height <= 0 || static_cast<u32>(p.region.height) >= extent.height);
-    EnsureContents(s, covers_level && s.levels == 1 && s.layers == 1 && s.type != VK_IMAGE_TYPE_3D);
+    EnsureContentsAs("CopyBufferToTexture", s,
+                   covers_level && s.levels == 1 && s.layers == 1 && s.type != VK_IMAGE_TYPE_3D);
     UploadRange(*pool, offset, geometry.span);
     PrepareImages({{&s, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL}});
     Cmd().CopyBufferToImage(pool->Handle(), *s.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                             geometry.regions);
-    barrier_pending = true;
+    MarkWritten(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
 }
 
 bool Recorder::DecodeBufferToTexture(Storage& s, u32 level, u32 layer,
@@ -3977,6 +5378,7 @@ bool Recorder::DecodeBufferToTexture(Storage& s, u32 level, u32 layer,
         Failed("CopyBufferToTexture", "source range leaves the memory pool");
         return false;
     }
+    ResolveCounterBatchIfOverlapping(pool, offset, span);
     if (HasLinearWritebackOverlapping(pool, offset, offset + span)) {
         EndDrawPass();
         FlushLinearWritebacks(&pool, offset, offset + span);
@@ -4024,7 +5426,7 @@ bool Recorder::DecodeBufferToTexture(Storage& s, u32 level, u32 layer,
         Failed("CopyBufferToTexture", "the BC stand-in could not be recreated as BC3");
         return false;
     }
-    EnsureContents(s, covers);
+    EnsureContentsAs("DecodeBufferToTexture", s, covers);
     if (s.host.bc_standin) {
         // 2D only (ToBcStandin): the slices are layers, decoded tightly one after the other.
         const u64 layer_bytes = u64{width} * height * 4;
@@ -4064,7 +5466,7 @@ bool Recorder::DecodeBufferToTexture(Storage& s, u32 level, u32 layer,
         .imageExtent = {width, height, is_3d ? slices : 1u},
     };
     Cmd().CopyBufferToImage(staging.buffer, *s.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
-    barrier_pending = true;
+    MarkWritten(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
     return true;
 }
 
@@ -4100,11 +5502,12 @@ void Recorder::CopyTextureToBuffer(const VC::CopyBufferTexturePayload& p) {
         Failed("CopyTextureToBuffer", "destination range leaves the memory pool");
         return;
     }
+    ResolveCounterBatchIfOverlapping(*pool, offset, geometry.span);
     if (HasLinearWritebackOverlapping(*pool, offset, offset + geometry.span)) {
         EndDrawPass();
         FlushLinearWritebacks(pool, offset, offset + geometry.span);
     }
-    EnsureContents(s, false);
+    EnsureContentsAs("CopyTextureToBuffer", s, false);
     if (geometry.padded) {
         // Bytes between rows are not written: the mirror must hold the guest's version of them.
         UploadRange(*pool, offset, geometry.span);
@@ -4113,7 +5516,7 @@ void Recorder::CopyTextureToBuffer(const VC::CopyBufferTexturePayload& p) {
     Cmd().CopyImageToBuffer(*s.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, pool->Handle(),
                             geometry.regions);
     NotePoolWrite(*pool, offset, geometry.span);
-    barrier_pending = true;
+    MarkWritten(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
 }
 
 void Recorder::CopyTextureToTexture(const VC::CopyTextureToTexturePayload& p) {
@@ -4227,8 +5630,8 @@ void Recorder::CopyTextureToTexture(const VC::CopyTextureToTexturePayload& p) {
                      "neighbors",
                      width, height, dst_level, dst_first);
         }
-        EnsureContents(*src, false);
-        EnsureContents(*dst, false);
+        EnsureContentsAs("CopyTextureToTexture", *src, false);
+        EnsureContentsAs("CopyTextureToTexture", *dst, false);
         BcGpuEncoder* encoder = impl.BcEncoder();
         if (!encoder || impl.device.MaxPushDescriptors() < 3) {
             Failed("CopyTextureToTexture", "partial BC copy needs three push descriptors");
@@ -4292,8 +5695,8 @@ void Recorder::CopyTextureToTexture(const VC::CopyTextureToTexturePayload& p) {
                           dst_covered)) {
         return; // both images are scaled: the copy ran on their twins
     }
-    EnsureContents(*src, false);
-    EnsureContents(*dst, dst_covered);
+    EnsureContentsAs("CopyTextureToTexture", *src, false);
+    EnsureContentsAs("CopyTextureToTexture", *dst, dst_covered);
     if (same) {
         PrepareImages({{src, VK_IMAGE_LAYOUT_GENERAL}});
     } else {
@@ -4339,7 +5742,7 @@ void Recorder::CopyTextureToTexture(const VC::CopyTextureToTexturePayload& p) {
         };
         Cmd().CopyImage(*src->image, src_layout, *dst->image, dst_layout, region);
     }
-    barrier_pending = true;
+    MarkWritten(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
 }
 
 void Recorder::FenceSync(const VC::FenceSyncPayload& p) {
@@ -4358,9 +5761,13 @@ void Recorder::WaitSync(const VC::WaitSyncPayload& p) {
     if (it->second.queue == queue_index) {
         return; // one NVN queue is one ordered stream
     }
-    EndSegment();
-    pending_waits.emplace_back(it->second.semaphore, it->second.value);
-    BeginSegment();
+    // Every NVN queue submits to impl.queue in scheduler order, so an already-submitted signal on
+    // another NVN queue is already in execution order on this VkQueue and needs only a memory
+    // dependency instead of splitting the command buffer.
+    if (draw.HasShadows()) {
+        draw.FlushShadows();
+    }
+    MarkWritten(ALL_STAGES, ALL_WRITES);
 }
 
 void Recorder::SignalEvent(const VC::SignalEventPayload& p) {
@@ -4422,28 +5829,19 @@ bool Recorder::WaitEvent(const VC::WaitEventPayload& p, bool& release) {
         note(wait_block_noted ? "wait_resumed" : "wait_ok");
         wait_block_noted = false;
     }
-    // The signals the word was built from execute on the GPU: wait for them. One segment break
-    // covers all of them; signals of this queue need nothing (one NVN queue is one ordered stream).
+    // The signals the word was built from execute on the GPU: wait for them. Every NVN queue
+    // submits to impl.queue in scheduler order and StreamScheduler guarantees satisfied foreign
+    // signals were already submitted, so submission order guarantees execution ordering on impl.queue;
+    // flush live shadows and mark a full memory dependency instead of splitting the command buffer.
     const bool foreign = std::ranges::any_of(
         event_deps, [this](const VC::SignalPoint& dep) { return dep.queue != queue_index; });
     if (!foreign) {
         return true;
     }
-    EndSegment();
-    for (const VC::SignalPoint& dep : event_deps) {
-        if (dep.queue == queue_index) {
-            continue;
-        }
-        const VkSemaphore semaphore = *impl.GetQueue(dep.queue).timeline;
-        const auto known = std::ranges::find_if(
-            pending_waits, [semaphore](const auto& wait) { return wait.first == semaphore; });
-        if (known != pending_waits.end()) {
-            known->second = (std::max)(known->second, dep.value);
-        } else {
-            pending_waits.emplace_back(semaphore, dep.value);
-        }
+    if (draw.HasShadows()) {
+        draw.FlushShadows();
     }
-    BeginSegment();
+    MarkWritten(ALL_STAGES, ALL_WRITES);
     return true;
 }
 
@@ -4514,15 +5912,32 @@ void Recorder::FoldOcclusion() {
     }
     impl.counters_engine->FoldOcclusion(Cmd(), Counters(), *occlusion, queue_index, flight.seq);
     occlusion.reset();
-    barrier_pending = true;
+    MarkWritten(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
 }
 
 void Recorder::ResolveCounterBatch() {
     if (counter_batch.Empty()) {
+        ordered_reports = 0;
         return;
     }
-    impl.counters_engine->ResolveBatch(Cmd(), Counters(), counter_batch, queue_index, flight.seq);
-    barrier_pending = true;
+    const u32 count = static_cast<u32>(counter_batch.events.size());
+    vk::CommandBuffer cmd = Cmd();
+    const GpuProf::Scope prof{flight.gpu_prof.get(), cmd,
+                              GpuProf::Tag{.kind = GpuProf::Kind::Copy,
+                                           .count = count,
+                                           .hash_a = GpuProf::SUB_COUNTERS}};
+    impl.counters_engine->ResolveBatch(cmd, Counters(), counter_batch, queue_index, flight.seq,
+                                       false);
+    ordered_reports = 0;
+    MarkWritten(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+}
+
+void Recorder::ResolveCounterBatchIfOverlapping(const Pool& pool, u64 offset, u64 size) {
+    if (counter_batch.HasReports() && counter_batch.Writes(&pool, offset, size)) {
+        ResolveCounterBatch();
+    }
 }
 
 void Recorder::ReserveCounterEvents(BreakCause cause) {
@@ -4572,7 +5987,7 @@ void Recorder::ReportValue(const VC::ReportValuePayload& p) {
     FlushPending();
     Cmd().FillBuffer(pool->Handle(), offset, sizeof(u32), p.value);
     NotePoolWrite(*pool, offset, sizeof(u32));
-    barrier_pending = true;
+    MarkWritten(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
     if (engine) {
         engine->Stats().reports_value.fetch_add(1, std::memory_order_relaxed);
     }
@@ -4581,7 +5996,7 @@ void Recorder::ReportValue(const VC::ReportValuePayload& p) {
 void Recorder::ReportCounter(const VC::ReportCounterPayload& p) {
     Pool* pool{};
     u64 offset{};
-    if (!ResolvePoolRange(p.address, 2 * sizeof(u64), pool, offset, "ReportCounter")) {
+    if (!ResolvePoolRange(p.address, 2 * sizeof(u64), pool, offset, "ReportCounter", true, false)) {
         return;
     }
     if (offset % 4 != 0) {
@@ -4618,12 +6033,13 @@ void Recorder::ReportCounter(const VC::ReportCounterPayload& p) {
         EndDrawPass(BreakCause::ReportCounter);
     }
     CounterFlight& counters = Counters();
+    bool wrote_memory = false;
     switch (p.counter_type) {
     case CounterType::SamplesPassed:
         // Cumulative since the last ResetCounter.
         if (in_pass) {
-            // The open query (begun in this pass) ends here; the value is written when the pass
-            // ends, right away when none is open.
+            // The open query (begun in this pass) ends here; the value is written later when the
+            // batch resolves, staying batched across passes while room remains.
             if (occlusion) {
                 engine->EndOcclusion(Cmd(), counters, *occlusion);
                 counter_batch.AddQuery(*occlusion);
@@ -4631,12 +6047,14 @@ void Recorder::ReportCounter(const VC::ReportCounterPayload& p) {
             }
             counter_batch.AddReport(destination, offset, pool);
             if (!draw.PassOpen()) {
-                ResolveCounterBatch();
+                ordered_reports = counter_batch.reports.size();
             }
         } else {
             // Fold the open query, then copy the total.
             FoldOcclusion();
+            ResolveCounterBatchIfOverlapping(*pool, offset, sizeof(u64));
             engine->CopyAccumulator(Cmd(), queue_index, destination, offset);
+            wrote_memory = true;
         }
         engine->Stats().reports_samples.fetch_add(1, std::memory_order_relaxed);
         if (queue.uncounted_draws != 0) {
@@ -4654,21 +6072,25 @@ void Recorder::ReportCounter(const VC::ReportCounterPayload& p) {
         if (draw.PassOpen()) {
             deferred_zero.emplace_back(destination, offset);
         } else {
+            ResolveCounterBatchIfOverlapping(*pool, offset, sizeof(u64));
             FlushPending();
             Cmd().FillBuffer(destination, offset, sizeof(u64), 0);
+            wrote_memory = true;
         }
         engine->Stats().reports_timestamp.fetch_add(1, std::memory_order_relaxed);
         break;
     default:
+        ResolveCounterBatchIfOverlapping(*pool, offset, sizeof(u64));
         FlushPending();
         Cmd().FillBuffer(destination, offset, sizeof(u64), 0);
+        wrote_memory = true;
         engine->Stats().reports_unsupported_type.fetch_add(1, std::memory_order_relaxed);
         LogOnce(fmt::format("counter type {:#x} is not counted by the Vulkan replay; its reports "
                             "carry 0",
                             p.counter_type));
         break;
     }
-    NotePoolWrite(*pool, offset, sizeof(u64));
+    NotePoolWrite(*pool, offset, sizeof(u64), true, 0, 0, 0, true);
     TimestampReport report;
     report.address = p.address;
     report.host = pool->host ? pool->host + offset : nullptr;
@@ -4678,19 +6100,43 @@ void Recorder::ReportCounter(const VC::ReportCounterPayload& p) {
     }
     engine->WriteTimestamp(Cmd(), counters, p.counter_type == CounterType::TimestampTop,
                            std::move(report));
-    barrier_pending = true;
+    if (wrote_memory) {
+        MarkWritten(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    }
 }
 
 void Recorder::FlushDeferredReports() {
     if (deferred_zero.empty() || draw.PassOpen()) {
         return;
     }
-    FlushPending();
+    if (counter_batch.HasReports()) {
+        const bool overlaps_batch =
+            std::ranges::any_of(deferred_zero, [&](const std::pair<VkBuffer, u64>& zero) {
+                return std::ranges::any_of(counter_batch.reports, [&](const CounterBatch::Report& r) {
+                    return r.buffer == zero.first && r.offset < zero.second + sizeof(u64) &&
+                           zero.second < r.offset + sizeof(u64);
+                });
+            });
+        if (overlaps_batch) {
+            ResolveCounterBatch();
+        }
+    }
+    const bool had_full_deferred = DeferredCoversFullTransfer(VK_ACCESS_TRANSFER_WRITE_BIT);
+    vk::CommandBuffer cmd = Cmd();
+    if (!had_full_deferred) {
+        const VkMemoryBarrier pre_barrier{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = ALL_WRITES,
+            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        };
+        cmd.PipelineBarrier(ALL_STAGES, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, pre_barrier);
+    }
     for (const auto& [buffer, offset] : deferred_zero) {
-        Cmd().FillBuffer(buffer, offset, sizeof(u64), 0);
+        cmd.FillBuffer(buffer, offset, sizeof(u64), 0);
     }
     deferred_zero.clear();
-    barrier_pending = true;
+    MarkWritten(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
 }
 
 bool Recorder::SamplesReportFollows() const {
@@ -4767,10 +6213,10 @@ void Recorder::ResetCounter(const VC::ResetCounterPayload& p) {
             occlusion.reset();
         }
         engine->ResetAccumulator(Cmd(), queue_index);
+        MarkWritten(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
     }
     queue.uncounted_draws = 0;
     queue.occlusion_counting = SamplesReportFollows();
-    barrier_pending = true;
 }
 
 void Recorder::SetRenderCondition(const VC::SetRenderConditionPayload& p) {
@@ -4831,9 +6277,6 @@ void Recorder::SetRenderCondition(const VC::SetRenderConditionPayload& p) {
             FlushLinearWritebacks(pool_a, offset_a, offset_a + sizeof(u64));
             FlushLinearWritebacks(pool_b, offset_b, offset_b + sizeof(u64));
         }
-        // CPU-written counters of mirrored pools must reach the mirror first.
-        UploadRange(*pool_a, offset_a, sizeof(u64));
-        UploadRange(*pool_b, offset_b, sizeof(u64));
         PrefetchConditions(p.address, mode, *pool_a, offset_a, *pool_b, offset_b);
         return;
     }
@@ -4849,6 +6292,11 @@ void Recorder::SetRenderCondition(const VC::SetRenderConditionPayload& p) {
 
 void Recorder::PrefetchConditions(u64 address, u32 mode, Pool& pool_a, u64 offset_a, Pool& pool_b,
                                   u64 offset_b) {
+    if (counter_batch.HasReports() &&
+        (counter_batch.Writes(&pool_a, offset_a, sizeof(u64)) ||
+         counter_batch.Writes(&pool_b, offset_b, sizeof(u64)))) {
+        ResolveCounterBatch();
+    }
     CounterEngine& engine = *impl.counters_engine;
     prefetch_batch.clear();
     prefetch_batch.push_back({.address = address,
@@ -4857,6 +6305,13 @@ void Recorder::PrefetchConditions(u64 address, u32 mode, Pool& pool_a, u64 offse
                               .offset_a = offset_a,
                               .pool_b = &pool_b,
                               .offset_b = offset_b});
+    condition_upload_scratch.clear();
+    if (pool_a.backing == Pool::Backing::Mirror) {
+        condition_upload_scratch.push_back({&pool_a, offset_a, sizeof(u64)});
+    }
+    if (pool_b.backing == Pool::Backing::Mirror) {
+        condition_upload_scratch.push_back({&pool_b, offset_b, sizeof(u64)});
+    }
     // OoT sets ~1,200 conditions a frame, mostly inside render passes, on report pairs written
     // long before (earlier passes): each one ending the pass to compute its predicate cost more
     // GPU time than the draws. The conditions ahead in this list are computed here as well, unless
@@ -4866,6 +6321,9 @@ void Recorder::PrefetchConditions(u64 address, u32 mode, Pool& pool_a, u64 offse
     // condition then computes it at its own point as before.
     prefetch_written.clear();
     const auto mark = [&](u64 at, u64 size) {
+        if (size == 0) {
+            return;
+        }
         for (u64 granule = at >> 3; granule <= (at + size - 1) >> 3; ++granule) {
             prefetch_written.insert(granule);
         }
@@ -4897,6 +6355,31 @@ void Recorder::PrefetchConditions(u64 address, u32 mode, Pool& pool_a, u64 offse
                  2 * sizeof(u64));
         } else if (op == VC::Op::ReportValue && payload_size >= sizeof(VC::ReportValuePayload)) {
             mark(reinterpret_cast<const VC::ReportValuePayload*>(header + 1)->address, sizeof(u32));
+        } else if (op == VC::Op::UpdateUniformBuffer &&
+                   payload_size >= sizeof(VC::UpdateUniformBufferPayload)) {
+            const auto& update =
+                *reinterpret_cast<const VC::UpdateUniformBufferPayload*>(header + 1);
+            if (update.size <= 256) {
+                mark(update.address, update.size);
+            } else {
+                break;
+            }
+        } else if (op == VC::Op::ClearBuffer && payload_size >= sizeof(VC::ClearBufferPayload)) {
+            const auto& clear = *reinterpret_cast<const VC::ClearBufferPayload*>(header + 1);
+            if (clear.size <= 256) {
+                mark(clear.address, clear.size);
+            } else {
+                break;
+            }
+        } else if (op == VC::Op::CopyBufferToBuffer &&
+                   payload_size >= sizeof(VC::CopyBufferToBufferPayload)) {
+            const auto& copy =
+                *reinterpret_cast<const VC::CopyBufferToBufferPayload*>(header + 1);
+            if (copy.size <= 256) {
+                mark(copy.dst, copy.size);
+            } else {
+                break;
+            }
         } else if (op == VC::Op::SetRenderCondition &&
                    payload_size >= sizeof(VC::SetRenderConditionPayload)) {
             const auto& next = *reinterpret_cast<const VC::SetRenderConditionPayload*>(header + 1);
@@ -4912,13 +6395,26 @@ void Recorder::PrefetchConditions(u64 address, u32 mode, Pool& pool_a, u64 offse
                 std::ranges::none_of(prefetch_batch, same) &&
                 !condition_prefetch.Contains(next.address, next_mode) &&
                 ResolveReportPairQuietly(next.address, next_a, next_offset_a, next_b,
-                                         next_offset_b)) {
+                                         next_offset_b) &&
+                (!counter_batch.HasReports() ||
+                 (!counter_batch.Writes(next_a, next_offset_a, sizeof(u64)) &&
+                  !counter_batch.Writes(next_b, next_offset_b, sizeof(u64)))) &&
+                !HasLinearWritebackOverlapping(*next_a, next_offset_a,
+                                               next_offset_a + sizeof(u64)) &&
+                !HasLinearWritebackOverlapping(*next_b, next_offset_b,
+                                               next_offset_b + sizeof(u64))) {
                 prefetch_batch.push_back({.address = next.address,
                                           .mode = next_mode,
                                           .pool_a = next_a,
                                           .offset_a = next_offset_a,
                                           .pool_b = next_b,
                                           .offset_b = next_offset_b});
+                if (next_a->backing == Pool::Backing::Mirror) {
+                    condition_upload_scratch.push_back({next_a, next_offset_a, sizeof(u64)});
+                }
+                if (next_b->backing == Pool::Backing::Mirror) {
+                    condition_upload_scratch.push_back({next_b, next_offset_b, sizeof(u64)});
+                }
             }
         }
         index += header->size / 8;
@@ -4936,20 +6432,22 @@ void Recorder::PrefetchConditions(u64 address, u32 mode, Pool& pool_a, u64 offse
         prefetch_inputs.push_back(
             {c.pool_a->Handle(), c.offset_a, c.pool_b->Handle(), c.offset_b, c.mode});
     }
-    engine.RecordConditions(Cmd(), prefetch_inputs, first_slot);
+    UploadRanges(condition_upload_scratch);
+    {
+        vk::CommandBuffer cmd = Cmd();
+        const GpuProf::Scope prof{flight.gpu_prof.get(), cmd,
+                                  GpuProf::Tag{.kind = GpuProf::Kind::Copy,
+                                               .count = count,
+                                               .hash_a = GpuProf::SUB_COUNTERS}};
+        engine.RecordConditions(cmd, prefetch_inputs, first_slot);
+    }
     condition_slot = prefetch_batch.front().slot;
     render_state = RenderState::Conditional;
-    barrier_pending = true;
     if (!ahead) {
         return;
     }
-    // Mirrored pools take CPU writes at the next upload, which a predicate computed ahead would
-    // miss: those are used at their own point only (the lookahead never takes them).
     for (const ConditionPrefetch::Entry& c : prefetch_batch) {
-        if (c.pool_a->backing != Pool::Backing::Mirror &&
-            c.pool_b->backing != Pool::Backing::Mirror) {
-            condition_prefetch.Add(c);
-        }
+        condition_prefetch.Add(c);
     }
 }
 
@@ -4960,7 +6458,7 @@ bool Recorder::ResolveReportPairQuietly(u64 address, Pool*& pool_a, u64& offset_
             return false;
         }
         impl.EnsureBacking(*pool);
-        if (pool->backing == Pool::Backing::None || pool->backing == Pool::Backing::Mirror) {
+        if (pool->backing == Pool::Backing::None) {
             return false;
         }
         impl.NoteUse(pool->serial, flight.seq);
@@ -4975,6 +6473,8 @@ bool Recorder::ResolveReportPairQuietly(u64 address, Pool*& pool_a, u64& offset_
 
 void Recorder::EvaluateConditionOnCpu(Pool& pool_a, u64 offset_a, Pool& pool_b, u64 offset_b,
                                       u32 mode) {
+    ResolveCounterBatchIfOverlapping(pool_a, offset_a, sizeof(u64));
+    ResolveCounterBatchIfOverlapping(pool_b, offset_b, sizeof(u64));
     // No predicated rendering: copy both counters to the host, run everything recorded so far,
     // and decide here. Correct but synchronous.
     auto readback = std::make_shared<vk::Buffer>(impl.CreateHostBuffer(
@@ -5146,7 +6646,7 @@ void Recorder::WatchSnapshot(std::string tag, u64 peek_address, u32 size_overrid
         impl.CreateHostBuffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, MemoryUsage::Download);
     const VkBufferCopy region{.srcOffset = offset, .dstOffset = 0, .size = size};
     Cmd().CopyBuffer(pool->Handle(), *entry.buffer, region);
-    barrier_pending = true;
+    MarkWritten(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
     host_barrier_needed = true;
     flight.watches.push_back(std::move(entry));
 }
@@ -5549,6 +7049,11 @@ bool Recorder::RecordWindowFilter(Texture& texture, VkFormat source_format, cons
                     static_cast<u32>(filter), exception.what());
         return false;
     }
+    if (source.pending_unrestricted_formats || !source.FormatListAllows(source_format)) {
+        if (!UpgradeImageCaps(source, false, true)) {
+            return false;
+        }
+    }
     const VkImageView source_view =
         impl.draw_resources->GetView(texture, {
                                                   .format = source_format,
@@ -5686,7 +7191,7 @@ bool Recorder::RecordPresent(Texture& texture, Frame& frame, std::vector<Frame*>
     // guest-sized image since); everything below reads `s` and sizes in its pixels.
     const bool twin_only = !guest.image && guest.scaled &&
                            Rescale::NativeIsStale(guest.scale_state) && guest.scaled->image;
-    const bool image_ready = twin_only || EnsureContents(guest, false, true);
+    const bool image_ready = twin_only || EnsureContentsAs("Present", guest, false, true);
     Storage& s = image_ready ? PresentSource(guest) : guest;
     const Rescale::Factor present_scale = &s != &guest ? impl.RescaleFactor() : Rescale::Factor{};
     if (!image_ready || !s.image) {
@@ -6248,10 +7753,11 @@ void Recorder::RecordPictureReadback(PictureReadback& readback, VkImage source_i
 }
 
 void Recorder::Finish(std::span<const VkSemaphore> binary_signals) {
-    // Deferred report zero-fills first: the write-back copies below must see them.
+    // Deferred report zero-fills and pending counter reports first: write-back copies must see them.
     EndRenderCondition();
     EndDrawPass();
     FlushLinearWritebacks();
+    ResolveCounterBatch();
     WriteReadbacks();
     EndSegment();
     draw.EndSubmission();
@@ -6358,6 +7864,17 @@ void Recorder::SubmitSegments(std::span<const VkSemaphore> binary_signals) {
         }
         vk::Check(result);
     }
+    bool any_gpu_work = false;
+    for (size_t k = 0; k < count; ++k) {
+        any_gpu_work |= segments[first + k].has_gpu_work;
+    }
+    if (any_gpu_work) {
+        u64 cur = impl.gpu_submitted_seq.load(std::memory_order_relaxed);
+        while (cur < flight.seq && !impl.gpu_submitted_seq.compare_exchange_weak(
+                                       cur, flight.seq, std::memory_order_release,
+                                       std::memory_order_relaxed)) {
+        }
+    }
     if (impl.mario_kart_world && count != 0) {
         impl.mkw_last_submit_semaphore = *queue.timeline;
         impl.mkw_last_submit_value = segments.back().signal_value;
@@ -6404,7 +7921,7 @@ void Recorder::FlushAndWait() {
 void Recorder::MaybeSubmitEarly() {
     const Debug::Config& config = Debug::Get();
     if (config.early_interval_us == 0 || !impl.options.early_submit || finished || condition_open ||
-        (!draw.PassOpen() && draw.HasInlineUpdates())) {
+        (!draw.PassOpen() && (draw.HasInlineUpdates() || draw.HasPendingClears()))) {
         return;
     }
     if (impl.mkw_coalesce_early_submit && early_pieces >= 2) {
@@ -6415,6 +7932,11 @@ void Recorder::MaybeSubmitEarly() {
         std::chrono::duration_cast<std::chrono::microseconds>(now - piece_start).count());
     const u64 normal_us = early_pieces == 0 ? config.early_first_us : config.early_interval_us;
     if (impl.mkw_coalesce_early_submit) {
+        const u64 done = impl.gpu_completed_seq.load(std::memory_order_relaxed);
+        const u64 busy_until = impl.gpu_submitted_seq.load(std::memory_order_relaxed);
+        if (done < busy_until && busy_until < flight.seq && elapsed < 8000) {
+            return;
+        }
         if (!MkwEarlySubmitDue(early_pieces, elapsed, normal_us, config.early_pass_us,
                                draw.PassOpen(), draw.HasShadows())) {
             return;

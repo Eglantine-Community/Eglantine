@@ -27,6 +27,9 @@ std::shared_ptr<Storage> MakeScaledTwin(Storage& native, const Rescale::Factor& 
     twin->layers = native.layers;
     twin->create_flags = native.create_flags;
     twin->usage = native.usage;
+    twin->can_upgrade_storage = native.can_upgrade_storage;
+    twin->view_formats = native.view_formats;
+    twin->view_format_count = native.view_format_count;
     twin->vram_bytes = native.vram_bytes / (std::max)(native.extent.width, 1u) /
                        (std::max)(native.extent.height, 1u) * twin->extent.width *
                        twin->extent.height;

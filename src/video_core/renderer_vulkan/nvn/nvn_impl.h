@@ -8,6 +8,7 @@
 
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -158,6 +159,7 @@ struct Pool {
         u64 hash{};     ///< CityHash64 of the guest page the mirror was last made equal to
         u32 checked{};  ///< submission (seq + 1) that last found the guest page unchanged
         bool valid{};   ///< the mirror holds a guest page at all (else the first use uploads it)
+        bool hash_valid{}; ///< `hash` still represents this page's non-GPU-dirty guest bytes
         /// Hashed while `mirror_track` watched the page, with no GPU write of it pending, and
         /// nothing wrote it since that the tracker does not see: unchanged unless the tracker
         /// reports a write, so it is not hashed again (Recorder::MirrorTakeCpuWrites).
@@ -166,6 +168,75 @@ struct Pool {
     };
     static constexpr u64 MIRROR_PAGE = 4096;
     std::vector<MirrorPage> mirror_pages;
+    std::vector<u64> mirror_trusted_bits;
+    u64 mirror_trusted_count{};
+
+    void InitMirrorPages(size_t count) {
+        mirror_pages.assign(count, MirrorPage{});
+        mirror_trusted_bits.assign((count + 63) / 64, 0);
+        mirror_trusted_count = 0;
+    }
+
+    void SetMirrorPageTrusted(size_t index, bool trusted) noexcept {
+        MirrorPage& page = mirror_pages[index];
+        page.trusted = trusted;
+        const bool bit = trusted && page.valid;
+        const u64 mask = u64{1} << (index & 63);
+        u64& word = mirror_trusted_bits[index >> 6];
+        const bool was = (word & mask) != 0;
+        if (bit == was) {
+            return;
+        }
+        if (bit) {
+            word |= mask;
+            ++mirror_trusted_count;
+        } else {
+            word &= ~mask;
+            --mirror_trusted_count;
+        }
+    }
+
+    void ClearAllMirrorTrusted() noexcept {
+        if (mirror_trusted_count == 0) {
+            return;
+        }
+        for (size_t w = 0; w < mirror_trusted_bits.size(); ++w) {
+            u64 word = mirror_trusted_bits[w];
+            mirror_trusted_bits[w] = 0;
+            while (word != 0) {
+                const unsigned bit = static_cast<unsigned>(std::countr_zero(word));
+                mirror_pages[w * 64 + bit].trusted = false;
+                word &= word - 1;
+            }
+        }
+        mirror_trusted_count = 0;
+    }
+
+    [[nodiscard]] bool MirrorRangeAllTrusted(u64 first, u64 last) const noexcept {
+        if (first > last || last >= mirror_pages.size() || mirror_trusted_count == 0) {
+            return false;
+        }
+        if (mirror_trusted_count == mirror_pages.size()) {
+            return true;
+        }
+        const size_t first_word = static_cast<size_t>(first >> 6);
+        const size_t last_word = static_cast<size_t>(last >> 6);
+        const u64 first_mask = ~u64{0} << (first & 63);
+        const u64 last_mask = ~u64{0} >> (63u - (last & 63));
+        if (first_word == last_word) {
+            const u64 mask = first_mask & last_mask;
+            return (mirror_trusted_bits[first_word] & mask) == mask;
+        }
+        if ((mirror_trusted_bits[first_word] & first_mask) != first_mask) {
+            return false;
+        }
+        for (size_t w = first_word + 1; w < last_word; ++w) {
+            if (mirror_trusted_bits[w] != ~u64{0}) {
+                return false;
+            }
+        }
+        return (mirror_trusted_bits[last_word] & last_mask) == last_mask;
+    }
     /// Mirror pools: GuestMemory::Track registration over the whole pool, every page armed, so
     /// that unchanged pages need no hash (Impl::mirror_hash_tracked). 0: not registered (yet, or
     /// tracking unavailable: `mirror_track_tried`). Replay thread.
@@ -291,6 +362,14 @@ struct Storage : std::enable_shared_from_this<Storage> {
     // Creation parameters (the image is created on first use).
     VkImageCreateFlags create_flags{};
     VkImageUsageFlags usage{};
+    bool can_upgrade_storage{false};
+    bool pending_unrestricted_formats{false};
+    std::array<VkFormat, 2> view_formats{};
+    u32 view_format_count{0};
+    [[nodiscard]] bool FormatListAllows(VkFormat fmt) const noexcept {
+        return view_format_count == 0 || fmt == view_formats[0] ||
+               (view_format_count > 1 && fmt == view_formats[1]);
+    }
     bool image_failed{false};
     u64 vram_bytes{}; ///< Estimated size of the image once created.
 
@@ -903,6 +982,10 @@ struct Context::Impl {
     /// Newest submission whose GPU commands and mirror readbacks have finished (published right
     /// before `completion_callback`, whereas `completed_seq` is published right after it).
     std::atomic<u64> gpu_completed_seq{0};
+    /// Newest submission whose recorded segments contained actual GPU work and were submitted.
+    std::atomic<u64> gpu_submitted_seq{0};
+    std::atomic<u64> storage_image_upgrades{0};
+    std::atomic<u64> format_list_upgrades{0};
     /// What the replay thread is doing (diagnostics only).
     std::atomic<const char*> replay_stage{"starting"};
     std::atomic<u64> replay_seq{0};
@@ -972,11 +1055,14 @@ struct Context::Impl {
     std::mutex free_commands_mutex;
     std::vector<VkCommandBuffer> free_command_buffers;
 
-    // The completion thread returns ordinary upload buffers after their final timeline signal.
+    // The completion thread returns ordinary upload and download buffers after their final timeline signal.
     static constexpr u64 STAGING_CHUNK = u64{8} << 20;
     std::mutex staging_cache_mutex;
     std::array<vk::Buffer, 2> staging_cache;
     [[nodiscard]] vk::Buffer AcquireStaging(u64 size);
+    std::mutex download_cache_mutex;
+    std::array<vk::Buffer, 6> download_cache;
+    [[nodiscard]] vk::Buffer AcquireDownload(u64 size);
 
     /// Usage of pool buffers: POOL_BUFFER_USAGE, plus a device address when the device has
     /// buffer device address (raw global memory).

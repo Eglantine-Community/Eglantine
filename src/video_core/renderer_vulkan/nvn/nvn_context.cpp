@@ -672,6 +672,7 @@ Context::Impl::~Impl() {
     mirror_merge_stats = {}; // allocator-owned, like the pool buffers above
     bc_scratch.reset();
     staging_cache = {};
+    download_cache = {};
     quad_indirect.reset();
     allocator.reset();
     command_buffer_allocations.clear();
@@ -782,12 +783,13 @@ void Context::Impl::Dispatch(Command& command) {
                          "exact buffer lookup cache and lazy raw mirror invalidation active");
             }
             impl.mkw_coalesce_early_submit =
-                impl.mario_kart_world && std::getenv("EDEN_NX2_NVN_EARLY_SUBMIT_US") == nullptr &&
+                c.title_id != 0 && std::getenv("EDEN_NX2_NVN_EARLY_SUBMIT_US") == nullptr &&
                 std::getenv("EDEN_NX2_NVN_EARLY_FIRST_US") == nullptr &&
                 std::getenv("EDEN_NX2_NVN_EARLY_PASS_US") == nullptr;
             if (impl.mkw_coalesce_early_submit && impl.options.early_submit) {
-                LOG_INFO(Render_Vulkan, "[nvn] Mario Kart World: early submit at most twice per "
-                                        "submission; live passes and shadows use the pass budget");
+                LOG_INFO(Render_Vulkan, "[nvn] title {:#018x}: early submit coalesced; live "
+                                        "passes, shadows, and queued GPU work avoid extra splits",
+                         c.title_id);
             }
             if (c.title_id != 0) {
                 if (!impl.options.barrier_merge &&
@@ -1195,6 +1197,30 @@ vk::Buffer Context::Impl::AcquireStaging(u64 size) {
                             MemoryUsage::Upload, AllocationKind::Staging);
 }
 
+vk::Buffer Context::Impl::AcquireDownload(u64 size) {
+    const u64 alloc_size = (std::max)(size, u64{64} << 10);
+    const u64 max_reuse = (std::max)(size * 2, u64{1} << 20);
+    {
+        std::scoped_lock lock{download_cache_mutex};
+        size_t best = download_cache.size();
+        u64 best_size = ~u64{0};
+        for (size_t i = 0; i < download_cache.size(); ++i) {
+            if (!download_cache[i]) {
+                continue;
+            }
+            const u64 buf_size = download_cache[i].Mapped().size();
+            if (buf_size >= size && buf_size <= max_reuse && buf_size < best_size) {
+                best = i;
+                best_size = buf_size;
+            }
+        }
+        if (best < download_cache.size()) {
+            return std::move(download_cache[best]);
+        }
+    }
+    return CreateHostBuffer(alloc_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, MemoryUsage::Download);
+}
+
 void Context::Impl::CompleteMain() {
     for (;;) {
         std::shared_ptr<InFlight> flight;
@@ -1392,6 +1418,16 @@ void Context::Impl::CompleteMain() {
                 draw_resources->ReleaseDescriptorPools(flight->descriptor_pools);
             } else {
                 flight->descriptor_pools.clear();
+            }
+        }
+        if (gpu_complete && flight->download && !device_lost.load(std::memory_order_acquire) &&
+            flight->download.Mapped().size() <= (u64{16} << 20)) {
+            std::scoped_lock lock{download_cache_mutex};
+            for (auto& slot : download_cache) {
+                if (!slot) {
+                    slot = std::move(flight->download);
+                    break;
+                }
             }
         }
         flight->download.reset();
