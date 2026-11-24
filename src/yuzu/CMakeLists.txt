@@ -542,5 +542,3 @@ endif()
 target_link_libraries(yuzu PRIVATE OpenSSL::SSL OpenSSL::Crypto SDL3::SDL3)
 
 create_target_directory_groups(yuzu)
-
-

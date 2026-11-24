@@ -17,6 +17,7 @@
 #include <string_view>
 #include <vector>
 #include "common/common_types.h"
+#include "shader_recompiler/frontend/ampere/program_address_map.h"
 
 namespace Shader::Ampere {
 
@@ -41,6 +42,8 @@ struct LoweredProgram {
     // UR28 and up seen without a mirror: lowering again with this many registers below R216
     // reserved for them (even, so pairs stay adjacent) maps them.
     u32 high_uniform_registers{};
+    /// Registers the instructions in each range read from a high quartet (PrepareRegisterPressure).
+    std::vector<NativeRegisterRemap> register_remaps;
     u32 error_offset{};
     std::string_view error;
 
@@ -55,6 +58,9 @@ struct LoweringOptions {
     /// inline expansion (much smaller programs; see the HMMA case).
     bool compact_tensor{};
     u64 native_code_address{};
+    /// Copy high registers in and out of a low quartet around each instruction that uses them,
+    /// as before register remaps (for comparing the two forms).
+    bool register_copies{};
 };
 
 // A MOV form the Maxwell frontend reads, for lowered native programs only, as a copy between
@@ -87,13 +93,18 @@ inline bool StrongGlobalFence() {
 struct RegisterPressure {
     Instruction instruction;
     std::vector<u64> prefix, suffix;
+    /// The same mapping as remaps instead of copies: low quartet, high quartet, bank 1 components.
+    struct Group { u32 low_group, high_group, bank_mask; };
+    std::vector<Group> groups;
     bool valid = true;
 };
 
 // Native registers at or above `reserved` (the lowering's uniform mirrors and scratch) live in
-// bank 1. For one instruction, each aligned quartet of them it uses is copied into a low quartet
-// the instruction doesn't use (whose own values wait in bank 2), and copied back afterwards.
-// The copies are SSA renames: they cost nothing in the host shader.
+// bank 1. For one instruction, each aligned quartet of them it uses is renamed to a low quartet
+// the instruction doesn't use. `groups` gives that as remaps (the translator reads the high
+// registers directly); `prefix` and `suffix` as copies into the low quartet (whose own values
+// wait in bank 2) and back. The copies are SSA renames, free in the host shader but not to
+// translate: 16 to 32 instructions around every such instruction.
 inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 reserved) {
     RegisterPressure result{input};
     struct Operand { u32 bit, count; };
@@ -245,14 +256,17 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
                 used[borrow + component] = true;
             }
         }
+        u32 bank_mask = 0;
         for (u32 component = 0; component < 4; ++component) {
             const u32 low = mapped[group] + component, high = group * 4 + component;
             const u32 high_bank = high >= reserved ? 1U : 0U;
+            bank_mask |= high_bank << component;
             result.prefix.push_back(NativeRegisterCopy(2, low, 0, low));
             result.prefix.push_back(NativeRegisterCopy(0, low, high_bank, high));
             result.suffix.push_back(NativeRegisterCopy(high_bank, high, 0, low));
             result.suffix.push_back(NativeRegisterCopy(0, low, 2, low));
         }
+        result.groups.push_back({mapped[group] / 4, group, bank_mask});
     }
     for (const auto [bit, count] : operands) {
         const u32 reg = input.Bits(bit, 8);
@@ -363,7 +377,11 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             pressure = PrepareRegisterPressure(insn, shadow_boundary);
             if (!pressure.valid) return fail(index, "native program uses lowering scratch registers");
             insn = pressure.instruction;
-            result.instructions.insert(result.instructions.end(), pressure.prefix.begin(), pressure.prefix.end());
+            if (options.register_copies) {
+                result.instructions.insert(result.instructions.end(), pressure.prefix.begin(), pressure.prefix.end());
+            } else {
+                pressure.suffix.clear();
+            }
         }
         const size_t instruction_start = result.instructions.size();
         const size_t relocation_start = relocations.size();
@@ -3912,6 +3930,14 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                     pending.output_target = static_cast<u32>(result.instructions.size());
             }
             result.instructions.insert(result.instructions.end(), pressure.suffix.begin(), pressure.suffix.end());
+        }
+        if (!options.register_copies && result.instructions.size() > instruction_start) {
+            for (const auto& group : pressure.groups) {
+                result.register_remaps.push_back({static_cast<u32>(instruction_start),
+                                                  static_cast<u32>(result.instructions.size()),
+                                                  group.low_group, group.high_group,
+                                                  group.bank_mask});
+            }
         }
     }
     return fail(static_cast<u32>(code.size()), main_exited ? "native program lacks captured library return" : "native program has no unconditional EXIT");

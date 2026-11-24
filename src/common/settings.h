@@ -694,7 +694,14 @@ struct Values {
                                                        "mesh_shader_mode",
                                                        Category::RendererAdvanced};
 
-    // Linux: the GPU driver's shader cache in a folder of our own (ConfigureDriverShaderCache),
+    // VK_EXT_graphics_pipeline_library: graphics pipelines that share shaders link library
+    // parts compiled once (vk_pipeline_library). Off while it is measured; EDEN_NX2_GPL=0/1
+    // overrides it. Applied when the Vulkan device is created (game start).
+    SwitchableSetting<bool> graphics_pipeline_library{linkage, false, "graphics_pipeline_library",
+                                                      Category::RendererAdvanced};
+
+    // Linux: the NVIDIA or Mesa driver's shader cache in a folder of our own
+    // (ConfigureDriverShaderCache),
     // with its size limit in GiB. Applied at startup, before anything loads a driver.
     Setting<bool> private_driver_shader_cache{linkage, true, "private_driver_shader_cache",
                                               Category::RendererAdvanced, Specialization::Paired};
