@@ -2651,9 +2651,28 @@ void RasterizerVulkan::TickFrame() {
     draw_counter = 0;
     // Debug server requests (docs/nx2/debug-mcp.md), taken between frames on the owning thread.
     if (VideoCore::Nx2Debug::HasRequests()) {
+        if (auto request = VideoCore::Nx2Debug::TakeAstcFusion()) {
+            const bool supported = texture_cache_runtime.SupportsAstcFusion();
+            size_t marked = 0;
+            try {
+                if (supported && request->enable &&
+                    *request->enable != texture_cache_runtime.AstcFusionEnabled()) {
+                    std::scoped_lock lock{texture_cache.mutex};
+                    texture_cache_runtime.SetAstcFusion(*request->enable);
+                    marked = texture_cache.InvalidateAstcTranscodes();
+                    LOG_INFO(Render_Vulkan, "ASTC fusion {}: {} cached images marked for refresh",
+                             *request->enable ? "enabled" : "disabled", marked);
+                }
+                request->result.set_value({supported,
+                                           supported && texture_cache_runtime.AstcFusionEnabled(),
+                                           marked});
+            } catch (...) {
+                request->result.set_exception(std::current_exception());
+            }
+        }
         if (auto capture = VideoCore::Nx2Debug::TakeCapture()) {
             frame_dump.Arm(std::move(capture->directory), capture->sampled, capture->buffers,
-                           capture->id, capture->sampled_max_bytes);
+                           capture->id, capture->sampled_max_bytes, std::move(capture->sampled_tics));
         }
         if (const auto change = VideoCore::Nx2Debug::TakeRejectChange()) {
             pipeline_cache.RefreshDebugRejections(change->unrejected);
