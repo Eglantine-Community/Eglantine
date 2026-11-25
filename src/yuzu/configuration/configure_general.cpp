@@ -10,6 +10,7 @@
 #include <functional>
 #include <utility>
 #include <vector>
+#include <QComboBox>
 #include <QDir>
 #include <QFileDialog>
 #include <QListWidget>
@@ -25,7 +26,8 @@
 #include "yuzu/configuration/shared_widget.h"
 #ifdef ENABLE_UPDATE_CHECKER
 #include "frontend_common/update_checker.h"
-#include "yuzu/configuration/tester_build_settings.h"
+#include "yuzu/configuration/experimental_builds_panel.h"
+#include "yuzu/configuration/update_settings_panel.h"
 #endif
 
 ConfigureGeneral::ConfigureGeneral(const Core::System& system_,
@@ -76,15 +78,28 @@ void ConfigureGeneral::Setup(const ConfigurationShared::Builder& builder) {
     };
 
     push(UISettings::values.linkage.by_category[Settings::Category::UiGeneral]);
+#ifdef ENABLE_UPDATE_CHECKER
+    // Release candidates now belong to Stable, and "Auto" is no longer offered: show such values
+    // as the options that stand for them.
+    auto& channel = UISettings::values.update_channel;
+    if (channel.GetValue() == Settings::UpdateChannel::Unset ||
+        channel.GetValue() == Settings::UpdateChannel::ReleaseCandidate) {
+        channel.SetValue(UpdateChecker::BuildChannel() == UpdateChecker::Channel::Daily
+                             ? Settings::UpdateChannel::Daily
+                             : Settings::UpdateChannel::Stable);
+    }
+    if (UISettings::values.update_variant.GetValue() == Settings::UpdateVariant::Auto) {
+        UISettings::values.update_variant.SetValue(UpdateChecker::ThisBuildVariant());
+    }
+    ConfigurationShared::Widget* channel_widget{};
+    ConfigurationShared::Widget* variant_widget{};
+#endif
     for (const auto setting : settings) {
         const bool is_update_channel = setting->Id() == UISettings::values.update_channel.Id();
         const bool is_update_variant = setting->Id() == UISettings::values.update_variant.Id();
         const bool is_update_setting = is_update_channel || is_update_variant ||
                                        setting->Id() == UISettings::values.check_for_updates.Id();
 #ifdef ENABLE_UPDATE_CHECKER
-        if (is_update_channel && !UpdateChecker::BuildChannel()) {
-            continue;
-        }
         if (is_update_variant && Common::g_build_release_platform[0] == '\0') {
             continue;
         }
@@ -105,6 +120,11 @@ void ConfigureGeneral::Setup(const ConfigurationShared::Builder& builder) {
         }
 
 #ifdef ENABLE_UPDATE_CHECKER
+        if (is_update_channel) {
+            channel_widget = widget;
+        } else if (is_update_variant) {
+            variant_widget = widget;
+        }
         if (is_update_channel) {
             widget->setToolTip(widget->toolTip() + QStringLiteral("\n\n") +
                                tr("Installed version: %1")
@@ -134,8 +154,19 @@ void ConfigureGeneral::Setup(const ConfigurationShared::Builder& builder) {
         ui->updates_widget->layout()->addWidget(widget);
     }
 #ifdef ENABLE_UPDATE_CHECKER
-    tester_settings = new TesterBuildSettings(this);
-    ui->updates_widget->layout()->addWidget(tester_settings);
+    // Checks what the settings show, before they are applied.
+    const auto choice = [channel_widget, variant_widget] {
+        const auto selected = [](ConfigurationShared::Widget* widget, auto fallback) {
+            using Enum = decltype(fallback);
+            return widget && widget->combobox && widget->combobox->currentIndex() >= 0
+                       ? static_cast<Enum>(widget->combobox->currentData().toUInt())
+                       : fallback;
+        };
+        return UpdateSettingsPanel::Choice{
+            selected(channel_widget, UISettings::values.update_channel.GetValue()),
+            selected(variant_widget, UISettings::values.update_variant.GetValue())};
+    };
+    ui->updates_widget->layout()->addWidget(new UpdateSettingsPanel(choice, this));
 #else
     if (update_hold.empty()) {
         ui->UpdatesGroupBox->setVisible(false);
@@ -147,6 +178,14 @@ void ConfigureGeneral::Setup(const ConfigurationShared::Builder& builder) {
     updates_page = std::make_unique<QWidget>();
     auto* const updates_layout = new QVBoxLayout(updates_page.get());
     updates_layout->addWidget(ui->UpdatesGroupBox);
+#ifdef ENABLE_UPDATE_CHECKER
+    auto* experimental = new ExperimentalBuildsPanel;
+    connect(experimental, &ExperimentalBuildsPanel::OpenVersionManagerRequested, this,
+            &ConfigureGeneral::OpenVersionManagerRequested);
+    connect(experimental, &ExperimentalBuildsPanel::LaunchRequested, this,
+            &ConfigureGeneral::LaunchExperimentalBuildRequested);
+    updates_layout->addWidget(experimental);
+#endif
     updates_layout->addStretch();
     updates_page->setAccessibleName(tr("Updates"));
 }
@@ -174,13 +213,6 @@ void ConfigureGeneral::ResetDefaults() {
     reset_callback();
 }
 
-bool ConfigureGeneral::ConfirmApply() {
-#ifdef ENABLE_UPDATE_CHECKER
-    return tester_settings == nullptr || tester_settings->ConfirmChanges();
-#else
-    return true;
-#endif
-}
 
 void ConfigureGeneral::ApplyConfiguration() {
     bool powered_on = system.IsPoweredOn();
@@ -191,11 +223,6 @@ void ConfigureGeneral::ApplyConfiguration() {
     if (UISettings::values.update_channel.GetValue() != previous_channel) {
         UISettings::values.skipped_update.SetValue({});
     }
-#ifdef ENABLE_UPDATE_CHECKER
-    if (tester_settings != nullptr) {
-        tester_settings->Apply();
-    }
-#endif
 
     std::vector<std::string> new_dirs;
     new_dirs.reserve(ui->external_content_list->count());

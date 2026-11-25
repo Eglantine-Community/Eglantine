@@ -295,7 +295,8 @@ if (ENABLE_UPDATE_CHECKER)
         updater/tester_build_dialog.cpp updater/tester_build_dialog.h
         updater/tester_build_launcher.cpp updater/tester_build_launcher.h
         updater/tester_build_monitor.cpp updater/tester_build_monitor.h
-        configuration/tester_build_settings.cpp configuration/tester_build_settings.h
+        configuration/update_settings_panel.cpp configuration/update_settings_panel.h
+        configuration/experimental_builds_panel.cpp configuration/experimental_builds_panel.h
         updater/tester_build_main.cpp updater/tester_build_main.h
         updater/tester_build_runner.cpp updater/tester_build_runner.h
         updater/version_manager_dialog.cpp updater/version_manager_dialog.h)

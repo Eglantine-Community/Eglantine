@@ -150,6 +150,15 @@ std::string DownloadPlatform(Settings::UpdateVariant variant, std::string_view b
     return platform;
 }
 
+Channel ChannelOfSetting(Settings::UpdateChannel setting) {
+    return setting == Settings::UpdateChannel::Daily ? Channel::Daily : Channel::ReleaseCandidate;
+}
+
+Settings::UpdateVariant ThisBuildVariant(std::string_view build_platform) {
+    return build_platform.ends_with("-pgo") ? Settings::UpdateVariant::Pgo
+                                            : Settings::UpdateVariant::Standard;
+}
+
 CheckResult Check(Channel channel, std::string_view platform) {
     const auto current_tag = BuildTag();
     if (current_tag.empty()) {

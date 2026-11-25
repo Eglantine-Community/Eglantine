@@ -342,7 +342,7 @@ void TesterBuildRunner::PruneLogs() const {
 }
 
 bool TesterBuildRunner::Prepare() {
-    const auto root = TesterBuild::DefaultRoot();
+    const auto root = TesterLauncher::Root();
     if (root.empty()) {
         return Fail(tr("Could not find a folder to build in. Set EGLANTINE_TESTER_ROOT."));
     }
@@ -364,7 +364,7 @@ bool TesterBuildRunner::Prepare() {
         return Fail(tr("Could not create the log file %1.").arg(m_log.fileName()));
     }
     PruneLogs();
-    Log(tr("Tester build in %1").arg(ToQ(root)));
+    Log(tr("Experimental build in %1").arg(ToQ(root)));
 
     m_state_path = TesterBuild::StatePath(
         Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir));
@@ -609,7 +609,7 @@ bool TesterBuildRunner::EnsureToolchain() {
                 names << Q(name);
             }
             return Fail(tr("Still missing after installing: %1. Install them yourself and run "
-                           "the tester build again.")
+                           "the experimental build again.")
                             .arg(names.join(QStringLiteral(", "))));
         }
         bool manual = false;
@@ -792,7 +792,7 @@ bool TesterBuildRunner::InstallWindows(const Missing& missing) {
     if (winget.empty()) {
         Consent(items,
                 tr("These tools are needed to build Eglantine, and winget, which would install "
-                   "them, was not found. Install them yourself and run the tester build again."),
+                   "them, was not found. Install them yourself and run the experimental build again."),
                 {}, {});
         return Fail(tr("Missing tools: %1").arg(items.join(QStringLiteral(", "))));
     }
@@ -843,8 +843,8 @@ bool TesterBuildRunner::InstallLinux(const Missing& missing, bool& manual) {
         }
         Consent(items,
                 tr("These tools are needed to build Eglantine and are not installed. Your "
-                   "distribution is not one the tester build can install packages for: install "
-                   "them yourself and run the tester build again."),
+                   "distribution is not one the experimental build can install packages for: install "
+                   "them yourself and run the experimental build again."),
                 {}, {});
         return Fail(tr("Missing tools: %1").arg(items.join(QStringLiteral(", "))));
     }
@@ -1051,7 +1051,7 @@ void TesterBuildRunner::LinkUserFolder(const fs::path& install) {
         false};
     const auto code = RunStep(step, m_base_env);
     if (!code || *code != 0) {
-        Log(tr("Could not share the user folder; the tester build will not see your settings."));
+        Log(tr("Could not share the user folder; the experimental build will not see your settings."));
     }
 #else
     Q_UNUSED(install);

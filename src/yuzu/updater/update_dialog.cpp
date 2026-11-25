@@ -40,11 +40,10 @@
 QString UpdateDialog::ChannelName(UpdateChecker::Channel channel) {
     switch (channel) {
     case UpdateChecker::Channel::Stable:
-        return tr("Stable");
     case UpdateChecker::Channel::ReleaseCandidate:
-        return tr("Release candidate");
+        return tr("Stable (nx2)");
     case UpdateChecker::Channel::Daily:
-        return tr("Daily");
+        return tr("Nightly (nx2-experimental)");
     }
     return {};
 }

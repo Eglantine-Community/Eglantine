@@ -18,7 +18,6 @@ class System;
 
 class ConfigureDialog;
 class HotkeyRegistry;
-class TesterBuildSettings;
 
 namespace Ui {
 class ConfigureGeneral;
@@ -41,14 +40,16 @@ public:
     void SetResetCallback(std::function<void()> callback);
     void ResetDefaults();
     void ApplyConfiguration() override;
-    // False when a setting is not valid; the user has been told why.
-    bool ConfirmApply();
     void SetConfiguration() override;
     // The Updates tab, or nullptr when this build has no update settings.
     QWidget* UpdatesPage() const;
 
 signals:
     void ExternalContentDirsChanged();
+    // Asks for the settings to be saved and closed, and the version manager opened.
+    void OpenVersionManagerRequested();
+    // Asks for the settings to be saved and closed, and the install in `install_dir` launched.
+    void LaunchExperimentalBuildRequested(const QString& install_dir);
 
 private:
     void Setup(const ConfigurationShared::Builder& builder);
@@ -69,5 +70,4 @@ private:
     const Core::System& system;
 
     std::unique_ptr<QWidget> updates_page;
-    TesterBuildSettings* tester_settings{};
 };

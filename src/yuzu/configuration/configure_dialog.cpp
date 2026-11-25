@@ -113,6 +113,15 @@ ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_,
     connect(ui_tab.get(), &ConfigureUi::LanguageChanged, this, &ConfigureDialog::OnLanguageChanged);
     connect(general_tab.get(), &ConfigureGeneral::ExternalContentDirsChanged, this,
             &ConfigureDialog::ExternalContentDirsChanged);
+    connect(general_tab.get(), &ConfigureGeneral::OpenVersionManagerRequested, this, [this] {
+        emit OpenVersionManagerRequested();
+        accept();
+    });
+    connect(general_tab.get(), &ConfigureGeneral::LaunchExperimentalBuildRequested, this,
+            [this](const QString& install_dir) {
+                emit LaunchExperimentalBuildRequested(install_dir);
+                accept();
+            });
     connect(ui->selectorList, &QListWidget::itemSelectionChanged, this,
             &ConfigureDialog::UpdateVisibleTabs);
 
@@ -183,27 +192,8 @@ void ConfigureDialog::RetranslateUI() {
     ui->tabWidget->setCurrentIndex(old_index);
 }
 
-bool ConfigureDialog::ConfirmSettings() {
-    if (general_tab->ConfirmApply()) {
-        return true;
-    }
-    // Only the update settings can refuse.
-    ui->selectorList->setCurrentRow(0);
-    QWidget* const updates_page = general_tab->UpdatesPage();
-    ui->tabWidget->setCurrentWidget(updates_page ? updates_page : general_tab.get());
-    return false;
-}
-
-void ConfigureDialog::accept() {
-    if (ConfirmSettings()) {
-        QDialog::accept();
-    }
-}
 
 void ConfigureDialog::HandleApplyButtonClicked() {
-    if (!ConfirmSettings()) {
-        return;
-    }
     UISettings::values.configuration_applied = true;
     ApplyConfiguration();
 }

@@ -19,6 +19,7 @@
 #include "frontend_common/update_installer.h"
 #include "qt_common/config/uisettings.h"
 #include "tester_build_dialog.h"
+#include "tester_build_launcher.h"
 #include "tester_build_main.h"
 #include "tester_build_runner.h"
 
@@ -98,7 +99,7 @@ void Report(bool console, const QString& text) {
     if (console) {
         Print(text);
     } else {
-        QMessageBox::critical(nullptr, QObject::tr("Tester build"), text);
+        QMessageBox::critical(nullptr, QObject::tr("Experimental build"), text);
     }
 }
 
@@ -195,7 +196,7 @@ int RunTesterBuild(int argc, char** argv) {
     QCoreApplication::setOrganizationName(QStringLiteral("eden"));
     QCoreApplication::setApplicationName(QStringLiteral("Eglantine"));
 
-    const auto root = TesterBuild::DefaultRoot();
+    const auto root = TesterLauncher::Root();
     std::error_code ec;
     if (!root.empty()) {
         std::filesystem::create_directories(root, ec);
@@ -206,7 +207,7 @@ int RunTesterBuild(int argc, char** argv) {
     }
     const UpdateInstaller::Lock lock{root / "builder.lock"};
     if (!lock.Held()) {
-        Report(console, QObject::tr("A tester build is already running."));
+        Report(console, QObject::tr("A experimental build is already running."));
         return 1;
     }
 

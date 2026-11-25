@@ -150,6 +150,15 @@ std::optional<Common::Net::Release> SelectUpdate(
 std::string DownloadPlatform(Settings::UpdateVariant variant,
                              std::string_view build_platform = Common::g_build_release_platform);
 
+// The channel a release channel setting checks. Stable (nx2) follows the versioned releases,
+// release candidates included, since those are what nx2 ships; Daily is the nightly build of
+// nx2-experimental.
+Channel ChannelOfSetting(Settings::UpdateChannel setting);
+
+// The build type of this build, for a setting still at Auto.
+Settings::UpdateVariant ThisBuildVariant(
+    std::string_view build_platform = Common::g_build_release_platform);
+
 // Queries the releases of the running build's repository. `platform` is the one to download.
 CheckResult Check(Channel channel, std::string_view platform = Common::g_build_release_platform);
 

@@ -316,6 +316,118 @@ fs::path DefaultRoot() {
     return {};
 }
 
+fs::path RootSettingPath(const fs::path& config_dir) {
+    return config_dir / "experimental-builds.json";
+}
+
+fs::path LoadRootSetting(const fs::path& file) {
+    const auto parsed = json::parse(ReadFile(file), nullptr, false);
+    if (!parsed.is_object()) {
+        return {};
+    }
+    const auto it = parsed.find("root");
+    return it != parsed.end() && it->is_string() ? PathFromUtf8(it->get<std::string>())
+                                                 : fs::path{};
+}
+
+bool SaveRootSetting(const fs::path& file, const fs::path& root, std::error_code& ec) {
+    fs::create_directories(file.parent_path(), ec);
+    if (ec) {
+        return false;
+    }
+    std::ofstream stream{file, std::ios::binary};
+    stream << json{{"root", PathToUtf8(root)}}.dump(2) << '\n';
+    stream.flush();
+    if (!stream.good()) {
+        ec = std::make_error_code(std::errc::io_error);
+        return false;
+    }
+    return true;
+}
+
+fs::path ConfiguredRoot(const fs::path& config_dir) {
+    if (const auto root = EnvVar("EGLANTINE_TESTER_ROOT")) {
+        return PathFromUtf8(*root);
+    }
+    if (auto chosen = LoadRootSetting(RootSettingPath(config_dir)); !chosen.empty()) {
+        return chosen;
+    }
+    return DefaultRoot();
+}
+
+bool HasContent(const Layout& layout) {
+    std::error_code ec;
+    for (const auto* dir : {&layout.installs, &layout.src, &layout.tools, &layout.build}) {
+        if (fs::exists(*dir, ec) && !fs::is_empty(*dir, ec)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool MoveRoot(const Layout& from, const Layout& to, State& state, std::error_code& ec) {
+    ec.clear();
+    if (from.root.empty() || to.root.empty() || SamePath(from.root, to.root)) {
+        ec = std::make_error_code(std::errc::invalid_argument);
+        return false;
+    }
+    // The build folder's cache names its own path; the lock belongs to the builder.
+    const auto skipped = [&](const fs::path& entry) {
+        return SamePath(entry, from.build) || entry.filename() == "builder.lock";
+    };
+    std::vector<fs::path> entries;
+    for (const auto& entry : fs::directory_iterator{from.root, ec}) {
+        if (skipped(entry.path())) {
+            continue;
+        }
+        std::error_code exists_ec;
+        if (fs::exists(to.root / entry.path().filename(), exists_ec)) {
+            ec = std::make_error_code(std::errc::file_exists);
+            return false;
+        }
+        entries.push_back(entry.path());
+    }
+    if (ec) {
+        return false;
+    }
+    fs::create_directories(to.root, ec);
+    if (ec) {
+        return false;
+    }
+    for (const auto& entry : entries) {
+        const auto target = to.root / entry.filename();
+        fs::rename(entry, target, ec);
+        if (ec == std::errc::cross_device_link) {
+            ec.clear();
+            fs::copy(entry, target, fs::copy_options::recursive | fs::copy_options::copy_symlinks,
+                     ec);
+            if (!ec) {
+                fs::remove_all(entry, ec);
+            }
+        }
+        if (ec) {
+            return false;
+        }
+    }
+    const auto rebase = [&](std::string& install) {
+        if (install.empty()) {
+            return;
+        }
+        const auto path = PathFromUtf8(install);
+        if (SamePath(path.parent_path(), from.installs)) {
+            install = PathToUtf8(to.installs / path.filename());
+        }
+    };
+    rebase(state.current_install);
+    rebase(state.previous_install);
+
+    std::error_code ignored;
+    fs::remove_all(from.build, ignored);
+    fs::remove(from.root / "builder.lock", ignored);
+    fs::remove(from.root, ignored);
+    return true;
+}
+
 Layout MakeLayout(const fs::path& root) {
     return {root, root / "tools", root / "src", root / "build", root / "installs", root / "logs"};
 }

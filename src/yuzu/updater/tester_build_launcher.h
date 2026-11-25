@@ -9,12 +9,29 @@
 #include <QStringList>
 #include "frontend_common/tester_build.h"
 
+class QWidget;
+
 // The release exe's side of tester builds: it is always the entry point, and hands over to the
 // installed tester build when the user follows a branch or pull request.
 namespace TesterLauncher {
 
 // tester.json, in the config folder.
 std::filesystem::path StateFile();
+
+// The folder experimental builds are kept in: the one chosen in the settings, or the default.
+std::filesystem::path Root();
+// Where that choice is saved.
+std::filesystem::path RootSettingFile();
+
+// Whether `install` is the build this process runs from.
+bool IsRunningInstall(const TesterBuild::InstallInfo& install);
+
+// The question to ask before launching `install`.
+QString LaunchQuestion(const TesterBuild::InstallInfo& install);
+
+// Makes `install` the build Eglantine starts with, closes `main_window` and starts the build.
+// When closing is declined the previous choice is put back and nothing starts.
+bool SwitchAndLaunch(const TesterBuild::InstallInfo& install, QWidget* main_window);
 
 // The exe to start for a plain relaunch of this build: $APPIMAGE inside an AppImage.
 QString SelfExe();

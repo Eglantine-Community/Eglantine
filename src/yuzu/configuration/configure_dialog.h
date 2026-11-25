@@ -68,7 +68,6 @@ public:
     ~ConfigureDialog() override;
 
     void ApplyConfiguration();
-    void accept() override;
 
     /// Selects the Profiles tab of the System category.
     void SelectProfilesTab();
@@ -79,13 +78,16 @@ private slots:
 signals:
     void LanguageChanged(const QString& locale);
     void ExternalContentDirsChanged();
+    // Emitted before the dialog closes as if OK was pressed.
+    void OpenVersionManagerRequested();
+    // Emitted before the dialog closes as if OK was pressed.
+    void LaunchExperimentalBuildRequested(const QString& install_dir);
 
 private:
     void changeEvent(QEvent* event) override;
     void RetranslateUI();
 
     void HandleApplyButtonClicked();
-    bool ConfirmSettings();
 
     void SetConfiguration();
     void UpdateVisibleTabs();

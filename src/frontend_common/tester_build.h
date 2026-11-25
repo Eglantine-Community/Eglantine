@@ -85,6 +85,27 @@ std::filesystem::path DefaultRoot();
 
 Layout MakeLayout(const std::filesystem::path& root);
 
+// experimental-builds.json in the config folder, naming the folder chosen in the settings. It is
+// not part of tester.json, which older builds rewrite without it.
+std::filesystem::path RootSettingPath(const std::filesystem::path& config_dir);
+// Empty when nothing was chosen.
+std::filesystem::path LoadRootSetting(const std::filesystem::path& file);
+// An empty `root` goes back to the default folder.
+bool SaveRootSetting(const std::filesystem::path& file, const std::filesystem::path& root,
+                     std::error_code& ec);
+
+// EGLANTINE_TESTER_ROOT, else the folder chosen in the settings, else the default folder.
+std::filesystem::path ConfiguredRoot(const std::filesystem::path& config_dir);
+
+// Whether the folder holds builds, sources or tools made by experimental builds.
+bool HasContent(const Layout& layout);
+
+// Moves everything in `from` to `to`, copying across file systems. The build folder is deleted
+// instead: its CMake cache records its own path, so the next build configures from scratch. Fails
+// before moving anything when `to` already holds an entry of the same name. The install paths in
+// `state` are rewritten; it is not saved.
+bool MoveRoot(const Layout& from, const Layout& to, State& state, std::error_code& ec);
+
 // Whether `exe` lies under root/installs. Compared lexically, ignoring case on Windows.
 bool IsTesterInstall(const std::filesystem::path& exe, const std::filesystem::path& root);
 

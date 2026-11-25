@@ -37,7 +37,7 @@ constexpr std::string_view MainRepository = "Eglantine-Community/Eglantine";
 
 // Remembered between builds, beside the builds themselves.
 std::unique_ptr<QSettings> BuilderSettings() {
-    const auto root = TesterBuild::DefaultRoot();
+    const auto root = TesterLauncher::Root();
     if (root.empty()) {
         return nullptr;
     }
@@ -85,10 +85,10 @@ TesterBuildDialog::TesterBuildDialog(TesterBuildRunner& runner, qint64 caller_pi
     : QDialog(parent), m_runner(runner),
       m_caller(caller_pid > 0 ? std::make_unique<TesterLauncher::CallerProcess>(caller_pid)
                               : nullptr) {
-    setWindowTitle(tr("Tester build"));
+    setWindowTitle(tr("Experimental build"));
 
     // Header: what is being built, and from which commit once that is known.
-    m_title = new QLabel(tr("Tester build"));
+    m_title = new QLabel(tr("Experimental build"));
     QFont title_font = m_title->font();
     title_font.setPointSizeF(title_font.pointSizeF() * 1.35);
     title_font.setBold(true);
@@ -307,7 +307,7 @@ TesterBuildDialog::~TesterBuildDialog() = default;
 void TesterBuildDialog::UpdateTitle() {
     QString title;
     if (m_name.isEmpty()) {
-        title = tr("Tester build");
+        title = tr("Experimental build");
     } else {
         switch (m_result) {
         case TesterBuildRunner::Success:

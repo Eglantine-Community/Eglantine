@@ -89,7 +89,7 @@ void TesterBuildMonitor::OnResult() {
     if (!current) {
         if (manual) {
             QMessageBox::information(m_window, title,
-                                     tr("No tester build of %1 is installed yet.").arg(name));
+                                     tr("No experimental build of %1 is installed yet.").arg(name));
         }
         return;
     }
@@ -109,7 +109,7 @@ void TesterBuildMonitor::OnResult() {
 }
 
 void TesterBuildMonitor::OfferBuild(const QString& name) {
-    auto* box = new QMessageBox(QMessageBox::Question, tr("Tester build"),
+    auto* box = new QMessageBox(QMessageBox::Question, tr("Experimental build"),
                                 tr("%1 has a new commit. Build it now?").arg(name), {}, m_window);
     box->setAttribute(Qt::WA_DeleteOnClose);
     auto* build = box->addButton(tr("Build"), QMessageBox::AcceptRole);

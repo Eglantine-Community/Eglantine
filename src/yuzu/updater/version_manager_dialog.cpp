@@ -179,7 +179,7 @@ VersionManagerDialog::VersionManagerDialog(QWidget* parent) : QDialog(parent) {
     title->setFont(title_font);
     layout->addWidget(title);
 
-    auto* intro = new QLabel(tr("Tester builds of branches and pull requests, installed beside "
+    auto* intro = new QLabel(tr("Experimental builds of branches and pull requests, installed beside "
                                 "this release. Pick a commit to build it, or switch to a build "
                                 "you already have."),
                              this);
@@ -252,9 +252,9 @@ VersionManagerDialog::VersionManagerDialog(QWidget* parent) : QDialog(parent) {
     }
     resize(size);
 
-    const auto root = TesterBuild::DefaultRoot();
+    const auto root = TesterLauncher::Root();
     if (root.empty()) {
-        m_status->setText(tr("Tester builds are not available: no folder to keep them in."));
+        m_status->setText(tr("Experimental builds are not available: no folder to keep them in."));
         m_add_branch->setEnabled(false);
         UpdateButtons();
         return;
@@ -380,8 +380,8 @@ void VersionManagerDialog::FillBranches(const std::string& keep) {
     if (m_branches.empty()) {
         m_commit_list->clear();
         m_shown.clear();
-        m_status->setText(tr("No tester builds yet. Choose a branch or pull request under "
-                             "Configure > General > Updates and build it."));
+        m_status->setText(tr("No experimental builds yet. Add a branch or pull request with "
+                             "Add Branch... and build it."));
         UpdateButtons();
         return;
     }
@@ -801,9 +801,7 @@ const TesterBuild::InstallInfo* VersionManagerDialog::SelectedInstall() const {
 }
 
 bool VersionManagerDialog::IsRunning(const TesterBuild::InstallInfo& install) const {
-    std::error_code ec;
-    const fs::path self{QCoreApplication::applicationFilePath().toStdU16String()};
-    return fs::equivalent(self, TesterBuild::InstalledExe(install.dir), ec);
+    return TesterLauncher::IsRunningInstall(install);
 }
 
 bool VersionManagerDialog::SaveState() {
@@ -812,7 +810,7 @@ bool VersionManagerDialog::SaveState() {
         return true;
     }
     QMessageBox::warning(this, tr("Version Manager"),
-                         tr("Could not save the tester build state: %1")
+                         tr("Could not save the experimental build state: %1")
                              .arg(Q(ec.message())));
     return false;
 }
@@ -894,36 +892,12 @@ void VersionManagerDialog::LaunchSelected() {
         return;
     }
     const auto info = *install;
-    const auto exe = PathText(TesterBuild::InstalledExe(info.dir));
-    QString text =
-        tr("Eglantine closes and starts again as the build of %1.").arg(Q(info.sha.substr(0, 10)));
-    if (!info.version_manager) {
-        text += QStringLiteral("\n\n") +
-                tr("This build is older than the Version Manager and cannot switch back by itself, "
-                   "so Eglantine starts the release again next time.");
-    }
-    if (QMessageBox::question(this, tr("Launch"), text,
+    if (QMessageBox::question(this, tr("Launch"), TesterLauncher::LaunchQuestion(info),
                               QMessageBox::Ok | QMessageBox::Cancel,
                               QMessageBox::Ok) != QMessageBox::Ok) {
         return;
     }
-
-    const auto saved = m_state;
-    TesterBuild::SwitchInstall(m_state, info);
-    m_state.start_tester = true;
-    if (!SaveState()) {
-        m_state = saved;
-        return;
-    }
     QWidget* const main_window = parentWidget() ? parentWidget()->window() : nullptr;
     accept();
-    if (main_window && !main_window->close()) {
-        // Closing was declined: stay on the build that is running.
-        m_state = saved;
-        SaveState();
-        return;
-    }
-    if (!TesterLauncher::StartDetached(exe, {})) {
-        QMessageBox::warning(nullptr, tr("Launch"), tr("Could not start %1.").arg(exe));
-    }
+    TesterLauncher::SwitchAndLaunch(info, main_window);
 }

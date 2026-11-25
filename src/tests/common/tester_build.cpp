@@ -1181,3 +1181,42 @@ TEST_CASE("UsableSystemQt and the configure flags it adds", "[tester]") {
     Write(layout.build / "CMakeCache.txt", "YUZU_USE_BUNDLED_QT:BOOL=OFF\n");
     CHECK(ConfiguredWithBundledQt(layout) == false);
 }
+
+TEST_CASE("Root setting and moving the experimental builds folder", "[tester]") {
+    TempDir dir;
+    const auto config = dir.path / "config";
+    const auto file = RootSettingPath(config);
+    CHECK(LoadRootSetting(file).empty());
+    std::error_code ec;
+    REQUIRE(SaveRootSetting(file, dir.path / "chosen", ec));
+    CHECK(LoadRootSetting(file) == dir.path / "chosen");
+    CHECK(ConfiguredRoot(config) == dir.path / "chosen");
+
+    const auto from = MakeLayout(dir.path / "old");
+    const auto to = MakeLayout(dir.path / "new");
+    CHECK_FALSE(HasContent(from));
+    Write(InstalledExe(from.InstallDir(Sha1)), "exe");
+    Write(from.src / "README", "src");
+    Write(from.build / "CMakeCache.txt", "cache");
+    Write(from.root / "version-manager.json", "{}");
+    CHECK(HasContent(from));
+
+    State state;
+    state.current_install = PathToUtf8(from.InstallDir(Sha1));
+    state.previous_install = "/elsewhere/installs/x";
+
+    // Refused, untouched, when the destination already has an entry of the same name.
+    Write(to.src / "taken", "");
+    CHECK_FALSE(MoveRoot(from, to, state, ec));
+    CHECK(fs::exists(InstalledExe(from.InstallDir(Sha1))));
+    fs::remove_all(to.root);
+
+    REQUIRE(MoveRoot(from, to, state, ec));
+    CHECK(fs::exists(InstalledExe(to.InstallDir(Sha1))));
+    CHECK(Read(to.src / "README") == "src");
+    CHECK(fs::exists(to.root / "version-manager.json"));
+    CHECK_FALSE(fs::exists(to.build));
+    CHECK_FALSE(fs::exists(from.root));
+    CHECK(state.current_install == PathToUtf8(to.InstallDir(Sha1)));
+    CHECK(state.previous_install == "/elsewhere/installs/x");
+}

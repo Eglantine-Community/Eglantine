@@ -390,16 +390,10 @@ inline static bool isDarkMode() {
 #endif // _WIN32
 
 #ifdef ENABLE_UPDATE_CHECKER
+// Release candidates are part of the Stable (nx2) channel.
 static Settings::UpdateChannel ToSettingsChannel(UpdateChecker::Channel channel) {
-    switch (channel) {
-    case UpdateChecker::Channel::ReleaseCandidate:
-        return Settings::UpdateChannel::ReleaseCandidate;
-    case UpdateChecker::Channel::Daily:
-        return Settings::UpdateChannel::Daily;
-    case UpdateChecker::Channel::Stable:
-        break;
-    }
-    return Settings::UpdateChannel::Stable;
+    return channel == UpdateChecker::Channel::Daily ? Settings::UpdateChannel::Daily
+                                                    : Settings::UpdateChannel::Stable;
 }
 #endif
 
@@ -4154,6 +4148,21 @@ void MainWindow::OpenConfigureDialog(bool select_profiles) {
             &MainWindow::OnLanguageChanged);
     connect(&configure_dialog, &ConfigureDialog::ExternalContentDirsChanged, this,
             &MainWindow::OnGameListRefresh);
+#ifdef ENABLE_UPDATE_CHECKER
+    // Opened once the settings are closed and applied, so it never runs on top of them.
+    connect(&configure_dialog, &ConfigureDialog::OpenVersionManagerRequested, this,
+            [this] { QTimer::singleShot(0, this, &MainWindow::OnVersionManager); });
+    connect(&configure_dialog, &ConfigureDialog::LaunchExperimentalBuildRequested, this,
+            [this](const QString& install_dir) {
+                QTimer::singleShot(0, this, [this, install_dir] {
+                    const auto state = TesterBuild::LoadState(TesterLauncher::StateFile());
+                    TesterLauncher::SwitchAndLaunch(
+                        TesterBuild::ReadInstallInfo(
+                            TesterBuild::PathFromUtf8(install_dir.toStdString()), state),
+                        this);
+                });
+            });
+#endif
 
     if (select_profiles) {
         configure_dialog.SelectProfilesTab();
@@ -5187,17 +5196,8 @@ void MainWindow::CheckForUpdates(bool manual) {
         return;
     }
 
-    switch (UISettings::values.update_channel.GetValue()) {
-    case Settings::UpdateChannel::ReleaseCandidate:
-        update_check_channel = UpdateChecker::Channel::ReleaseCandidate;
-        break;
-    case Settings::UpdateChannel::Daily:
-        update_check_channel = UpdateChecker::Channel::Daily;
-        break;
-    default:
-        update_check_channel = UpdateChecker::Channel::Stable;
-        break;
-    }
+    update_check_channel =
+        UpdateChecker::ChannelOfSetting(UISettings::values.update_channel.GetValue());
     update_check_running = true;
     update_check_manual = manual;
     update_future = QtConcurrent::run(

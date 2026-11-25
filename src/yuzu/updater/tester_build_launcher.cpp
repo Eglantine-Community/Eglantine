@@ -243,13 +243,64 @@ fs::path StateFile() {
     return TesterBuild::StatePath(Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir));
 }
 
+bool IsRunningInstall(const TesterBuild::InstallInfo& install) {
+    std::error_code ec;
+    const fs::path self{QCoreApplication::applicationFilePath().toStdU16String()};
+    return fs::equivalent(self, TesterBuild::InstalledExe(install.dir), ec);
+}
+
+QString LaunchQuestion(const TesterBuild::InstallInfo& install) {
+    QString text = QObject::tr("Eglantine closes and starts again as the build of %1.")
+                       .arg(QString::fromStdString(install.sha.substr(0, 10)));
+    if (!install.version_manager) {
+        text += QStringLiteral("\n\n") +
+                QObject::tr("This build is older than the Version Manager and cannot switch back "
+                            "by itself, so Eglantine starts the release again next time.");
+    }
+    return text;
+}
+
+bool SwitchAndLaunch(const TesterBuild::InstallInfo& install, QWidget* main_window) {
+    const auto saved = TesterBuild::LoadState(StateFile());
+    auto state = saved;
+    TesterBuild::SwitchInstall(state, install);
+    state.start_tester = true;
+    std::error_code ec;
+    if (!TesterBuild::SaveState(StateFile(), state, ec)) {
+        QMessageBox::warning(main_window, QObject::tr("Launch"),
+                             QObject::tr("Could not save the experimental build state: %1")
+                                 .arg(QString::fromStdString(ec.message())));
+        return false;
+    }
+    if (main_window && !main_window->close()) {
+        // Closing was declined: stay on the build that is running.
+        TesterBuild::SaveState(StateFile(), saved, ec);
+        return false;
+    }
+    const auto exe = ToQ(TesterBuild::InstalledExe(install.dir));
+    if (!StartDetached(exe, {})) {
+        QMessageBox::warning(nullptr, QObject::tr("Launch"),
+                             QObject::tr("Could not start %1.").arg(exe));
+        return false;
+    }
+    return true;
+}
+
+fs::path Root() {
+    return TesterBuild::ConfiguredRoot(Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir));
+}
+
+fs::path RootSettingFile() {
+    return TesterBuild::RootSettingPath(Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir));
+}
+
 QString SelfExe() {
     const auto image = qEnvironmentVariable("APPIMAGE");
     return image.isEmpty() ? ToQ(SelfPath()) : image;
 }
 
 bool IsTesterBuild() {
-    const auto root = TesterBuild::DefaultRoot();
+    const auto root = Root();
     return !root.empty() && TesterBuild::IsTesterInstall(SelfPath(), root);
 }
 
@@ -402,7 +453,7 @@ void CallerProcess::RequestClose() const {
 std::optional<int> Run(int argc, char** argv) {
     const auto args = Arguments(argc, argv);
     auto state = TesterBuild::LoadState(StateFile());
-    const auto root = TesterBuild::DefaultRoot();
+    const auto root = Root();
     const bool self_is_tester = !root.empty() && TesterBuild::IsTesterInstall(SelfPath(), root);
 
     // A CI build of a branch follows that branch, once per branch.
@@ -506,8 +557,8 @@ std::optional<int> Run(int argc, char** argv) {
         if (started && (!exit_code || *exit_code == 0)) {
             return 0;
         }
-        const auto text = started ? QObject::tr("The tester build closed right after starting.")
-                                  : QObject::tr("The tester build could not be started.");
+        const auto text = started ? QObject::tr("The experimental build closed right after starting.")
+                                  : QObject::tr("The experimental build could not be started.");
         switch (ask(text,
                     {QObject::tr("Rebuild"), QObject::tr("Use release build"),
                      QObject::tr("Close")},
@@ -528,7 +579,7 @@ std::optional<int> Run(int argc, char** argv) {
 
     switch (action) {
     case Action::OfferFirstBuild:
-        return ask(QObject::tr("No tester build of %1 is installed yet.").arg(name),
+        return ask(QObject::tr("No experimental build of %1 is installed yet.").arg(name),
                    {QObject::tr("Build now"), QObject::tr("Use release build")}, 1) == 0
                    ? start_builder(false)
                    : start_release();
