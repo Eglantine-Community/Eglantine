@@ -238,6 +238,7 @@
     <addaction name="action_Open_UserHandbook"/>
     <addaction name="separator"/>
     <addaction name="action_Check_For_Updates"/>
+    <addaction name="action_Version_Manager"/>
     <addaction name="action_About"/>
     <addaction name="action_Eden_Dependencies"/>
     <addaction name="action_Restore_Previous_Version"/>
@@ -418,6 +419,11 @@
   <action name="action_Check_For_Updates">
    <property name="text">
     <string>Check for &amp;Updates</string>
+   </property>
+  </action>
+  <action name="action_Version_Manager">
+   <property name="text">
+    <string>&amp;Version Manager...</string>
    </property>
   </action>
   <action name="action_Restore_Previous_Version">

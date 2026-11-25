@@ -256,6 +256,7 @@ add_executable(yuzu
 
     render/performance_overlay.h render/performance_overlay.cpp
     render/perf_sampler.h render/perf_sampler.cpp
+    updater/download.h updater/download.cpp
     updater/update_dialog.h updater/update_dialog.cpp updater/update_dialog.ui
     game/common.h
     game/carousel.h game/carousel.cpp
@@ -319,6 +320,15 @@ file(GLOB_RECURSE THEMES ${PROJECT_SOURCE_DIR}/dist/qt_themes/*)
 
 if (ENABLE_UPDATE_CHECKER)
     target_compile_definitions(yuzu PUBLIC ENABLE_UPDATE_CHECKER)
+    target_sources(yuzu PRIVATE
+        updater/tester_build_dialog.cpp updater/tester_build_dialog.h
+        updater/tester_build_launcher.cpp updater/tester_build_launcher.h
+        updater/tester_build_monitor.cpp updater/tester_build_monitor.h
+        configuration/update_settings_panel.cpp configuration/update_settings_panel.h
+        configuration/experimental_builds_panel.cpp configuration/experimental_builds_panel.h
+        updater/tester_build_main.cpp updater/tester_build_main.h
+        updater/tester_build_runner.cpp updater/tester_build_runner.h
+        updater/version_manager_dialog.cpp updater/version_manager_dialog.h)
     target_link_libraries(yuzu PRIVATE QuaZip::QuaZip)
 endif()
 

@@ -453,11 +453,15 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "it bypasses such prompts and directly exits the emulation."));
     INSERT(UISettings, hide_mouse, tr("Hide mouse on inactivity"),
            tr("Hides the mouse after 2.5s of inactivity."));
-    INSERT(UISettings, check_for_updates, tr("Check for updates"),
+    INSERT(UISettings, check_for_updates, tr("Automatically check for updates on launch"),
            tr("Whether or not to check for updates upon startup."));
-    INSERT(UISettings, update_channel, tr("Update channel"),
-           tr("Stable only offers finished releases.\nRelease candidate also offers release "
-              "candidates of upcoming versions.\nDaily offers the automatic daily builds."));
+    INSERT(UISettings, update_channel, tr("Release channel"),
+           tr("Stable offers the releases of nx2.\nNightly offers the daily builds of "
+              "nx2-experimental, with the newest changes and more risk."));
+    INSERT(UISettings, update_variant, tr("Build type"),
+           tr("PGO builds are optimized using a profile of real games and are usually faster.\n"
+              "When a release has no PGO build, the non-PGO one is used.\n"
+              "Experimental builds compiled on this computer are always non-PGO."));
 
     // Linux
     INSERT(UISettings, enable_gamemode, tr("Enable Gamemode"), QString());
@@ -789,9 +793,13 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
          }});
     translations->insert({Settings::EnumMetadata<Settings::UpdateChannel>::Index(),
                           {
-                              PAIR(UpdateChannel, Stable, tr("Stable")),
-                              PAIR(UpdateChannel, ReleaseCandidate, tr("Release candidate")),
-                              PAIR(UpdateChannel, Daily, tr("Daily")),
+                              PAIR(UpdateChannel, Stable, tr("Stable (nx2)")),
+                              PAIR(UpdateChannel, Daily, tr("Nightly (nx2-experimental)")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::UpdateVariant>::Index(),
+                          {
+                              PAIR(UpdateVariant, Standard, tr("Non-PGO")),
+                              PAIR(UpdateVariant, Pgo, tr("PGO")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::GpuClock>::Index(),
                           {
