@@ -7,6 +7,7 @@
 #include "core/file_sys/control_metadata.h"
 #include "core/file_sys/nca_metadata.h"
 #include "core/file_sys/registered_cache.h"
+#include "core/hle/kernel/k_event.h"
 #include "core/hle/service/cmif_serialization.h"
 #include "core/hle/service/filesystem/filesystem.h"
 #include "core/hle/service/ipc_helpers.h"
@@ -31,8 +32,7 @@ IApplicationManagerInterface::IApplicationManagerInterface(Core::System& system_
       record_update_system_event{service_context}, sd_card_mount_status_event{service_context},
       gamecard_update_detection_event{service_context},
       gamecard_mount_status_event{service_context}, gamecard_mount_failure_event{service_context},
-      gamecard_waken_ready_event{service_context}, unknown_event{service_context},
-      unknown_3250_event{service_context} {
+      gamecard_waken_ready_event{service_context}, unknown_event{service_context} {
     // clang-format off
     static const FunctionInfo functions[] = {
         {0, D<&IApplicationManagerInterface::ListApplicationRecord>, "ListApplicationRecord"},
@@ -389,9 +389,9 @@ IApplicationManagerInterface::IApplicationManagerInterface(Core::System& system_
         {3050, nullptr, "ListAssignELicenseTaskResult"},
         {3104, nullptr, "GetApplicationNintendoLogo"}, //18.0.0+
         {3105, nullptr, "GetApplicationStartupMovie"}, //18.0.0+
-        {3250, D<&IApplicationManagerInterface::Unknown3250>, "Unknown3250"}, //23.0.0+
-        {3251, D<&IApplicationManagerInterface::Unknown3251>, "Unknown3251"}, //23.0.0+
-        {3254, D<&IApplicationManagerInterface::Unknown3254>, "Unknown3254"}, //23.0.0+
+        {3250, D<&IApplicationManagerInterface::Unknown3250>, "Unknown3250"}, //23.5.0+
+        {3251, D<&IApplicationManagerInterface::Unknown3251>, "Unknown3251"}, //23.5.0+
+        {3254, D<&IApplicationManagerInterface::Unknown3254>, "Unknown3254"}, //23.5.0+
         {4000, nullptr, "Unknown4000"}, //20.0.0+
         {4004, nullptr, "Unknown4004"}, //20.0.0+
         {4006, nullptr, "Unknown4006"}, //20.0.0+
@@ -488,9 +488,14 @@ IApplicationManagerInterface::IApplicationManagerInterface(Core::System& system_
     // clang-format on
 
     RegisterHandlers(functions);
+
+    unknown_3250_event =
+        service_context.CreateEvent("IApplicationManagerInterface:Unknown3250Event");
 }
 
-IApplicationManagerInterface::~IApplicationManagerInterface() = default;
+IApplicationManagerInterface::~IApplicationManagerInterface() {
+    service_context.CloseEvent(unknown_3250_event);
+}
 
 Result IApplicationManagerInterface::UnregisterNetworkServiceAccountWithUserSaveDataDeletion(Common::UUID user_id) {
     LOG_DEBUG(Service_NS, "called, user_id={}", user_id.FormattedString());
@@ -868,17 +873,17 @@ Result IApplicationManagerInterface::Unknown4022(
 
 Result IApplicationManagerInterface::Unknown3250(
     OutCopyHandle<Kernel::KReadableEvent> out_event) {
-    // 23.0.0+, called by qlaunch right after GetApplicationRecordUpdateSystemEvent and
+    // 23.5.0+, called by qlaunch right after GetApplicationRecordUpdateSystemEvent and
     // GetGameCardUpdateDetectionEvent, so it is most likely another event getter.
     // Hand out an event that is never signaled.
     LOG_WARNING(Service_NS, "(STUBBED) called");
-    *out_event = unknown_3250_event.GetHandle();
+    *out_event = &unknown_3250_event->GetReadableEvent();
     R_SUCCEED();
 }
 
 Result IApplicationManagerInterface::Unknown3251(
     OutBuffer<BufferAttr_HipcMapAlias> out_buffer) {
-    // 23.0.0+, called by qlaunch during startup with one output buffer.
+    // 23.5.0+, called by qlaunch during startup with one output buffer.
     // Semantics unknown; return an empty (zeroed) buffer.
     LOG_WARNING(Service_NS, "(STUBBED) called, buffer_size={:#x}", out_buffer.size());
     std::memset(out_buffer.data(), 0, out_buffer.size());
@@ -887,7 +892,7 @@ Result IApplicationManagerInterface::Unknown3251(
 
 Result IApplicationManagerInterface::Unknown3254(
     Out<s32> out_count, OutBuffer<BufferAttr_HipcMapAlias> out_buffer) {
-    // 23.0.0+, called by qlaunch right after 3250 with one output buffer. Looks like a
+    // 23.5.0+, called by qlaunch right after 3250 with one output buffer. Looks like a
     // list query; report zero entries and return an empty (zeroed) buffer.
     LOG_WARNING(Service_NS, "(STUBBED) called, buffer_size={:#x}", out_buffer.size());
     std::memset(out_buffer.data(), 0, out_buffer.size());

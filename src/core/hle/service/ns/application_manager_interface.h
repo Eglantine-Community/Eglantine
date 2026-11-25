@@ -98,7 +98,7 @@ private:
     Event gamecard_mount_failure_event;
     Event gamecard_waken_ready_event;
     Event unknown_event;
-    Event unknown_3250_event;
+    Kernel::KEvent* unknown_3250_event{};
 };
 
 } // namespace Service::NS
