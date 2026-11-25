@@ -565,6 +565,13 @@ Result FSP_SRV::OpenDataStorageWithProgramIndex(OutInterface<IStorage> out_inter
         patched_romfs = romfs_controller->OpenRomFSCurrentProcess();
     }
 
+    // Loose (extracted) dumps have no NCA in the content provider; the current program's own
+    // index still resolves to the RomFS the loader already opened.
+    if (!patched_romfs &&
+        FileSys::GetBaseTitleIDWithProgramIndex(program_id, program_index) == program_id) {
+        patched_romfs = romfs_controller->OpenRomFSCurrentProcess();
+    }
+
     if (!patched_romfs) {
         // TODO: Find the right error code to use here
         LOG_ERROR(Service_FS, "Could not open storage with program_index={}", program_index);

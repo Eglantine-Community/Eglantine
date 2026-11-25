@@ -85,6 +85,7 @@ add_executable(tests
     video_core/shader_bench.cpp
     video_core/shader_precache.cpp
     video_core/shader_precache_identity.cpp
+    video_core/stage_cache_in_flight.cpp
     video_core/h264_packet.cpp
     video_core/vertex_repack.cpp
     video_core/virtual_range_cache.cpp
@@ -179,9 +180,13 @@ create_target_directory_groups(tests)
 if (ENABLE_UPDATE_CHECKER)
     target_sources(tests PRIVATE
         common/update_checker.cpp
+        common/net_heads.cpp
         common/update_installer.cpp
+        common/tester_build.cpp
         ../frontend_common/update_checker.cpp
-        ../frontend_common/update_installer.cpp)
+        ../frontend_common/update_installer.cpp
+        ../frontend_common/tester_build.cpp
+        ${CMAKE_BINARY_DIR}/src/frontend_common/tester_recipe.cpp)
 endif()
 
 target_link_libraries(tests PRIVATE common core input_common video_core Opus::opus)
