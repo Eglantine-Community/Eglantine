@@ -11,9 +11,17 @@
 #include <QApplication>
 #include <QCoreApplication>
 #include <QElapsedTimer>
+#include <QFile>
+#include <QGuiApplication>
+#include <QIcon>
 #include <QMessageBox>
+#include <QPalette>
+#include <QSettings>
+#include <QStyleHints>
+#include <QTextStream>
 #include <QThread>
 #include <QTimer>
+#include "common/fs/path_util.h"
 #include "frontend_common/tester_build.h"
 #include "frontend_common/config.h"
 #include "frontend_common/update_installer.h"
@@ -58,6 +66,51 @@ void InstallInterruptHandler() {
     std::signal(SIGTERM, [](int) { g_interrupted = true; });
 }
 #endif
+
+bool SystemIsDark() {
+#if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
+    return QGuiApplication::styleHints()->colorScheme() == Qt::ColorScheme::Dark;
+#else
+    const QPalette palette;
+    return palette.color(QPalette::WindowText).lightness() >
+           palette.color(QPalette::Window).lightness();
+#endif
+}
+
+// The theme chosen in the emulator's settings, applied as the main window does.
+void ApplyTheme() {
+    const auto config = Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir) / "qt-config.ini";
+    const QSettings settings{QString::fromStdString(Common::FS::PathToUTF8String(config)),
+                             QSettings::IniFormat};
+    const QString default_theme = QString::fromUtf8(
+        UISettings::themes[static_cast<std::size_t>(UISettings::default_theme)].second);
+    QString theme = settings.value(QStringLiteral("UI/theme"), default_theme).toString();
+    if (theme.isEmpty()) {
+        theme = default_theme;
+    }
+
+    if (theme == QStringLiteral("default") || theme == QStringLiteral("colorful")) {
+        if (theme == QStringLiteral("colorful")) {
+            QIcon::setThemeName(theme);
+            QIcon::setThemeSearchPaths(QIcon::themeSearchPaths() << QStringLiteral(":/icons"));
+        }
+        if (SystemIsDark()) {
+            theme = QStringLiteral("default_dark");
+        }
+    } else {
+        QIcon::setThemeName(theme);
+        QIcon::setThemeSearchPaths({QStringLiteral(":/icons")});
+    }
+
+    QFile file{QStringLiteral(":%1/style.qss").arg(theme)};
+    if (!file.open(QFile::ReadOnly | QFile::Text)) {
+        file.setFileName(QStringLiteral(":%1/style.qss").arg(default_theme));
+        if (!file.open(QFile::ReadOnly | QFile::Text)) {
+            return;
+        }
+    }
+    qApp->setStyleSheet(QTextStream{&file}.readAll());
+}
 
 void Print(const QString& text) {
     const auto bytes = text.toUtf8();
@@ -186,7 +239,11 @@ int RunTesterBuild(int argc, char** argv) {
     if (console) {
         core.emplace(argc, argv);
     } else {
+#ifdef _WIN32
+        QApplication::setStyle(QStringLiteral("windowsvista"));
+#endif
         gui.emplace(argc, argv);
+        ApplyTheme();
     }
     QCoreApplication::setOrganizationName(QStringLiteral("eden"));
     QCoreApplication::setApplicationName(QStringLiteral("Eglantine"));

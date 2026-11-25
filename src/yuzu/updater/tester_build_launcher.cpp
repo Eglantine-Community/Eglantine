@@ -306,6 +306,11 @@ bool StartDetached(const QString& program, const QStringList& args, const QStrin
 #ifndef _WIN32
     process.setProcessEnvironment(ChildEnvironment());
 #endif
+    // It outlives this process: writing to the terminal that started this one would keep that
+    // terminal looking busy after this process exits. Its log file has everything.
+    process.setStandardInputFile(QProcess::nullDevice());
+    process.setStandardOutputFile(QProcess::nullDevice());
+    process.setStandardErrorFile(QProcess::nullDevice());
     return process.startDetached();
 }
 

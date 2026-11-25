@@ -86,7 +86,6 @@ TesterBuildDialog::TesterBuildDialog(TesterBuildRunner& runner, qint64 caller_pi
       m_caller(caller_pid > 0 ? std::make_unique<TesterLauncher::CallerProcess>(caller_pid)
                               : nullptr) {
     setWindowTitle(tr("Tester build"));
-    setMinimumWidth(560);
 
     // Header: what is being built, and from which commit once that is known.
     m_title = new QLabel(tr("Tester build"));
@@ -94,6 +93,8 @@ TesterBuildDialog::TesterBuildDialog(TesterBuildRunner& runner, qint64 caller_pi
     title_font.setPointSizeF(title_font.pointSizeF() * 1.35);
     title_font.setBold(true);
     m_title->setFont(title_font);
+    // The layout sizes the window to its content, so the width is held here.
+    m_title->setMinimumWidth(520);
     m_subtitle = new QLabel;
     m_subtitle->setTextInteractionFlags(Qt::TextSelectableByMouse);
     const QString repository = QString::fromUtf8(Common::g_build_auto_update_repo);
@@ -538,6 +539,10 @@ void TesterBuildDialog::LaunchBuiltEmulator() {
     }
     process.setProcessEnvironment(environment);
 #endif
+    // The build outlives the builder; its log file has what it would print.
+    process.setStandardInputFile(QProcess::nullDevice());
+    process.setStandardOutputFile(QProcess::nullDevice());
+    process.setStandardErrorFile(QProcess::nullDevice());
     if (!process.startDetached()) {
         m_message->setText(tr("Could not start %1.").arg(exe));
         m_start->setEnabled(true);
