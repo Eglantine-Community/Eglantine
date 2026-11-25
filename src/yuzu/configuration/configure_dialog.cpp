@@ -187,8 +187,10 @@ bool ConfigureDialog::ConfirmSettings() {
     if (general_tab->ConfirmApply()) {
         return true;
     }
+    // Only the update settings can refuse.
     ui->selectorList->setCurrentRow(0);
-    ui->tabWidget->setCurrentWidget(general_tab.get());
+    QWidget* const updates_page = general_tab->UpdatesPage();
+    ui->tabWidget->setCurrentWidget(updates_page ? updates_page : general_tab.get());
     return false;
 }
 
@@ -209,9 +211,14 @@ void ConfigureDialog::HandleApplyButtonClicked() {
 Q_DECLARE_METATYPE(QList<QWidget*>);
 
 void ConfigureDialog::PopulateSelectionList() {
+    QList<QWidget*> general_tabs{general_tab.get()};
+    if (QWidget* const updates_page = general_tab->UpdatesPage()) {
+        general_tabs.push_back(updates_page);
+    }
+    general_tabs.append({hotkeys_tab.get(), ui_tab.get(), web_tab.get(), debug_tab_tab.get()});
+
     const std::array<std::pair<QString, QList<QWidget*>>, 7> items{
-        {{tr("General"),
-          {general_tab.get(), hotkeys_tab.get(), ui_tab.get(), web_tab.get(), debug_tab_tab.get()}},
+        {{tr("General"), general_tabs},
          {tr("System"),
           {system_tab.get(), profile_tab.get(), network_tab.get(), filesystem_tab.get(),
            applets_tab.get()}},

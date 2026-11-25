@@ -44,6 +44,8 @@ public:
     // False when a setting is not valid; the user has been told why.
     bool ConfirmApply();
     void SetConfiguration() override;
+    // The Updates tab, or nullptr when this build has no update settings.
+    QWidget* UpdatesPage() const;
 
 signals:
     void ExternalContentDirsChanged();
@@ -66,5 +68,6 @@ private:
 
     const Core::System& system;
 
+    std::unique_ptr<QWidget> updates_page;
     TesterBuildSettings* tester_settings{};
 };

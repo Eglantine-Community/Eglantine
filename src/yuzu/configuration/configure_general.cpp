@@ -14,6 +14,7 @@
 #include <QFileDialog>
 #include <QListWidget>
 #include <QMessageBox>
+#include <QVBoxLayout>
 #include "common/scm_rev.h"
 #include "common/settings.h"
 #include "core/core.h"
@@ -135,10 +136,23 @@ void ConfigureGeneral::Setup(const ConfigurationShared::Builder& builder) {
 #ifdef ENABLE_UPDATE_CHECKER
     tester_settings = new TesterBuildSettings(this);
     ui->updates_widget->layout()->addWidget(tester_settings);
-    ui->UpdatesGroupBox->setVisible(true);
 #else
-    ui->UpdatesGroupBox->setVisible(!update_hold.empty());
+    if (update_hold.empty()) {
+        ui->UpdatesGroupBox->setVisible(false);
+        return;
+    }
 #endif
+
+    // Updates get their own tab under General.
+    updates_page = std::make_unique<QWidget>();
+    auto* const updates_layout = new QVBoxLayout(updates_page.get());
+    updates_layout->addWidget(ui->UpdatesGroupBox);
+    updates_layout->addStretch();
+    updates_page->setAccessibleName(tr("Updates"));
+}
+
+QWidget* ConfigureGeneral::UpdatesPage() const {
+    return updates_page.get();
 }
 
 // Called to set the callback when resetting settings to defaults
@@ -243,4 +257,7 @@ void ConfigureGeneral::changeEvent(QEvent* event) {
 
 void ConfigureGeneral::RetranslateUI() {
     ui->retranslateUi(this);
+    if (updates_page) {
+        updates_page->setAccessibleName(tr("Updates"));
+    }
 }
