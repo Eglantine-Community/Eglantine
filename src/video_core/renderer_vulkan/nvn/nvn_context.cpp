@@ -1465,6 +1465,9 @@ void Context::Impl::CompleteMain() {
         if (!flight->shadow.empty()) {
             draw_resources->ReleaseShadows(flight->shadow);
         }
+        if (!flight->scratch_shadows.empty()) {
+            draw_resources->ReleaseShadows(flight->scratch_shadows);
+        }
         flight->download.reset();
         flight->keepalive.clear();
         {
