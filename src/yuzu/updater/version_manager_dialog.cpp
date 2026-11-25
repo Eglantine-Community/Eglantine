@@ -895,9 +895,14 @@ void VersionManagerDialog::LaunchSelected() {
     }
     const auto info = *install;
     const auto exe = PathText(TesterBuild::InstalledExe(info.dir));
-    if (QMessageBox::question(this, tr("Launch"),
-                              tr("Eglantine closes and starts again as the build of %1.")
-                                  .arg(Q(info.sha.substr(0, 10))),
+    QString text =
+        tr("Eglantine closes and starts again as the build of %1.").arg(Q(info.sha.substr(0, 10)));
+    if (!info.version_manager) {
+        text += QStringLiteral("\n\n") +
+                tr("This build is older than the Version Manager and cannot switch back by itself, "
+                   "so Eglantine starts the release again next time.");
+    }
+    if (QMessageBox::question(this, tr("Launch"), text,
                               QMessageBox::Ok | QMessageBox::Cancel,
                               QMessageBox::Ok) != QMessageBox::Ok) {
         return;

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <cstring>
 #include <cctype>
 #include <chrono>
 #include <cstdlib>
@@ -1118,11 +1119,12 @@ s64 NowSeconds() {
 } // namespace
 
 bool WriteInstallInfo(const fs::path& install_dir, const Source& source, std::string_view sha,
-                      s64 built_at, std::error_code& ec) {
+                      s64 built_at, bool version_manager, std::error_code& ec) {
     const json out = {
         {"source", source.ToString()},
         {"sha", std::string{sha}},
         {"built_at", built_at},
+        {"version_manager", version_manager},
     };
     std::ofstream stream{install_dir / InstallInfoFile, std::ios::binary};
     stream << out.dump(2) << '\n';
@@ -1150,6 +1152,10 @@ InstallInfo ReadInstallInfo(const fs::path& install_dir, const State& state) {
             it != parsed.end() && it->is_number_integer()) {
             info.built_at = it->get<s64>();
         }
+        if (const auto it = parsed.find("version_manager");
+            it != parsed.end() && it->is_boolean()) {
+            info.version_manager = it->get<bool>();
+        }
         return info;
     }
 
@@ -1173,6 +1179,25 @@ InstallInfo ReadInstallInfo(const fs::path& install_dir, const State& state) {
         }
     }
     return info;
+}
+
+bool HasVersionManager(const fs::path& exe) {
+    // The class name is in the Qt meta object of every build that has the dialog.
+    constexpr std::string_view marker = "VersionManagerDialog";
+    std::ifstream stream{exe, std::ios::binary};
+    std::string buffer(std::size_t{1} << 20, '\0');
+    std::size_t kept = 0;
+    while (stream) {
+        stream.read(buffer.data() + kept, static_cast<std::streamsize>(buffer.size() - kept));
+        const auto size = kept + static_cast<std::size_t>(stream.gcount());
+        if (std::string_view{buffer.data(), size}.find(marker) != std::string_view::npos) {
+            return true;
+        }
+        // Keep the tail, in case the marker straddles two reads.
+        kept = std::min(size, marker.size() - 1);
+        std::memmove(buffer.data(), buffer.data() + size - kept, kept);
+    }
+    return false;
 }
 
 std::vector<InstallInfo> ListInstalls(const Layout& layout, const State& state) {

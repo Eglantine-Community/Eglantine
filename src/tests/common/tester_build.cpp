@@ -1064,8 +1064,8 @@ TEST_CASE("Install info, switching and removing installs", "[tester]") {
     const auto first = make(Sha1);
     const auto second = make(Sha2);
     std::error_code ec;
-    REQUIRE(WriteInstallInfo(first, branch, Sha1, 100, ec));
-    REQUIRE(WriteInstallInfo(second, pr, Sha2, 200, ec));
+    REQUIRE(WriteInstallInfo(first, branch, Sha1, 100, true, ec));
+    REQUIRE(WriteInstallInfo(second, pr, Sha2, 200, false, ec));
     // Made before installs were described: known only as the current install.
     const auto legacy = make(Sha3);
 
@@ -1084,6 +1084,9 @@ TEST_CASE("Install info, switching and removing installs", "[tester]") {
     CHECK(installs[1].source == pr);
     CHECK(installs[2].sha == Sha1);
     CHECK(installs[2].built_at == 100);
+    CHECK(installs[2].version_manager);
+    CHECK_FALSE(installs[1].version_manager);
+    CHECK_FALSE(installs[0].version_manager);
 
     SwitchInstall(state, installs[2]);
     CHECK(state.current_install == PathToUtf8(first));
@@ -1123,4 +1126,18 @@ TEST_CASE("Saved version manager sources", "[tester]") {
     Write(file, R"({"sources": ["branch:a", 5, "branch:a", "pr:9"]})");
     CHECK(LoadSavedSources(file) == std::vector<Source>{{Source::Kind::Branch, "a", 0},
                                                         {Source::Kind::PullRequest, {}, 9}});
+}
+
+TEST_CASE("HasVersionManager reads the exe", "[tester]") {
+    TempDir dir;
+    const auto exe = dir.path / "eglantine";
+    Write(exe, std::string(3 << 20, 'x'));
+    CHECK_FALSE(HasVersionManager(exe));
+    // Across the 1 MiB read boundary.
+    std::string content((1 << 20) - 5, 'x');
+    content += "VersionManagerDialog";
+    content += std::string(100, 'y');
+    Write(exe, content);
+    CHECK(HasVersionManager(exe));
+    CHECK_FALSE(HasVersionManager(dir.path / "missing"));
 }

@@ -1032,7 +1032,9 @@ bool TesterBuildRunner::Activate(const std::string& sha, const QString& message)
     const auto destination = m_layout.InstallDir(sha);
     LinkUserFolder(destination);
     std::error_code info_ec;
-    if (!TesterBuild::WriteInstallInfo(destination, m_source, sha, m_state.built_at, info_ec)) {
+    if (!TesterBuild::WriteInstallInfo(
+            destination, m_source, sha, m_state.built_at,
+            TesterBuild::HasVersionManager(TesterBuild::InstalledExe(destination)), info_ec)) {
         Log(tr("Could not describe the install: %1").arg(QString::fromStdString(info_ec.message())));
     }
     if (!SaveState()) {

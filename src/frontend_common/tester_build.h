@@ -237,11 +237,18 @@ struct InstallInfo {
     // Empty when unknown.
     std::optional<Source> source;
     s64 built_at{}; // Unix seconds
+    // The build has the version manager, so it can switch back to the release by itself. False
+    // for an install made before installs were described.
+    bool version_manager{};
 };
 
 // Writes install.json into `install_dir`.
 bool WriteInstallInfo(const std::filesystem::path& install_dir, const Source& source,
-                      std::string_view sha, s64 built_at, std::error_code& ec);
+                      std::string_view sha, s64 built_at, bool version_manager,
+                      std::error_code& ec);
+
+// Whether the exe was built with the version manager, read from its contents.
+bool HasVersionManager(const std::filesystem::path& exe);
 
 // Reads install.json; without it the current and previous installs are described from `state`.
 InstallInfo ReadInstallInfo(const std::filesystem::path& install_dir, const State& state);

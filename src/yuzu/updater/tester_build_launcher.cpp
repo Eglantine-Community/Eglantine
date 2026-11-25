@@ -424,6 +424,15 @@ std::optional<int> Run(int argc, char** argv) {
         TesterBuild::SaveState(StateFile(), state, ec);
     }
     const bool install_exists = TesterBuild::HasInstall(state);
+    if (state.start_tester && install_exists && !self_is_tester &&
+        !TesterBuild::ReadInstallInfo(TesterBuild::PathFromUtf8(state.current_install), state)
+             .version_manager) {
+        // A build without the version manager could not switch back to the release by itself,
+        // so it is only started from the version manager, for that session.
+        state.start_tester = false;
+        std::error_code ec;
+        TesterBuild::SaveState(StateFile(), state, ec);
+    }
 
     using Action = TesterBuild::LaunchAction;
     // With an install the answer without a remote only depends on the flags, which is all that
