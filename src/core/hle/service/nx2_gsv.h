@@ -1551,10 +1551,34 @@ struct Nx2NativeObjects {
 
 // What nn::gpu::sdk::QueryNativeImage (gsv 428) would be told about image `handle`, for VTX-HLE
 // (Nx2NativeImageDirectory): the descriptor QueryNativeImage builds. nullopt for a handle that
-// names no image, a decoder output image, or an image whose memory is not bound or does not hold it.
+// names no image, or an image whose memory is not bound or does not hold it.
 inline std::optional<Nx2NativeImageInfo> Nx2DescribeNativeImage(Nx2NativeObjects& objects,
                                                                 u32 handle) {
     std::scoped_lock lk{objects.mutex};
+    // A decoder output image (Welcome Tour's movies): the descriptor gsv 428 replies for one
+    // (QueryDecoderImage). The client reads it on the GPU, so the decoder writes it block-linear.
+    if (const auto decoder = objects.images.find(handle);
+        decoder != objects.images.end() && decoder->second.decoder) {
+        auto& image = decoder->second;
+        const auto memory = objects.memories.find(image.memory);
+        if (memory == objects.memories.end() || memory->second.address == 0 ||
+            image.offset > memory->second.size || image.size > memory->second.size - image.offset) {
+            LOG_WARNING(Service, "nx2:gsv decoder image {}: memory {} is not bound or too small",
+                        handle, image.memory);
+            return std::nullopt;
+        }
+        image.gpu_read = true;
+        Nx2NativeImageInfo info;
+        info.address = memory->second.address;
+        info.size = image.size;
+        info.descriptor[0] = 1;
+        info.descriptor[2] = image.preference[2];
+        info.descriptor[8] = 0x01000001;
+        info.descriptor[9] = 1;
+        info.descriptor[10] = static_cast<u32>(image.offset);
+        info.descriptor[11] = static_cast<u32>(image.size);
+        return info;
+    }
     auto it = objects.images.upper_bound(handle);
     if (it == objects.images.begin()) {
         LOG_WARNING(Service, "nx2:gsv native image {} is not in the table", handle);
