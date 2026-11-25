@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Vortex727 (FUKKO)
 // SPDX-License-Identifier: GPL-3.0-or-later AND MIT
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -266,33 +267,6 @@ void nvnDeviceRegisterFastClearIndex(Call& c) {
     c.ret.SetU32(0);
 }
 
-/// Ray tracing is not implemented on VTX-HLE, so report a minimal 256-byte aligned size for every
-/// non-null output pointer instead of leaving caller stack bytes untouched.
-void nvnDeviceCalculateAccelerationStructureMemoryRequirements(Call& c) {
-    static_cast<void>(c.args.NextPointer()); // device
-    static_cast<void>(c.args.NextPointer()); // inputs
-    const u64 out_as_size = c.args.NextPointer();
-    const u64 out_build_scratch = c.args.NextPointer();
-    const u64 out_update_scratch = c.args.NextPointer();
-    constexpr u64 MinAccelSize = 256;
-    if (out_as_size != 0) {
-        c.Store<u64>(out_as_size, MinAccelSize);
-    }
-    if (out_build_scratch != 0) {
-        c.Store<u64>(out_build_scratch, MinAccelSize);
-    }
-    if (out_update_scratch != 0) {
-        c.Store<u64>(out_update_scratch, MinAccelSize);
-    }
-    static Common::BootCounter logged;
-    if (logged.First()) {
-        LOG_WARNING(Core,
-                    "[nvn] CalculateAccelerationStructureMemoryRequirements: ray tracing is not "
-                    "implemented on VTX-HLE; reporting placeholder {}-byte sizes",
-                    MinAccelSize);
-    }
-}
-
 /// Switch 2 SDK (sdk+0x674650): packs a UBO GPU address and size into a descriptor handle.
 void nvnDeviceGetUniformBufferHandle(Call& c) {
     static_cast<void>(c.args.NextPointer()); // device
@@ -414,9 +388,58 @@ void nvnDeviceGetCurrentTimestampInNanoseconds(Call& c) {
     c.ret.SetU64(result);
 }
 
+/// nvnDeviceCalculateAccelerationStructureMemoryRequirements(device, build info, u64* size,
+/// u64* scratch, u64* update scratch). The HLE builds no acceleration structures, but games size
+/// their memory pools from these answers: left unwritten, Welcome Tour read stack garbage
+/// (0x100000001) and its heap ran out. Build info: +0x08 the geometries, +0x10 their count;
+/// geometry +0x00 the type (3: instances), +0x10 the instance count. Welcome Tour's SDK answers
+/// 0x125d00 / 0x6df00 / 0 for one geometry of 4096 instances; these sizes are no smaller.
+/// [INFERENCE] The layout and the per-instance cost come from that one call.
+void nvnDeviceCalculateAccelerationStructureMemoryRequirements(Call& c) {
+    static_cast<void>(c.args.NextPointer()); // device
+    const u64 info = c.args.NextPointer();
+    const u64 size_out = c.args.NextPointer();
+    const u64 scratch_out = c.args.NextPointer();
+    const u64 update_out = c.args.NextPointer();
+    constexpr u32 GeometryInstances = 3;
+    constexpr u64 InstanceBytes = 0x130;
+    constexpr u64 InstanceScratchBytes = 0x70;
+    constexpr u64 HeaderBytes = 0x1000;
+    constexpr u64 FallbackBytes = 0x100000;
+
+    u64 size = FallbackBytes;
+    u64 scratch = FallbackBytes;
+    const u64 geometries = info != 0 ? c.Load<u64>(info + 0x08) : 0;
+    const u64 count = info != 0 ? c.Load<u64>(info + 0x10) : 0;
+    const u32 type = geometries != 0 ? c.Load<u32>(geometries) : 0;
+    if (count == 1 && type == GeometryInstances) {
+        const u64 instances = std::min<u64>(c.Load<u64>(geometries + 0x10), 1u << 24);
+        size = HeaderBytes + instances * InstanceBytes;
+        scratch = instances * InstanceScratchBytes;
+    } else {
+        static std::atomic<bool> logged{};
+        if (!logged.exchange(true, std::memory_order_relaxed)) {
+            LOG_WARNING(Core,
+                        "[nvn] nvnDeviceCalculateAccelerationStructureMemoryRequirements: {} "
+                        "geometries of type {}, answering {:#x} bytes",
+                        count, type, FallbackBytes);
+        }
+    }
+    if (size_out != 0) {
+        c.Store<u64>(size_out, size);
+    }
+    if (scratch_out != 0) {
+        c.Store<u64>(scratch_out, scratch);
+    }
+    if (update_out != 0) {
+        c.Store<u64>(update_out, 0);
+    }
+}
+
 } // namespace
 
 void RegisterDeviceFunctions(Registry& registry) {
+    NVN_HLE(registry, nvnDeviceCalculateAccelerationStructureMemoryRequirements);
     NVN_HLE(registry, nvnDeviceBuilderSetDefaults);
     NVN_HLE(registry, nvnDeviceBuilderSetFlags);
     NVN_HLE(registry, nvnDeviceBuilderGetFlags);
@@ -443,7 +466,6 @@ void RegisterDeviceFunctions(Registry& registry) {
     registry.Add<&nvnDeviceRegisterFastClearIndex>("nvnDeviceRegisterFastClearColoruiIndex");
     registry.Add<&nvnDeviceRegisterFastClearIndex>("nvnDeviceRegisterFastClearDepthIndex");
     registry.Add<&nvnDeviceRegisterFastClearIndex>("nvnDeviceRegisterFastClearStencilIndex");
-    NVN_HLE(registry, nvnDeviceCalculateAccelerationStructureMemoryRequirements);
     NVN_HLE(registry, nvnDeviceGetUniformBufferHandle);
     NVN_HLE(registry, nvnDeviceGetWindowOriginMode);
     NVN_HLE(registry, nvnDeviceGetDepthMode);
