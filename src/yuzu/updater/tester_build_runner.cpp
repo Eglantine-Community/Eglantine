@@ -951,6 +951,15 @@ bool TesterBuildRunner::Fetch(std::string& sha) {
         }
     }
     Log(tr("Commit %1").arg(Q(sha)));
+    QString subject;
+    QByteArray log;
+    const auto log_step = TesterBuild::LogStep(m_layout, m_tools.git, "HEAD", 1);
+    if (const auto code = RunStep(log_step, env, &log); code && *code == 0) {
+        if (const auto commits = TesterBuild::ParseLog(log.toStdString()); !commits.empty()) {
+            subject = Q(commits.front().message).section(QLatin1Char('\n'), 0, 0);
+        }
+    }
+    emit CommitResolved(Q(sha), subject);
     return true;
 }
 
@@ -1047,6 +1056,7 @@ bool TesterBuildRunner::FetchCiBuild(const Common::Net::Release& release, const 
     }
     const auto& asset = assets.front();
 
+    emit StageChanged(Downloading);
     emit StepStarted(tr("Downloading the CI build of %1").arg(Q(m_source.DisplayName())));
     emit Progress(0, 0);
     std::error_code ec;
@@ -1096,6 +1106,7 @@ std::optional<TesterBuildRunner::Result> TesterBuildRunner::TryInstallCiBuild() 
         return std::nullopt;
     }
     const std::string sha = remote.info->sha;
+    emit CommitResolved(Q(sha), Q(remote.info->title));
     if (sha == m_state.built_sha && TesterBuild::HasInstall(m_state)) {
         m_installed_exe =
             TesterBuild::InstalledExe(TesterBuild::PathFromUtf8(m_state.current_install));
@@ -1143,6 +1154,7 @@ std::optional<TesterBuildRunner::Result> TesterBuildRunner::TryInstallCiBuild() 
     if (!FetchCiBuild(*release, sha, staging)) {
         return give_up(tr("The CI build could not be installed."));
     }
+    emit StageChanged(Installing);
     emit StepStarted(tr("Installing"));
     emit Progress(0, 0);
     if (!TesterBuild::PromoteStaged(m_layout, staging, sha, m_state, ec)) {
@@ -1158,6 +1170,7 @@ std::optional<TesterBuildRunner::Result> TesterBuildRunner::TryInstallCiBuild() 
 
 TesterBuildRunner::Result TesterBuildRunner::Execute() {
     const auto stopped = [this] { return IsCanceled() ? Canceled : Failed; };
+    emit StageChanged(Preparing);
     if (!Prepare()) {
         return stopped();
     }
@@ -1166,12 +1179,14 @@ TesterBuildRunner::Result TesterBuildRunner::Execute() {
         if (const auto installed = TryInstallCiBuild()) {
             return *installed;
         }
+        emit StageChanged(Preparing);
     }
     if (!EnsureTools() || !EnsureToolchain()) {
         return stopped();
     }
 
     std::string sha;
+    emit StageChanged(Fetching);
     if (!Fetch(sha)) {
         return stopped();
     }
@@ -1196,7 +1211,12 @@ TesterBuildRunner::Result TesterBuildRunner::Execute() {
         (m_platform == TesterBuild::Platform::Linux && !EnsureToolchain())) {
         return stopped();
     }
-    if (!Build() || !Finish(sha)) {
+    emit StageChanged(Building);
+    if (!Build()) {
+        return stopped();
+    }
+    emit StageChanged(Installing);
+    if (!Finish(sha)) {
         return stopped();
     }
     return Success;

@@ -27,6 +27,8 @@ class TesterBuildRunner : public QObject {
 
 public:
     enum Result { Success, UpToDate, Failed, Canceled };
+    // The coarse part of the run a window can name; StepStarted gives the detail.
+    enum Stage { Preparing, Downloading, Fetching, Building, Installing };
 
     struct Options {
         QString source;
@@ -62,6 +64,9 @@ public:
 
 signals:
     void SourceResolved(const QString& name);
+    void StageChanged(int stage);
+    // The commit being built; `subject` is empty when it is not known.
+    void CommitResolved(const QString& sha, const QString& subject);
     void StepStarted(const QString& label);
     void LogLine(const QString& line);
     // `total` is 0 while there is nothing to measure.
