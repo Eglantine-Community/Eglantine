@@ -67,6 +67,11 @@ public:
 
     void Finish();
 
+    [[nodiscard]] bool CanFuseAstc(const Image& image) const;
+    [[nodiscard]] bool SupportsAstcFusion() const;
+    [[nodiscard]] bool AstcFusionEnabled() const;
+    void SetAstcFusion(bool enable);
+
     StagingBufferRef UploadStagingBuffer(size_t size, bool deferred = false);
 
     StagingBufferRef DownloadStagingBuffer(size_t size, bool deferred = false);
@@ -275,6 +280,7 @@ public:
     std::optional<ASTCDecoderPass> astc_decoder_pass;
     std::optional<BcEncoderPass> bc_encoder_pass;
     std::optional<AstcBcPass> astc_bc_pass;
+    bool astc_fusion_enabled{};
 
     /// ASTC decoded on the GPU and re-compressed to BC1/BC3 there (accelerate_astc=Gpu with
     /// astc_recompression=Bc1/Bc3): decode into a temporary RGBA8 image, encode, copy.

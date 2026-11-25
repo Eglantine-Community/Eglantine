@@ -130,6 +130,19 @@ TOOLS = [
         },
     },
     {
+        "name": "astc_fusion",
+        "description": "Query or switch ASTC-to-BC fusion in the emulated Vulkan GPU. Changes "
+                       "apply at a frame boundary and mark eligible cached textures for "
+                       "re-transcoding on next use. Omit 'enable' to query.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "enable": {"type": "boolean"},
+                "timeout_s": {"type": "integer", "minimum": 1, "maximum": 60},
+            },
+        },
+    },
+    {
         "name": "sample",
         "description": "Sampling profiler: pauses the named host threads about 1000 times a second "
                        "for the given seconds and returns where they were (self, self <- caller, "

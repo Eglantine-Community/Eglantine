@@ -1233,8 +1233,8 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
         if (Settings::GetAstcRecompression() != Settings::AstcRecompression::Uncompressed) {
             bc_encoder_pass.emplace(device, scheduler, descriptor_pool,
                                     compute_pass_descriptor_queue);
-            astc_bc_pass.emplace(device, scheduler, descriptor_pool,
-                                 compute_pass_descriptor_queue);
+            const char* fusion = std::getenv("EDEN_NX2_ASTC_FUSED");
+            SetAstcFusion(fusion == nullptr || fusion[0] != '0');
         }
     }
     if (!device.IsKhrImageFormatListSupported()) {
@@ -5192,17 +5192,45 @@ void TextureCacheRuntime::TranscodeAstcToBcnFused(
     transcode_meter.Note(0, output_bytes, false, 0, 0);
 }
 
+bool TextureCacheRuntime::SupportsAstcFusion() const {
+    return bc_encoder_pass.has_value() && !device.IsOptimalAstcSupported() &&
+           Settings::values.accelerate_astc.GetValue() == Settings::AstcDecodeMode::Gpu &&
+           Settings::GetAstcRecompression() != Settings::AstcRecompression::Uncompressed;
+}
+
+bool TextureCacheRuntime::AstcFusionEnabled() const {
+    return astc_fusion_enabled;
+}
+
+void TextureCacheRuntime::SetAstcFusion(bool enable) {
+    if (enable && !astc_bc_pass) {
+        astc_bc_pass.emplace(device, scheduler, descriptor_pool, compute_pass_descriptor_queue);
+    }
+    astc_fusion_enabled = enable;
+}
+
+bool TextureCacheRuntime::CanFuseAstc(const Image& image) const {
+    const auto& info = image.info;
+    const u64 max_range = device.GetMaxStorageBufferRange();
+    if (!WillUseGpuBcnTranscode(device, info) || image.guest_size_bytes > max_range) {
+        return false;
+    }
+    const bool bc3 = !IsOpaqueBc1Astc(device, info) &&
+                     Settings::GetAstcRecompression() != Settings::AstcRecompression::Bc1;
+    u64 output_bytes = 0;
+    for (u32 level = 0; level < static_cast<u32>(info.resources.levels); ++level) {
+        const u32 width = (std::max)(info.size.width >> level, 1U);
+        const u32 height = (std::max)(info.size.height >> level, 1U);
+        output_bytes += u64{Common::DivCeil(width, 4U)} * Common::DivCeil(height, 4U) *
+                        static_cast<u32>(info.resources.layers) * (bc3 ? 16 : 8);
+    }
+    return output_bytes <= max_range;
+}
+
 void TextureCacheRuntime::TranscodeAstcToBcn(
     Image& image, const StagingBufferRef& map,
     std::span<const VideoCommon::SwizzleParameters> swizzles) {
-    // The fused path (astc_bc.comp): the ASTC blocks are decoded and encoded in one dispatch, so
-    // the RGBA8 image, the second dispatch, the layer chunks and the decode-image recycling are
-    // all gone. EDEN_NX2_ASTC_FUSED=0 keeps the two-pass path for an A/B.
-    static const bool fused = [] {
-        const char* value = std::getenv("EDEN_NX2_ASTC_FUSED");
-        return value == nullptr || value[0] != '0';
-    }();
-    if (fused && astc_bc_pass) {
+    if (astc_fusion_enabled && CanFuseAstc(image)) {
         return TranscodeAstcToBcnFused(image, map, swizzles);
     }
     const ImageInfo& info = image.info;

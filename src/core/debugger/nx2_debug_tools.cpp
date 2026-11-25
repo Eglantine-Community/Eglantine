@@ -428,6 +428,27 @@ json RejectShaders(ToolState&, const json& params) {
     return result;
 }
 
+json AstcFusion(ToolState& state, const json& params) {
+    if (!IsVulkan() || NvnHle::HleRunning()) {
+        return {{"supported", false}};
+    }
+    std::optional<bool> enable;
+    if (const auto it = params.find("enable"); it != params.end()) {
+        enable = it->get<bool>();
+    }
+    auto future = VideoCore::Nx2Debug::RequestAstcFusion(enable);
+    const auto timeout = std::chrono::seconds{Param<int>(params, "timeout_s", 5, 1, 60)};
+    if (!WaitReady(state, future, timeout)) {
+        return {{"applied", false}, {"queued", true},
+                {"note", "waiting for the next presented frame"}};
+    }
+    const auto result = future.get();
+    return {{"supported", result.supported},
+            {"enabled", result.enabled},
+            {"applied", result.supported},
+            {"marked_for_refresh", result.marked_for_refresh}};
+}
+
 json SampleThreads(ToolState& state, const json& params) {
     const std::string threads = params.value("threads", std::string{"GPU,GPUBack"});
     const double seconds = Param<double>(params, "seconds", 10.0, 1.0, 60.0);
@@ -900,6 +921,7 @@ Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {
         {"log_filter", handler(LogFilter)},
         {"capture_frame", handler(CaptureFrame)},
         {"reject_shaders", handler(RejectShaders)},
+        {"astc_fusion", handler(AstcFusion)},
         {"sample", handler(SampleThreads)},
         {"read_memory", handler(ReadMemory)},
         {"search_memory", handler(SearchMemory)},

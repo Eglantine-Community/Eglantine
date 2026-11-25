@@ -45,6 +45,9 @@ class FakeEmulator:
             return {"result": {"width": 1280, "height": 720, "png_base64": PNG}}
         if method == "capture_frame":
             return {"result": {"directory": self.capture_dir, "entries_total": 1}}
+        if method == "astc_fusion":
+            return {"result": {"supported": True, "enabled": request["params"].get("enable", True),
+                               "applied": True, "marked_for_refresh": 0}}
         if method == "read_memory":
             return {"result": {"address": request["params"]["address"], "hex": "0000803f"}}
         if method == "read_gpu_memory":
@@ -115,7 +118,7 @@ class AdapterTest(unittest.TestCase):
         names = [tool["name"] for tool in self.adapter.handle({"id": 2, "method": "tools/list"})
                  ["result"]["tools"]]
         self.assertEqual(names, ["status", "screenshot", "log_tail", "log_filter", "capture_frame",
-                                 "capture_image", "reject_shaders", "sample", "read_memory",
+                                 "capture_image", "reject_shaders", "astc_fusion", "sample", "read_memory",
                                  "search_memory", "write_memory", "read_gpu_memory", "input",
                                  "input_sequence", "nvn_draws", "nvn_draw_skip", "nvn_draw_dump",
                                  "nvn_stats"])
@@ -126,6 +129,13 @@ class AdapterTest(unittest.TestCase):
         self.assertFalse(result["isError"])
         self.assertEqual(json.loads(result["content"][0]["text"])["title"], "Test")
         self.assertEqual(self.fake.requests[-1]["params"], {"fps_window_ms": 0})
+
+    def test_astc_fusion_query_and_disable_are_forwarded(self):
+        for params, enabled in (({}, True), ({"enable": False, "timeout_s": 3}, False)):
+            result = self.call("astc_fusion", params)
+            self.assertFalse(result["isError"])
+            self.assertEqual(json.loads(result["content"][0]["text"])["enabled"], enabled)
+            self.assertEqual(self.fake.requests[-1]["params"], params)
 
     def test_memory_reads_are_forwarded(self):
         arguments = {"address": "0x8000001000", "size": 4, "as": "hex"}
