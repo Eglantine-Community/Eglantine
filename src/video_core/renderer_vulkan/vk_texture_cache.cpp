@@ -486,7 +486,8 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
             return image;
         }
     }
-    return allocator.CreateImage(image_ci);
+    return allocator.CreateImage(image_ci, false,
+                                 VideoCommon::ReusableImageAllocationKey(info).has_value());
 }
 
 [[nodiscard]] vk::ImageView MakeStorageView(const vk::Device& device, u32 level, VkImage image,
@@ -1023,8 +1024,6 @@ void TryTransformSwizzleIfNeeded(PixelFormat format, std::array<SwizzleSource, 4
     }
 }
 
-
-
 [[nodiscard]] VkFormat Format(Shader::ImageFormat format) {
     switch (format) {
     case Shader::ImageFormat::Typeless:
@@ -1414,6 +1413,15 @@ void TextureCacheRuntime::EraseResolveShadow(VkImage msaa_image) {
 }
 
 void TextureCacheRuntime::BarrierFeedbackLoop() {
+    // The draw samples the bound depth/stencil image: ending the pass makes what earlier draws
+    // of the pass wrote to it visible. If none of them wrote it (particles and other
+    // transparent draws test depth without writing it), there is nothing to make visible.
+    // Ocarina of Time ended 3,500-7,250 render passes a second here. EDEN_NX2_FEEDBACK_ALWAYS=1
+    // ends the pass every time, as before.
+    static const bool always = std::getenv("EDEN_NX2_FEEDBACK_ALWAYS") != nullptr;
+    if (!always && scheduler.IsRenderPassActive() && !scheduler.RenderPassWroteDepthStencil()) {
+        return;
+    }
     scheduler.RequestOutsideRenderPassOperationContext();
 }
 
@@ -2700,24 +2708,15 @@ void TextureCacheRuntime::ReleaseMsaaScratchImage(VkImage image) {
 
 namespace {
 bool PlainGpuUnswizzleEnabled() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("EDEN_NX2_GPU_UNSWIZZLE_2D");
-        return value != nullptr && value[0] == '1';
-    }();
-    return enabled;
-}
-bool PlainGpuUnswizzleVerify() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("EDEN_NX2_GPU_UNSWIZZLE_VERIFY");
-        return value != nullptr && value[0] == '1';
-    }();
+    static constexpr bool enabled = true;
     return enabled;
 }
 bool ImageAllocationReuseEnabled() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("EDEN_NX2_IMAGE_ALLOCATION_REUSE");
-        return value != nullptr && value[0] == '1';
-    }();
+    static constexpr bool enabled = true;
+    return enabled;
+}
+bool ScaledImagePoolEnabled() {
+    static constexpr bool enabled = true;
     return enabled;
 }
 }
@@ -2725,7 +2724,7 @@ bool ImageAllocationReuseEnabled() {
 bool TextureCacheRuntime::CanGpuUnswizzle(const Image& image) const {
     constexpr auto unsupported = ImageFlagBits::Converted | ImageFlagBits::AcceleratedUpload |
                                  ImageFlagBits::AsynchronousDecode | ImageFlagBits::IsDecoding;
-    if (!PlainGpuUnswizzleEnabled() || plain_unswizzle_failed || !image.info.native_tiling ||
+    if (!PlainGpuUnswizzleEnabled() || !image.info.native_tiling ||
         resolution.up_scale != 1 || resolution.down_shift != 0 || image.HasScaled() ||
         !VideoCommon::IsAttachmentBackingUsable(image) || True(image.flags & unsupported) ||
         image.AspectMask() == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
@@ -2739,148 +2738,11 @@ bool TextureCacheRuntime::CanGpuUnswizzle(const Image& image) const {
 }
 
 VkBuffer TextureCacheRuntime::DispatchPlainUnswizzle(
-    const VideoCommon::PlainUnswizzleParameters& params, const StagingBufferRef& source, bool guarded) {
+    const VideoCommon::PlainUnswizzleParameters& params, const StagingBufferRef& source) {
     const u64 output_bytes = u64{params.word_count} * 4;
-    const VkBuffer output = GetTemporaryBuffer(output_bytes + (guarded ? 64 : 0));
-    if (guarded) {
-        scheduler.RequestOutsideRenderPassOperationContext();
-        scheduler.Record([output, output_bytes](vk::CommandBuffer cmdbuf) {
-            const VkMemoryBarrier before{
-                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
-                .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-            };
-            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                  VK_PIPELINE_STAGE_TRANSFER_BIT, 0, before);
-            cmdbuf.FillBuffer(output, output_bytes, 64, 0xcdcdcdcd);
-        });
-    }
-    plain_unswizzle_pass->Dispatch(source.buffer, source.offset, output, params, guarded ? 64 : 0);
+    const VkBuffer output = GetTemporaryBuffer(output_bytes);
+    plain_unswizzle_pass->Dispatch(source.buffer, source.offset, output, params, 0);
     return output;
-}
-
-StagingBufferRef TextureCacheRuntime::QueuePlainUnswizzleReadback(
-    const VideoCommon::PlainUnswizzleParameters& params, VkBuffer output, bool deferred) {
-    const size_t bytes = size_t{params.word_count} * 4;
-    const auto download = DownloadStagingBuffer(bytes + 64, deferred);
-    scheduler.Record([output, download, bytes](vk::CommandBuffer cmdbuf) {
-        const VkMemoryBarrier before{
-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-        };
-        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, before);
-        cmdbuf.CopyBuffer(output, download.buffer, VkBufferCopy{0, download.offset, bytes + 64});
-        const VkBufferMemoryBarrier after{
-            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .buffer = download.buffer,
-            .offset = download.offset,
-            .size = bytes + 64,
-        };
-        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
-                              0, nullptr, after, nullptr);
-    });
-    return download;
-}
-
-bool TextureCacheRuntime::CheckPlainUnswizzle(const ImageInfo& info,
-                                             const VideoCommon::PlainUnswizzleParameters& params,
-                                             const StagingBufferRef& source, VkBuffer output) {
-    const size_t bytes = size_t{params.word_count} * 4;
-    std::vector<u8> expected(bytes);
-    const auto swizzle = VideoCommon::FullUploadSwizzles(info).front();
-    Tegra::Texture::UnswizzleTexture(expected, source.mapped_span, BytesPerBlock(info.format),
-                                     info.size.width, info.size.height, 1, swizzle.block.height,
-                                     swizzle.block.depth, VideoCommon::CalculateLevelStrideAlignment(info, 0),
-                                     info.native_tiling);
-    const auto download = QueuePlainUnswizzleReadback(params, output, false);
-    Finish();
-    const bool equal = std::equal(expected.begin(), expected.end(), download.mapped_span.begin());
-    const auto guard = download.mapped_span.subspan(bytes, 64);
-    const bool intact = std::all_of(guard.begin(), guard.end(), [](u8 value) { return value == 0xcd; });
-    if (!equal || !intact) {
-        LOG_ERROR(Render_Vulkan, "Plain GPU unswizzle verification failed: {}x{} format {} equal={} guard={}",
-                  info.size.width, info.size.height, static_cast<u32>(info.format), equal, intact);
-    }
-    return equal && intact;
-}
-
-bool TextureCacheRuntime::TestPlainUnswizzle() {
-    u32 passed = 0;
-    constexpr std::array widths{4U, 17U, 65U, 81U, 97U, 128U, 257U, 960U};
-    constexpr std::array heights{1U, 7U, 8U, 9U, 33U, 65U, 97U, 540U};
-    for (const auto format : {PixelFormat::A8B8G8R8_UNORM, PixelFormat::R16G16B16A16_FLOAT,
-                              PixelFormat::R8_UNORM, PixelFormat::D32_FLOAT}) {
-        for (u32 index = 0; index < widths.size(); ++index) {
-            ImageInfo info;
-            info.type = ImageType::e2D;
-            info.format = format;
-            info.size = {widths[index], heights[index], 1};
-            info.resources = {.levels = 1, .layers = 1};
-            info.block = {0, index % 6, 0};
-            info.tile_width_spacing = index % 3;
-            info.native_tiling = (index % 2) != 0;
-            const auto params = VideoCommon::MakePlainUnswizzleParameters(info);
-            if (!params) {
-                continue;
-            }
-            auto input = UploadStagingBuffer(size_t{params->source_words} * 4);
-            for (size_t i = 0; i < size_t{params->source_words} * 4; ++i) {
-                input.mapped_span[i] = static_cast<u8>((i * 71) ^ (i >> 7) ^ index);
-            }
-            const VkBuffer output = DispatchPlainUnswizzle(*params, input, true);
-            if (!CheckPlainUnswizzle(info, *params, input, output)) {
-                return false;
-            }
-            ++passed;
-        }
-    }
-    struct PendingCheck {
-        StagingBufferRef download;
-        std::vector<u8> expected;
-    };
-    std::vector<PendingCheck> pending;
-    for (u32 index = 0; index < 4; ++index) {
-        ImageInfo info;
-        info.type = ImageType::e2D;
-        info.format = PixelFormat::A8B8G8R8_UNORM;
-        info.size = {97, 65, 1};
-        info.resources = {.levels = 1, .layers = 1};
-        info.block = {0, index, 0};
-        info.native_tiling = (index % 2) != 0;
-        const auto params = VideoCommon::MakePlainUnswizzleParameters(info).value();
-        auto input = UploadStagingBuffer(size_t{params.source_words} * 4);
-        for (size_t i = 0; i < size_t{params.source_words} * 4; ++i) {
-            input.mapped_span[i] = static_cast<u8>((i * 83) ^ (i >> 9) ^ (index * 37));
-        }
-        std::vector<u8> expected(size_t{params.word_count} * 4 + 64, 0xcd);
-        const auto swizzle = VideoCommon::FullUploadSwizzles(info).front();
-        Tegra::Texture::UnswizzleTexture(expected, input.mapped_span, 4, 97, 65, 1,
-                                         swizzle.block.height, 0,
-                                         VideoCommon::CalculateLevelStrideAlignment(info, 0),
-                                         info.native_tiling);
-        const VkBuffer output = DispatchPlainUnswizzle(params, input, true);
-        pending.push_back({QueuePlainUnswizzleReadback(params, output, true), std::move(expected)});
-    }
-    Finish();
-    bool batch_valid = true;
-    for (auto& check : pending) {
-        batch_valid &= std::equal(check.expected.begin(), check.expected.end(),
-                                  check.download.mapped_span.begin());
-        FreeDeferredStagingBuffer(check.download);
-    }
-    if (!batch_valid) {
-        LOG_ERROR(Render_Vulkan, "Plain GPU unswizzle queued scratch-reuse verification failed");
-        return false;
-    }
-    passed += 4;
-    LOG_INFO(Render_Vulkan, "Plain GPU unswizzle self-test: {} byte-exact guarded cases passed (4 queued)", passed);
-    return passed != 0;
 }
 
 bool TextureCacheRuntime::UploadGpuUnswizzle(Image& image, std::span<const u8> source) {
@@ -2891,33 +2753,12 @@ bool TextureCacheRuntime::UploadGpuUnswizzle(Image& image, std::span<const u8> s
     if (!plain_unswizzle_pass) {
         plain_unswizzle_pass.emplace(device, scheduler, descriptor_pool, compute_pass_descriptor_queue);
     }
-    if (PlainGpuUnswizzleVerify() && !plain_unswizzle_tested) {
-        plain_unswizzle_tested = true;
-        if (!TestPlainUnswizzle()) {
-            plain_unswizzle_failed = true;
-            return false;
-        }
-    }
     auto input = UploadStagingBuffer(size_t{params->source_words} * 4);
     if (input.offset % device.GetStorageBufferAlignment() != 0) {
         return false;
     }
     std::memcpy(input.mapped_span.data(), source.data(), size_t{params->source_words} * 4);
-    const bool verify_early = PlainGpuUnswizzleVerify() && plain_verified_early < 64;
-    const bool verify_late = PlainGpuUnswizzleVerify() && plain_unswizzle_frames >= 2500 &&
-                             plain_verified_early >= 64 && plain_verified_late < 64;
-    const VkBuffer output = DispatchPlainUnswizzle(*params, input, verify_early || verify_late);
-    if (verify_early || verify_late) {
-        if (!CheckPlainUnswizzle(image.info, *params, input, output)) {
-            plain_unswizzle_failed = true;
-            return false;
-        }
-        ++(verify_early ? plain_verified_early : plain_verified_late);
-        if ((plain_verified_early + plain_verified_late) % 16 == 0) {
-            LOG_INFO(Render_Vulkan, "Plain GPU unswizzle verification: {} early / {} late byte-exact uploads",
-                     plain_verified_early, plain_verified_late);
-        }
-    }
+    const VkBuffer output = DispatchPlainUnswizzle(*params, input);
     const std::array copies{VideoCommon::BufferImageCopy{
         .buffer_offset = 0,
         .buffer_size = size_t{params->word_count} * 4,
@@ -2928,13 +2769,12 @@ bool TextureCacheRuntime::UploadGpuUnswizzle(Image& image, std::span<const u8> s
         .image_extent = image.info.size,
     }};
     image.UploadMemory(output, 0, copies);
-    ++plain_unswizzle_uploads;
-    plain_unswizzle_bytes += u64{params->word_count} * 4;
     return true;
 }
 
 vk::Image TextureCacheRuntime::AcquireImageAllocation(const ImageInfo& info) {
-    if (!ImageAllocationReuseEnabled() || resolution.up_scale != 1 || resolution.down_shift != 0) {
+    const bool scaling = resolution.up_scale != 1 || resolution.down_shift != 0;
+    if (!ImageAllocationReuseEnabled() || (scaling && !ScaledImagePoolEnabled())) {
         return {};
     }
     if (const auto key = VideoCommon::ReusableImageAllocationKey(info)) {
@@ -2943,37 +2783,70 @@ vk::Image TextureCacheRuntime::AcquireImageAllocation(const ImageInfo& info) {
     return {};
 }
 
+vk::Image TextureCacheRuntime::AcquireScaledImageAllocation(const ImageInfo& scaled_info) {
+    if (!ImageAllocationReuseEnabled() || !ScaledImagePoolEnabled()) {
+        return {};
+    }
+    if (const auto key = VideoCommon::ReusableImageAllocationKey(scaled_info)) {
+        return image_allocation_pool.Acquire(*key);
+    }
+    return {};
+}
+
 void TextureCacheRuntime::RecycleImage(Image& image, u64 completed_tick) {
     constexpr auto unsupported = VideoCommon::ImageFlagBits::Converted |
                                  VideoCommon::ImageFlagBits::IsDecoding;
-    if (!ImageAllocationReuseEnabled() || resolution.up_scale != 1 || resolution.down_shift != 0 ||
-        !image.original_image || image.original_image.IsUnbacked() || image.scaled_image ||
-        image.HasScaled() || !VideoCommon::IsAttachmentBackingUsable(image) ||
-        True(image.flags & unsupported)) {
+    const bool scaling = resolution.up_scale != 1 || resolution.down_shift != 0;
+    if (!ImageAllocationReuseEnabled() || (scaling && !ScaledImagePoolEnabled())) {
         return;
     }
-    const auto key = VideoCommon::ReusableImageAllocationKey(image.info);
-    if (!key) {
+    // Rescaled images are fine when scaling: both their allocations are recycled by size.
+    constexpr auto unusable = VideoCommon::ImageFlagBits::Remapped |
+                              VideoCommon::ImageFlagBits::Unbacked |
+                              VideoCommon::ImageFlagBits::TrimmedLevels |
+                              VideoCommon::ImageFlagBits::Sparse |
+                              VideoCommon::ImageFlagBits::SparseLayers |
+                              VideoCommon::ImageFlagBits::SparseTiles;
+    if (scaling ? True(image.flags & unusable) : !VideoCommon::IsAttachmentBackingUsable(image)) {
         return;
     }
-    const VkImage handle = *image.original_image;
-    const auto memory = image.original_image.GetMemoryBlock();
-    if (image_allocation_pool.Recycle(*key, image.original_image,
-                                      memory.size, completed_tick,
-                                      [this](u64 tick) { return scheduler.IsFree(tick); },
-                                      memory.block, memory.block_size)) {
-        EraseResolveShadow(handle);
+    if (True(image.flags & unsupported)) {
+        return;
+    }
+    if (!scaling && (image.scaled_image || image.HasScaled())) {
+        return;
+    }
+    const auto recycle = [&](vk::Image& allocation, const ImageInfo& info) {
+        if (!allocation || allocation.IsUnbacked()) {
+            return;
+        }
+        const auto key = VideoCommon::ReusableImageAllocationKey(info);
+        if (!key) {
+            return;
+        }
+        const VkImage handle = *allocation;
+        const auto memory = allocation.GetMemoryBlock();
+        // Charge each allocation rather than its entire shared memory block.
+        if (image_allocation_pool.Recycle(*key, allocation, memory.size, completed_tick,
+                                          [this](u64 tick) { return scheduler.IsFree(tick); },
+                                          u64{0},
+                                          u64{0})) {
+            EraseResolveShadow(handle);
+        }
+    };
+    recycle(image.original_image, image.info);
+    if (scaling && image.scaled_image) {
+        // The same size ScaleUp gives it.
+        auto scaled_info = image.info;
+        scaled_info.size.width = resolution.ScaleUp(image.info.size.width);
+        if (image.info.type == ImageType::e2D) {
+            scaled_info.size.height = resolution.ScaleUp(image.info.size.height);
+        }
+        recycle(image.scaled_image, scaled_info);
     }
 }
 
 void TextureCacheRuntime::TickFrame() {
-    if (PlainGpuUnswizzleEnabled()) {
-        static const bool log_plain = std::getenv("EDEN_NX2_TC_LOG") != nullptr;
-        if (++plain_unswizzle_frames % 600 == 0 && log_plain) {
-            LOG_INFO(Render_Vulkan, "Plain GPU unswizzle totals: {} uploads, {} MiB, verification failed={}",
-                     plain_unswizzle_uploads, plain_unswizzle_bytes >> 20, plain_unswizzle_failed);
-        }
-    }
     if (ImageAllocationReuseEnabled()) {
         const u32 pressure_events = MemoryPressureEvents();
         if (pressure_events != allocation_pool_pressure_events) {
@@ -2991,41 +2864,9 @@ void TextureCacheRuntime::TickFrame() {
         if (allocation_pool_pressure_frames != 0) {
             --allocation_pool_pressure_frames;
         }
-        static const bool log_pool = std::getenv("EDEN_NX2_TC_LOG") != nullptr;
-        if (log_pool && allocation_pool_frames % 600 == 0) {
-            LOG_INFO(Render_Vulkan,
-                     "Image allocation reuse totals: {} hits, {} misses, {} recycled, {} evicted; "
-                     "{} images {} MiB allocations / {} MiB blocks held",
-                     image_allocation_pool.Hits(), image_allocation_pool.Misses(),
-                     image_allocation_pool.Recycled(), image_allocation_pool.Evicted(), image_allocation_pool.Size(),
-                     image_allocation_pool.AllocationBytes() >> 20,
-                     image_allocation_pool.Bytes() >> 20);
-        }
     }
     static constexpr u32 MAX_UNUSED_SCRATCH_FRAMES = 60;
-    // Finished decode images wait for the next texture of their shape, up to this much memory.
-    static constexpr u64 MaxFreeTranscodeBytes = u64{256} << 20;
-    const auto decode_bytes = [](const PendingTranscode& t) {
-        u64 bytes{};
-        for (u32 level = 0; level < t.levels; ++level) {
-            bytes += u64{(std::max)(t.width >> level, 1U)} * (std::max)(t.height >> level, 1U) * 4;
-        }
-        return bytes * t.layers;
-    };
-    u64 free_bytes{};
-    for (const PendingTranscode& t : free_transcodes) {
-        free_bytes += decode_bytes(t);
-    }
-    while (!pending_transcodes.empty() && scheduler.IsFree(pending_transcodes.front().tick)) {
-        PendingTranscode& done = pending_transcodes.front();
-        const u64 bytes = decode_bytes(done);
-        if (free_bytes + bytes <= MaxFreeTranscodeBytes) {
-            done.unused_frames = 0;
-            free_bytes += bytes;
-            free_transcodes.push_back(std::move(done));
-        }
-        pending_transcodes.pop_front();
-    }
+    RecycleTranscodes();
     std::erase_if(free_transcodes, [](PendingTranscode& t) {
         return ++t.unused_frames > MAX_UNUSED_SCRATCH_FRAMES;
     });
@@ -4320,8 +4161,11 @@ bool Image::ScaleUp(bool ignore) {
         auto scaled_info = info;
         scaled_info.size.width = scaled_width;
         scaled_info.size.height = scaled_height;
-        scaled_image = MakeImage(runtime->device, runtime->memory_allocator, scaled_info,
-                                 runtime->ViewFormats(info.format));
+        scaled_image = runtime->AcquireScaledImageAllocation(scaled_info);
+        if (!scaled_image) {
+            scaled_image = MakeImage(runtime->device, runtime->memory_allocator, scaled_info,
+                                     runtime->ViewFormats(info.format));
+        }
         ignore = false;
     }
     current_image = &Image::scaled_image;
@@ -4849,7 +4693,9 @@ Sampler::VariantKey Sampler::MakeKey(const ImageView& image_view, bool is_depth)
 }
 
 VkSampler Sampler::Find(const VariantKey& key) const noexcept {
-    const auto it = std::ranges::find(variants, key, &Variant::key);
+    static constexpr bool scalar_key = true;
+    const auto it = scalar_key ? std::ranges::find(variants, key.Code(), &Variant::code)
+                              : std::ranges::find(variants, key, &Variant::key);
     if (it == variants.end()) {
         return VK_NULL_HANDLE;
     }
@@ -4920,6 +4766,7 @@ VkSampler Sampler::Emplace(VariantKey key) {
     }
     variants.push_back(Variant{
         .key = key,
+        .code = key.Code(),
         .sampler = device_ptr->GetLogical().CreateSampler(create_info),
     });
     return *variants.back().sampler;
@@ -5160,6 +5007,34 @@ void TextureCacheRuntime::AccelerateImageUploadLayers(
     astc_decoder_pass->AssembleLayers(image, map, swizzles, layers);
 }
 
+u64 TextureCacheRuntime::TranscodeDecodeBytes(const PendingTranscode& t) {
+    u64 bytes{};
+    for (u32 level = 0; level < t.levels; ++level) {
+        bytes += u64{(std::max)(t.width >> level, 1U)} * (std::max)(t.height >> level, 1U) * 4;
+    }
+    return bytes * t.layers;
+}
+
+void TextureCacheRuntime::RecycleTranscodes() {
+    // Finished decode images wait for the next texture of their shape, up to this much memory;
+    // the rest are destroyed, which returns their video memory.
+    static constexpr u64 MaxFreeTranscodeBytes = u64{256} << 20;
+    u64 free_bytes{};
+    for (const PendingTranscode& t : free_transcodes) {
+        free_bytes += TranscodeDecodeBytes(t);
+    }
+    while (!pending_transcodes.empty() && scheduler.IsFree(pending_transcodes.front().tick)) {
+        PendingTranscode& done = pending_transcodes.front();
+        const u64 bytes = TranscodeDecodeBytes(done);
+        if (free_bytes + bytes <= MaxFreeTranscodeBytes) {
+            done.unused_frames = 0;
+            free_bytes += bytes;
+            free_transcodes.push_back(std::move(done));
+        }
+        pending_transcodes.pop_front();
+    }
+}
+
 void TextureCacheRuntime::TranscodeAstcToBcn(
     Image& image, const StagingBufferRef& map,
     std::span<const VideoCommon::SwizzleParameters> swizzles) {
@@ -5169,11 +5044,34 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     const u32 levels = static_cast<u32>(info.resources.levels);
     const u32 layers = static_cast<u32>(info.resources.layers);
     constexpr VkFormat DecodeFormat = VK_FORMAT_A8B8G8R8_UNORM_PACK32;
+    // Decode images used to be recycled only once a frame. While a frame took 17 s (driver
+    // shader builds in Ocarina of Time) every ASTC texture got a new one, up to 0.9 GB each for
+    // 90-layer arrays, and 3.8 GB of them filled an 8 GB card. Recycle finished ones now, and
+    // keep at most this much decode memory in flight, waiting for the GPU beyond it.
+    // The wait comes after this texture's decode is recorded (end of the function): waiting
+    // here finished the submission that `map` belongs to, so the staging pool handed it to the
+    // next upload before the decode read it (another texture's data in this one, #905).
+    static constexpr u64 MaxInFlightTranscodeBytes = u64{512} << 20;
+    RecycleTranscodes();
     // A decode image of the same shape the GPU is done with: title 1's title screen decodes
     // dozens of textures a frame, mostly of a few shapes. Making one took 263 us; from VMA's
     // shared blocks 90 us, but freeing them there left ~1 GB of those blocks unused.
+    // Large arrays are decoded a few layers at a time into a smaller decode image: a 90-layer
+    // 1365x1365 array needed a 0.9 GB one (and a 256 MiB encode buffer), which an 8 GB card
+    // could not fit next to the game. Smaller textures keep the single pass.
+    static constexpr u64 MaxDecodeChunkBytes = u64{64} << 20;
+    u64 layer_decode_bytes{};
+    for (u32 level = 0; level < levels; ++level) {
+        layer_decode_bytes += u64{(std::max)(width >> level, 1U)} * (std::max)(height >> level, 1U) * 4;
+    }
+    const u32 chunk_layers =
+        layer_decode_bytes * layers <= MaxDecodeChunkBytes
+            ? layers
+            : static_cast<u32>(std::clamp<u64>(MaxDecodeChunkBytes / layer_decode_bytes, 1, layers));
+    const bool chunked = chunk_layers < layers;
     const auto reusable = std::ranges::find_if(free_transcodes, [&](const PendingTranscode& t) {
-        return t.width == width && t.height == height && t.levels == levels && t.layers == layers;
+        return t.width == width && t.height == height && t.levels == levels &&
+               t.layers == chunk_layers;
     });
     PendingTranscode pending;
     if (reusable != free_transcodes.end()) {
@@ -5190,7 +5088,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
                 .format = DecodeFormat,
                 .extent = {width, height, 1},
                 .mipLevels = levels,
-                .arrayLayers = layers,
+                .arrayLayers = chunk_layers,
                 .samples = VK_SAMPLE_COUNT_1_BIT,
                 .tiling = VK_IMAGE_TILING_OPTIMAL,
                 .usage = VK_IMAGE_USAGE_STORAGE_BIT,
@@ -5200,10 +5098,11 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
                 .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
             }, true),
             .views = {},
+            .layer_views = {},
             .width = width,
             .height = height,
             .levels = levels,
-            .layers = layers,
+            .layers = chunk_layers,
             .unused_frames = 0,
         };
         for (u32 level = 0; level < levels; ++level) {
@@ -5211,63 +5110,109 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
                 MakeStorageView(device.GetLogical(), level, *pending.image, DecodeFormat));
         }
     }
-    astc_decoder_pass->AssembleInto(
-        info, 0, image.guest_size_bytes,
-        ASTCDecoderPass::Target{
-            .image = *pending.image,
-            .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .initialized = false,
-            .level_view = [&pending](s32 level) { return *pending.views[level]; },
-            .wait = true,
-        },
-        map, swizzles);
+    if (chunked && pending.layer_views.empty()) {
+        for (u32 level = 0; level < levels; ++level) {
+            for (u32 layer = 0; layer < chunk_layers; ++layer) {
+                pending.layer_views.push_back(MakeStorageView(
+                    device.GetLogical(), level, *pending.image, DecodeFormat, layer, 1));
+            }
+        }
+    }
 
-    // Encode every level into one buffer, then copy it into the image.
     const bool bc3 = !IsOpaqueBc1Astc(device, info) &&
                      Settings::GetAstcRecompression() != Settings::AstcRecompression::Bc1;
     const u64 block_bytes = bc3 ? 16 : 8;
-    boost::container::small_vector<VideoCommon::BufferImageCopy, 16> copies;
-    u64 total = 0;
-    for (u32 level = 0; level < levels; ++level) {
-        const u32 level_width = (std::max)(width >> level, 1U);
-        const u32 level_height = (std::max)(height >> level, 1U);
-        const u32 blocks_x = Common::DivCeil(level_width, 4U);
-        const u32 blocks_y = Common::DivCeil(level_height, 4U);
-        const u64 size = u64{blocks_x} * blocks_y * layers * block_bytes;
-        copies.push_back({
-            .buffer_offset = total,
-            .buffer_size = size,
-            .buffer_row_length = blocks_x * 4,
-            .buffer_image_height = blocks_y * 4,
-            .image_subresource{
-                .base_level = static_cast<s32>(level),
-                .base_layer = 0,
-                .num_layers = static_cast<s32>(layers),
-            },
-            .image_offset{0, 0, 0},
-            .image_extent{level_width, level_height, 1},
+    std::vector<u32> chunk_layer_indices(chunk_layers);
+    for (u32 i = 0; i < chunk_layers; ++i) {
+        chunk_layer_indices[i] = i;
+    }
+    for (u32 first_layer = 0; first_layer < layers; first_layer += chunk_layers) {
+        const u32 count = (std::min)(chunk_layers, layers - first_layer);
+        if (chunked) {
+            // The input holds every layer at info.layer_stride apart; start at this chunk.
+            StagingBufferRef chunk_map = map;
+            chunk_map.offset += VkDeviceSize{first_layer} * info.layer_stride;
+            astc_decoder_pass->AssembleInto(
+                info, 0, image.guest_size_bytes,
+                ASTCDecoderPass::Target{
+                    .image = *pending.image,
+                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .initialized = first_layer != 0,
+                    .level_view = [&pending](s32 level) { return *pending.views[level]; },
+                    .wait = true,
+                    .layers = std::span<const u32>(chunk_layer_indices).first(count),
+                    .layer_view = [&pending, chunk_layers](s32 level, u32 layer) {
+                        return *pending.layer_views[static_cast<size_t>(level) * chunk_layers +
+                                                    layer];
+                    },
+                },
+                chunk_map, swizzles);
+        } else {
+            astc_decoder_pass->AssembleInto(
+                info, 0, image.guest_size_bytes,
+                ASTCDecoderPass::Target{
+                    .image = *pending.image,
+                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .initialized = false,
+                    .level_view = [&pending](s32 level) { return *pending.views[level]; },
+                    .wait = true,
+                },
+                map, swizzles);
+        }
+
+        // Encode every level of these layers into one buffer, then copy it into the image.
+        boost::container::small_vector<VideoCommon::BufferImageCopy, 16> copies;
+        u64 total = 0;
+        for (u32 level = 0; level < levels; ++level) {
+            const u32 level_width = (std::max)(width >> level, 1U);
+            const u32 level_height = (std::max)(height >> level, 1U);
+            const u32 blocks_x = Common::DivCeil(level_width, 4U);
+            const u32 blocks_y = Common::DivCeil(level_height, 4U);
+            const u64 size = u64{blocks_x} * blocks_y * count * block_bytes;
+            copies.push_back({
+                .buffer_offset = total,
+                .buffer_size = size,
+                .buffer_row_length = blocks_x * 4,
+                .buffer_image_height = blocks_y * 4,
+                .image_subresource{
+                    .base_level = static_cast<s32>(level),
+                    .base_layer = static_cast<s32>(first_layer),
+                    .num_layers = static_cast<s32>(count),
+                },
+                .image_offset{0, 0, 0},
+                .image_extent{level_width, level_height, 1},
+            });
+            total += size;
+        }
+        const auto output = staging_buffer_pool.Request(total, MemoryUsage::DeviceLocal);
+        for (u32 level = 0; level < levels; ++level) {
+            bc_encoder_pass->Encode(*pending.views[level], copies[level].image_extent.width,
+                                    copies[level].image_extent.height, count, bc3, output.buffer,
+                                    output.offset, total, copies[level].buffer_offset);
+        }
+        scheduler.Record([](vk::CommandBuffer cmdbuf) {
+            const VkMemoryBarrier barrier{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            };
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0, barrier);
         });
-        total += size;
+        image.UploadMemory(output.buffer, output.offset, copies);
     }
-    const auto output = staging_buffer_pool.Request(total, MemoryUsage::DeviceLocal);
-    for (u32 level = 0; level < levels; ++level) {
-        bc_encoder_pass->Encode(*pending.views[level], copies[level].image_extent.width,
-                                copies[level].image_extent.height, layers, bc3, output.buffer,
-                                output.offset, total, copies[level].buffer_offset);
-    }
-    scheduler.Record([](vk::CommandBuffer cmdbuf) {
-        const VkMemoryBarrier barrier{
-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            .pNext = nullptr,
-            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-        };
-        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                               0, barrier);
-    });
-    image.UploadMemory(output.buffer, output.offset, copies);
     pending.tick = scheduler.CurrentTick();
     pending_transcodes.push_back(std::move(pending));
+
+    u64 in_flight{};
+    for (const PendingTranscode& t : pending_transcodes) {
+        in_flight += TranscodeDecodeBytes(t);
+    }
+    if (pending_transcodes.size() > 1 && in_flight > MaxInFlightTranscodeBytes) {
+        scheduler.Wait(pending_transcodes.back().tick);
+        RecycleTranscodes();
+    }
 }
 
 void TextureCacheRuntime::TransitionImageLayout(Image& image) {

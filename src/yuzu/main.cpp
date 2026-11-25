@@ -18,6 +18,7 @@
 #include "common/settings.h"
 #include "frontend_common/config.h"
 #include "startup_checks.h"
+#include "video_core/renderer_vulkan/nvn/nvn_debug.h"
 #include "yuzu/nx2_switches.h"
 
 #if YUZU_ROOM
@@ -183,6 +184,7 @@ int main(int argc, char* argv[]) {
     }
 #endif
     LoadNx2Switches(argv[0]);
+    Vulkan::Nvn::Debug::Reload();
     // Before StartupChecks: its Vulkan check is the first thing to load a GPU driver. The config
     // isn't loaded yet, so the setting is read from the file.
     Config::ReadGlobalSettingEarly("qt-config", Settings::values.private_driver_shader_cache);
