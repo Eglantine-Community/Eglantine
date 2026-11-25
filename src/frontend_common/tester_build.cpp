@@ -902,6 +902,44 @@ std::vector<Step> FetchSteps(const BuildRequest& request) {
     return steps;
 }
 
+fs::path UsableSystemQt(std::string_view version, std::string_view libs, int min_major,
+                        int min_minor) {
+    version = Trim(version);
+    int major = 0;
+    int minor = 0;
+    const auto major_end = std::from_chars(version.data(), version.data() + version.size(), major);
+    if (major_end.ec != std::errc{} || major_end.ptr == version.data() + version.size() ||
+        *major_end.ptr != '.' ||
+        std::from_chars(major_end.ptr + 1, version.data() + version.size(), minor).ec !=
+            std::errc{}) {
+        return {};
+    }
+    if (major != min_major || minor < min_minor) {
+        return {};
+    }
+    const auto lib_dir = PathFromUtf8(Trim(libs));
+    if (lib_dir.empty()) {
+        return {};
+    }
+    const auto cmake = lib_dir / "cmake";
+    std::error_code ec;
+    for (const char* module : {"", "Core", "Gui", "Widgets", "Charts", "Concurrent", "DBus"}) {
+        const std::string name = std::string{"Qt6"} + module;
+        if (!fs::is_regular_file(cmake / name / (name + "Config.cmake"), ec)) {
+            return {};
+        }
+    }
+    return cmake;
+}
+
+std::optional<bool> ConfiguredWithBundledQt(const Layout& layout) {
+    const auto cache = ReadFile(layout.build / "CMakeCache.txt");
+    if (cache.empty()) {
+        return std::nullopt;
+    }
+    return cache.find("YUZU_USE_BUNDLED_QT:BOOL=ON") != std::string::npos;
+}
+
 std::optional<std::string> ParseRevParse(std::string_view output) {
     const auto sha = Trim(output);
     if (sha.size() != 40 || !std::ranges::all_of(sha, [](char c) {
@@ -954,6 +992,13 @@ std::vector<Step> BuildSteps(const BuildRequest& request) {
             !flag.starts_with("-DCMAKE_MAKE_PROGRAM")) {
             configure.push_back(flag);
         }
+    }
+    if (!request.system_qt.empty()) {
+        configure.push_back("-DYUZU_USE_BUNDLED_QT=OFF");
+        configure.push_back("-DQt6_DIR=" + PathToUtf8(request.system_qt / "Qt6"));
+    }
+    if (request.fresh) {
+        configure.push_back("--fresh");
     }
     configure.push_back("-DEGLANTINE_UPDATE_REPO=" + request.repo);
     if (!request.platform.empty()) {
@@ -1206,6 +1251,7 @@ std::vector<InstallInfo> ListInstalls(const Layout& layout, const State& state) 
     for (const auto& entry : fs::directory_iterator{layout.installs, ec}) {
         std::error_code type_ec;
         if (!entry.is_directory(type_ec) || entry.path().extension() == ".tmp" ||
+            entry.path().extension() == ".old" ||
             !fs::is_regular_file(InstalledExe(entry.path()), type_ec)) {
             continue;
         }

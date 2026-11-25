@@ -189,7 +189,21 @@ struct BuildRequest {
     std::string platform;
     // A commit of the source to build instead of its newest one: 40 lowercase hex characters.
     std::string commit;
+    // Linux: the CMake package folder (.../lib/cmake) of a system Qt to build with instead of the
+    // bundled one, so the build loads the desktop's platform theme. Empty keeps the recipe's Qt.
+    std::filesystem::path system_qt;
+    // Configure from scratch: the build folder was configured with the other Qt.
+    bool fresh{};
 };
+
+// The CMake package folder of a system Qt that can replace the bundled one: version
+// `min_major`.`min_minor` or newer within that major version, with every module the build uses. `version` and `libs` are what
+// `qmake6 -query` (or `qtpaths6 --query`) answers for QT_VERSION and QT_INSTALL_LIBS. Empty when it cannot.
+std::filesystem::path UsableSystemQt(std::string_view version, std::string_view libs,
+                                     int min_major = 6, int min_minor = 11);
+
+// Whether the build folder was configured with the bundled Qt; empty when it is not configured.
+std::optional<bool> ConfiguredWithBundledQt(const Layout& layout);
 
 // Clone when needed, fetch the source, check it out and read back the commit (capture).
 std::vector<Step> FetchSteps(const BuildRequest& request);

@@ -1141,3 +1141,43 @@ TEST_CASE("HasVersionManager reads the exe", "[tester]") {
     CHECK(HasVersionManager(exe));
     CHECK_FALSE(HasVersionManager(dir.path / "missing"));
 }
+
+TEST_CASE("UsableSystemQt and the configure flags it adds", "[tester]") {
+    TempDir dir;
+    const auto libs = dir.path / "lib";
+    const auto add_module = [&](const std::string& module) {
+        const std::string name = "Qt6" + module;
+        Write(libs / "cmake" / name / (name + "Config.cmake"), "");
+    };
+    for (const char* module : {"", "Core", "Gui", "Widgets", "Charts", "Concurrent"}) {
+        add_module(module);
+    }
+    const auto libs_text = PathToUtf8(libs) + "\n";
+    // DBus is missing.
+    CHECK(UsableSystemQt("6.12.0\n", libs_text).empty());
+    add_module("DBus");
+    CHECK(UsableSystemQt("6.12.0\n", libs_text) == libs / "cmake");
+    CHECK(UsableSystemQt("6.11.1", libs_text) == libs / "cmake");
+    CHECK(UsableSystemQt("6.10.2", libs_text).empty());
+    CHECK(UsableSystemQt("5.15.2", libs_text).empty());
+    CHECK(UsableSystemQt("garbage", libs_text).empty());
+    CHECK(UsableSystemQt("6.12.0", "").empty());
+
+    auto request = MakeRequest(dir.path);
+    auto configure = BuildSteps(request)[0].args;
+    CHECK(std::ranges::find(configure, "-DYUZU_USE_BUNDLED_QT=OFF") == configure.end());
+    request.system_qt = libs / "cmake";
+    request.fresh = true;
+    configure = BuildSteps(request)[0].args;
+    CHECK(std::ranges::find(configure, "-DYUZU_USE_BUNDLED_QT=OFF") != configure.end());
+    CHECK(std::ranges::find(configure, "-DQt6_DIR=" + PathToUtf8(libs / "cmake" / "Qt6")) !=
+          configure.end());
+    CHECK(std::ranges::find(configure, "--fresh") != configure.end());
+
+    const auto layout = MakeLayout(dir.path);
+    CHECK_FALSE(ConfiguredWithBundledQt(layout).has_value());
+    Write(layout.build / "CMakeCache.txt", "YUZU_USE_BUNDLED_QT:BOOL=ON\n");
+    CHECK(ConfiguredWithBundledQt(layout) == true);
+    Write(layout.build / "CMakeCache.txt", "YUZU_USE_BUNDLED_QT:BOOL=OFF\n");
+    CHECK(ConfiguredWithBundledQt(layout) == false);
+}

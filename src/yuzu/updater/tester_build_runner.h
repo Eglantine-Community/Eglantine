@@ -105,8 +105,12 @@ private:
     bool Consent(const QStringList& items, const QString& text, const QString& command,
                  const QString& accept_label);
     bool Fetch(std::string& sha);
+    // Linux: builds with the system Qt when it can, so the build follows the desktop theme.
+    void ChooseQt();
     bool Build();
     bool Finish(const std::string& sha);
+    // Replaces the current install with a new build of its commit, unless that build is running.
+    bool Reinstall(const std::string& sha);
     // Link the user folder, save the state and prune once `sha` is the current install.
     bool Activate(const std::string& sha, const QString& message);
     // Installs the CI build of the source's newest commit when there is one. Nothing is returned
@@ -154,6 +158,8 @@ private:
     TesterBuild::Source m_source;
     // The commit to build instead of the source's newest; empty for the newest.
     std::string m_commit;
+    std::filesystem::path m_system_qt;
+    bool m_fresh_configure{};
     TesterBuild::Recipe m_recipe;
     TesterBuild::Toolchain m_tools;
     TesterBuild::PackageManager m_manager{TesterBuild::PackageManager::None};

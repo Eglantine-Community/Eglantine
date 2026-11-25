@@ -910,6 +910,8 @@ TesterBuild::BuildRequest TesterBuildRunner::MakeRequest() const {
     // A build compiled here is never a PGO build.
     request.platform = UpdateChecker::DownloadPlatform(Settings::UpdateVariant::Standard);
     request.commit = m_commit;
+    request.system_qt = m_system_qt;
+    request.fresh = m_fresh_configure;
     return request;
 }
 
@@ -963,7 +965,56 @@ bool TesterBuildRunner::Fetch(std::string& sha) {
     return true;
 }
 
+void TesterBuildRunner::ChooseQt() {
+    m_system_qt.clear();
+    m_fresh_configure = false;
+    if (m_platform != TesterBuild::Platform::Linux) {
+        return;
+    }
+    // qtpaths6 and qmake6 answer the same queries; distributions ship one or both, not always
+    // on PATH.
+    const auto search = PathEnv(m_base_env) + ":/usr/lib/qt6/bin:/usr/lib64/qt6/bin:" +
+                        "/usr/lib/x86_64-linux-gnu/qt6/bin:/usr/lib/aarch64-linux-gnu/qt6/bin";
+    QByteArray version;
+    QByteArray libs;
+    for (const char* tool : {"qtpaths6", "qmake6"}) {
+        const auto program = TesterBuild::FindProgram(tool, search);
+        if (program.empty()) {
+            continue;
+        }
+        const std::string query = std::string_view{tool} == "qmake6" ? "-query" : "--query";
+        const TesterBuild::Step version_step{
+            "qt-version", "Looking for the system Qt", program, {query, "QT_VERSION"}, {},
+            false,        true};
+        const TesterBuild::Step libs_step{
+            "qt-libs", "Looking for the system Qt", program, {query, "QT_INSTALL_LIBS"}, {},
+            false,     true};
+        version.clear();
+        libs.clear();
+        if (RunStep(version_step, m_base_env, &version) == 0 &&
+            RunStep(libs_step, m_base_env, &libs) == 0) {
+            m_system_qt = TesterBuild::UsableSystemQt(version.toStdString(), libs.toStdString());
+            if (!m_system_qt.empty()) {
+                break;
+            }
+        }
+    }
+    if (m_system_qt.empty()) {
+        Log(tr("No complete system Qt 6.11 or newer found; building with the bundled Qt, which "
+               "does not follow the desktop theme."));
+    } else {
+        Log(tr("Building with the system Qt %1, so the build follows the desktop theme.")
+                .arg(QString::fromUtf8(version).trimmed()));
+    }
+    // A cache made with the bundled Qt keeps pointing at it.
+    if (const auto bundled = TesterBuild::ConfiguredWithBundledQt(m_layout);
+        bundled && *bundled && !m_system_qt.empty()) {
+        m_fresh_configure = true;
+    }
+}
+
 bool TesterBuildRunner::Build() {
+    ChooseQt();
     const auto env = BuildEnvironment();
     for (const auto& step : TesterBuild::BuildSteps(MakeRequest())) {
         emit StepStarted(Q(step.label));
@@ -1013,11 +1064,7 @@ bool TesterBuildRunner::Finish(const std::string& sha) {
     const auto destination = m_layout.InstallDir(sha);
     if (!m_state.current_install.empty() &&
         SameFile(TesterBuild::PathFromUtf8(m_state.current_install), destination)) {
-        // Replacing it could mean replacing a running copy.
-        m_installed_exe = TesterBuild::InstalledExe(destination);
-        m_message = tr("Built %1, which is already installed. The install was not replaced.")
-                        .arg(Q(sha.substr(0, 10)));
-        return true;
+        return Reinstall(sha);
     }
 
     std::error_code ec;
@@ -1026,6 +1073,67 @@ bool TesterBuildRunner::Finish(const std::string& sha) {
     }
     return Activate(sha,
                     tr("Installed %1 (%2).").arg(Q(m_source.DisplayName()), Q(sha.substr(0, 10))));
+}
+
+namespace {
+// Whether a process runs `exe`. Windows needs no answer: there a running exe's folder cannot be
+// moved, which Reinstall finds out by itself.
+bool IsExeRunning([[maybe_unused]] const fs::path& exe) {
+#ifdef _WIN32
+    return false;
+#else
+    std::error_code ec;
+    const auto target = fs::weakly_canonical(exe, ec);
+    for (const auto& entry : fs::directory_iterator{"/proc", ec}) {
+        std::error_code link_ec;
+        auto running = fs::read_symlink(entry.path() / "exe", link_ec).string();
+        if (link_ec) {
+            continue;
+        }
+        if (constexpr std::string_view deleted = " (deleted)"; running.ends_with(deleted)) {
+            running.resize(running.size() - deleted.size());
+        }
+        if (fs::path{running} == target) {
+            return true;
+        }
+    }
+    return false;
+#endif
+}
+} // namespace
+
+bool TesterBuildRunner::Reinstall(const std::string& sha) {
+    const auto destination = m_layout.InstallDir(sha);
+    const auto keep = [&] {
+        m_installed_exe = TesterBuild::InstalledExe(destination);
+        m_message = tr("Built %1, but that build is running, so the install was not replaced. "
+                       "Close it and rebuild.")
+                        .arg(Q(sha.substr(0, 10)));
+        return true;
+    };
+    if (IsExeRunning(TesterBuild::InstalledExe(destination))) {
+        return keep();
+    }
+    // Moved aside rather than deleted, so a failed install can put it back.
+    const auto old = fs::path{destination}.concat(".old");
+    std::error_code ec;
+    fs::remove_all(old, ec);
+    fs::rename(destination, old, ec);
+    if (ec) {
+        return keep();
+    }
+    const auto previous = m_state.previous_install;
+    m_state.current_install.clear();
+    if (!TesterBuild::Promote(m_layout, sha, m_state, ec)) {
+        std::error_code ignored;
+        fs::rename(old, destination, ignored);
+        m_state.current_install = TesterBuild::PathToUtf8(destination);
+        return Fail(tr("Could not install the build: %1").arg(QString::fromStdString(ec.message())));
+    }
+    m_state.previous_install = previous;
+    fs::remove_all(old, ec);
+    return Activate(sha, tr("Reinstalled %1 (%2).")
+                             .arg(Q(m_source.DisplayName()), Q(sha.substr(0, 10))));
 }
 
 bool TesterBuildRunner::Activate(const std::string& sha, const QString& message) {
