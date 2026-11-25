@@ -5172,6 +5172,16 @@ void TextureCacheRuntime::TranscodeAstcToBcnFused(
                           output.offset, total);
     }
 
+    scheduler.Record([](vk::CommandBuffer cmdbuf) {
+        const VkMemoryBarrier barrier{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, barrier);
+    });
     image.UploadMemory(output.buffer, output.offset, copies);
 
     u64 output_bytes{};

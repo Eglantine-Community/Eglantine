@@ -14,8 +14,6 @@ set(FIDELITYFX_FILES
 set(GLSL_INCLUDES
     fidelityfx_fsr.frag
     ${FIDELITYFX_FILES}
-    # astc_bc.comp's bodies: the ASTC block decoder, the encode functions bc_encoder.comp shares,
-    # and the fused pass itself. Listed so an edit rebuilds the shaders that include them.
     ${CMAKE_CURRENT_SOURCE_DIR}/astc_decode.glsl
     ${CMAKE_CURRENT_SOURCE_DIR}/bcn_encode.glsl
     ${CMAKE_CURRENT_SOURCE_DIR}/astc_bc.glsl
@@ -182,6 +180,12 @@ foreach(SOURCE_FILE IN ITEMS ${SHADER_FILES})
     endif()
     # Skip compiling to SPIR-V OpenGL exclusive files
     if (NOT ${FILENAME} MATCHES "opengl.*")
+        set(SPIRV_DEPENDS)
+        if (FILENAME STREQUAL "astc_bc.comp")
+            set(SPIRV_DEPENDS astc_decode.glsl astc_bc.glsl bcn_encode.glsl)
+        elseif (FILENAME STREQUAL "bc_encoder.comp")
+            set(SPIRV_DEPENDS bcn_encode.glsl)
+        endif()
         string(TOUPPER ${SHADER_NAME}_SPV SPIRV_VARIABLE_NAME)
         set(SPIRV_HEADER_FILE ${SHADER_DIR}/${SHADER_NAME}_spv.h)
         add_custom_command(
@@ -191,6 +195,8 @@ foreach(SOURCE_FILE IN ITEMS ${SHADER_FILES})
                 ${GLSLANGVALIDATOR} -V ${QUIET_FLAG} -I"${FIDELITYFX_INCLUDE_DIR}" ${GLSL_FLAGS} --variable-name ${SPIRV_VARIABLE_NAME} -o ${SPIRV_HEADER_FILE} ${SOURCE_FILE} --target-env ${SPIR_V_VERSION}
             MAIN_DEPENDENCY
                 ${SOURCE_FILE}
+            DEPENDS
+                ${SPIRV_DEPENDS}
         )
         set(SHADER_HEADERS ${SHADER_HEADERS} ${SPIRV_HEADER_FILE})
     endif()

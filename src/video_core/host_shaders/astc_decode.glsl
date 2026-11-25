@@ -21,9 +21,10 @@
 #define QUINT 1u
 #define TRIT 2u
 
-/* the LDR profile's error color, opaque magenta (R in the low byte): illegal blocks, HDR void extents and the
-   texels of HDR partitions. Eden's is transparent black */
-#define ERROR_COLOR 0xFFFF00FFu
+/* Match astc_decoder.comp for invalid blocks, including zero-filled texture regions. */
+#define INVALID_BLOCK_COLOR 0u
+/* ScarletNX's LDR error color for HDR partitions, which this decoder does not support. */
+#define HDR_PARTITION_COLOR 0xFFFF00FFu
 
 /* the block, and the bit stream being decoded from it, consumed from the low end of x */
 uvec4 blk;
@@ -255,7 +256,7 @@ uint PackClampedRGB(int r, int g, int b, uint a) {
    15, the bits of 0xC88C) are the error color, as in the LDR profile, which interpolates to itself */
 uvec2 ComputeEndpoints(uint cem, uint off) {
     if (((0xC88Cu >> cem) & 1u) != 0u) {
-        return uvec2(ERROR_COLOR, ERROR_COLOR);
+        return uvec2(HDR_PARTITION_COLOR, HDR_PARTITION_COLOR);
     }
     const uint qa = Read32At(ASTC_SLOT, off), qb = Read32At(ASTC_SLOT, off + 4u);
     const uint v0 = Bits(qa, 0u, 8u), v1 = Bits(qa, 8u, 8u), v2 = Bits(qa, 16u, 8u), v3 = qa >> 24u;
@@ -321,6 +322,9 @@ uint Unorm16To8(uint c) {
    interpolates to itself whatever the weights read */
 void SetSolid(uint rgba) {
     const uint slot = ASTC_SLOT;
+    TILE(F_VALUES, slot) = 0u;
+    TILE(F_VALUES + 1u, slot) = 0u;
+    TILE(F_VALUES + 2u, slot) = 0u;
     TILE(F_INFO, slot) = 2u | (2u << 4u);
     TILE(F_E0, slot) = rgba;
     TILE(F_E1, slot) = rgba;
@@ -342,7 +346,7 @@ void DecodeBlock() {
         const uint t_min = Bits(blk.y, 6u, 13u), t_max = blk.y >> 19u;
         const bool hdr_or_reserved = (mode & 0x200u) != 0u || (mode & 0x400u) == 0u || Bits(blk.x, 11u, 1u) == 0u;
         if (hdr_or_reserved || ((s_min & s_max & t_min & t_max) != 0x1FFFu && (s_min >= s_max || t_min >= t_max))) {
-            SetSolid(ERROR_COLOR);
+            SetSolid(INVALID_BLOCK_COLOR);
             return;
         }
         const uint r = blk.z & 0xFFFFu, g = blk.z >> 16u, b = blk.w & 0xFFFFu;
@@ -354,7 +358,7 @@ void DecodeBlock() {
     }
     /* reserved modes */
     if ((mode & 0xFu) == 0u || ((mode & 3u) == 0u && (mode & 0x1C0u) == 0x1C0u)) {
-        SetSolid(ERROR_COLOR);
+        SetSolid(INVALID_BLOCK_COLOR);
         return;
     }
     /* the layout (0 to 9, the specification's table of block modes) from a nibble table on the bits that tell
@@ -383,7 +387,7 @@ void DecodeBlock() {
     const int remaining = 128 - int(weight_bits + header + extra_cem_bits + plane_bits);
     if (N > block_dims.x || M > block_dims.y || (np == 4u && dual_plane) || num_weights > 64u || weight_bits < 24u ||
         weight_bits > 96u || remaining < 0) {
-        SetSolid(ERROR_COLOR);
+        SetSolid(INVALID_BLOCK_COLOR);
         return;
     }
     const uint color_bits = uint(remaining);
@@ -409,7 +413,7 @@ void DecodeBlock() {
     /* the specification's illegal encodings that Eden decodes anyway: more than 18 color values, or too few bits
        for them to have at least 6 levels (trits of 1 bit) */
     if (num_values > 18u || num_values + ((num_values * 8u + 4u) * 0x3334u >> 16u) > color_bits) {
-        SetSolid(ERROR_COLOR);
+        SetSolid(INVALID_BLOCK_COLOR);
         return;
     }
 
