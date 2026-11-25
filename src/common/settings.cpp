@@ -36,6 +36,27 @@
 
 namespace Settings {
 
+template <>
+void Setting<CpuBackend, true>::LoadString(const std::string& input) {
+    if (input == ToString(CpuBackend::Dynarmic)) {
+        SetValue(CpuBackend::Dynarmic);
+        return;
+    }
+#ifdef HAS_NCE
+    if (input == ToString(CpuBackend::Nce)) {
+        SetValue(CpuBackend::Nce);
+        return;
+    }
+#endif
+#ifdef HAS_SCARLETNX
+    if (input == ToString(CpuBackend::ScarletNx)) {
+        SetValue(CpuBackend::ScarletNx);
+        return;
+    }
+#endif
+    SetValue(GetDefault());
+}
+
 // Clang 14 and earlier have errors when explicitly instantiating these classes
 #ifndef CANNOT_EXPLICITLY_INSTANTIATE
 #define SETTING(TYPE, RANGED) template class Setting<TYPE, RANGED>

@@ -1,0 +1,366 @@
+--- a/src/common/cpu/recompiler/snx_recompiler.h
++++ b/src/common/cpu/recompiler/snx_recompiler.h
+@@ -81,6 +81,35 @@
+ SNX_RECOMPILER_API void snx_recompiler_set_hook_direct_calls(struct snx_recompiler* r, int enabled);
+ /* Progress lines on stdout, as the scarletnx command prints them; off by default */
+ SNX_RECOMPILER_API void snx_recompiler_set_verbose(struct snx_recompiler* r, int verbose);
++/* Embedder timings: host wall nanoseconds and I/O bytes (zero for non-I/O stages).
++   CACHE_LOOKUP includes CACHE_READ and any CACHE_IMAGE_LOAD. CACHE_IMAGE_LOAD and IMAGE_LOAD
++   (newly linked modules) both include IMAGE_WRITE and DLOPEN.
++   LLVM_METADATA includes RTLIB, which includes RTLIB_CACHE_READ and RTLIB_CACHE_WRITE.
++   A successful CACHE_LOOKUP means the cached module was loaded and accepted. Writes report
++   requested bytes; reads report bytes returned. Discovery timings cover snx_recompile_from.
++   The callback runs on the caller's thread and must not reenter the recompiler. NULL disables it. */
++enum snx_profile_stage {
++    SNX_PROFILE_DISCOVERY,
++    SNX_PROFILE_CACHE_LOOKUP,
++    SNX_PROFILE_CACHE_READ,
++    SNX_PROFILE_CACHE_IMAGE_LOAD,
++    SNX_PROFILE_LLVM_INIT,
++    SNX_PROFILE_LLVM_UNITS,
++    SNX_PROFILE_LLVM_METADATA,
++    SNX_PROFILE_RTLIB,
++    SNX_PROFILE_RTLIB_CACHE_READ,
++    SNX_PROFILE_RTLIB_CACHE_WRITE,
++    SNX_PROFILE_LINK,
++    SNX_PROFILE_IMAGE_LOAD,
++    SNX_PROFILE_IMAGE_WRITE,
++    SNX_PROFILE_DLOPEN,
++    SNX_PROFILE_CACHE_WRITE,
++    SNX_PROFILE_STAGE_COUNT,
++};
++typedef void (*snx_profile_fn)(void* context, enum snx_profile_stage stage, uint64_t ns,
++                               uint64_t bytes, int success);
++SNX_RECOMPILER_API void snx_recompiler_set_profile(struct snx_recompiler* r, snx_profile_fn fn,
++                                                   void* context);
+ /* A folder the generated code's text (LLVM IR as .ll) is saved in, for inspection; NULL (the
+    default) saves nothing. The string is copied */
+ SNX_RECOMPILER_API int snx_recompiler_set_keep_ir(struct snx_recompiler* r, const char* folder);
+--- a/src/common/cpu/recompiler/library.c
++++ b/src/common/cpu/recompiler/library.c
+@@ -79,6 +79,8 @@
+     char* keep_ir;
+     char* cache; /* folder of linked modules by the hash of what they were made from (LLVM), NULL for none */
+     char error[1024];
++    snx_profile_fn profile;
++    void* profile_context;
+     /* PowerPC64: the code arena every module of the recompiler is loaded into, with the runtime library once, so all
+        of them share one TOC (code_loader.h): a guest's jump from one module's code into another's keeps r2. Made by
+        the first module, freed with the last (an execve frees them all) */
+@@ -86,6 +88,22 @@
+     size_t arena_modules;
+ };
+ 
++void snx_recompiler_set_profile(struct snx_recompiler* r, snx_profile_fn fn, void* context) {
++    r->profile = fn;
++    r->profile_context = context;
++}
++
++static double profile_now(const struct snx_recompiler* r) {
++    return r->profile ? snx_seconds() : 0;
++}
++
++static void profile_end(struct snx_recompiler* r, enum snx_profile_stage stage, double start,
++                        size_t bytes, int success) {
++    if (r->profile)
++        r->profile(r->profile_context, stage, (uint64_t)((snx_seconds() - start) * 1000000000.0),
++                   bytes, success);
++}
++
+ typedef struct {
+     uint64_t start, end, prefix_max_end;
+     GuestFn code;
+@@ -465,8 +483,11 @@
+    The memfd stays open as long as the module is loaded: dlopen looks a path up among the objects already loaded
+    before opening it, and a closed descriptor's number is the next one memfd_create hands out, so two modules
+    loaded through the same "/proc/self/fd/N" would be one */
+-static int load_image(struct snx_recompiler* r, struct snx_recompiled* m, const unsigned char* data, size_t size) {
++static int load_image_impl(struct snx_recompiler* r, struct snx_recompiled* m,
++                           const unsigned char* data, size_t size) {
+     char *dir = NULL, *path = NULL;
++    double start;
++    int write_failed, write_errno;
+ #ifdef SNX_MEMFD
+     /* snx_recompile_from deltas can live for the entire guest process. Do not hold an fd for each. */
+     if (m->view_count) {
+@@ -474,14 +495,18 @@
+         if (fd >= 0) {
+             size_t done = 0;
+             char proc[64];
++            start = profile_now(r);
+             while (done < size) {
+                 ssize_t n = write(fd, data + done, size - done);
+                 if (n <= 0) break;
+                 done += (size_t)n;
+             }
++            profile_end(r, SNX_PROFILE_IMAGE_WRITE, start, size, done == size);
+             if (done == size) {
+                 snprintf(proc, sizeof(proc), "/proc/self/fd/%d", fd);
++                start = profile_now(r);
+                 m->image = open_image(proc);
++                profile_end(r, SNX_PROFILE_DLOPEN, start, 0, m->image != NULL);
+             }
+             if (m->image) {
+                 m->image_fd = fd;
+@@ -515,8 +540,12 @@
+         path = snx_path_join(dir, name);
+     }
+ #endif
+-    if (snx_write_file(path, data, size)) {
+-        fail(r, "cannot write the recompiled module to %s: %s", path, strerror(errno));
++    start = profile_now(r);
++    write_failed = snx_write_file(path, data, size);
++    write_errno = errno;
++    profile_end(r, SNX_PROFILE_IMAGE_WRITE, start, size, !write_failed);
++    if (write_failed) {
++        fail(r, "cannot write the recompiled module to %s: %s", path, strerror(write_errno));
+         snx_remove_tree(dir);
+         free(dir);
+         free(path);
+@@ -537,8 +566,10 @@
+     }
+     fail(r, "cannot load the recompiled module (Windows error %lu)", (unsigned long)GetLastError());
+ #else
++    start = profile_now(r);
+     m->image = open_image(path);
+     if (!m->image) fail(r, "cannot load the recompiled module: %s", dlerror());
++    profile_end(r, SNX_PROFILE_DLOPEN, start, 0, m->image != NULL);
+ #endif
+     snx_remove_tree(dir);
+     free(dir);
+@@ -546,6 +577,14 @@
+     return m->image ? 0 : -1;
+ }
+ 
++static int load_image(struct snx_recompiler* r, struct snx_recompiled* m, const unsigned char* data,
++                      size_t size, enum snx_profile_stage stage) {
++    double start = profile_now(r);
++    int rc = load_image_impl(r, m, data, size);
++    profile_end(r, stage, start, 0, !rc);
++    return rc;
++}
++
+ static void* image_symbol(struct snx_recompiled* m, const char* name) {
+ #ifdef _WIN32
+     return (void*)GetProcAddress((HMODULE)m->image, name);
+@@ -896,7 +935,7 @@
+ static unsigned char* rtlib_objects[6];
+ static size_t rtlib_sizes[6];
+ 
+-static void save_cached(const char* path, const unsigned char* data, size_t size);
++static int save_cached(const char* path, const unsigned char* data, size_t size);
+ 
+ /* the cache's copy of the compiled runtime library: a short-lived process (a just-in-time compiler's, which a
+    program's every execve starts again) would spend most of its first compile on it */
+@@ -919,23 +958,31 @@
+     return snx_path_join(cache, name);
+ }
+ 
+-static int rtlib_object(const char* cache, char opt, const unsigned char** data, size_t* size, char* error,
+-                        size_t error_size) {
++static int rtlib_object(struct snx_recompiler* r, const unsigned char** data, size_t* size,
++                        char* error, size_t error_size) {
+     static const char levels[] = "0123sz";
+-    const char* level = opt ? strchr(levels, opt) : NULL;
++    const char* level = r->opt ? strchr(levels, r->opt) : NULL;
+     size_t i = level ? (size_t)(level - levels) : 2;
+     int rc = 0;
++    double start = profile_now(r);
+ #ifdef _WIN32
+     AcquireSRWLockExclusive(&rtlib_lock);
+ #else
+     pthread_mutex_lock(&rtlib_lock);
+ #endif
+-    if (!rtlib_objects[i] && cache) {
+-        char* path = rtlib_cache_path(cache, levels[i]);
++    if (!rtlib_objects[i] && r->cache) {
++        char* path = rtlib_cache_path(r->cache, levels[i]);
++        double io_start = profile_now(r);
+         rtlib_objects[i] = snx_read_file(path, &rtlib_sizes[i]);
++        profile_end(r, SNX_PROFILE_RTLIB_CACHE_READ, io_start,
++                    rtlib_objects[i] ? rtlib_sizes[i] : 0, rtlib_objects[i] != NULL);
+         if (!rtlib_objects[i] &&
+-            !(rc = snx_ir_rtlib_object(levels[i], &rtlib_objects[i], &rtlib_sizes[i], error, error_size)))
+-            save_cached(path, rtlib_objects[i], rtlib_sizes[i]);
++            !(rc = snx_ir_rtlib_object(levels[i], &rtlib_objects[i], &rtlib_sizes[i], error, error_size))) {
++            int saved;
++            io_start = profile_now(r);
++            saved = !save_cached(path, rtlib_objects[i], rtlib_sizes[i]);
++            profile_end(r, SNX_PROFILE_RTLIB_CACHE_WRITE, io_start, rtlib_sizes[i], saved);
++        }
+         free(path);
+     } else if (!rtlib_objects[i])
+         rc = snx_ir_rtlib_object(levels[i], &rtlib_objects[i], &rtlib_sizes[i], error, error_size);
+@@ -946,6 +993,7 @@
+ #else
+     pthread_mutex_unlock(&rtlib_lock);
+ #endif
++    profile_end(r, SNX_PROFILE_RTLIB, start, 0, !rc);
+     return rc;
+ }
+ 
+@@ -953,11 +1001,13 @@
+ /* the cached module at path, loaded; nonzero when there is none or it can't be loaded (then it is made again) */
+ static int load_cached(struct snx_recompiler* r, struct snx_recompiled* m, const char* path) {
+     size_t size = 0;
++    double start = profile_now(r);
+     unsigned char* data = snx_read_file(path, &size);
+     DescriptorFn describe;
+     int rc = -1;
++    profile_end(r, SNX_PROFILE_CACHE_READ, start, data ? size : 0, data != NULL);
+     if (!data) return -1;
+-    if (!load_image(r, m, data, size)) {
++    if (!load_image(r, m, data, size, SNX_PROFILE_CACHE_IMAGE_LOAD)) {
+         describe = (DescriptorFn)(uintptr_t)image_symbol(m, DESCRIPTOR_SYMBOL);
+         rc = describe ? load_descriptor(r, m, describe()) : -1;
+         if (rc) {
+@@ -972,15 +1022,16 @@
+ }
+ #endif
+ /* saved under a temporary name first and then renamed: another process may be loading the same module */
+-static void save_cached(const char* path, const unsigned char* data, size_t size) {
++static int save_cached(const char* path, const unsigned char* data, size_t size) {
+     static unsigned long serial;
+     char* temporary = snx_format("%s.%lu.%lu.tmp", path, (unsigned long)(snx_seconds() * 1000000.0), ++serial);
+     if (!snx_write_file(temporary, data, size) && !snx_replace(temporary, path)) {
+         free(temporary);
+-        return;
++        return 0;
+     }
+     snx_remove_tree(temporary);
+     free(temporary);
++    return -1;
+ }
+ 
+ #if defined(__powerpc64__)
+@@ -996,7 +1047,7 @@
+         r->arena = snx_code_loader_new((size_t)1 << 31, error, sizeof(error));
+         memset(&rtlib, 0, sizeof(rtlib));
+         rtlib.name = "rtlib";
+-        if (!r->arena || rtlib_object(r->cache, r->opt, &rtlib.data, &rtlib.size, error, sizeof(error)) ||
++        if (!r->arena || rtlib_object(r, &rtlib.data, &rtlib.size, error, sizeof(error)) ||
+             snx_code_load(r->arena, &rtlib, 1, NULL, 0, NULL, error, sizeof(error))) {
+             fail(r, "the code arena: %s", error);
+             snx_code_loader_free(r->arena);
+@@ -1080,33 +1131,43 @@
+     size_t descriptor_size = 0, rtlib_size = 0, *units = NULL, count = 0, i, n = 0;
+     const char* exports[1];
+     char error[1024];
+-    int rc = -1;
++    int rc = -1, failed;
+     char* cached = NULL;
++    double start;
+     memset(&q, 0, sizeof(q));
+     memset(&linked, 0, sizeof(linked));
+     error[0] = 0;
+-    if (llvm_init(error, sizeof(error))) {
++    start = profile_now(r);
++    failed = llvm_init(error, sizeof(error));
++    profile_end(r, SNX_PROFILE_LLVM_INIT, start, 0, !failed);
++    if (failed) {
+         fail(r, "%s", error);
+         return -1;
+     }
+     if (r->cache) {
++        start = profile_now(r);
+         cached = cache_path(r, codegen);
+ #if defined(__powerpc64__)
+-        if (!load_cached_objects(r, m, cached)) {
++        failed = load_cached_objects(r, m, cached);
+ #else
+-        if (!load_cached(r, m, cached)) {
++        failed = load_cached(r, m, cached);
+ #endif
++        profile_end(r, SNX_PROFILE_CACHE_LOOKUP, start, 0, !failed);
++        if (!failed) {
+             free(cached);
+             return 0;
+         }
+     }
++    start = profile_now(r);
+     units = chunks(codegen, r->jobs, &count);
+     if (!units) {
++        profile_end(r, SNX_PROFILE_LLVM_UNITS, start, 0, 0);
+         fail(r, "out of memory");
+         return -1;
+     }
+     q.units = (Unit*)calloc(count ? count : 1, sizeof(*q.units));
+     if (!q.units) {
++        profile_end(r, SNX_PROFILE_LLVM_UNITS, start, 0, 0);
+         fail(r, "out of memory");
+         free(units);
+         return -1;
+@@ -1120,18 +1181,23 @@
+     q.codegen = codegen;
+     report(r, "LLVM: %lu code unit%s and the descriptor\n", (unsigned long)count, count == 1 ? "" : "s");
+     if (count) run_queue(&q, r->jobs);
++    profile_end(r, SNX_PROFILE_LLVM_UNITS, start, 0, !q.failed);
+     if (q.failed) {
+         fail(r, "LLVM backend: %s", q.error);
+         goto done;
+     }
++    start = profile_now(r);
+     ir = snx_ir_new("module", r->opt, error, sizeof(error));
+     if (!ir || llvm_descriptor(ir, codegen, error, sizeof(error)) ||
+         (r->keep_ir && save_ir(ir, r->keep_ir, "module")) ||
+         snx_ir_object(ir, r->opt, &descriptor_object, &descriptor_size, error, sizeof(error))) {
++        profile_end(r, SNX_PROFILE_LLVM_METADATA, start, 0, 0);
+         fail(r, "LLVM backend: %s", error[0] ? error : "cannot save the descriptor's IR");
+         goto done;
+     }
+-    if (rtlib_object(r->cache, r->opt, &rtlib, &rtlib_size, error, sizeof(error))) {
++    failed = rtlib_object(r, &rtlib, &rtlib_size, error, sizeof(error));
++    profile_end(r, SNX_PROFILE_LLVM_METADATA, start, 0, !failed);
++    if (failed) {
+         fail(r, "LLVM backend: %s", error);
+         goto done;
+     }
+@@ -1166,17 +1232,24 @@
+     rc = 0;
+     goto done;
+ #endif
++    start = profile_now(r);
+ #ifdef _WIN32
+-    if (snx_link(inputs, n, exports, 1, "recompiled.dll", &linked, error, sizeof(error))) {
++    failed = snx_link(inputs, n, exports, 1, "recompiled.dll", &linked, error, sizeof(error));
+ #else
+-    if (snx_link(inputs, n, exports, 1, "recompiled.so", &linked, error, sizeof(error))) {
++    failed = snx_link(inputs, n, exports, 1, "recompiled.so", &linked, error, sizeof(error));
+ #endif
++    profile_end(r, SNX_PROFILE_LINK, start, 0, !failed);
++    if (failed) {
+         fail(r, "linking the recompiled module failed: %s", error);
+         goto done;
+     }
+     report(r, "LLVM module: %.1f MB\n", (double)linked.size / 1000000.0);
+-    if (load_image(r, m, linked.data, linked.size)) goto done;
+-    if (cached) save_cached(cached, linked.data, linked.size);
++    if (load_image(r, m, linked.data, linked.size, SNX_PROFILE_IMAGE_LOAD)) goto done;
++    if (cached) {
++        start = profile_now(r);
++        failed = save_cached(cached, linked.data, linked.size);
++        profile_end(r, SNX_PROFILE_CACHE_WRITE, start, linked.size, !failed);
++    }
+     {
+         DescriptorFn describe = (DescriptorFn)(uintptr_t)image_symbol(m, DESCRIPTOR_SYMBOL);
+         if (!describe) {
+@@ -1393,10 +1466,17 @@
+     SnxCodegen codegen;
+     uint64_t lo, hi;
+     size_t i;
++    double start = profile_now(r);
++    int failed;
+     r->error[0] = 0;
+     views = images(r, ranges, range_count, 1, &lo, &hi);
+-    if (!views) return NULL;
+-    if (snx_codegen_analyze_from(&codegen, views, range_count, hints, hint_count, limit, skip, context, r->features)) {
++    if (!views) {
++        profile_end(r, SNX_PROFILE_DISCOVERY, start, 0, 0);
++        return NULL;
++    }
++    failed = snx_codegen_analyze_from(&codegen, views, range_count, hints, hint_count, limit, skip, context, r->features);
++    profile_end(r, SNX_PROFILE_DISCOVERY, start, 0, !failed);
++    if (failed) {
+         fail(r, "no code at the starting addresses");
+         snx_codegen_free(&codegen);
+         free(views);

@@ -76,7 +76,7 @@ public:
 
 template <typename AddressType>
 void InvalidateInstructionCache(KernelCore& kernel, KPageTableBase* table, AddressType addr,
-                                u64 size) {
+                                u64 size, bool execute_revoked = false) {
     // TODO: lock the process list
     for (auto& process : kernel.GetProcessList()) {
         if (std::addressof(process->GetPageTable().GetBasePageTable()) != table) {
@@ -86,7 +86,11 @@ void InvalidateInstructionCache(KernelCore& kernel, KPageTableBase* table, Addre
         for (size_t i = 0; i < Core::Hardware::NUM_CPU_CORES; i++) {
             auto* interface = process->GetArmInterface(i);
             if (interface) {
-                interface->InvalidateCacheRange(GetInteger(addr), size);
+                if (execute_revoked) {
+                    interface->InvalidateCacheOnExecuteRevocation(GetInteger(addr), size);
+                } else {
+                    interface->InvalidateCacheRange(GetInteger(addr), size);
+                }
             }
         }
     }
@@ -2068,6 +2072,9 @@ Result KPageTableBase::SetProcessMemoryPermission(KProcessAddress addr, size_t s
 
     // Perform mapping operation.
     const KPageProperties properties = {new_perm, false, false, DisableMergeAttribute::None};
+    if (was_x && !is_x) {
+        InvalidateInstructionCache(m_system.Kernel(), this, addr, size, true);
+    }
     const auto operation = was_x ? OperationType::ChangePermissionsAndRefreshAndFlush
                                  : OperationType::ChangePermissions;
     R_TRY(this->Operate(updater.GetPageList(), addr, num_pages, 0, false, properties, operation,

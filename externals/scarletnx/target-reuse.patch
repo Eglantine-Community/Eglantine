@@ -1,0 +1,276 @@
+--- a/src/common/cpu/recompiler/library.c
++++ b/src/common/cpu/recompiler/library.c
+@@ -83,6 +83,8 @@
+     snx_profile_fn profile;
+     void* profile_context;
+     int inprocess_delta_loader;
++    int reuse_delta_target;
++    SnxIrTargetCache delta_target;
+     /* PowerPC64: the code arena every module of the recompiler is loaded into, with the runtime library once, so all
+        of them share one TOC (code_loader.h): a guest's jump from one module's code into another's keeps r2. Made by
+        the first module, freed with the last (an execve frees them all) */
+@@ -94,6 +96,11 @@
+     r->inprocess_delta_loader = enabled != 0;
+ }
+ 
++void snx_recompiler_set_reuse_delta_target(struct snx_recompiler* r, int enabled) {
++    r->reuse_delta_target = enabled != 0;
++    if (!enabled) snx_ir_target_cache_clear(&r->delta_target);
++}
++
+ void snx_recompiler_set_profile(struct snx_recompiler* r, snx_profile_fn fn, void* context) {
+     r->profile = fn;
+     r->profile_context = context;
+@@ -214,6 +221,7 @@
+ void snx_recompiler_free(struct snx_recompiler* r) {
+     if (r) free(r->cache);
+     if (!r) return;
++    snx_ir_target_cache_clear(&r->delta_target);
+     free(r->keep_ir);
+     snx_code_loader_free(r->arena);
+     free(r);
+@@ -221,6 +229,7 @@
+ 
+ int snx_recompiler_forked(struct snx_recompiler* r) {
+     char error[512];
++    snx_ir_target_cache_clear(&r->delta_target);
+     if (!r->arena || !snx_code_loader_unshare(r->arena, error, sizeof(error))) return 0;
+     fail(r, "%s", error);
+     return -1;
+@@ -233,6 +242,7 @@
+         fail(r, "optimization level must be 0, 1, 2, 3, s or z");
+         return -1;
+     }
++    if (r->opt != opt) snx_ir_target_cache_clear(&r->delta_target);
+     r->opt = opt;
+     return 0;
+ }
+@@ -747,6 +757,7 @@
+     Unit* units;
+     size_t count, next, done;
+     int failed;
++    int serial_delta;
+     char error[1024];
+ #ifdef _WIN32
+     CRITICAL_SECTION lock;
+@@ -780,6 +791,22 @@
+     return rc;
+ }
+ 
++static SnxIr* new_delta_ir(struct snx_recompiler* r, const char* name, char* error, size_t error_size) {
++    SnxIrTargetCache* owner = NULL;
++    SnxIr* ir;
++    enum snx_profile_stage stage;
++    double start;
++#if defined(__linux__) && defined(__x86_64__) && !defined(__ANDROID__) && !defined(__ILP32__)
++    if (r->reuse_delta_target && r->opt == '0') owner = &r->delta_target;
++#endif
++    stage = owner && owner->tm ? SNX_PROFILE_LLVM_REUSED_TARGET_IR : SNX_PROFILE_LLVM_NEW_TARGET_IR;
++    start = profile_now(r);
++    ir = owner ? snx_ir_new_cached_target(name, r->opt, owner, error, error_size)
++               : snx_ir_new(name, r->opt, error, error_size);
++    profile_end(r, stage, start, 0, ir != NULL);
++    return ir;
++}
++
+ static int llvm_unit(Queue* q, size_t index, char* error, size_t error_size) {
+     Unit* u = &q->units[index];
+     char name[32];
+@@ -787,7 +814,8 @@
+     SnxIr* ir;
+     int rc = 0;
+     snprintf(name, sizeof(name), "code_%03lu", (unsigned long)index);
+-    ir = snx_ir_new(name, q->r->opt, error, error_size);
++    ir = q->serial_delta ? new_delta_ir(q->r, name, error, error_size)
++                        : snx_ir_new(name, q->r->opt, error, error_size);
+     if (!ir) return -1;
+     if (q->codegen->hook_direct_calls) snx_ir_stale_checks(ir);
+     for (i = u->first; i < u->last; ++i) snx_ir_emit(ir, q->codegen, &q->codegen->functions[i]);
+@@ -1279,6 +1307,8 @@
+     q.count = count;
+     q.r = r;
+     q.codegen = codegen;
++    /* run_queue clamps jobs to count, so only the caller uses this target. */
++    q.serial_delta = incremental && count == 1;
+     report(r, "LLVM: %lu code unit%s and the descriptor\n", (unsigned long)count, count == 1 ? "" : "s");
+     if (count) run_queue(&q, r->jobs);
+     profile_end(r, SNX_PROFILE_LLVM_UNITS, start, 0, !q.failed);
+@@ -1287,7 +1317,8 @@
+         goto done;
+     }
+     start = profile_now(r);
+-    ir = snx_ir_new("module", r->opt, error, sizeof(error));
++    ir = q.serial_delta ? new_delta_ir(r, "module", error, sizeof(error))
++                        : snx_ir_new("module", r->opt, error, sizeof(error));
+     if (!ir || llvm_descriptor(ir, codegen, error, sizeof(error)) ||
+         (r->keep_ir && save_ir(ir, r->keep_ir, "module")) ||
+         snx_ir_object(ir, r->opt, &descriptor_object, &descriptor_size, error, sizeof(error))) {
+--- a/src/common/cpu/recompiler/snx_recompiler.h
++++ b/src/common/cpu/recompiler/snx_recompiler.h
+@@ -85,6 +85,8 @@
+    With it enabled, incremental compilation requires a verified W^X policy, including cache
+    hits. Cache hits still use the default loader; rejected fresh images fail compilation. */
+ SNX_RECOMPILER_API void snx_recompiler_set_inprocess_delta_loader(struct snx_recompiler* r, int enabled);
++/* Optional Linux x86-64 optimization for serial, single-unit -O0 snx_recompile_from deltas. */
++SNX_RECOMPILER_API void snx_recompiler_set_reuse_delta_target(struct snx_recompiler* r, int enabled);
+ /* Embedder timings: host wall nanoseconds and I/O bytes (zero for non-I/O stages).
+    CACHE_LOOKUP includes CACHE_READ and any CACHE_IMAGE_LOAD. CACHE_IMAGE_LOAD and IMAGE_LOAD
+    (newly linked modules) both include IMAGE_WRITE and DLOPEN when used. IMAGE_LOAD can also
+@@ -112,6 +114,10 @@
+     SNX_PROFILE_INPROCESS_LOAD,
+     SNX_PROFILE_INPROCESS_MAP,
+     SNX_PROFILE_INPROCESS_DESCRIPTOR,
++    /* Disjoint IR setup counts/times nested in LLVM_UNITS or LLVM_METADATA on single-unit deltas.
++       Both include fresh context/module setup, NEW_TARGET_IR also constructs a target machine. */
++    SNX_PROFILE_LLVM_NEW_TARGET_IR,
++    SNX_PROFILE_LLVM_REUSED_TARGET_IR,
+     SNX_PROFILE_STAGE_COUNT,
+ };
+ typedef void (*snx_profile_fn)(void* context, enum snx_profile_stage stage, uint64_t ns,
+--- a/src/common/cpu/recompiler/llvm/ir.h
++++ b/src/common/cpu/recompiler/llvm/ir.h
+@@ -112,6 +112,7 @@
+     LLVMModuleRef mod;
+     LLVMBuilderRef b;
+     LLVMTargetMachineRef tm;
++    int borrowed_target;
+     int windows;
+     const SnxIrFeatures* features;
+     LLVMTypeRef t_void, t_i1, t_i8, t_i16, t_i32, t_i64, t_i128, t_ptr, t_guest;
+@@ -164,6 +165,18 @@
+ int snx_ir_slp(void);
+ /* opt is the -O letter: 0,1,2,3,s,z */
+ SnxIr* snx_ir_new(const char* name, char opt, char* error, size_t error_size);
++/* Serial native library deltas only, without tuning. Give each IR a fresh context/module.
++   Zero-initialize the owner and never borrow it from overlapping compilations. */
++typedef struct {
++    LLVMTargetMachineRef tm;
++    char* triple;
++    char* layout;
++    char opt;
++    int big_endian, elfv2;
++} SnxIrTargetCache;
++SnxIr* snx_ir_new_cached_target(const char* name, char opt, SnxIrTargetCache* owner, char* error,
++                                size_t error_size);
++void snx_ir_target_cache_clear(SnxIrTargetCache* owner);
+ /* the same for code the JIT loader loads into this process (code_loader.h): the host's target, CPU and calling
+    convention, its objects in the format the loader reads, ELF on Darwin, whose own is Mach-O */
+ SnxIr* snx_ir_new_jit(const char* name, char opt, char* error, size_t error_size);
+--- a/src/common/cpu/recompiler/llvm/ir.c
++++ b/src/common/cpu/recompiler/llvm/ir.c
+@@ -131,21 +131,37 @@
+     return triple;
+ }
+ 
+-static SnxIr* new_ir(const char* name, char opt, const char* target_triple, int jit, char* error, size_t error_size);
++static SnxIr* new_ir(const char* name, char opt, const char* target_triple, int jit, SnxIrTargetCache* owner,
++                     char* error, size_t error_size);
+ 
+ SnxIr* snx_ir_new(const char* name, char opt, char* error, size_t error_size) {
+-    return new_ir(name, opt, NULL, 0, error, error_size);
++    return new_ir(name, opt, NULL, 0, NULL, error, error_size);
++}
++
++SnxIr* snx_ir_new_cached_target(const char* name, char opt, SnxIrTargetCache* owner, char* error,
++                                size_t error_size) {
++    if (owner->tm && owner->opt != opt) snx_ir_target_cache_clear(owner);
++    return new_ir(name, opt, NULL, 0, owner, error, error_size);
++}
++
++void snx_ir_target_cache_clear(SnxIrTargetCache* owner) {
++    if (!owner->tm) return;
++    LLVMDisposeTargetMachine(owner->tm);
++    LLVMDisposeMessage(owner->triple);
++    LLVMDisposeMessage(owner->layout);
++    memset(owner, 0, sizeof(*owner));
+ }
+ 
+ SnxIr* snx_ir_new_jit(const char* name, char opt, char* error, size_t error_size) {
+-    return new_ir(name, opt, NULL, 1, error, error_size);
++    return new_ir(name, opt, NULL, 1, NULL, error, error_size);
+ }
+ 
+ SnxIr* snx_ir_new_target(const char* name, char opt, const char* target_triple, char* error, size_t error_size) {
+-    return new_ir(name, opt, target_triple, 0, error, error_size);
++    return new_ir(name, opt, target_triple, 0, NULL, error, error_size);
+ }
+ 
+-static SnxIr* new_ir(const char* name, char opt, const char* target_triple, int jit, char* error, size_t error_size) {
++static SnxIr* new_ir(const char* name, char opt, const char* target_triple, int jit, SnxIrTargetCache* owner,
++                     char* error, size_t error_size) {
+     SnxIr* ir;
+     char *triple, *cpu, *features, *message = NULL, *layout;
+     int ppc;
+@@ -154,6 +170,14 @@
+     LLVMTypeRef params[2];
+     ir = (SnxIr*)calloc(1, sizeof(*ir));
+     if (!ir) return NULL;
++    if (owner && owner->tm) {
++        ir->tm = owner->tm;
++        ir->big_endian = owner->big_endian;
++        ir->elfv2 = owner->elfv2;
++        triple = owner->triple;
++        layout = owner->layout;
++        goto configure_module;
++    }
+     triple = target_triple ? LLVMCreateMessage(target_triple) : host_triple(jit);
+     if (LLVMGetTargetFromTriple(triple, &target, &message)) {
+         snprintf(error, error_size, "LLVM target %s: %s", triple, message ? message : "unavailable");
+@@ -226,25 +250,40 @@
+         ir->tm = LLVMCreateTargetMachine(target, triple, cpu, features, codegen_level(opt), LLVMRelocPIC,
+                                          loongarch_triple(triple) ? LLVMCodeModelMedium : LLVMCodeModelDefault);
+     }
++    if (!ir->tm) {
++        snprintf(error, error_size, "cannot create the LLVM target machine for %s", triple);
++        LLVMDisposeMessage(triple);
++        LLVMDisposeMessage(cpu);
++        LLVMDisposeMessage(features);
++        free(ir);
++        return NULL;
++    }
+ #ifdef __ANDROID__
+     /* AArch64's machine outliner holds a unit's functions in memory and outlines nothing at O2: on Android that memory
+        runs the recompile out of mappings */
+     LLVMSetTargetMachineMachineOutliner(ir->tm, 0);
+ #endif
+-    ir->windows = strstr(triple, "windows") != NULL || strstr(triple, "mingw") != NULL;
+-    ir->features = target_triple ? &generic_features : &snx_ir_host;
+-    ir->ctx = LLVMContextCreate();
+-    ir->mod = LLVMModuleCreateWithNameInContext(name, ir->ctx);
+-    LLVMSetTarget(ir->mod, triple);
+     data = LLVMCreateTargetDataLayout(ir->tm);
+     ir->big_endian = LLVMByteOrder(data) == LLVMBigEndian;
+     layout = LLVMCopyStringRepOfTargetData(data);
+-    LLVMSetDataLayout(ir->mod, layout);
+-    LLVMDisposeMessage(layout);
+     LLVMDisposeTargetData(data);
+-    LLVMDisposeMessage(triple);
+     LLVMDisposeMessage(cpu);
+     LLVMDisposeMessage(features);
++    if (owner)
++        *owner = (SnxIrTargetCache){ir->tm, triple, layout, opt, ir->big_endian, ir->elfv2};
++
++configure_module:
++    ir->borrowed_target = owner != NULL;
++    ir->windows = strstr(triple, "windows") != NULL || strstr(triple, "mingw") != NULL;
++    ir->features = target_triple ? &generic_features : &snx_ir_host;
++    ir->ctx = LLVMContextCreate();
++    ir->mod = LLVMModuleCreateWithNameInContext(name, ir->ctx);
++    LLVMSetTarget(ir->mod, triple);
++    LLVMSetDataLayout(ir->mod, layout);
++    if (!owner) {
++        LLVMDisposeMessage(layout);
++        LLVMDisposeMessage(triple);
++    }
+     ir->b = LLVMCreateBuilderInContext(ir->ctx);
+     ir->t_void = LLVMVoidTypeInContext(ir->ctx);
+     ir->t_i1 = LLVMInt1TypeInContext(ir->ctx);
+@@ -281,7 +320,7 @@
+     LLVMDisposeBuilder(ir->b);
+     LLVMDisposeModule(ir->mod);
+     LLVMContextDispose(ir->ctx);
+-    LLVMDisposeTargetMachine(ir->tm);
++    if (!ir->borrowed_target) LLVMDisposeTargetMachine(ir->tm);
+     free(ir);
+ }
+ 

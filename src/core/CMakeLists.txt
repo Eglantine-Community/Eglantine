@@ -1322,6 +1322,21 @@ if (HAS_NCE)
     target_link_libraries(core PRIVATE merry::oaknut)
 endif()
 
+if (ENABLE_SCARLETNX)
+    target_sources(core PRIVATE
+        arm/scarletnx/arm_scarletnx_64.cpp
+        arm/scarletnx/arm_scarletnx_64.h
+        arm/scarletnx/scarletnx_api.h
+        arm/scarletnx/scarletnx_jit_budget.h
+        arm/scarletnx/scarletnx_process.cpp
+        arm/scarletnx/scarletnx_process.h)
+    set_property(SOURCE hle/kernel/k_process.cpp APPEND PROPERTY COMPILE_DEFINITIONS HAS_SCARLETNX=1)
+    set_property(SOURCE hle/kernel/k_process.cpp arm/scarletnx/arm_scarletnx_64.cpp
+                 arm/scarletnx/scarletnx_process.cpp APPEND PROPERTY INCLUDE_DIRECTORIES
+                 ${SCARLETNX_INCLUDE_DIRS})
+    target_link_libraries(core PRIVATE ScarletNX::recompiler)
+endif()
+
 if (ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64 OR ARCHITECTURE_riscv64 OR ARCHITECTURE_loongarch64)
     target_sources(core PRIVATE
         arm/dynarmic/arm_dynarmic.h

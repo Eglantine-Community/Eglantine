@@ -36,6 +36,7 @@ enum class HaltReason : u64 {
     SupervisorCall = 0x04000000,
     InstructionBreakpoint = 0x08000000,
     PrefetchAbort = 0x20000000,
+    CodeCacheMiss = 0x100000000,
 };
 DECLARE_ENUM_FLAG_OPERATORS(HaltReason);
 
@@ -62,6 +63,12 @@ public:
     // Runs the CPU for one instruction or until an event happens.
     virtual HaltReason StepThread(Kernel::KThread* thread) = 0;
 
+    // Resolves a code-cache miss after leaving the physical core's running context.
+    virtual void ResolveCodeCacheMiss() {}
+
+    // Reports a memory fault after leaving the physical core's running context.
+    virtual void ReportMemoryFault() {}
+
     // Admits a backend-specific mechanism to lock the thread context.
     virtual void LockThread(Kernel::KThread* thread) {}
     virtual void UnlockThread(Kernel::KThread* thread) {}
@@ -71,6 +78,8 @@ public:
 
     // Clear a range of the instruction cache for this CPU.
     virtual void InvalidateCacheRange(u64 addr, std::size_t size) = 0;
+
+    virtual void InvalidateCacheOnExecuteRevocation(u64 addr, std::size_t size) {}
 
     // Get the current architecture.
     // This returns AArch64 when PSTATE.nRW == 0 and AArch32 when PSTATE.nRW == 1.

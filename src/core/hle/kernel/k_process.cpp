@@ -26,6 +26,10 @@
 #ifdef HAS_NCE
 #include "core/arm/nce/arm_nce.h"
 #endif
+#ifdef HAS_SCARLETNX
+#include "core/arm/scarletnx/arm_scarletnx_64.h"
+#include "core/arm/scarletnx/scarletnx_process.h"
+#endif
 
 namespace Kernel {
 
@@ -1323,7 +1327,17 @@ void KProcess::InitializeInterfaces(KernelCore& kernel) {
             m_arm_interfaces[i] = std::make_unique<Core::ArmNce>(kernel.System(), true, i);
     } else
 #endif
-        if (this->Is64Bit()) {
+#ifdef HAS_SCARLETNX
+    if (Core::ScarletNxProcess::ShouldUse(kernel.System(), *this)) {
+        auto scarletnx = std::make_shared<Core::ScarletNxProcess>(kernel.System(), *this);
+        for (auto& interface : m_arm_interfaces) {
+            interface = std::make_unique<Core::ArmScarletNx64>(scarletnx);
+        }
+        LOG_INFO(Core_ARM, "Using ScarletNX for process {:016X}", m_program_id);
+        return;
+    }
+#endif
+    if (this->Is64Bit()) {
         for (size_t i = 0; i < Core::Hardware::NUM_CPU_CORES; i++) {
             m_arm_interfaces[i] = std::make_unique<Core::ArmDynarmic64>(
                 kernel.System(), kernel.IsMulticore(), this,

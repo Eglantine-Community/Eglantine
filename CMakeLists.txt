@@ -759,7 +759,23 @@ if (MSVC AND CXX_CLANG)
     link_libraries(llvm-mingw-runtime)
 endif()
 
+option(ENABLE_SCARLETNX "Build the experimental ScarletNX AArch64 CPU backend" OFF)
+if (ENABLE_SCARLETNX)
+    include(ScarletNX)
+endif()
+
 add_subdirectory(src)
+
+if (ENABLE_SCARLETNX)
+    set_property(SOURCE src/common/settings.cpp TARGET_DIRECTORY common
+                 APPEND PROPERTY COMPILE_DEFINITIONS HAS_SCARLETNX=1)
+    if (ENABLE_QT)
+        set_property(SOURCE src/qt_common/config/shared_translation.cpp TARGET_DIRECTORY qt_common
+                     APPEND PROPERTY COMPILE_DEFINITIONS HAS_SCARLETNX=1)
+        set_property(SOURCE src/yuzu/configuration/configure_cpu.cpp TARGET_DIRECTORY yuzu
+                     APPEND PROPERTY COMPILE_DEFINITIONS HAS_SCARLETNX=1)
+    endif()
+endif()
 
 if (ENABLE_DEBUG_TOOLS)
     add_subdirectory(tools/maxwell-disas)

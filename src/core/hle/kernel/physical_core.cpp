@@ -128,6 +128,11 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
         // Since scheduling may occur here, we cannot use any cached
         // state after returning from calls we make.
 
+        if (True(hr & Core::HaltReason::CodeCacheMiss)) {
+            interface->ResolveCodeCacheMiss();
+            return;
+        }
+
         // Notify the debugger and go to sleep if a breakpoint was hit,
         // or if the thread is unable to continue for any reason.
         if (breakpoint || prefetch_abort) {
@@ -143,6 +148,9 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
                 system.GetDebugger().NotifyThreadStopped(thread);
             } else {
                 interface->LogBacktrace(process);
+            }
+            if (prefetch_abort) {
+                interface->ReportMemoryFault();
             }
             thread->RequestSuspend(kernel, SuspendType::Debug);
             return;

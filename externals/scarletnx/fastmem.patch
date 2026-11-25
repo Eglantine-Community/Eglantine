@@ -1,0 +1,210 @@
+diff --git a/src/common/cpu/aarch64/cpu.h b/src/common/cpu/aarch64/cpu.h
+--- a/src/common/cpu/aarch64/cpu.h
++++ b/src/common/cpu/aarch64/cpu.h
+@@ -50,3 +50,4 @@
+       runs its entry through dispatch, where the runtime compiles the code there now. */
+-#define SNX_ABI 14
++/* Eglantine: guest CNTFRQ, confined fastmem addresses, and identity PAuth. */
++#define SNX_ABI 18
+ 
+@@ -96,5 +97,6 @@
+        calls rt->poll */
+     u32 poll;
++    u32 cntfrq;
+ } CPU;
+ 
+ /* The emitters bake these offsets into generated code, so modules built before a layout change would read the
+diff --git a/src/common/cpu/aarch64/decode/a64.profile b/src/common/cpu/aarch64/decode/a64.profile
+--- a/src/common/cpu/aarch64/decode/a64.profile
++++ b/src/common/cpu/aarch64/decode/a64.profile
+@@ -88,17 +88,19 @@
+ SEVL            PLAIN nop v8.0
+-XPACLRI         PLAIN FEAT_PAuth
+-PACIA1716       PLAIN FEAT_PAuth
+-PACIB1716       PLAIN FEAT_PAuth
+-AUTIA1716       PLAIN FEAT_PAuth
+-AUTIB1716       PLAIN FEAT_PAuth
++# Eglantine does not sign user pointers. PAuth HINTs are identity operations
++# on both targets, including on the Cortex-A57 where they fall back to HINT.
++XPACLRI         PLAIN nop v8.0
++PACIA1716       PLAIN nop v8.0
++PACIB1716       PLAIN nop v8.0
++AUTIA1716       PLAIN nop v8.0
++AUTIB1716       PLAIN nop v8.0
+ ESB             PLAIN FEAT_RAS
+ GCSB            PLAIN FEAT_GCS
+-PACIAZ          PLAIN FEAT_PAuth
+-PACIASP         PLAIN FEAT_PAuth
+-PACIBZ          PLAIN FEAT_PAuth
+-PACIBSP         PLAIN FEAT_PAuth
+-AUTIAZ          PLAIN FEAT_PAuth
+-AUTIASP         PLAIN FEAT_PAuth
+-AUTIBZ          PLAIN FEAT_PAuth
+-AUTIBSP         PLAIN FEAT_PAuth
++PACIAZ          PLAIN nop v8.0
++PACIASP         PLAIN nop v8.0
++PACIBZ          PLAIN nop v8.0
++PACIBSP         PLAIN nop v8.0
++AUTIAZ          PLAIN nop v8.0
++AUTIASP         PLAIN nop v8.0
++AUTIBZ          PLAIN nop v8.0
++AUTIBSP         PLAIN nop v8.0
+ CHKFEAT         PLAIN FEAT_CHK
+diff --git a/src/common/cpu/recompiler/llvm/ir_codegen.c b/src/common/cpu/recompiler/llvm/ir_codegen.c
+--- a/src/common/cpu/recompiler/llvm/ir_codegen.c
++++ b/src/common/cpu/recompiler/llvm/ir_codegen.c
+@@ -256,7 +256,10 @@
+     }
+     if (snx_ir_ldst_handles(insn->op) || snx_ir_fpu_handles(insn->op) || snx_ir_vec_handles(insn->op))
+         return insn->flow;
+-    if (snx_ir_int_handles(insn->op) && !(insn->feature & ~(SnxU64)SNX_A64_TARGET_SWITCH)) return insn->flow;
++    /* The decoder has already checked the guest feature and reserved PAuth fields. */
++    if (snx_ir_int_handles(insn->op) &&
++        !(insn->feature & ~(SnxU64)(SNX_A64_TARGET_SWITCH | SNX_A64_FEAT_PAUTH)))
++        return insn->flow;
+     return SNX_A64_FLOW_UNDEF;
+ }
+ 
+diff --git a/src/common/cpu/recompiler/llvm/ir_int.c b/src/common/cpu/recompiler/llvm/ir_int.c
+--- a/src/common/cpu/recompiler/llvm/ir_int.c
++++ b/src/common/cpu/recompiler/llvm/ir_int.c
+@@ -472,5 +472,6 @@
+         case SYSREG(3, 0, 0, 7): return ir_i64(ir, SWITCH_DCZID_EL0);
+-        case SYSREG(3, 14, 0, 0): return ir_i64(ir, SWITCH_CNTFRQ);
++        case SYSREG(3, 14, 0, 0):
++            return ir_u64(ir, ir_cpu_load(ir, ir->t_i32, offsetof(CPU, cntfrq)));
+         case SYSREG(3, 14, 0, 1): /* CNTPCT_EL0, the SDK's system tick */
+         case SYSREG(3, 14, 0, 2): /* CNTVCT_EL0 */
+             return mrs_helper(ir, key);
+@@ -605,7 +606,34 @@
+         case SNX_A64_OP_BLR:
+         case SNX_A64_OP_RET:
++        case SNX_A64_OP_RETA:
+         case SNX_A64_OP_SVC:
+         case SNX_A64_OP_BRK:
+         case SNX_A64_OP_NOP:
++        /* Eglantine's PAuth HINTs have no register or flag effects. */
++        case SNX_A64_OP_XPACLRI:
++        case SNX_A64_OP_PACIA1716:
++        case SNX_A64_OP_PACIB1716:
++        case SNX_A64_OP_AUTIA1716:
++        case SNX_A64_OP_AUTIB1716:
++        case SNX_A64_OP_PACIAZ:
++        case SNX_A64_OP_PACIASP:
++        case SNX_A64_OP_PACIBZ:
++        case SNX_A64_OP_PACIBSP:
++        case SNX_A64_OP_AUTIAZ:
++        case SNX_A64_OP_AUTIASP:
++        case SNX_A64_OP_AUTIBZ:
++        case SNX_A64_OP_AUTIBSP:
++        /* As in Dynarmic, register PAC/AUT/XPAC leave the pointer unchanged. */
++        case SNX_A64_OP_PACIA:
++        case SNX_A64_OP_PACIB:
++        case SNX_A64_OP_PACDA:
++        case SNX_A64_OP_PACDB:
++        case SNX_A64_OP_AUTIA:
++        case SNX_A64_OP_AUTIB:
++        case SNX_A64_OP_AUTDA:
++        case SNX_A64_OP_AUTDB:
++        case SNX_A64_OP_XPACI:
++        case SNX_A64_OP_XPACD:
++        case SNX_A64_OP_PACGA:
+         case SNX_A64_OP_YIELD:
+         case SNX_A64_OP_WFE:
+@@ -681,6 +709,13 @@
+                     crc32(ir, ir_u32(ir, ir_rx(ir, (unsigned)a->rn)), ir_rx(ir, (unsigned)a->rm), (unsigned)a->esz,
+                           op == SNX_A64_OP_CRC32C));
+             break;
++        case SNX_A64_OP_PACGA: {
++            /* Match Dynarmic's deterministic code. Only Rm can name SP. */
++            V mixed = LLVMBuildXor(B, ir_rx(ir, (unsigned)a->rn),
++                                    ir_x(ir, (unsigned)a->rm), "");
++            ir_setx(ir, (unsigned)a->rd, LLVMBuildAnd(B, mixed, ir_i64(ir, 0xffffffff00000000ULL), ""));
++            break;
++        }
+         case SNX_A64_OP_MADD_w:
+         case SNX_A64_OP_MSUB_w:
+         case SNX_A64_OP_MADD_x:
+@@ -723,5 +758,6 @@
+         case SNX_A64_OP_BLR:
+         case SNX_A64_OP_RET: return ir_rx(ir, (unsigned)a->rn);
++        case SNX_A64_OP_RETA: return ir_rx(ir, 30);
+         case SNX_A64_OP_SVC:
+         case SNX_A64_OP_BRK: return ir_i32(ir, (SnxU32)a->imm & 0xFFFFu);
+         default: return NULL;
+diff --git a/src/common/cpu/recompiler/llvm/ir_state.c b/src/common/cpu/recompiler/llvm/ir_state.c
+--- a/src/common/cpu/recompiler/llvm/ir_state.c
++++ b/src/common/cpu/recompiler/llvm/ir_state.c
+@@ -246,4 +246,9 @@
+ LLVMValueRef ir_mp(SnxIr* ir, LLVMValueRef address) {
+-    LLVMValueRef index = ir_u64(ir, address);
++    /* Follow Eglantine's address normalization, then keep the access in the fastmem arena.
++       Page zero is unmapped; the last page is excluded so a wide transfer cannot straddle the arena. */
++    LLVMValueRef index = LLVMBuildAnd(ir->b, ir_u64(ir, address), ir_i64(ir, 0xffffffffffffULL), "");
++    LLVMValueRef valid =
++        LLVMBuildICmp(ir->b, LLVMIntULT, index, ir_i64(ir, (1ULL << 39) - 4096), "");
++    index = LLVMBuildSelect(ir->b, valid, index, ir_i64(ir, 0), "");
+     return LLVMBuildGEP2(ir->b, ir->t_i8, ir->M, &index, 1, "");
+ }
+diff --git a/src/common/cpu/recompiler/library.c b/src/common/cpu/recompiler/library.c
+--- a/src/common/cpu/recompiler/library.c
++++ b/src/common/cpu/recompiler/library.c
+@@ -23,6 +23,7 @@
+ #include "common/cpu/recompiler/llvm/code_loader.h"
+ #include <llvm-c/Support.h>
+ #include <llvm-c/TargetMachine.h>
++#include <errno.h>
+ #include <stdarg.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -467,7 +468,8 @@
+ static int load_image(struct snx_recompiler* r, struct snx_recompiled* m, const unsigned char* data, size_t size) {
+     char *dir = NULL, *path = NULL;
+ #ifdef SNX_MEMFD
+-    {
++    /* snx_recompile_from deltas can live for the entire guest process. Do not hold an fd for each. */
++    if (m->view_count) {
+         int fd = memfd_create("scarletnx-recompiled", MFD_CLOEXEC);
+         if (fd >= 0) {
+             size_t done = 0;
+@@ -504,10 +506,17 @@
+ #ifdef _WIN32
+     path = snx_path_join(dir, "recompiled.dll");
+ #else
+-    path = snx_path_join(dir, "recompiled.so");
++    {
++        char name[48];
++        static unsigned long long serial;
++        /* A removed temp directory name may recur while dlopen still remembers the old path. */
++        snprintf(name, sizeof(name), "recompiled-%llu.so",
++                 __atomic_fetch_add(&serial, 1, __ATOMIC_RELAXED));
++        path = snx_path_join(dir, name);
++    }
+ #endif
+     if (snx_write_file(path, data, size)) {
+-        fail(r, "cannot write the recompiled module to %s", path);
++        fail(r, "cannot write the recompiled module to %s: %s", path, strerror(errno));
+         snx_remove_tree(dir);
+         free(dir);
+         free(path);
+diff --git a/src/common/utilities/common.c b/src/common/utilities/common.c
+--- a/src/common/utilities/common.c
++++ b/src/common/utilities/common.c
+@@ -595,10 +595,14 @@
+ }
+ int snx_write_file(const char* path, const void* data, size_t size) {
+     FILE* f = snx_fopen(path, "wb");
+-    int result;
+     if (!f) return 1;
+-    result = fwrite(data, 1, size, f) != size;
+-    return fclose(f) != 0 || result;
++    if (fwrite(data, 1, size, f) != size) {
++        int saved_errno = errno;
++        fclose(f);
++        errno = saved_errno;
++        return 1;
++    }
++    return fclose(f) != 0;
+ }
+ int snx_write_changed(const char* path, const void* data, size_t size) {
+     size_t n;

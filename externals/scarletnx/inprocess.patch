@@ -1,0 +1,487 @@
+--- a/src/common/cpu/recompiler/library.c
++++ b/src/common/cpu/recompiler/library.c
+@@ -21,6 +21,7 @@
+ #include "common/cpu/recompiler/llvm/jit_service.h"
+ #include "common/cpu/recompiler/llvm/link.h"
+ #include "common/cpu/recompiler/llvm/code_loader.h"
++#include "common/cpu/recompiler/llvm/fresh_image.h"
+ #include <llvm-c/Support.h>
+ #include <llvm-c/TargetMachine.h>
+ #include <errno.h>
+@@ -81,6 +82,7 @@
+     char error[1024];
+     snx_profile_fn profile;
+     void* profile_context;
++    int inprocess_delta_loader;
+     /* PowerPC64: the code arena every module of the recompiler is loaded into, with the runtime library once, so all
+        of them share one TOC (code_loader.h): a guest's jump from one module's code into another's keeps r2. Made by
+        the first module, freed with the last (an execve frees them all) */
+@@ -88,6 +90,10 @@
+     size_t arena_modules;
+ };
+ 
++void snx_recompiler_set_inprocess_delta_loader(struct snx_recompiler* r, int enabled) {
++    r->inprocess_delta_loader = enabled != 0;
++}
++
+ void snx_recompiler_set_profile(struct snx_recompiler* r, snx_profile_fn fn, void* context) {
+     r->profile = fn;
+     r->profile_context = context;
+@@ -120,6 +126,9 @@
+     void* image;       /* dlopen/LoadLibrary handle */
+     char* image_file;  /* Windows: the DLL's file, deleted after FreeLibrary */
+     int image_fd;      /* Linux: the memfd the module was loaded from, kept open while it is (see load_image) */
++#ifdef SNX_FRESH_IMAGE_SUPPORTED
++    SnxFreshImage fresh_image;
++#endif
+     GuestFn* dispatch; /* (pc - code_lo) >> 2 -> function, NULL for one the JIT compiles when reached */
+     /* snx_recompiled_set_fallback's: what a miss runs instead of the module's JIT, NULL for the JIT */
+     GuestFn fallback;
+@@ -594,6 +603,9 @@
+ }
+ 
+ static void unload_image(struct snx_recompiled* m) {
++#ifdef SNX_FRESH_IMAGE_SUPPORTED
++    if (m->fresh_image.size) snx_fresh_image_unload(&m->fresh_image);
++#endif
+     if (!m->image) return;
+ #ifdef _WIN32
+     FreeLibrary((HMODULE)m->image);
+@@ -614,8 +626,8 @@
+ static int load_descriptor(struct snx_recompiler* r, struct snx_recompiled* m, const Descriptor* d) {
+     size_t i, slots;
+     void** block;
+-    if (!d || d->abi != SNX_ABI) {
+-        fail(r, "the recompiled module's descriptor is missing or of another ABI");
++    if (!d || d->abi != SNX_ABI || (m->hook_direct_calls && !d->stale)) {
++        fail(r, "the recompiled module's descriptor is missing, incomplete or of another ABI");
+         return -1;
+     }
+     slots = (size_t)((m->code_hi - m->code_lo + 3) / 4);
+@@ -640,6 +652,87 @@
+     return 0;
+ }
+ 
++#ifdef SNX_FRESH_IMAGE_SUPPORTED
++static int checked_descriptor(const SnxFreshImage* image, const SnxFreshLayout* layout,
++                              const struct snx_recompiled* m, const Descriptor* d) {
++    size_t i;
++    const size_t rw = layout->rw_offset;
++    if ((uintptr_t)d % sizeof(uint64_t) ||
++        !snx_fresh_image_contains(image, d, sizeof(*d), rw, layout->rw_mem_size) ||
++        d->abi != SNX_ABI || d->reserved || d->interp || !d->count ||
++        d->count > (m->code_hi - m->code_lo) / 4 || d->count > SIZE_MAX / sizeof(GuestFn) ||
++        (uintptr_t)d->addresses % sizeof(uint64_t) || (uintptr_t)d->functions % sizeof(GuestFn) ||
++        !snx_fresh_image_contains(image, d->addresses, d->count * sizeof(uint64_t), 0, layout->r_size) ||
++        !snx_fresh_image_contains(image, d->functions, d->count * sizeof(GuestFn), rw, layout->rw_reloc_size))
++        return 0;
++    if (m->hook_direct_calls) {
++        if (!snx_fresh_image_contains(image, d->stale, m->functions, rw, layout->rw_mem_size)) return 0;
++    } else if (d->stale) {
++        return 0;
++    }
++    for (i = 0; i < d->count; ++i) {
++        uint64_t address = d->addresses[i];
++        if (address < m->code_lo || address >= m->code_hi || (address & 3) ||
++            (i && address <= d->addresses[i - 1]) ||
++            !snx_fresh_image_contains(image, (const void*)(uintptr_t)d->functions[i], 1,
++                                      layout->rx_offset, layout->rx_size))
++            return 0;
++    }
++    return 1;
++}
++
++static int try_fresh_image(struct snx_recompiler* r, struct snx_recompiled* m, const SnxLinkOutput* linked) {
++    SnxFreshImage image = {0};
++    double start = profile_now(r);
++    int rc = snx_fresh_image_load(linked, &image);
++    profile_end(r, SNX_PROFILE_INPROCESS_MAP, start, image.size, !rc);
++    if (rc) {
++        fail(r, "fresh incremental image failed mapping or protection validation");
++        return -1;
++    }
++    {
++        DescriptorFn describe = (DescriptorFn)(uintptr_t)(image.base + linked->fresh.descriptor);
++        const Descriptor* d;
++        start = profile_now(r);
++        d = describe();
++        if (!checked_descriptor(&image, &linked->fresh, m, d)) {
++            fail(r, "fresh incremental image has an invalid descriptor");
++            rc = -1;
++        } else {
++            rc = load_descriptor(r, m, d);
++        }
++        profile_end(r, SNX_PROFILE_INPROCESS_DESCRIPTOR, start, 0, !rc);
++    }
++    if (!rc)
++        m->fresh_image = image;
++    else
++        snx_fresh_image_unload(&image);
++    return rc;
++}
++#endif
++
++static int load_linked(struct snx_recompiler* r, struct snx_recompiled* m, const SnxLinkOutput* linked,
++                       int incremental, int* described) {
++    const double start = profile_now(r);
++    int rc;
++    *described = 0;
++#ifdef SNX_FRESH_IMAGE_SUPPORTED
++    if (incremental && r->inprocess_delta_loader) {
++        const double attempt = profile_now(r);
++        rc = try_fresh_image(r, m, linked);
++        profile_end(r, SNX_PROFILE_INPROCESS_LOAD, attempt, 0, !rc);
++        *described = !rc;
++        profile_end(r, SNX_PROFILE_IMAGE_LOAD, start, 0, !rc);
++        return rc;
++    }
++#else
++    (void)incremental;
++#endif
++    rc = load_image_impl(r, m, linked->data, linked->size);
++    profile_end(r, SNX_PROFILE_IMAGE_LOAD, start, 0, !rc);
++    return rc;
++}
++
+ /* ---- the LLVM backend ---- */
+ 
+ typedef struct {
+@@ -1121,7 +1214,7 @@
+ }
+ #endif
+ 
+-static int recompile_llvm(struct snx_recompiler* r, struct snx_recompiled* m, SnxCodegen* codegen) {
++static int recompile_llvm(struct snx_recompiler* r, struct snx_recompiled* m, SnxCodegen* codegen, int incremental) {
+     Queue q;
+     SnxIr* ir = NULL;
+     SnxLinkInput* inputs = NULL;
+@@ -1131,7 +1224,7 @@
+     size_t descriptor_size = 0, rtlib_size = 0, *units = NULL, count = 0, i, n = 0;
+     const char* exports[1];
+     char error[1024];
+-    int rc = -1, failed;
++    int rc = -1, failed, described;
+     char* cached = NULL;
+     double start;
+     memset(&q, 0, sizeof(q));
+@@ -1144,6 +1237,13 @@
+         fail(r, "%s", error);
+         return -1;
+     }
++#ifdef SNX_FRESH_IMAGE_SUPPORTED
++    /* dlopen also maps readable+writable pages. Check before even trying the disk cache. */
++    if (incremental && r->inprocess_delta_loader && !snx_fresh_image_policy_safe()) {
++        fail(r, "incremental image loading requires a verified W^X personality");
++        return -1;
++    }
++#endif
+     if (r->cache) {
+         start = profile_now(r);
+         cached = cache_path(r, codegen);
+@@ -1244,13 +1344,8 @@
+         goto done;
+     }
+     report(r, "LLVM module: %.1f MB\n", (double)linked.size / 1000000.0);
+-    if (load_image(r, m, linked.data, linked.size, SNX_PROFILE_IMAGE_LOAD)) goto done;
+-    if (cached) {
+-        start = profile_now(r);
+-        failed = save_cached(cached, linked.data, linked.size);
+-        profile_end(r, SNX_PROFILE_CACHE_WRITE, start, linked.size, !failed);
+-    }
+-    {
++    if (load_linked(r, m, &linked, incremental, &described)) goto done;
++    if (!described) {
+         DescriptorFn describe = (DescriptorFn)(uintptr_t)image_symbol(m, DESCRIPTOR_SYMBOL);
+         if (!describe) {
+             fail(r, "the recompiled module exports no descriptor");
+@@ -1258,6 +1353,11 @@
+         }
+         if (load_descriptor(r, m, describe())) goto done;
+     }
++    if (cached) {
++        start = profile_now(r);
++        failed = save_cached(cached, linked.data, linked.size);
++        profile_end(r, SNX_PROFILE_CACHE_WRITE, start, linked.size, !failed);
++    }
+     rc = 0;
+ done:
+     for (i = 0; i < count; ++i) free(q.units[i].object);
+@@ -1392,14 +1492,15 @@
+ }
+ 
+ /* the backend's half of snx_recompile_ranges and snx_recompile_from, for the functions codegen found; frees codegen */
+-static struct snx_recompiled* recompile(struct snx_recompiler* r, struct snx_recompiled* m, SnxCodegen* codegen) {
++static struct snx_recompiled* recompile(struct snx_recompiler* r, struct snx_recompiled* m, SnxCodegen* codegen,
++                                       int incremental) {
+     int rc;
+     m->functions = codegen->function_count;
+     /* A module that keeps its code has a JIT, and its units go in one file of the cache folder that the modules and
+        processes using the folder share. Without the memory for the path there is no file, and the JIT still works */
+     if (r->cache && m->view_count) m->jit_cache_path = snx_path_join(r->cache, "library-jit.cache");
+     m->hook_direct_calls = codegen->hook_direct_calls;
+-    rc = recompile_llvm(r, m, codegen);
++    rc = recompile_llvm(r, m, codegen, incremental);
+     if (!rc) rc = keep_invalidation_map(r, m, codegen);
+     snx_codegen_free(codegen);
+     if (rc) {
+@@ -1455,7 +1556,7 @@
+     free(views);
+     report(r, "%lu functions, %lu instructions\n", (unsigned long)codegen.function_count,
+            (unsigned long)codegen.instruction_count);
+-    return recompile(r, m, &codegen);
++    return recompile(r, m, &codegen, 0);
+ }
+ 
+ struct snx_recompiled* snx_recompile_from(struct snx_recompiler* r, const struct snx_code_range* ranges,
+@@ -1504,7 +1605,7 @@
+         if (first < m->code_lo) m->code_lo = first;
+         if (last > m->code_hi) m->code_hi = last;
+     }
+-    return recompile(r, m, &codegen);
++    return recompile(r, m, &codegen, 1);
+ }
+ 
+ void snx_recompiled_free(struct snx_recompiled* m) {
+--- a/src/common/cpu/recompiler/snx_recompiler.h
++++ b/src/common/cpu/recompiler/snx_recompiler.h
+@@ -81,9 +81,14 @@
+ SNX_RECOMPILER_API void snx_recompiler_set_hook_direct_calls(struct snx_recompiler* r, int enabled);
+ /* Progress lines on stdout, as the scarletnx command prints them; off by default */
+ SNX_RECOMPILER_API void snx_recompiler_set_verbose(struct snx_recompiler* r, int verbose);
++/* Optional Linux x86-64 loader for newly linked snx_recompile_from deltas only.
++   With it enabled, incremental compilation requires a verified W^X policy, including cache
++   hits. Cache hits still use the default loader; rejected fresh images fail compilation. */
++SNX_RECOMPILER_API void snx_recompiler_set_inprocess_delta_loader(struct snx_recompiler* r, int enabled);
+ /* Embedder timings: host wall nanoseconds and I/O bytes (zero for non-I/O stages).
+    CACHE_LOOKUP includes CACHE_READ and any CACHE_IMAGE_LOAD. CACHE_IMAGE_LOAD and IMAGE_LOAD
+-   (newly linked modules) both include IMAGE_WRITE and DLOPEN.
++   (newly linked modules) both include IMAGE_WRITE and DLOPEN when used. IMAGE_LOAD can also
++   include INPROCESS_LOAD; its children are INPROCESS_MAP and INPROCESS_DESCRIPTOR.
+    LLVM_METADATA includes RTLIB, which includes RTLIB_CACHE_READ and RTLIB_CACHE_WRITE.
+    A successful CACHE_LOOKUP means the cached module was loaded and accepted. Writes report
+    requested bytes; reads report bytes returned. Discovery timings cover snx_recompile_from.
+@@ -104,6 +109,9 @@
+     SNX_PROFILE_IMAGE_WRITE,
+     SNX_PROFILE_DLOPEN,
+     SNX_PROFILE_CACHE_WRITE,
++    SNX_PROFILE_INPROCESS_LOAD,
++    SNX_PROFILE_INPROCESS_MAP,
++    SNX_PROFILE_INPROCESS_DESCRIPTOR,
+     SNX_PROFILE_STAGE_COUNT,
+ };
+ typedef void (*snx_profile_fn)(void* context, enum snx_profile_stage stage, uint64_t ns,
+--- a/src/common/cpu/recompiler/llvm/CMakeLists.txt
++++ b/src/common/cpu/recompiler/llvm/CMakeLists.txt
+@@ -130,12 +130,12 @@
+ 
+ add_library(snx_llvm STATIC ir.c ir_state.c ir_emit.c ir_profile.c ir_helpers.c
+     ir_int.c ir_ldst.c ir_fpu.c ir_vec.c ir_vec_fp.c ir_vec_crypto.c ir_codegen.c link.c link_elf.c link_coff.c link_macho.c elf_object.c objects_pack.c
+-    code_loader.c code_loader_coff.c gdb_jit.c jit_service.c jit_cache.c "${PROJECT_SOURCE_DIR}/src/common/cpu/arm/exec.c"
++    code_loader.c code_loader_coff.c fresh_image.c gdb_jit.c jit_service.c jit_cache.c "${PROJECT_SOURCE_DIR}/src/common/cpu/arm/exec.c"
+     "${CMAKE_CURRENT_BINARY_DIR}/rtlib_object.c" "${CMAKE_CURRENT_BINARY_DIR}/rtlib_bitcode.c"
+     "${CMAKE_CURRENT_BINARY_DIR}/armlib_bitcode.c")
+ set_target_properties(snx_llvm PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS ON)
+ # The object loader needs no LLVM headers: strict C99 (RFC #142), after the target's -std
+-set_source_files_properties(elf_object.c code_loader.c code_loader_coff.c gdb_jit.c PROPERTIES COMPILE_OPTIONS "-std=c99;-pedantic-errors")
++set_source_files_properties(elf_object.c code_loader.c code_loader_coff.c fresh_image.c gdb_jit.c PROPERTIES COMPILE_OPTIONS "-std=c99;-pedantic-errors")
+ target_include_directories(snx_llvm SYSTEM PUBLIC "${SNX_LLVM_INCLUDE_DIR}")
+ target_compile_options(snx_llvm PRIVATE -Wall -Wextra -Werror=missing-prototypes)
+ target_compile_definitions(snx_llvm PRIVATE _CRT_SECURE_NO_WARNINGS)
+--- a/src/common/cpu/recompiler/llvm/link.h
++++ b/src/common/cpu/recompiler/llvm/link.h
+@@ -17,8 +17,16 @@
+ } SnxLinkInput;
+ 
+ typedef struct {
++    /* Fresh Linux/x86-64 image with a single function export. Offsets are both file offsets
++       and virtual addresses relative to the image base. A zero descriptor means unavailable. */
++    size_t r_size, rx_offset, rx_size, rw_offset, rw_file_size, rw_mem_size;
++    size_t rw_reloc_size, rela_offset, rela_count, descriptor;
++} SnxFreshLayout;
++
++typedef struct {
+     unsigned char* data; /* malloc'd */
+     size_t size;
++    SnxFreshLayout fresh;
+ } SnxLinkOutput;
+ 
+ /* Links by the format of the first input. exports name defined functions the shared library exports (by their C
+--- a/src/common/cpu/recompiler/llvm/link_elf.c
++++ b/src/common/cpu/recompiler/llvm/link_elf.c
+@@ -226,6 +226,7 @@
+     uint64_t hash_off, dynsym_off, dynstr_off, rela_off, rodata_off, text_off, data_off, got_off, dynamic_off, bss_off,
+         end_r, end_data, nbucket, *export_address;
+     size_t i, j, k, nsyms = export_count + 1, ndyn = 0, symbol_count = 0;
++    int single_text_export = 0;
+     int rc = -1;
+     unsigned char* p;
+     uint32_t word;
+@@ -397,6 +398,13 @@
+             goto done;
+         }
+         export_address[i] = symbol_address(&l, found >> 32, found & 0xFFFFFFFFu, &absolute);
++        if (export_count == 1 && !absolute) {
++            const SnxElfObject* object = &l.objs[found >> 32];
++            const Elf64_Sym* symbol = &object->syms[found & 0xFFFFFFFFu];
++            single_text_export = ELF64_ST_TYPE(symbol->st_info) == STT_FUNC &&
++                                 symbol->st_shndx < object->eh->e_shnum &&
++                                 object->kind[symbol->st_shndx] == SNX_ELF_TEXT;
++        }
+     }
+     /* .hash: nbucket, nchain, buckets, chains, words in the host's order as the dynamic loader reads them (a
+        big-endian PowerPC64 host's too) */
+@@ -584,6 +592,14 @@
+     memcpy(out.data, &eh, sizeof(eh));
+     output->data = out.data;
+     output->size = out.size;
++    if (l.machine == EM_X86_64 && single_text_export) {
++        output->fresh = (SnxFreshLayout){
++            .r_size = end_r, .rx_offset = text_off, .rx_size = ph[1].p_memsz,
++            .rw_offset = data_off, .rw_file_size = ph[2].p_filesz, .rw_mem_size = ph[2].p_memsz,
++            .rw_reloc_size = dynamic_off - data_off, .rela_offset = rela_off,
++            .rela_count = rela.size / sizeof(Elf64_Rela), .descriptor = export_address[0],
++        };
++    }
+     out.data = NULL;
+     rc = 0;
+ done:
+--- a/src/common/cpu/recompiler/llvm/fresh_image.h
++++ b/src/common/cpu/recompiler/llvm/fresh_image.h
+@@ -0,0 +1,28 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++   Copyright 2026 Eglantine Emulator Project */
++#ifndef SNX_FRESH_IMAGE_H
++#define SNX_FRESH_IMAGE_H
++
++#include "common/cpu/recompiler/llvm/link.h"
++
++#if defined(__linux__) && defined(__x86_64__) && !defined(__ILP32__) && !defined(__ANDROID__)
++#define SNX_FRESH_IMAGE_SUPPORTED 1
++
++typedef struct {
++    unsigned char* base;
++    size_t size;
++} SnxFreshImage;
++
++/* A failed personality query is not proof that readable pages are nonexecutable. */
++int snx_fresh_image_policy_safe(void);
++
++/* Only for the current call's linker output. No ELF headers, names or disk input are read.
++   image must be empty on entry and remains empty on failure. */
++int snx_fresh_image_load(const SnxLinkOutput* linked, SnxFreshImage* image);
++void snx_fresh_image_unload(SnxFreshImage* image);
++
++/* Check that a nonempty host range belongs to one of the image's logical segments. */
++int snx_fresh_image_contains(const SnxFreshImage* image, const void* address, size_t size,
++                             size_t segment, size_t segment_size);
++#endif
++#endif
+--- a/src/common/cpu/recompiler/llvm/fresh_image.c
++++ b/src/common/cpu/recompiler/llvm/fresh_image.c
+@@ -0,0 +1,106 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++   Copyright 2026 Eglantine Emulator Project */
++#if defined(__linux__) && !defined(_GNU_SOURCE)
++#define _GNU_SOURCE
++#endif
++#include "common/cpu/recompiler/llvm/fresh_image.h"
++
++#ifdef SNX_FRESH_IMAGE_SUPPORTED
++#include "common/cpu/recompiler/llvm/elf_defs.h"
++#include <string.h>
++#include <sys/mman.h>
++#include <sys/personality.h>
++#include <unistd.h>
++
++#define PAGE_SIZE_BYTES ((size_t)4096)
++#define MAX_IMAGE_BYTES ((size_t)64 << 20)
++
++static int fits(size_t offset, size_t size, size_t limit) {
++    return offset <= limit && size <= limit - offset;
++}
++
++static int within(size_t offset, size_t size, size_t start, size_t length) {
++    return offset >= start && fits(offset - start, size, length);
++}
++
++static size_t round_page(size_t size) {
++    return (size + PAGE_SIZE_BYTES - 1) & ~(PAGE_SIZE_BYTES - 1);
++}
++
++int snx_fresh_image_contains(const SnxFreshImage* image, const void* address, size_t size,
++                             size_t segment, size_t segment_size) {
++    uintptr_t base = (uintptr_t)image->base, ptr = (uintptr_t)address;
++    return image->base && size && fits(segment, segment_size, image->size) && ptr >= base &&
++           within(ptr - base, size, segment, segment_size);
++}
++
++static int valid_layout(const SnxLinkOutput* linked) {
++    const SnxFreshLayout* l = &linked->fresh;
++    /* Accept only three adjacent page ranges, R/RX/RW. */
++    return linked->data && l->r_size && l->rx_size && l->rw_file_size &&
++           l->r_size <= MAX_IMAGE_BYTES && l->r_size <= linked->size &&
++           fits(l->rx_offset, l->rx_size, MAX_IMAGE_BYTES) &&
++           fits(l->rx_offset, l->rx_size, linked->size) &&
++           fits(l->rw_offset, l->rw_mem_size, MAX_IMAGE_BYTES) &&
++           fits(l->rw_offset, l->rw_file_size, linked->size) &&
++           l->rx_offset == round_page(l->r_size) &&
++           l->rw_offset == round_page(l->rx_offset + l->rx_size) &&
++           l->rw_reloc_size <= l->rw_file_size && l->rw_file_size <= l->rw_mem_size &&
++           l->rela_offset <= l->r_size && l->rela_count <= (l->r_size - l->rela_offset) / sizeof(Elf64_Rela) &&
++           within(l->descriptor, 1, l->rx_offset, l->rx_size);
++}
++
++static int relocate(const SnxLinkOutput* linked, unsigned char* base) {
++    const SnxFreshLayout* l = &linked->fresh;
++    size_t i;
++    for (i = 0; i < l->rela_count; ++i) {
++        Elf64_Rela r;
++        size_t target;
++        memcpy(&r, linked->data + l->rela_offset + i * sizeof(r), sizeof(r));
++        if (r.r_info != ELF64_R_INFO(0, R_X86_64_RELATIVE) || r.r_addend <= 0 ||
++            r.r_offset % sizeof(uint64_t) ||
++            !within(r.r_offset, sizeof(uint64_t), l->rw_offset, l->rw_reloc_size))
++            return -1;
++        target = (size_t)r.r_addend;
++        if (target >= l->r_size && !within(target, 1, l->rx_offset, l->rx_size) &&
++            !within(target, 1, l->rw_offset, l->rw_mem_size))
++            return -1;
++        snx_link_put64(base + r.r_offset, (uintptr_t)(base + target));
++    }
++    return 0;
++}
++
++int snx_fresh_image_policy_safe(void) {
++    const int flags = personality(0xffffffffUL);
++    return flags >= 0 && !(flags & READ_IMPLIES_EXEC);
++}
++
++int snx_fresh_image_load(const SnxLinkOutput* linked, SnxFreshImage* image) {
++    const SnxFreshLayout* l = &linked->fresh;
++    unsigned char* base;
++    size_t size;
++    if (image->base || image->size || !valid_layout(linked) ||
++        sysconf(_SC_PAGESIZE) != PAGE_SIZE_BYTES || !snx_fresh_image_policy_safe())
++        return -1;
++    size = round_page(l->rw_offset + l->rw_mem_size);
++    base = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++    if (base == MAP_FAILED) return -1;
++    memcpy(base, linked->data, l->r_size);
++    memcpy(base + l->rx_offset, linked->data + l->rx_offset, l->rx_size);
++    memcpy(base + l->rw_offset, linked->data + l->rw_offset, l->rw_file_size);
++    if (relocate(linked, base) ||
++        mprotect(base, l->rx_offset, PROT_READ) ||
++        mprotect(base + l->rx_offset, l->rw_offset - l->rx_offset, PROT_READ | PROT_EXEC)) {
++        munmap(base, size);
++        return -1;
++    }
++    image->base = base;
++    image->size = size;
++    return 0;
++}
++
++void snx_fresh_image_unload(SnxFreshImage* image) {
++    if (image->size) munmap(image->base, image->size);
++    memset(image, 0, sizeof(*image));
++}
++#endif

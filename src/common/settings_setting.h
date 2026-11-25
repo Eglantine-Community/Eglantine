@@ -279,6 +279,9 @@ protected:
     const Type minimum{};       ///< Minimum allowed value of the setting
 };
 
+template <>
+void Setting<CpuBackend, true>::LoadString(const std::string& input);
+
 /**
  * The SwitchableSetting class is a slightly more complex version of the Setting class. This adds a
  * custom setting to switch to when a guest application specifically requires it. The effect is that

@@ -37,6 +37,7 @@ add_executable(tests
     common/cityhash.cpp
     common/container_hash.cpp
     common/cpu_layout.cpp
+    common/cpu_backend_settings.cpp
     common/event.cpp
     common/fibers.cpp
     common/game_presets.cpp
@@ -189,6 +190,14 @@ if (ENABLE_UPDATE_CHECKER)
 endif()
 
 target_link_libraries(tests PRIVATE common core input_common video_core Opus::opus)
+
+if (ENABLE_SCARLETNX)
+    target_sources(tests PRIVATE core/scarletnx.cpp)
+    set_property(SOURCE common/cpu_backend_settings.cpp APPEND PROPERTY COMPILE_DEFINITIONS HAS_SCARLETNX=1)
+    set_property(SOURCE core/scarletnx.cpp APPEND PROPERTY INCLUDE_DIRECTORIES ${SCARLETNX_INCLUDE_DIRS})
+    target_link_libraries(tests PRIVATE ScarletNX::recompiler)
+    target_link_options(tests PRIVATE "LINKER:--wrap=snx_fresh_image_load" "LINKER:--wrap=mprotect")
+endif()
 
 if (ENABLE_MCP_SERVER)
     target_sources(tests PRIVATE mcp/protocol.cpp)

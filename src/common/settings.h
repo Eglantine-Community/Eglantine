@@ -261,11 +261,7 @@ struct Values {
                                                     CpuBackend::Dynarmic,
 #endif
                                                     CpuBackend::Dynarmic,
-#ifdef HAS_NCE
-                                                    CpuBackend::Nce,
-#else
-                                                    CpuBackend::Dynarmic,
-#endif
+                                                    CpuBackend::ScarletNx,
                                                     "cpu_backend",
                                                     Category::Cpu};
     SwitchableSetting<CpuAccuracy, true> cpu_accuracy{linkage, CpuAccuracy::Auto,
