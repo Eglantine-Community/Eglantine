@@ -464,6 +464,7 @@ private slots:
 #ifdef ENABLE_UPDATE_CHECKER
     void OnEmulatorUpdateAvailable();
     void OnCheckForUpdates();
+    void OnVersionManager();
 #endif
 
 private:

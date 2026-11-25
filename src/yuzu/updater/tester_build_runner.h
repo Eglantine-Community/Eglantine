@@ -30,6 +30,8 @@ public:
 
     struct Options {
         QString source;
+        // A commit of the source to build instead of its newest one (--commit).
+        QString commit;
         // Rebuild even when the fetched commit is the one already built.
         bool force{};
         // The user agreed beforehand to install missing tools (--yes).
@@ -145,6 +147,8 @@ private:
     std::filesystem::path m_state_path;
     TesterBuild::State m_state;
     TesterBuild::Source m_source;
+    // The commit to build instead of the source's newest; empty for the newest.
+    std::string m_commit;
     TesterBuild::Recipe m_recipe;
     TesterBuild::Toolchain m_tools;
     TesterBuild::PackageManager m_manager{TesterBuild::PackageManager::None};

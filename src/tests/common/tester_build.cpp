@@ -155,6 +155,7 @@ TEST_CASE("State round trips", "[tester]") {
     state.built_at = 1'700'000'000;
     state.pr_warning_shown = true;
     state.auto_source = "nx2-experimental";
+    state.start_tester = true;
 
     std::error_code ec;
     REQUIRE(SaveState(file, state, ec));
@@ -170,6 +171,7 @@ TEST_CASE("State round trips", "[tester]") {
     CHECK(loaded.built_at == state.built_at);
     CHECK(loaded.pr_warning_shown);
     CHECK(loaded.auto_source == "nx2-experimental");
+    CHECK(loaded.start_tester);
 
     state.source = Source{Source::Kind::Branch, "dev", 0};
     REQUIRE(SaveState(file, state, ec));
@@ -907,6 +909,7 @@ TEST_CASE("DecideLaunch follows the policy", "[tester]") {
     State state;
     state.source = Source{Source::Kind::Branch, "dev", 0};
     state.built_sha = Sha1;
+    state.start_tester = true;
     const auto decide = [&](bool self_is_tester, bool release_flag, bool install_exists,
                             const std::optional<RemoteInfo>& remote) {
         return DecideLaunch(state, self_is_tester, release_flag, install_exists, remote);
@@ -943,6 +946,10 @@ TEST_CASE("DecideLaunch counts this exe as the build of its own commit", "[teste
     CHECK(decide(false, false, RemoteInfo{Sha1}) == LaunchAction::RunRelease);
     CHECK(decide(false, false, RemoteInfo{Sha2}) == LaunchAction::OfferUpdate);
     CHECK(decide(false, false, RemoteInfo{}) == LaunchAction::RunRelease);
+    // Without a tester build launched last, only this exe's own update is offered.
+    CHECK(DecideLaunch(state, false, false, false, RemoteInfo{Sha2}, std::nullopt) ==
+          LaunchAction::RunRelease);
+    state.start_tester = true;
     // Not a build of the followed source (or no valid commit): the first build is offered.
     CHECK(DecideLaunch(state, false, false, false, RemoteInfo{Sha2}, std::nullopt) ==
           LaunchAction::OfferFirstBuild);
@@ -965,6 +972,7 @@ TEST_CASE("DecideLaunch on a closed pull request", "[tester]") {
     State state;
     state.source = Source{Source::Kind::PullRequest, {}, 838};
     state.built_sha = Sha1;
+    state.start_tester = true;
 
     RemoteInfo remote{Sha1};
     CHECK(DecideLaunch(state, false, false, true, remote) == LaunchAction::StartTester);
@@ -981,6 +989,17 @@ TEST_CASE("DecideLaunch on a closed pull request", "[tester]") {
     remote.pr_open = false;
     remote.sha = Sha1;
     CHECK(DecideLaunch(state, false, false, true, remote) == LaunchAction::StartTester);
+}
+
+TEST_CASE("DecideLaunch runs the release unless a tester build was launched last", "[tester]") {
+    State state;
+    state.source = Source{Source::Kind::Branch, "dev", 0};
+    state.built_sha = Sha1;
+    CHECK(DecideLaunch(state, false, false, true, RemoteInfo{Sha1}) == LaunchAction::RunRelease);
+    CHECK(DecideLaunch(state, false, false, true, RemoteInfo{Sha2}) == LaunchAction::RunRelease);
+    CHECK(DecideLaunch(state, false, false, false, std::nullopt) == LaunchAction::RunRelease);
+    state.start_tester = true;
+    CHECK(DecideLaunch(state, false, false, true, RemoteInfo{Sha1}) == LaunchAction::StartTester);
 }
 
 TEST_CASE("HasInstall needs the exe on disk", "[tester]") {
@@ -1005,4 +1024,103 @@ TEST_CASE("EstimateRemaining waits for enough progress", "[tester]") {
     CHECK(EstimateRemaining(2, 100, 60) == u64{2940});
     CHECK(EstimateRemaining(50, 100, 600) == u64{600});
     CHECK(EstimateRemaining(100, 100, 600) == u64{0});
+}
+
+TEST_CASE("FetchSteps checks out a pinned commit", "[tester]") {
+    TempDir dir;
+    auto request = MakeRequest(dir.path);
+    request.commit = Sha2;
+    const auto steps = FetchSteps(request);
+    REQUIRE(steps.size() == 4);
+    CHECK(steps[1].args.back() == "+refs/pull/838/head:refs/tester/head");
+    CHECK(steps[2].args.back() == Sha2);
+}
+
+TEST_CASE("ParseLog", "[tester]") {
+    const std::string output = Sha1 + "\x1f" + "Ann\x1f" + "1700000000\x1f" +
+                               "Fix the thing\n\nLonger text.\n\x1e\n" + Sha2 +
+                               "\x1f" + "Bob\x1f" + "1600000000\x1f" + "Second\n\x1e\n" +
+                               "garbage\x1e";
+    const auto commits = ParseLog(output);
+    REQUIRE(commits.size() == 2);
+    CHECK(commits[0].sha == Sha1);
+    CHECK(commits[0].author == "Ann");
+    CHECK(commits[0].time == 1700000000);
+    CHECK(commits[0].message == "Fix the thing\n\nLonger text.");
+    CHECK(commits[1].sha == Sha2);
+    CHECK(commits[1].message == "Second");
+}
+
+TEST_CASE("Install info, switching and removing installs", "[tester]") {
+    TempDir dir;
+    const auto layout = MakeLayout(dir.path);
+    const Source branch{Source::Kind::Branch, "dev/x", 0};
+    const Source pr{Source::Kind::PullRequest, {}, 838};
+    const auto make = [&](const std::string& sha) {
+        const auto install = layout.InstallDir(sha);
+        Write(InstalledExe(install), "exe");
+        return install;
+    };
+    const auto first = make(Sha1);
+    const auto second = make(Sha2);
+    std::error_code ec;
+    REQUIRE(WriteInstallInfo(first, branch, Sha1, 100, ec));
+    REQUIRE(WriteInstallInfo(second, pr, Sha2, 200, ec));
+    // Made before installs were described: known only as the current install.
+    const auto legacy = make(Sha3);
+
+    State state;
+    state.source = branch;
+    state.current_install = PathToUtf8(legacy);
+    state.previous_install = PathToUtf8(second);
+    state.built_sha = Sha3;
+    state.built_at = 300;
+
+    const auto installs = ListInstalls(layout, state);
+    REQUIRE(installs.size() == 3);
+    CHECK(installs[0].sha == Sha3);
+    CHECK(installs[0].source == branch);
+    CHECK(installs[1].sha == Sha2);
+    CHECK(installs[1].source == pr);
+    CHECK(installs[2].sha == Sha1);
+    CHECK(installs[2].built_at == 100);
+
+    SwitchInstall(state, installs[2]);
+    CHECK(state.current_install == PathToUtf8(first));
+    CHECK(state.previous_install == PathToUtf8(legacy));
+    CHECK(state.built_sha == Sha1);
+    CHECK(state.source == branch);
+
+    // Removing the current install falls back to the previous one.
+    REQUIRE(RemoveInstall(state, installs[2], ec));
+    CHECK_FALSE(fs::exists(first));
+    CHECK(state.current_install == PathToUtf8(legacy));
+    CHECK(state.previous_install.empty());
+
+    REQUIRE(RemoveInstall(state, installs[1], ec));
+    CHECK(state.current_install == PathToUtf8(legacy));
+    CHECK(ListInstalls(layout, state).size() == 1);
+
+    // Without any install left the release starts again.
+    state.start_tester = true;
+    REQUIRE(RemoveInstall(state, installs[0], ec));
+    CHECK(state.current_install.empty());
+    CHECK_FALSE(state.start_tester);
+}
+
+TEST_CASE("Saved version manager sources", "[tester]") {
+    TempDir dir;
+    const auto layout = MakeLayout(dir.path);
+    const auto file = SavedSourcesPath(layout);
+    CHECK(LoadSavedSources(file).empty());
+
+    const std::vector<Source> sources{{Source::Kind::Branch, "dev/x", 0},
+                                      {Source::Kind::PullRequest, {}, 838}};
+    std::error_code ec;
+    REQUIRE(SaveSavedSources(file, sources, ec));
+    CHECK(LoadSavedSources(file) == sources);
+
+    Write(file, R"({"sources": ["branch:a", 5, "branch:a", "pr:9"]})");
+    CHECK(LoadSavedSources(file) == std::vector<Source>{{Source::Kind::Branch, "a", 0},
+                                                        {Source::Kind::PullRequest, {}, 9}});
 }

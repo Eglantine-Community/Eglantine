@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 #include "common/common_types.h"
+#include "common/net/net.h"
 
 // Tester builds: the release build clones a branch or pull request of the official repository,
 // builds it and runs it beside the release install. This library parses, plans and does the file
@@ -53,6 +54,8 @@ struct State {
     bool pr_warning_shown{};
     // The branch a CI build pointed `source` at; a different one points it again.
     std::string auto_source;
+    // The last build the user launched was the tester build, so the release hands over to it.
+    bool start_tester{};
 };
 
 // Paths in State are UTF-8 strings.
@@ -184,6 +187,8 @@ struct BuildRequest {
     Toolchain tools;
     // Release asset platform of this build; passed on so the tester build knows it as well.
     std::string platform;
+    // A commit of the source to build instead of its newest one: 40 lowercase hex characters.
+    std::string commit;
 };
 
 // Clone when needed, fetch the source, check it out and read back the commit (capture).
@@ -223,6 +228,46 @@ void PruneInstalls(const Layout& layout, const State& state);
 // Whether state.current_install holds a runnable exe.
 bool HasInstall(const State& state);
 
+// An install folder and what it was built from.
+struct InstallInfo {
+    std::filesystem::path dir;
+    // The full commit, or the folder's 10 characters for an install made before installs were
+    // described.
+    std::string sha;
+    // Empty when unknown.
+    std::optional<Source> source;
+    s64 built_at{}; // Unix seconds
+};
+
+// Writes install.json into `install_dir`.
+bool WriteInstallInfo(const std::filesystem::path& install_dir, const Source& source,
+                      std::string_view sha, s64 built_at, std::error_code& ec);
+
+// Reads install.json; without it the current and previous installs are described from `state`.
+InstallInfo ReadInstallInfo(const std::filesystem::path& install_dir, const State& state);
+
+// The install folders that hold an exe, the newest build first.
+std::vector<InstallInfo> ListInstalls(const Layout& layout, const State& state);
+
+// Makes `install` the current install and the current one the previous. Does not save `state`.
+void SwitchInstall(State& state, const InstallInfo& install);
+
+// Deletes `install`. When it was the current install, the previous one takes its place. Does not
+// save `state`.
+bool RemoveInstall(State& state, const InstallInfo& install, std::error_code& ec);
+
+// Branches and pull requests added to the version manager by hand, kept apart from tester.json so
+// an older tester build cannot drop them.
+std::filesystem::path SavedSourcesPath(const Layout& layout);
+std::vector<Source> LoadSavedSources(const std::filesystem::path& file);
+bool SaveSavedSources(const std::filesystem::path& file, const std::vector<Source>& sources,
+                      std::error_code& ec);
+
+// The newest `count` commits reachable from `ref` in the checkout (capture).
+Step LogStep(const Layout& layout, const std::filesystem::path& git, std::string_view ref,
+             int count);
+std::vector<Common::Net::Commit> ParseLog(std::string_view output);
+
 // The first 10 characters, which name an install folder.
 std::string ShortSha(std::string_view sha);
 
@@ -244,7 +289,8 @@ enum class LaunchAction {
     OfferClosedPullRequest,
 };
 
-// What the release exe does at startup. `remote` is empty when the check failed, timed out or was
+// What the release exe does at startup. Unless `state.start_tester`, it runs itself and asks
+// nothing, apart from a CI build of the followed branch offering its own newer commit. `remote` is empty when the check failed, timed out or was
 // skipped, and an unknown remote never blocks starting the installed tester build.
 // `self_commit` is the commit of this exe when it is itself a build of the followed source (a CI
 // build of the branch); until a newer install exists it counts as the build of that commit.

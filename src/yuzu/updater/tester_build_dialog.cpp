@@ -231,6 +231,13 @@ void TesterBuildDialog::StartBuiltEmulator() {
 
 void TesterBuildDialog::LaunchBuiltEmulator() {
     const QString exe = m_runner.InstalledExePath();
+    {
+        // The release starts this build from now on, until the release is launched on purpose.
+        auto state = TesterBuild::LoadState(TesterLauncher::StateFile());
+        state.start_tester = true;
+        std::error_code ec;
+        TesterBuild::SaveState(TesterLauncher::StateFile(), state, ec);
+    }
     QProcess process;
     process.setProgram(exe);
     // A portable user folder is found from the working directory on Linux.

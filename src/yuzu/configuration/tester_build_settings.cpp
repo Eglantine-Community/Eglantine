@@ -400,6 +400,7 @@ void TesterBuildSettings::DeleteBuilds() {
     state.current_install.clear();
     state.previous_install.clear();
     state.built_at = 0;
+    state.start_tester = false;
     std::error_code save_ec;
     TesterBuild::SaveState(TesterLauncher::StateFile(), state, save_ec);
 

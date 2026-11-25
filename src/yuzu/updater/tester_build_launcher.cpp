@@ -309,13 +309,17 @@ bool StartDetached(const QString& program, const QStringList& args, const QStrin
     return process.startDetached();
 }
 
-bool StartBuilder(const QString& exe, bool force, const QString& source, bool close_caller) {
+bool StartBuilder(const QString& exe, bool force, const QString& source, bool close_caller,
+                  const QString& commit) {
     QStringList args{QStringLiteral("--tester-build")};
     if (force) {
         args << QStringLiteral("--force");
     }
     if (!source.isEmpty()) {
         args << QStringLiteral("--source") << source;
+    }
+    if (!commit.isEmpty()) {
+        args << QStringLiteral("--commit") << commit;
     }
     if (close_caller) {
         args << QStringLiteral("--caller") << QString::number(QCoreApplication::applicationPid());
@@ -413,6 +417,12 @@ std::optional<int> Run(int argc, char** argv) {
     // This exe is the build of its own commit when it was made for the followed branch.
     const auto self_commit = self_is_tester ? std::nullopt : FollowedBranchCommit(state);
     const bool release_flag = args.contains(QStringLiteral("--release")) || ShiftHeld();
+    if (release_flag && state.start_tester && !self_is_tester) {
+        // Starting the release on purpose makes it the build to start next time as well.
+        state.start_tester = false;
+        std::error_code ec;
+        TesterBuild::SaveState(StateFile(), state, ec);
+    }
     const bool install_exists = TesterBuild::HasInstall(state);
 
     using Action = TesterBuild::LaunchAction;
@@ -501,7 +511,6 @@ std::optional<int> Run(int argc, char** argv) {
                                 .arg(name, QString::fromStdString(
                                                TesterBuild::ShortSha(state.built_sha)));
     const auto release = QObject::tr("Release");
-    const auto choose_text = QObject::tr("Which build of Eglantine do you want to start?");
 
     switch (action) {
     case Action::OfferFirstBuild:
@@ -550,15 +559,8 @@ std::optional<int> Run(int argc, char** argv) {
     case Action::RunRelease:
         break;
     }
-    // Closing the window starts neither.
-    switch (ask(choose_text, {last_built, release, QObject::tr("Cancel")}, 2)) {
-    case 0:
-        return start_tester();
-    case 1:
-        return start_release();
-    default:
-        return 0;
-    }
+    // Hold Shift or pass --release for the release build.
+    return start_tester();
 }
 
 } // namespace TesterLauncher

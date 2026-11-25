@@ -48,9 +48,10 @@ bool StartDetached(const QString& program, const QStringList& args,
                    const QString& working_dir = {});
 
 // `<exe> --tester-build`, which shows the builder window. `close_caller` lets the builder close
-// this process when the user starts the new build.
+// this process when the user starts the new build. A non-empty `commit` builds that commit of the
+// source instead of its newest.
 bool StartBuilder(const QString& exe, bool force, const QString& source = {},
-                  bool close_caller = true);
+                  bool close_caller = true, const QString& commit = {});
 
 // The Eglantine that started the builder. It is held from the builder's start, so its pid cannot
 // be reused by another process before it is asked to close.

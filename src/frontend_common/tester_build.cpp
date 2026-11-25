@@ -4,6 +4,8 @@
 #include "frontend_common/tester_build.h"
 
 #include <algorithm>
+#include <array>
+#include <charconv>
 #include <cctype>
 #include <chrono>
 #include <cstdlib>
@@ -243,6 +245,9 @@ State LoadState(const fs::path& file) {
     state.previous_install = text("previous_install");
     state.release_exe = text("release_exe");
     state.auto_source = text("auto_source");
+    if (const auto it = parsed.find("start_tester"); it != parsed.end() && it->is_boolean()) {
+        state.start_tester = it->get<bool>();
+    }
     if (const auto it = parsed.find("built_at"); it != parsed.end() && it->is_number_integer()) {
         state.built_at = it->get<s64>();
     }
@@ -262,6 +267,7 @@ bool SaveState(const fs::path& file, const State& state, std::error_code& ec) {
         {"built_at", state.built_at},
         {"pr_warning_shown", state.pr_warning_shown},
         {"auto_source", state.auto_source},
+        {"start_tester", state.start_tester},
     };
     fs::create_directories(file.parent_path(), ec);
     if (ec) {
@@ -885,7 +891,8 @@ std::vector<Step> FetchSteps(const BuildRequest& request) {
     steps.push_back({"checkout",
                      "Checking out the source",
                      git,
-                     {"-C", src, "checkout", "--force", "--detach", "refs/tester/head"},
+                     {"-C", src, "checkout", "--force", "--detach",
+                      request.commit.empty() ? std::string{"refs/tester/head"} : request.commit},
                      {},
                      false,
                      false});
@@ -1094,6 +1101,233 @@ void PruneInstalls(const Layout& layout, const State& state) {
     }
 }
 
+namespace {
+
+constexpr std::string_view InstallInfoFile = "install.json";
+
+bool IsSamePath(const std::string& utf8, const fs::path& path) {
+    return !utf8.empty() && SamePath(PathFromUtf8(utf8), path);
+}
+
+s64 NowSeconds() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+} // namespace
+
+bool WriteInstallInfo(const fs::path& install_dir, const Source& source, std::string_view sha,
+                      s64 built_at, std::error_code& ec) {
+    const json out = {
+        {"source", source.ToString()},
+        {"sha", std::string{sha}},
+        {"built_at", built_at},
+    };
+    std::ofstream stream{install_dir / InstallInfoFile, std::ios::binary};
+    stream << out.dump(2) << '\n';
+    stream.flush();
+    if (!stream.good()) {
+        ec = std::make_error_code(std::errc::io_error);
+        return false;
+    }
+    return true;
+}
+
+InstallInfo ReadInstallInfo(const fs::path& install_dir, const State& state) {
+    InstallInfo info{.dir = install_dir, .sha = PathToUtf8(install_dir.filename())};
+    const auto parsed = json::parse(ReadFile(install_dir / InstallInfoFile), nullptr, false);
+    if (parsed.is_object()) {
+        if (const auto it = parsed.find("sha"); it != parsed.end() && it->is_string()) {
+            if (const auto sha = ParseRevParse(it->get<std::string>())) {
+                info.sha = *sha;
+            }
+        }
+        if (const auto it = parsed.find("source"); it != parsed.end() && it->is_string()) {
+            info.source = ParseSource(it->get<std::string>(), {});
+        }
+        if (const auto it = parsed.find("built_at");
+            it != parsed.end() && it->is_number_integer()) {
+            info.built_at = it->get<s64>();
+        }
+        return info;
+    }
+
+    const bool current = IsSamePath(state.current_install, install_dir);
+    if (current || IsSamePath(state.previous_install, install_dir)) {
+        info.source = state.source;
+    }
+    if (current) {
+        if (state.built_sha.starts_with(info.sha)) {
+            info.sha = state.built_sha;
+        }
+        info.built_at = state.built_at;
+    } else {
+        std::error_code ec;
+        const auto written = fs::last_write_time(InstalledExe(install_dir), ec);
+        if (!ec) {
+            info.built_at = std::chrono::duration_cast<std::chrono::seconds>(
+                                std::chrono::clock_cast<std::chrono::system_clock>(written)
+                                    .time_since_epoch())
+                                .count();
+        }
+    }
+    return info;
+}
+
+std::vector<InstallInfo> ListInstalls(const Layout& layout, const State& state) {
+    std::vector<InstallInfo> installs;
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator{layout.installs, ec}) {
+        std::error_code type_ec;
+        if (!entry.is_directory(type_ec) || entry.path().extension() == ".tmp" ||
+            !fs::is_regular_file(InstalledExe(entry.path()), type_ec)) {
+            continue;
+        }
+        installs.push_back(ReadInstallInfo(entry.path(), state));
+    }
+    std::ranges::stable_sort(installs, std::ranges::greater{}, &InstallInfo::built_at);
+    return installs;
+}
+
+void SwitchInstall(State& state, const InstallInfo& install) {
+    if (!IsSamePath(state.current_install, install.dir)) {
+        state.previous_install = state.current_install;
+        state.current_install = PathToUtf8(install.dir);
+    }
+    state.built_sha = install.sha;
+    state.built_at = install.built_at != 0 ? install.built_at : NowSeconds();
+    if (install.source) {
+        state.source = install.source;
+    }
+}
+
+bool RemoveInstall(State& state, const InstallInfo& install, std::error_code& ec) {
+    fs::remove_all(install.dir, ec);
+    if (ec) {
+        return false;
+    }
+    if (IsSamePath(state.previous_install, install.dir)) {
+        state.previous_install.clear();
+    }
+    if (IsSamePath(state.current_install, install.dir)) {
+        state.current_install.clear();
+        state.built_sha.clear();
+        state.built_at = 0;
+        if (!state.previous_install.empty()) {
+            const auto previous = PathFromUtf8(state.previous_install);
+            state.previous_install.clear();
+            std::error_code exists_ec;
+            if (fs::is_regular_file(InstalledExe(previous), exists_ec)) {
+                SwitchInstall(state, ReadInstallInfo(previous, state));
+            }
+        }
+        if (state.current_install.empty()) {
+            state.start_tester = false;
+        }
+    }
+    return true;
+}
+
+fs::path SavedSourcesPath(const Layout& layout) {
+    return layout.root / "version-manager.json";
+}
+
+std::vector<Source> LoadSavedSources(const fs::path& file) {
+    std::vector<Source> sources;
+    const auto parsed = json::parse(ReadFile(file), nullptr, false);
+    if (!parsed.is_object()) {
+        return sources;
+    }
+    const auto it = parsed.find("sources");
+    if (it == parsed.end() || !it->is_array()) {
+        return sources;
+    }
+    for (const auto& entry : *it) {
+        if (!entry.is_string()) {
+            continue;
+        }
+        const auto source = ParseSource(entry.get<std::string>(), {});
+        if (source && std::ranges::find(sources, *source) == sources.end()) {
+            sources.push_back(*source);
+        }
+    }
+    return sources;
+}
+
+bool SaveSavedSources(const fs::path& file, const std::vector<Source>& sources,
+                      std::error_code& ec) {
+    json list = json::array();
+    for (const auto& source : sources) {
+        list.push_back(source.ToString());
+    }
+    fs::create_directories(file.parent_path(), ec);
+    if (ec) {
+        return false;
+    }
+    const auto temp = fs::path{file}.concat(".tmp");
+    {
+        std::ofstream stream{temp, std::ios::binary};
+        stream << json{{"sources", list}}.dump(2) << '\n';
+        stream.flush();
+        if (!stream.good()) {
+            ec = std::make_error_code(std::errc::io_error);
+            return false;
+        }
+    }
+    fs::rename(temp, file, ec);
+    return !ec;
+}
+
+Step LogStep(const Layout& layout, const fs::path& git, std::string_view ref, int count) {
+    return {"log",
+            "Reading the commits",
+            git,
+            {"-C", PathToUtf8(layout.src), "log", "-n", std::to_string(count),
+             "--format=%H%x1f%an%x1f%ct%x1f%B%x1e", std::string{ref}, "--"},
+            {},
+            false,
+            true};
+}
+
+std::vector<Common::Net::Commit> ParseLog(std::string_view output) {
+    std::vector<Common::Net::Commit> commits;
+    while (!output.empty()) {
+        const auto end = output.find('\x1e');
+        auto record = output.substr(0, end);
+        output = end == std::string_view::npos ? std::string_view{} : output.substr(end + 1);
+
+        std::array<std::string_view, 4> fields{};
+        bool complete = true;
+        for (size_t i = 0; i < fields.size(); ++i) {
+            if (i + 1 == fields.size()) {
+                fields[i] = record;
+                break;
+            }
+            const auto separator = record.find('\x1f');
+            if (separator == std::string_view::npos) {
+                complete = false;
+                break;
+            }
+            fields[i] = record.substr(0, separator);
+            record = record.substr(separator + 1);
+        }
+        if (!complete) {
+            continue;
+        }
+        const auto sha = ParseRevParse(fields[0]);
+        if (!sha) {
+            continue;
+        }
+        Common::Net::Commit commit{.sha = *sha,
+                                   .message = std::string{Trim(fields[3])},
+                                   .author = std::string{fields[1]}};
+        std::from_chars(fields[2].data(), fields[2].data() + fields[2].size(), commit.time);
+        commits.push_back(std::move(commit));
+    }
+    return commits;
+}
+
 bool HasInstall(const State& state) {
     std::error_code ec;
     return !state.current_install.empty() &&
@@ -1112,6 +1346,9 @@ LaunchAction DecideLaunch(const State& state, bool self_is_tester, bool release_
     }
     // Without an install, this exe stands in for the build of its own commit.
     const bool self_is_build = !install_exists && self_commit && !self_commit->empty();
+    if (!state.start_tester && !self_is_build) {
+        return LaunchAction::RunRelease;
+    }
     if (!install_exists && !self_is_build) {
         return LaunchAction::OfferFirstBuild;
     }

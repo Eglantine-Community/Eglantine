@@ -219,3 +219,18 @@ TEST_CASE("Net: FindReleaseForCommit", "[tester]") {
     CHECK_FALSE(FindReleaseForCommit(releases, "", "windows-x86_64").has_value());
     CHECK_FALSE(FindReleaseForCommit({}, kSha, "windows-x86_64").has_value());
 }
+
+TEST_CASE("Net: commits from JSON", "[tester]") {
+    const auto json = fmt::format(
+        R"([{{"sha":"{}","commit":{{"message":"Subject\n\nBody","author":{{"name":"Ann"}},)"
+        R"("committer":{{"date":"2026-01-02T03:04:05Z"}}}}}},)"
+        R"({{"sha":"bad","commit":{{"message":"x"}}}},{{"sha":"{}"}}])",
+        kSha, kSha);
+    const auto commits = Common::Net::CommitsFromJson(json);
+    REQUIRE(commits.size() == 1);
+    CHECK(commits[0].sha == kSha);
+    CHECK(commits[0].message == "Subject\n\nBody");
+    CHECK(commits[0].author == "Ann");
+    CHECK(commits[0].time == 1767323045);
+    CHECK(Common::Net::CommitsFromJson("{}").empty());
+}

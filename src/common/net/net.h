@@ -169,4 +169,33 @@ struct BranchList {
 // The most recently pushed branches, or every branch name when the activity cannot be read.
 BranchList GetBranches();
 
+// Every branch name, reading up to `max_pages` pages of 100.
+BranchList GetAllBranches(std::size_t max_pages = 20);
+
+// One commit of a branch or pull request.
+struct Commit {
+    // Lowercase 40-character commit hash.
+    std::string sha;
+    // The whole message: the subject line, then the description.
+    std::string message;
+    std::string author;
+    // Committer date, Unix seconds; 0 when unknown.
+    u64 time{};
+};
+
+// From GET /repos/{repo}/commits or /repos/{repo}/pulls/{number}/commits, in the order given.
+std::vector<Commit> CommitsFromJson(const std::string_view& json);
+
+struct CommitList {
+    // Newest first.
+    std::vector<Commit> commits;
+    bool ok{};
+    int status{};
+};
+
+// The newest `limit` commits of a branch (at most 100, one request).
+CommitList GetBranchCommits(const std::string& branch, std::size_t limit);
+// The commits of a pull request (at most 100, one request).
+CommitList GetPullRequestCommits(u64 number);
+
 }

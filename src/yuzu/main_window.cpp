@@ -149,6 +149,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #ifdef ENABLE_UPDATE_CHECKER
 #include "frontend_common/update_checker.h"
 #include "frontend_common/update_installer.h"
+#include "yuzu/updater/version_manager_dialog.h"
 #endif
 
 // Common //
@@ -2092,8 +2093,10 @@ void MainWindow::ConnectMenuEvents() {
     connect_menu(ui->action_Install_Keys, &MainWindow::OnInstallDecryptionKeys);
 #ifdef ENABLE_UPDATE_CHECKER
     connect_menu(ui->action_Check_For_Updates, &MainWindow::OnCheckForUpdates);
+    connect_menu(ui->action_Version_Manager, &MainWindow::OnVersionManager);
 #else
     ui->action_Check_For_Updates->setVisible(false);
+    ui->action_Version_Manager->setVisible(false);
 #endif
 #if defined(ENABLE_UPDATE_CHECKER) && (defined(__linux__) || defined(_WIN32))
     // In main.ui, so a language change retranslates it; hidden until there is a version to restore.
@@ -5203,6 +5206,11 @@ void MainWindow::CheckForUpdates(bool manual) {
             return UpdateChecker::Check(channel, platform);
         });
     update_watcher.setFuture(update_future);
+}
+
+void MainWindow::OnVersionManager() {
+    VersionManagerDialog dialog(this);
+    dialog.exec();
 }
 
 void MainWindow::OnCheckForUpdates() {

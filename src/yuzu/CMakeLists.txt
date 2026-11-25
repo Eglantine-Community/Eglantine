@@ -297,7 +297,8 @@ if (ENABLE_UPDATE_CHECKER)
         updater/tester_build_monitor.cpp updater/tester_build_monitor.h
         configuration/tester_build_settings.cpp configuration/tester_build_settings.h
         updater/tester_build_main.cpp updater/tester_build_main.h
-        updater/tester_build_runner.cpp updater/tester_build_runner.h)
+        updater/tester_build_runner.cpp updater/tester_build_runner.h
+        updater/version_manager_dialog.cpp updater/version_manager_dialog.h)
     target_link_libraries(yuzu PRIVATE QuaZip::QuaZip)
 endif()
 

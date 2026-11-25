@@ -381,6 +381,13 @@ bool TesterBuildRunner::Prepare() {
         return Fail(tr("No branch or pull request is set. Pass --source <branch or PR number>."));
     }
     m_source = *m_state.source;
+    if (!m_options.commit.isEmpty()) {
+        const auto commit = TesterBuild::ParseRevParse(Utf8(m_options.commit));
+        if (!commit) {
+            return Fail(tr("\"%1\" is not a full commit hash.").arg(m_options.commit));
+        }
+        m_commit = *commit;
+    }
     emit SourceResolved(Q(m_source.DisplayName()));
 
     // Where "Release" in the settings leads back to, unless this is itself a tester build.
@@ -902,6 +909,7 @@ TesterBuild::BuildRequest TesterBuildRunner::MakeRequest() const {
     request.tools = m_tools;
     // A build compiled here is never a PGO build.
     request.platform = UpdateChecker::DownloadPlatform(Settings::UpdateVariant::Standard);
+    request.commit = m_commit;
     return request;
 }
 
@@ -1014,6 +1022,10 @@ bool TesterBuildRunner::Finish(const std::string& sha) {
 bool TesterBuildRunner::Activate(const std::string& sha, const QString& message) {
     const auto destination = m_layout.InstallDir(sha);
     LinkUserFolder(destination);
+    std::error_code info_ec;
+    if (!TesterBuild::WriteInstallInfo(destination, m_source, sha, m_state.built_at, info_ec)) {
+        Log(tr("Could not describe the install: %1").arg(QString::fromStdString(info_ec.message())));
+    }
     if (!SaveState()) {
         return false;
     }
@@ -1149,7 +1161,8 @@ TesterBuildRunner::Result TesterBuildRunner::Execute() {
     if (!Prepare()) {
         return stopped();
     }
-    if (!m_options.force) {
+    // CI builds exist only for the newest commit.
+    if (!m_options.force && m_commit.empty()) {
         if (const auto installed = TryInstallCiBuild()) {
             return *installed;
         }

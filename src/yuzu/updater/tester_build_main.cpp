@@ -85,6 +85,8 @@ Arguments ParseArguments(int argc, char** argv) {
             arguments.options.source = QString::fromLocal8Bit(argv[++i]);
         } else if (std::strncmp(arg, "--source=", 9) == 0) {
             arguments.options.source = QString::fromLocal8Bit(arg + 9);
+        } else if (std::strcmp(arg, "--commit") == 0 && i + 1 < argc) {
+            arguments.options.commit = QString::fromLocal8Bit(argv[++i]);
         } else if (std::strcmp(arg, "--caller") == 0 && i + 1 < argc) {
             arguments.caller_pid = std::strtoll(argv[++i], nullptr, 10);
         }
