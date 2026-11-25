@@ -1329,9 +1329,13 @@ InstallInfo ReadInstallInfo(const fs::path& install_dir, const State& state) {
         std::error_code ec;
         const auto written = fs::last_write_time(InstalledExe(install_dir), ec);
         if (!ec) {
+            // Apple Clang's libc++ has no std::chrono::clock_cast: map the file clock onto
+            // the system clock from the two "now"s (the gap between them is far below
+            // the seconds precision this timestamp needs).
+            const auto sys_written =
+                std::chrono::system_clock::now() + (written - fs::file_time_type::clock::now());
             info.built_at = std::chrono::duration_cast<std::chrono::seconds>(
-                                std::chrono::clock_cast<std::chrono::system_clock>(written)
-                                    .time_since_epoch())
+                                sys_written.time_since_epoch())
                                 .count();
         }
     }
