@@ -148,6 +148,32 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Changes the output graphics API.\nVulkan is recommended."));
     INSERT(Settings, vulkan_device, tr("Device:"),
            tr("This setting selects the GPU to use (Vulkan only)."));
+    INSERT(Settings, graphics_path, tr("Graphics path:"),
+           tr("Selects how Switch 2 games' graphics run.\n"
+              "Emulated GPU (the default) emulates the console's GPU instruction by instruction.\n"
+              "VTX-HLE (NVN) replays the game's own NVN graphics calls directly on Vulkan: much "
+              "faster in the games it supports, but it does not apply every graphics setting "
+              "(those are greyed out while it is selected).\n"
+              "Switch 1 games, games without NVN and Vulkan devices that cannot run VTX-HLE always "
+              "use the emulated GPU. Takes effect at the next game start."));
+    INSERT(Settings, nvn_in_pass_queries, tr("Occlusion queries inside render passes"),
+           tr("Keeps the game's occlusion queries inside the GPU's render passes instead of ending "
+              "the pass at each result: faster GPU work in games that use many occlusion queries, "
+              "same picture. VTX-HLE only. Takes effect at the next game start."));
+    INSERT(Settings, nvn_pipeline_library,
+           tr("Fast-linked pipelines (no skipped draws while compiling)"),
+           tr("Draws whose shaders are still compiling use a quickly linked pipeline instead of "
+              "being skipped: less pop-in and stutter in new areas, still under test. VTX-HLE "
+              "only. Takes effect at the next game start."));
+    INSERT(Settings, nvn_sync_diet, tr("Fewer GPU syncs between render passes"),
+           tr("Drops the two full GPU syncs each render pass carried at its start and end; the one "
+              "barrier between passes stays, so the picture is the same. Slightly less GPU time per "
+              "frame. VTX-HLE only. Takes effect at the next game start."));
+    INSERT(Settings, nvn_shader_refresh, tr("Refresh shaders every minute"),
+           tr("Starts with fresh shaders and rebuilds them every 60 seconds while playing. "
+              "Use to test black areas that appear after continued play. May cause brief stutters; "
+              "draws wait for compilation. Existing disk caches are left untouched. VTX-HLE only. "
+              "Takes effect at the next game start."));
     INSERT(Settings, resolution_setup, tr("Resolution:"),
            tr("Forces to render at a different resolution.\n"
               "Higher resolutions require more VRAM and bandwidth.\n"
@@ -209,6 +235,11 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "intermediate format: RGBA8.\n"
               "BC1/BC3: The intermediate format will be recompressed to BC1 or BC3 format,\n"
               " saving VRAM but degrading image quality."));
+    INSERT(Settings, nvn_smart_bc, tr("Smart BC stand-ins (VTX-HLE only)"),
+           tr("Holds each ASTC texture in the BC format its channels need: BC4 for luminance,\n"
+              "BC5 for luminance and alpha, BC1 for opaque colour (half the VRAM of BC3) and\n"
+              "BC3 for the rest. Off: BC3 everywhere. Applied when the graphics path is VTX-HLE\n"
+              "and ASTC recompression is BC3; needs a restart."));
     INSERT(Settings, frame_pacing_mode, tr("Frame Pacing Mode (Vulkan only)"),
            tr("Controls how the emulator manages frame pacing to reduce stuttering and make the "
               "frame rate smoother and more consistent."));
@@ -296,6 +327,14 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "shaders, and the GPU's own stages elsewhere.\n"
               "GPUs without VK_EXT_mesh_shader always use the compute fallback.\n"
               "Takes effect when a game starts."));
+    INSERT(Settings, graphics_pipeline_library, tr("Link pipelines from shared parts (experimental)"),
+           tr("Uses VK_EXT_graphics_pipeline_library: a new pipeline whose shaders another "
+              "pipeline already compiled as parts is linked from them in a few milliseconds. "
+              "Others compile whole, as with this off, and their parts compile in the background "
+              "for the next one.\n"
+              "Experimental: the gain is limited to pipelines new to the driver's cache, and "
+              "shader modules are kept in memory for reuse.\n"
+              "Needs fast linking support from the driver. Takes effect when a game starts."));
     INSERT(Settings, use_vulkan_driver_pipeline_cache, tr("Use Vulkan pipeline cache"),
            tr("Enables GPU vendor-specific pipeline cache.\nThis option can improve shader loading "
               "time significantly in cases where the Vulkan driver does not store pipeline cache "
@@ -310,9 +349,9 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "hundreds of milliseconds each time."));
 #if defined(__linux__)
     INSERT(Settings, driver_shader_cache_size, tr("Separate driver shader cache (Linux only)"),
-           tr("Keeps the NVIDIA driver's shader cache for this emulator in its own folder, up to "
-              "this size, so other applications can't evict it.\nTurn it off to use the "
-              "driver's shared cache instead.\nTakes effect at the next start."));
+           tr("Keeps the NVIDIA or Mesa driver's shader cache for this emulator in its own "
+              "folder, up to this size, so other applications can't evict it.\nTurn it off to "
+              "use the driver's shared cache instead.\nTakes effect at the next start."));
 #else
     INSERT(Settings, driver_shader_cache_size, QString(), QString());
 #endif
@@ -414,11 +453,15 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "it bypasses such prompts and directly exits the emulation."));
     INSERT(UISettings, hide_mouse, tr("Hide mouse on inactivity"),
            tr("Hides the mouse after 2.5s of inactivity."));
-    INSERT(UISettings, check_for_updates, tr("Check for updates"),
+    INSERT(UISettings, check_for_updates, tr("Automatically check for updates on launch"),
            tr("Whether or not to check for updates upon startup."));
-    INSERT(UISettings, update_channel, tr("Update channel"),
-           tr("Stable only offers finished releases.\nRelease candidate also offers release "
-              "candidates of upcoming versions.\nDaily offers the automatic daily builds."));
+    INSERT(UISettings, update_channel, tr("Release channel"),
+           tr("Stable offers the releases of nx2.\nNightly offers the daily builds of "
+              "nx2-experimental, with the newest changes and more risk."));
+    INSERT(UISettings, update_variant, tr("Build type"),
+           tr("PGO builds are optimized using a profile of real games and are usually faster.\n"
+              "When a release has no PGO build, the non-PGO one is used.\n"
+              "Experimental builds compiled on this computer are always non-PGO."));
 
     // Linux
     INSERT(UISettings, enable_gamemode, tr("Enable Gamemode"), QString());
@@ -568,6 +611,11 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
              PAIR(ResolutionSetup, Res7X, tr("7X (5040p/7560p)")),
              PAIR(ResolutionSetup, Res8X, tr("8X (5760p/8640p)")),
          }});
+    translations->insert({Settings::EnumMetadata<Settings::GraphicsPath>::Index(),
+                          {
+                              PAIR(GraphicsPath, Hle, tr("VTX-HLE (NVN)")),
+                              PAIR(GraphicsPath, Emulated, tr("Emulated GPU")),
+                          }});
     translations->insert({Settings::EnumMetadata<Settings::FrameGenType>::Index(),
                           {
                               PAIR(FrameGenType, Lsfg, tr("Lossless Scaling (LSFG)")),
@@ -745,9 +793,13 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
          }});
     translations->insert({Settings::EnumMetadata<Settings::UpdateChannel>::Index(),
                           {
-                              PAIR(UpdateChannel, Stable, tr("Stable")),
-                              PAIR(UpdateChannel, ReleaseCandidate, tr("Release candidate")),
-                              PAIR(UpdateChannel, Daily, tr("Daily")),
+                              PAIR(UpdateChannel, Stable, tr("Stable (nx2)")),
+                              PAIR(UpdateChannel, Daily, tr("Nightly (nx2-experimental)")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::UpdateVariant>::Index(),
+                          {
+                              PAIR(UpdateVariant, Standard, tr("Non-PGO")),
+                              PAIR(UpdateVariant, Pgo, tr("PGO")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::GpuClock>::Index(),
                           {

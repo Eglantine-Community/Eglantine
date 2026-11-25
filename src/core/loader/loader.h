@@ -313,6 +313,17 @@ public:
     }
 
     /**
+     * Get the add-on content (DLC) the application ships with inside its own file
+     *
+     * @param[out] out_content Pairs of each entry's title ID and version
+     *
+     * @return ResultStatus result of function
+     */
+    virtual ResultStatus ReadAddOnContent(std::vector<std::pair<u64, u32>>& out_content) {
+        return ResultStatus::ErrorNotImplemented;
+    }
+
+    /**
      * Get whether or not updates can be applied to the RomFS.
      * By default, this is true, however for formats where it cannot be guaranteed that the RomFS is
      * the base game it should be set to false.
