@@ -504,6 +504,8 @@ public:
         return *(this->*current_image);
     }
 
+    [[nodiscard]] VkFormat HostFormat() const;
+
     [[nodiscard]] VkImageAspectFlags AspectMask() const noexcept {
         return aspect_mask;
     }

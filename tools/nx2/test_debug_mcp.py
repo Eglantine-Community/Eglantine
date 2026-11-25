@@ -196,7 +196,9 @@ class AdapterTest(unittest.TestCase):
     def test_capture_image_only_reads_this_sessions_captures(self):
         self.assertTrue(self.call("capture_image", {"directory": self.capture_dir,
                                                     "name": "0001_present"})["isError"])
-        self.assertFalse(self.call("capture_frame")["isError"])
+        params = {"sampled": True, "sampled_tics": [705, 706], "sampled_max_mib": 2}
+        self.assertFalse(self.call("capture_frame", params)["isError"])
+        self.assertEqual(self.fake.requests[-1]["params"], params)
         image = self.call("capture_image", {"directory": self.capture_dir, "name": "0001_present"})
         self.assertFalse(image["isError"])
         self.assertEqual(base64.b64decode(image["content"][0]["data"]), b"\x89PNG present")

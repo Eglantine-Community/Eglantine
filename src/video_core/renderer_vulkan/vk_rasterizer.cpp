@@ -2636,7 +2636,7 @@ void RasterizerVulkan::TickFrame() {
         }
         if (auto capture = VideoCore::Nx2Debug::TakeCapture()) {
             frame_dump.Arm(std::move(capture->directory), capture->sampled, capture->buffers,
-                           capture->id, capture->sampled_max_bytes);
+                           capture->id, capture->sampled_max_bytes, std::move(capture->sampled_tics));
         }
         if (const auto change = VideoCore::Nx2Debug::TakeRejectChange()) {
             pipeline_cache.RefreshDebugRejections(change->unrejected);

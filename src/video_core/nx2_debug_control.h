@@ -30,6 +30,7 @@ struct CaptureRequest {
     bool buffers;
     /// Sampled textures larger than this are listed but not read back; 0 reads back all.
     u64 sampled_max_bytes{};
+    std::vector<u32> sampled_tics;
 };
 
 struct CaptureResult {

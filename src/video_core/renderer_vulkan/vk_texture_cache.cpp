@@ -3021,6 +3021,14 @@ void Image::AllocateComputeUnswizzleBuffer(u32 max_slices) {
     has_compute_unswizzle_buffer = true;
 }
 
+VkFormat Image::HostFormat() const {
+    if (const auto format = AstcHostFormat(runtime->device, info)) {
+        return *format;
+    }
+    return MaxwellToVK::SurfaceFormat(runtime->device, FormatType::Optimal, false, info.format)
+        .format;
+}
+
 void Image::UploadMemory(VkBuffer buffer, VkDeviceSize offset,
                          std::span<const VideoCommon::BufferImageCopy> copies) {
     // TODO: Move this to another API

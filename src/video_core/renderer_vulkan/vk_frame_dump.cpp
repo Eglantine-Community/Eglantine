@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -277,7 +278,7 @@ void FrameDump::StopWriter() {
 }
 
 void FrameDump::Arm(std::filesystem::path directory_, bool sampled, bool buffers, u64 id,
-                    size_t sampled_max_bytes_) {
+                    size_t sampled_max_bytes_, std::vector<u32> sampled_tics_) {
     if (!schedule.Arm(sampled, buffers, id)) {
         VideoCore::Nx2Debug::FinishCapture(id, {.error = "another capture is in progress"});
         return;
@@ -285,6 +286,7 @@ void FrameDump::Arm(std::filesystem::path directory_, bool sampled, bool buffers
     StopWriter();
     directory = std::move(directory_);
     sampled_max_bytes = sampled_max_bytes_;
+    sampled_tics = std::move(sampled_tics_);
     truncated = false;
     recorded_bytes = 0;
     written_bytes = 0;
@@ -358,6 +360,8 @@ std::optional<FrameDump::Target> FrameDump::MakeTarget(ImageView& view, u32 slot
         .rescaled = rescaled,
         .msaa = info.num_samples > 1,
         .depth_encoding = depth_encoding,
+        .view_image = view.ImageHandle(),
+        .view_mip_count = view.range.extent.levels,
     };
 }
 
@@ -370,6 +374,14 @@ u32 FrameDump::TexelBytes(const Target& target) {
     default:
         return 4;
     }
+}
+
+size_t FrameDump::ImageBytes(const Target& target) {
+    if (target.host_blocks) {
+        return size_t{(target.width + 3) / 4} * ((target.height + 3) / 4) * target.depth *
+               VideoCore::Surface::BytesPerBlock(*target.host_blocks);
+    }
+    return size_t{target.width} * target.height * target.depth * TexelBytes(target);
 }
 
 int FrameDump::Decode(const Target& target, const u8* pixel, std::array<float, 4>& out) {
@@ -411,6 +423,26 @@ bool FrameDump::BeginPass(const void* framebuffer, std::span<ImageView* const> c
 }
 
 namespace {
+std::optional<PixelFormat> HostBcFormat(VkFormat format) {
+    switch (format) {
+    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: return PixelFormat::BC1_RGBA_UNORM;
+    case VK_FORMAT_BC1_RGBA_SRGB_BLOCK: return PixelFormat::BC1_RGBA_SRGB;
+    case VK_FORMAT_BC2_UNORM_BLOCK: return PixelFormat::BC2_UNORM;
+    case VK_FORMAT_BC2_SRGB_BLOCK: return PixelFormat::BC2_SRGB;
+    case VK_FORMAT_BC3_UNORM_BLOCK: return PixelFormat::BC3_UNORM;
+    case VK_FORMAT_BC3_SRGB_BLOCK: return PixelFormat::BC3_SRGB;
+    case VK_FORMAT_BC4_UNORM_BLOCK: return PixelFormat::BC4_UNORM;
+    case VK_FORMAT_BC4_SNORM_BLOCK: return PixelFormat::BC4_SNORM;
+    case VK_FORMAT_BC5_UNORM_BLOCK: return PixelFormat::BC5_UNORM;
+    case VK_FORMAT_BC5_SNORM_BLOCK: return PixelFormat::BC5_SNORM;
+    case VK_FORMAT_BC6H_UFLOAT_BLOCK: return PixelFormat::BC6H_UFLOAT;
+    case VK_FORMAT_BC6H_SFLOAT_BLOCK: return PixelFormat::BC6H_SFLOAT;
+    case VK_FORMAT_BC7_UNORM_BLOCK: return PixelFormat::BC7_UNORM;
+    case VK_FORMAT_BC7_SRGB_BLOCK: return PixelFormat::BC7_SRGB;
+    default: return std::nullopt;
+    }
+}
+
 std::optional<std::pair<GPUVAddr, u32>> SampledKey(const FrameDump::Sampled& texture) {
     const Image* const image = texture.view ? texture.view->BackingImage() : nullptr;
     if (!image) {
@@ -426,8 +458,7 @@ bool FrameDump::RecordSampled(const Sampled& texture, u32 index, std::string nam
                               std::string tags) {
     tags += SamplerJson(texture.sampler);
     if (const auto target = MakeTarget(*texture.view, index)) {
-        const size_t size =
-            size_t{target->width} * target->height * target->depth * TexelBytes(*target);
+        const size_t size = ImageBytes(*target);
         if (sampled_max_bytes != 0 && size > sampled_max_bytes) {
             Enqueue({.tags = fmt::format(
                          R"({{"name":"{}",{},"format":"{}","width":{},"height":{},"depth":{},)"
@@ -440,6 +471,46 @@ bool FrameDump::RecordSampled(const Sampled& texture, u32 index, std::string nam
     }
     const Image& image = *texture.view->BackingImage();
     const auto& info = image.info;
+    if (!sampled_tics.empty() && info.type == VideoCommon::ImageType::e2D &&
+        info.num_samples == 1 && image.host_level_offset == 0 && !image.IsRescaled() &&
+        False(image.flags & VideoCommon::ImageFlagBits::Unbacked) &&
+        (image.UsageFlags() & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0) {
+        if (const auto host_blocks = HostBcFormat(image.HostFormat())) {
+            const auto& range = texture.view->range;
+            const s32 end_level = std::min(range.base.level + range.extent.levels,
+                                           info.resources.levels);
+            const auto view_tags = fmt::format(
+                R"({},"view_base_level":{},"view_levels":{},"view_base_layer":{},"view_layers":{})",
+                tags, range.base.level, range.extent.levels, range.base.layer, range.extent.layers);
+            bool recorded = false;
+            for (s32 level = range.base.level; level < end_level; ++level) {
+                const Target target{
+                    .slot = index,
+                    .image = image.Handle(),
+                    .format = texture.view->format,
+                    .width = std::max(1U, info.size.width >> level),
+                    .height = std::max(1U, info.size.height >> level),
+                    .depth = 1,
+                    .level = level,
+                    .layer = range.base.layer,
+                    .gpu_addr = image.gpu_addr,
+                    .rescaled = false,
+                    .msaa = false,
+                    .depth_encoding = DepthEncoding::None,
+                    .host_blocks = host_blocks,
+                    .view_image = texture.view->ImageHandle(),
+                    .view_mip_count = range.extent.levels,
+                };
+                if (sampled_max_bytes != 0 && ImageBytes(target) > sampled_max_bytes) {
+                    continue;
+                }
+                recorded |= Record(target, fmt::format("{}_mip{}", name, level), view_tags);
+            }
+            if (recorded || truncated) {
+                return recorded;
+            }
+        }
+    }
     Enqueue({.tags = fmt::format(
                  R"({{"name":"{}",{},"format":"{}","width":{},"height":{},"depth":{},"type":{},)"
                  R"("gpu_addr":"{:#x}","skipped":"format"}})",
@@ -451,6 +522,9 @@ bool FrameDump::RecordSampled(const Sampled& texture, u32 index, std::string nam
 bool FrameDump::NoteSampled(std::span<const Sampled> textures) {
     bool recorded = false;
     for (const Sampled& texture : textures) {
+        if (!sampled_tics.empty() && std::ranges::find(sampled_tics, texture.tic) == sampled_tics.end()) {
+            continue;
+        }
         const auto key = SampledKey(texture);
         if (!key || std::ranges::find(pass_sampled, *key) != pass_sampled.end()) {
             continue;
@@ -470,6 +544,9 @@ bool FrameDump::NoteSampled(std::span<const Sampled> textures) {
 void FrameDump::NoteDispatchSampled(u64 shader_hash, std::span<const Sampled> textures) {
     for (u32 index = 0; index < textures.size(); ++index) {
         const Sampled& texture = textures[index];
+        if (!sampled_tics.empty() && std::ranges::find(sampled_tics, texture.tic) == sampled_tics.end()) {
+            continue;
+        }
         const auto key = SampledKey(texture);
         if (!key) {
             continue;
@@ -629,7 +706,7 @@ bool FrameDump::Record(const Target& target, std::string name, std::string tags)
         Enqueue({.tags = fmt::format(R"({{"name":"{}",{},"skipped":"msaa"}})", name, tags)});
         return false;
     }
-    const size_t size = size_t{target.width} * target.height * target.depth * TexelBytes(target);
+    const size_t size = ImageBytes(target);
     if (recorded_bytes + size > SIZE_CAP) {
         truncated = true;
         return false;
@@ -741,12 +818,9 @@ void FrameDump::Drain() {
     scheduler.Finish();
     for (Readback& readback : readbacks) {
         readback.buffer.Invalidate();
-        const Target& target = readback.target;
-        const auto mapped =
-            readback.buffer.Mapped().first(readback.raw ? readback.bytes
-                                                        : size_t{target.width} * target.height *
-                                                              target.depth * TexelBytes(target));
-        Enqueue({.target = target,
+        const auto mapped = readback.buffer.Mapped().first(
+            readback.raw ? readback.bytes : ImageBytes(readback.target));
+        Enqueue({.target = readback.target,
                  .name = std::move(readback.name),
                  .tags = std::move(readback.tags),
                  .data = {mapped.begin(), mapped.end()},
@@ -812,7 +886,7 @@ void FrameDump::Write(const Job& job) {
     ++images;
 
     std::array<float, 4> pixel;
-    const int channels = Decode(target, data.data(), pixel);
+    const int channels = target.host_blocks ? 0 : Decode(target, data.data(), pixel);
     std::string stats;
     std::string png{"null"};
     if (channels != 0) {
@@ -882,10 +956,14 @@ void FrameDump::Write(const Job& job) {
         << fmt::format(
                R"({{"name":"{}",{},"format":"{}","width":{},"height":{},"depth":{},"level":{},)"
                R"("layer":{},"gpu_addr":"{:#x}","rescaled":{},"depth_encoding":{},)"
-               R"("raw":"{}.raw.zst","png":{}{}}})",
+               R"("host_image":"{:#x}","view_image":"{:#x}","view_mip_count":{},)"
+               R"("raw":"{}.raw.zst","png":{}{}{}}})",
                job.name, job.tags, target.format, target.width, target.height, target.depth,
                target.level, target.layer, target.gpu_addr, target.rescaled,
-               static_cast<u32>(target.depth_encoding), job.name, png, stats)
+               static_cast<u32>(target.depth_encoding), std::bit_cast<u64>(target.image),
+               std::bit_cast<u64>(target.view_image), target.view_mip_count, job.name, png, stats,
+               target.host_blocks ? fmt::format(R"(,"host_format":"{}")", *target.host_blocks)
+                                  : std::string{})
         << '\n';
 }
 
