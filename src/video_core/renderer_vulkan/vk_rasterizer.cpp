@@ -3159,8 +3159,12 @@ void RasterizerVulkan::LoadDiskResources(u64 title_id, std::stop_token stop_load
     pipeline_cache.LoadDiskResources(title_id, stop_loading, callback);
 }
 
+namespace {
+// Cap on guest bytes recorded per buffer, so one oversized binding cannot blow up the dump.
+constexpr u32 BUFFER_CAP = 4U << 20;
+} // namespace
+
 bool RasterizerVulkan::FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes) {
-    static constexpr u32 BUFFER_CAP = 4U << 20;
     std::vector<FrameDump::BoundBuffer> buffers;
     buffer_cache.ForEachBoundBuffer(compute, [&](u32 stage, bool storage, u32 index, bool written,
                                                  const auto& binding, u32 bound_size,
@@ -3190,7 +3194,6 @@ bool RasterizerVulkan::FrameDumpBuffers(bool compute, std::span<const u64> shade
 }
 
 bool RasterizerVulkan::FrameDumpDrawInputs(bool is_indexed, std::span<const u64> shader_hashes) {
-    static constexpr u32 BUFFER_CAP = 4U << 20;
     static constexpr u32 INDIRECT_WORDS = 64;
     const auto& regs = maxwell3d->regs;
     const auto& state = maxwell3d->draw_manager.draw_state;
