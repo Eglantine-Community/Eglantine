@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <array>
+
 #include "shader_recompiler/frontend/ampere/translate/impl/impl.h"
 #include "shader_recompiler/frontend/maxwell/translate/impl/common_funcs.h"
 
@@ -134,14 +136,67 @@ void TranslatorVisitor::SGXT(const Instruction& insn) {
 }
 
 void TranslatorVisitor::PRMT(const Instruction& insn) {
-    const bool is_uniform = insn.Bits(0, 12) == 0x896;
+    const bool is_uniform = insn.Bits(7, 1) != 0;
     const u32 dest = insn.Bits(16, 8);
+    const u32 form = insn.Bits(9, 3);
+    const u32 mode = insn.Bits(72, 3);
     const IR::U32 a = is_uniform ? UR(insn.Bits(24, 8)) : R(insn.Bits(24, 8));
-    const IR::U32 c = is_uniform ? UR(insn.Bits(64, 8)) : R(insn.Bits(64, 8));
-    const u32 sel = insn.words[1] & 0xffffU;
-
+    const IR::U32 c = !is_uniform ? AluSourceU32(insn, 2)
+                      : form == 2 ? ir.Imm32(insn.words[1])
+                                  : UR(insn.Bits(64, 8));
+    const u32 control_field = form == 2 ? 64U : 32U;
+    IR::U32 control = !is_uniform ? AluSourceU32(insn, 1)
+                      : form == 4 ? ir.Imm32(insn.words[1])
+                                  : UR(insn.Bits(control_field, 8));
+    if (mode != 0U) {
+        // PTX prmt selector table, packed in destination-byte order (low nibble first).
+        constexpr std::array<std::array<u32, 4>, 6> modes{{
+            {0x3210, 0x4321, 0x5432, 0x6543}, // F4E
+            {0x5670, 0x6701, 0x7012, 0x0123}, // B4E
+            {0x0000, 0x1111, 0x2222, 0x3333}, // RC8
+            {0x3210, 0x3211, 0x3222, 0x3333}, // ECL
+            {0x0000, 0x1110, 0x2210, 0x3210}, // ECR
+            {0x1010, 0x3232, 0x1010, 0x3232}, // RC16
+        }};
+        const auto& selections = modes[mode - 1];
+        if (control.IsImmediate()) {
+            control = ir.Imm32(selections[control.U32() & 3U]);
+        } else {
+            const IR::U32 selector = ir.BitwiseAnd(control, ir.Imm32(3U));
+            const IR::U32 low{ir.Select(ir.IEqual(selector, ir.Imm32(0U)), ir.Imm32(selections[0]),
+                                        ir.Imm32(selections[1]))};
+            const IR::U32 high{ir.Select(ir.IEqual(selector, ir.Imm32(2U)), ir.Imm32(selections[2]),
+                                         ir.Imm32(selections[3]))};
+            control = IR::U32{ir.Select(ir.ILessThan(selector, ir.Imm32(2U), false), low, high)};
+        }
+    }
     const auto write_dst = [&](const IR::U32& val) { is_uniform ? UR(dest, val) : R(dest, val); };
 
+    if (!control.IsImmediate()) {
+        IR::U32 result = ir.Imm32(0U);
+        for (u32 i = 0; i < 4U; ++i) {
+            const IR::U32 nib = ir.BitFieldExtract(control, ir.Imm32(i * 4U), ir.Imm32(4U), false);
+            IR::U32 source = a;
+            if (mode <= 2U) {
+                const IR::U1 from_high =
+                    ir.INotEqual(ir.BitwiseAnd(nib, ir.Imm32(4U)), ir.Imm32(0U));
+                source = IR::U32{ir.Select(from_high, c, a)};
+            }
+            const IR::U32 pos =
+                ir.ShiftLeftLogical(ir.BitwiseAnd(nib, ir.Imm32(3U)), ir.Imm32(3U));
+            IR::U32 byte = ir.BitFieldExtract(source, pos, ir.Imm32(8U), false);
+            if (mode == 0U) {
+                const IR::U1 spread = ir.INotEqual(ir.BitwiseAnd(nib, ir.Imm32(8U)), ir.Imm32(0U));
+                const IR::U32 sign = ir.BitFieldExtract(byte, ir.Imm32(7U), ir.Imm32(1U), true);
+                byte = IR::U32{ir.Select(spread, sign, byte)};
+            }
+            result = ir.BitFieldInsert(result, byte, ir.Imm32(i * 8U), ir.Imm32(8U));
+        }
+        write_dst(result);
+        return;
+    }
+
+    const u32 sel = control.U32() & 0xffffU;
     if (sel == 0x5410U) {
         write_dst(ir.BitFieldInsert(a, c, ir.Imm32(16U), ir.Imm32(16U)));
         return;

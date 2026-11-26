@@ -19,6 +19,7 @@
 #include "ampere_exec.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#include "shader_recompiler/frontend/ampere/control_flow.h"
 #include "shader_recompiler/frontend/ampere/instruction.h"
 #include "video_core/native_tensor_programs.h"
 
@@ -122,6 +123,10 @@ Inst SgxtImm(u32 rd, u32 ra, u32 width, bool is_signed) {
 
 Inst PrmtImm(u32 rd, u32 ra, u32 rc, u32 sel) {
     return {{0x00007816U | (rd << 16) | (ra << 24), sel, rc, Sched}};
+}
+
+Inst PrmtReg(u32 rd, u32 ra, u32 rb, u32 rc, u32 mode) {
+    return {{0x00007216U | (rd << 16) | (ra << 24), rb, (mode << 8) | rc, Sched}};
 }
 
 Inst FloReg(u32 rd, u32 rb, bool is_signed, bool shift, bool tilde = false) {
@@ -503,6 +508,63 @@ TEST_CASE("Direct Ampere GPU execution: logic, bitfield, shifts, predicates, P2R
         CHECK(res.outputs[i][5] == static_cast<u32>(std::popcount(a)));
         CHECK(res.outputs[i][6] == brev);
         CHECK(res.outputs[i][7] == pmask);
+    }
+}
+
+TEST_CASE("Direct Ampere PRMT and UPRMT reject the reserved mode", "[nvn][ampere_direct_exec]") {
+    using Shader::Ampere::Instruction;
+    const std::array rejected{PrmtReg(16U, 8U, 9U, 10U, 7U),
+                              Inst{{0x01027896U, 0U, 0x08000703U, Sched}}};
+    for (const Inst instruction : rejected) {
+        const std::array program{std::bit_cast<Instruction>(instruction),
+                                 std::bit_cast<Instruction>(Exit)};
+        CHECK(Shader::Ampere::AnalyzeProgram(program).error == "native permutation mode");
+    }
+}
+
+TEST_CASE("Direct Ampere GPU execution: PRMT byte selection modes", "[nvn][ampere_direct_exec]") {
+    auto rig = Rig::Create();
+    if (!rig) {
+        SKIP("no Vulkan device");
+    }
+
+    const std::array prog{
+        PrmtReg(16U, 8U, 9U, 10U, 1U), // F4E
+        PrmtReg(17U, 8U, 9U, 10U, 2U), // B4E
+        PrmtReg(18U, 8U, 9U, 10U, 3U), // RC8
+        PrmtReg(19U, 8U, 9U, 10U, 4U), // ECL
+        PrmtReg(20U, 8U, 9U, 10U, 5U), // ECR
+        PrmtReg(21U, 8U, 9U, 10U, 6U), // RC16
+        PrmtReg(22U, 8U, 9U, 10U, 0U), // Generic, with sign replication
+        UMovImm(1U, 0x84736251U),
+        UMovImm(2U, 0xc8b7a695U),
+        Inst{{0x01037896U, 0xabcde001U, 0x08000102U, Sched}}, // UPRMT.F4E UR3, UR1, imm, UR2
+        MovFromUr(23U, 3U),
+    };
+    const std::array<Words, 4> cases{{
+        {0x84736251U, 0xabc0b420U, 0xc8b7a695U},
+        {0x84736251U, 0xabc0b421U, 0xc8b7a695U},
+        {0x84736251U, 0xabc0b422U, 0xc8b7a695U},
+        {0x84736251U, 0xabc0b423U, 0xc8b7a695U},
+    }};
+    const std::array<Words, 4> expected{{
+        {0x84736251U, 0xa6b7c851U, 0x51515151U, 0x84736251U, 0x51515151U, 0x62516251U,
+         0xff957351U, 0x95847362U},
+        {0x95847362U, 0xb7c85162U, 0x62626262U, 0x84736262U, 0x62626251U, 0x84738473U,
+         0xff957362U, 0x95847362U},
+        {0xa6958473U, 0xc8516273U, 0x73737373U, 0x84737373U, 0x73736251U, 0x62516251U,
+         0xff957373U, 0x95847362U},
+        {0xb7a69584U, 0x51627384U, 0x84848484U, 0x84848484U, 0x84736251U, 0x84738473U,
+         0xff957384U, 0x95847362U},
+    }};
+
+    const auto result = rig->Run(prog, cases);
+    INFO(result.error);
+    REQUIRE(result.error.empty());
+    REQUIRE(result.outputs.size() == expected.size());
+    for (size_t i = 0; i < expected.size(); ++i) {
+        CAPTURE(i);
+        CHECK(result.outputs[i] == expected[i]);
     }
 }
 

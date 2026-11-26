@@ -123,6 +123,7 @@ struct BcScratch {
     u32 width{};
     u32 height{};
     u32 layers{};
+    u64 allocated_bytes{};
 
     [[nodiscard]] bool Fits(u32 w, u32 h, u32 l, bool bc7 = false) const {
         return w <= width && h <= height && l <= layers && (!bc7 || modes);

@@ -773,13 +773,30 @@ void DrawContext::UpdateUniformBuffer(const VC::RecordHeader* header) {
     if (size == 0) {
         return;
     }
+    const auto* data = reinterpret_cast<const u8*>(p + 1);
+    // Earlier draws keep private uniform copies. The flush is the first GPU read of an update's
+    // staging bytes, and removes the entry. Move the replacement behind any intervening update.
+    constexpr size_t MAX_REUSE_DISTANCE = 8;
+    auto entry = inline_updates.end();
+    const size_t recent = (std::min)(inline_updates.size(), MAX_REUSE_DISTANCE);
+    for (size_t i = 0; i < recent; ++i) {
+        --entry;
+        if (entry->address != p->address || entry->size != size) {
+            continue;
+        }
+        std::memcpy(entry->data, data, size);
+        std::rotate(entry, entry + 1, inline_updates.end());
+        ++counters.inline_updates;
+        ++counters.inline_updates_superseded;
+        return;
+    }
     u8* pointer = nullptr;
     const BufferRef slice = AllocArena(size, 16, &pointer);
     if (!slice.buffer) {
         host->HostFailed("UpdateUniformBuffer", "no arena space");
         return;
     }
-    std::memcpy(pointer, reinterpret_cast<const u8*>(p + 1), size);
+    std::memcpy(pointer, data, size);
     inline_updates.push_back({p->address, size, pointer, slice.buffer, slice.offset});
     ++counters.inline_updates;
 }
@@ -1339,6 +1356,7 @@ bool DrawContext::BeginPass(bool read_only_depth) {
         const u64 fb_epoch = resources.framebuffer_views_epoch;
         if (framebuffer_cache_epoch != fb_epoch) {
             framebuffer_cache.clear();
+            framebuffer_cache_order.clear();
             framebuffer_cache_epoch = fb_epoch;
             last_framebuffer.handle = VK_NULL_HANDLE;
         }
@@ -1353,22 +1371,14 @@ bool DrawContext::BeginPass(bool read_only_depth) {
             auto it = framebuffer_cache.find(fb_key);
             if (it != framebuffer_cache.end()) {
                 CachedFramebuffer& cached = it->second;
-                cached.last_used_seq = seq;
                 if (cached.last_retained_seq != seq) {
                     host->HostFlight().keepalive.push_back(cached.fb);
                     cached.last_retained_seq = seq;
+                    framebuffer_cache_order.splice(framebuffer_cache_order.begin(),
+                                                   framebuffer_cache_order, cached.order);
                 }
                 framebuffer = **cached.fb;
             } else {
-                if (framebuffer_cache.size() >= FRAMEBUFFER_CACHE_MAX) {
-                    auto victim = framebuffer_cache.begin();
-                    for (auto iter = std::next(victim); iter != framebuffer_cache.end(); ++iter) {
-                        if (iter->second.last_used_seq < victim->second.last_used_seq) {
-                            victim = iter;
-                        }
-                    }
-                    framebuffer_cache.erase(victim);
-                }
                 auto created =
                     std::make_shared<vk::Framebuffer>(device.GetLogical().CreateFramebuffer({
                         .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
@@ -1383,7 +1393,19 @@ bool DrawContext::BeginPass(bool read_only_depth) {
                     }));
                 framebuffer = **created;
                 host->HostFlight().keepalive.push_back(created);
-                framebuffer_cache.emplace(fb_key, CachedFramebuffer{std::move(created), seq, seq});
+                framebuffer_cache_order.push_front(fb_key);
+                try {
+                    framebuffer_cache.emplace(
+                        fb_key, CachedFramebuffer{std::move(created), seq,
+                                                  framebuffer_cache_order.begin()});
+                } catch (...) {
+                    framebuffer_cache_order.pop_front();
+                    throw;
+                }
+                if (framebuffer_cache.size() > FRAMEBUFFER_CACHE_MAX) {
+                    framebuffer_cache.erase(framebuffer_cache_order.back());
+                    framebuffer_cache_order.pop_back();
+                }
             }
             last_framebuffer = {base_render_pass, framebuffer, extent,           layers,
                                 views,            attachment_count, fb_epoch, seq};

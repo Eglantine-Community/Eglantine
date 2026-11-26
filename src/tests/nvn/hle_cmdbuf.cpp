@@ -687,6 +687,10 @@ TEST_CASE("nvn hle cmdbuf: copies with regions read from guest memory and copy s
     f.InitTextures();
     f.memory.Put(Rig::SCRATCH, std::array<s32, 6>{4, 8, 0, 16, 12, 1});
     f.memory.Put(Rig::SCRATCH + 0x40, std::array<s32, 6>{1, 2, 3, 6, 5, 4});
+    GuestTextureView src_view{};
+    src_view.set_bits = GUEST_VIEW_SET_FORMAT;
+    src_view.format = MakeTexture(16, 12).format;
+    f.memory.Put(Rig::SCRATCH + 0x80, src_view);
 
     CHECK(f.Call("nvnCommandBufferGetCopyRowStride", {Rig::I(CMD)}) == 0);
     f.Call("nvnCommandBufferSetCopyRowStride", {Rig::I(CMD), Rig::I(256)});
@@ -705,8 +709,8 @@ TEST_CASE("nvn hle cmdbuf: copies with regions read from guest memory and copy s
                 Rig::I(Rig::STORAGE + 0x600), Rig::I(0x4)});
         // (cmd, src, src view, src region, dst, dst view, dst region, flags)
         f.Call("nvnCommandBufferCopyTextureToTexture",
-               {Rig::I(CMD), Rig::I(TEX_A), Rig::I(0), Rig::I(Rig::SCRATCH), Rig::I(TEX_B),
-                Rig::I(0), Rig::I(Rig::SCRATCH + 0x40), Rig::I(0x1)});
+               {Rig::I(CMD), Rig::I(TEX_A), Rig::I(Rig::SCRATCH + 0x80), Rig::I(Rig::SCRATCH),
+                Rig::I(TEX_B), Rig::I(0), Rig::I(Rig::SCRATCH + 0x40), Rig::I(0x1)});
     });
     REQUIRE(Ops(list) == std::vector<Op>{Op::CopyBufferToTexture, Op::CopyTextureToBuffer,
                                          Op::CopyTextureToTexture});
@@ -735,6 +739,8 @@ TEST_CASE("nvn hle cmdbuf: copies with regions read from guest memory and copy s
     CHECK(t2t->dst_region.x == 1);
     CHECK(t2t->dst_region.height == 5);
     CHECK(t2t->flags == 1);
+    CHECK(t2t->src_view_format == src_view.format);
+    CHECK(t2t->dst_view_format == 0);
 }
 
 TEST_CASE("nvn hle cmdbuf: Downsample resolves whole textures", "[nvn]") {

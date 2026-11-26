@@ -1713,6 +1713,42 @@ TEST_CASE("MKW sparse row binds preserve distinct neighboring tiles", "[nvn][mkw
     CHECK(rig.context.Stats().ops_unsupported == 0);
 }
 
+TEST_CASE("NVN BC scratch cache bounds retained allocations and preserves active work",
+          "[nvn][bc-scratch-cache]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    Nvn::Context::Impl impl(*vulkan->device, vulkan->submit_mutex, nullptr,
+                           {.background_backing = false, .storage_cache_budget_bytes = 384_MiB});
+    impl.astc_standin = GENERATE(Nvn::AstcStandin::Bc3, Nvn::AstcStandin::Bc7);
+    constexpr u64 CACHE_BUDGET = 24_MiB;
+    const u64 min_bytes = impl.astc_standin == Nvn::AstcStandin::Bc7 ? 22_MiB : 20_MiB;
+    auto first = impl.AcquireBcScratch(2048, 2048, 1);
+    REQUIRE(first);
+    CHECK(impl.AcquireBcScratch(2048, 2048, 1) == first);
+    REQUIRE(first->allocated_bytes <= CACHE_BUDGET);
+    CHECK(first->allocated_bytes >= min_bytes);
+    CHECK(impl.BcScratchCacheBytes() == first->allocated_bytes);
+
+    // A different shape can be used while this scratch is held by the recorded work.
+    auto second = impl.AcquireBcScratch(1024, 2048, 2);
+    REQUIRE(second);
+    CHECK(first != second);
+    CHECK(first->allocated_bytes + second->allocated_bytes > CACHE_BUDGET);
+    CHECK(impl.BcScratchCacheBytes() == first->allocated_bytes);
+    CHECK(impl.TrimBcScratchCache(0) == 0);
+
+    const std::weak_ptr<Nvn::BcScratch> retired = first;
+    first.reset();
+    second.reset();
+    const auto replacement = impl.AcquireBcScratch(1024, 2048, 2);
+    REQUIRE(replacement);
+    CHECK(retired.expired());
+    CHECK(impl.BcScratchCacheBytes() == replacement->allocated_bytes);
+    CHECK(impl.BcScratchCacheBytes() <= CACHE_BUDGET);
+}
+
 TEST_CASE("MKW BC3: large atlas residency fits a constrained device heap",
           "[nvn][mkw][.vram-stress]") {
     auto vulkan = MakeHeadlessVulkan();
@@ -2381,6 +2417,77 @@ TEST_CASE("nvn memory: cold hints, resource cleanup, and linux memory descriptio
         impl.HintColdGuestSpan(unimported_span_pool, 0, 256_KiB);
         CHECK(has_cold_cover(import_guard_mem.ColdHints(), 0x7000'0000, 256_KiB));
     }
+}
+
+TEST_CASE("NVN storage view invalidation detaches all aliases of the replaced image",
+          "[nvn][memory]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    Nvn::Context::Impl impl(*vulkan->device, vulkan->submit_mutex, nullptr, {});
+    auto& resources = *impl.draw_resources;
+    const auto make_storage = [&] {
+        auto storage = std::make_shared<Nvn::Storage>(
+            MakeStorage(NVN_FORMAT_RGBA8, 32, 32, 1, PixelFormat::A8B8G8R8_UNORM,
+                        VK_FORMAT_A8B8G8R8_UNORM_PACK32));
+        storage->usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        REQUIRE(impl.EnsureImage(*storage));
+        return storage;
+    };
+    auto storage = make_storage();
+    auto unrelated = make_storage();
+    Nvn::Texture first{.serial = 10, .storage = storage};
+    Nvn::Texture alias{.serial = 11, .storage = storage};
+    Nvn::Texture other{.serial = 12, .storage = unrelated};
+    const Nvn::ViewKey view{.format = storage->host.format, .type = VK_IMAGE_VIEW_TYPE_2D,
+                            .aspect = VK_IMAGE_ASPECT_COLOR_BIT, .levels = 1, .layers = 1};
+    const VkImageView first_view = resources.GetView(first, view, true);
+    const VkImageView alias_view = resources.GetView(alias, view);
+    const VkImageView other_view = resources.GetView(other, view);
+    REQUIRE(first_view);
+    REQUIRE(alias_view);
+    REQUIRE(other_view);
+
+    const u64 framebuffer_epoch = resources.framebuffer_views_epoch;
+    auto detached = resources.TakeStorageViews(*storage);
+    REQUIRE(detached.size() == 2);
+    CHECK(std::ranges::any_of(detached, [&](const auto& handle) { return *handle == first_view; }));
+    CHECK(std::ranges::any_of(detached, [&](const auto& handle) { return *handle == alias_view; }));
+    CHECK(resources.framebuffer_views_epoch == framebuffer_epoch + 1);
+    CHECK(resources.GetView(other, view) == other_view);
+    CHECK(resources.TakeStorageViews(*storage).empty());
+    CHECK(resources.framebuffer_views_epoch == framebuffer_epoch + 1);
+
+    detached.clear();
+    storage->image = {};
+    REQUIRE(impl.EnsureImage(*storage));
+    REQUIRE(resources.GetView(first, view));
+    REQUIRE(resources.GetView(alias, view));
+    const auto* other_slot = other.view_slot;
+    REQUIRE(resources.TakeViews(first)->views.size() == 1);
+    CHECK(first.view_slot == nullptr);
+    REQUIRE(resources.TakeViews(alias)->views.size() == 1);
+    CHECK(alias.view_slot == nullptr);
+    CHECK(other.view_slot == other_slot);
+    CHECK(resources.GetView(other, view) == other_view);
+    CHECK_FALSE(resources.storage_views.contains(storage.get()));
+    REQUIRE(resources.GetView(first, view));
+    CHECK(resources.TakeStorageViews(*storage).size() == 1);
+
+    alias.storage = unrelated;
+    REQUIRE(resources.GetView(alias, view));
+    CHECK(resources.TakeStorageViews(*storage).empty());
+    CHECK(resources.TakeStorageViews(*unrelated).size() == 2);
+
+    Nvn::Texture same_serial{.serial = first.serial, .storage = storage};
+    const VkImageView shared_view = resources.GetView(first, view);
+    REQUIRE(shared_view);
+    REQUIRE(resources.GetView(same_serial, view) == shared_view);
+    const auto keep = resources.TakeViews(same_serial);
+    REQUIRE(keep->views.size() == 1);
+    CHECK(same_serial.view_slot == nullptr);
+    CHECK(resources.GetView(first, view) != shared_view);
 }
 
 TEST_CASE("NVN present keeps the previous picture until the new source has pixels",

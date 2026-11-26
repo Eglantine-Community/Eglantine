@@ -290,10 +290,40 @@ TEST_CASE("PageTracker: overlapping owners collect independently", "[core][page_
     CHECK(Collect(state, b) == Runs{{7, 8}});
     CHECK(Collect(state, a) == Runs{{7, 8}});
     state.Unregister(a);
+    CHECK(state.WriteEpoch(a) == nullptr);
     CHECK(sink.Cached(7)); // b still holds it
     CHECK_FALSE(sink.Cached(2));
+    const u64 replacement = state.Register(0, 10, true);
+    state.OnWrite(7, 8);
+    CHECK(Collect(state, a).empty());
+    CHECK(Collect(state, replacement) == Runs{{7, 8}});
+    CHECK(Collect(state, b) == Runs{{7, 8}});
+    state.Unregister(replacement);
     state.Unregister(b);
     CHECK_FALSE(sink.Cached(7));
+}
+
+TEST_CASE("PageTracker: long ranges inserted before shorter owners remain visible",
+          "[core][page_tracker]") {
+    FakeSink sink;
+    PageTrackerState state{sink};
+    const u64 short_range = state.Register(40, 43, true);
+    const u64 outer = state.Register(8, 96, true);
+    const u64 inner = state.Register(16, 80, true);
+
+    state.OnWrite(72, 73);
+    CHECK(Collect(state, outer) == Runs{{72, 73}});
+    CHECK(Collect(state, inner) == Runs{{72, 73}});
+    CHECK(Collect(state, short_range).empty());
+    state.Unregister(outer);
+
+    state.OnWrite(72, 73);
+    CHECK(Collect(state, inner) == Runs{{72, 73}});
+    state.Unregister(inner);
+    CHECK_FALSE(sink.Cached(72));
+
+    state.OnWrite(42, 43);
+    CHECK(Collect(state, short_range) == Runs{{42, 43}});
 }
 
 TEST_CASE("PageTracker: access traps call back once and survive a re-arm during the callback",

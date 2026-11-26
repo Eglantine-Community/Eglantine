@@ -143,7 +143,8 @@ struct CopyTextureToTexturePayload {
     TextureRef dst;
     CopyRegion dst_region;
     u32 flags;
-    u32 pad;
+    u16 src_view_format; // zero inherits the texture format
+    u16 dst_view_format;
 };
 
 struct FenceSyncPayload {

@@ -30,6 +30,28 @@ namespace {
 constexpr u64 MAX_UNIFORM_RANGE = 65536;
 constexpr u64 ZERO_SIZE_RANGE_MAX = u64{8} << 20; // longest range of a size-0 storage entry
 
+void CopyInlineUniformBytes(u8* destination, const u8* source, size_t size) {
+    // Most inline uniform writes are a scalar, a vector, or a matrix. Use constant-size
+    // copies here so the replay loop can copy them inline, including unaligned fragments.
+    switch (size) {
+    case 4:
+        std::memcpy(destination, source, 4);
+        break;
+    case 8:
+        std::memcpy(destination, source, 8);
+        break;
+    case 16:
+        std::memcpy(destination, source, 16);
+        break;
+    case 64:
+        std::memcpy(destination, source, 64);
+        break;
+    default:
+        std::memcpy(destination, source, size);
+        break;
+    }
+}
+
 enum class TargetKind { Dim1D, Dim2D, Dim3D, Dim1DArray, Dim2DArray, Cube, CubeArray, Buffer, Rect };
 
 Shader::TextureType TypeOfTarget(s32 target) {
@@ -1233,8 +1255,8 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                     const u64 begin = (std::max)(update.address, binding.address);
                     const u64 end = (std::min)(update.address + update.size, binding.address + size);
                     if (begin < end) {
-                        std::memcpy(pointer + (begin - binding.address),
-                                    update.data + (begin - update.address), end - begin);
+                        CopyInlineUniformBytes(pointer + (begin - binding.address),
+                                               update.data + (begin - update.address), end - begin);
                     }
                 }
                 return VkDescriptorBufferInfo{copy.buffer, copy.offset, size};

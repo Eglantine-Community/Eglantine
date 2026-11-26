@@ -451,6 +451,8 @@ struct System::Impl {
         SystemResultStatus init_result{SetupForApplicationProcess(system, emu_window)};
         if (init_result != SystemResultStatus::Success) {
             LOG_CRITICAL(Core, "Failed to initialize system (Error {})!", int(init_result));
+            // Finalize the unstarted application while its kernel objects are still alive.
+            process.reset();
             ShutdownMainProcess();
             return init_result;
         }

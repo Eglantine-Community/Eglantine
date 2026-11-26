@@ -1460,7 +1460,7 @@ void Context::Impl::DestroyNow(u64 serial) {
         // The image views of the draw path go with the texture, after the last submission that
         // used them completed.
         std::shared_ptr<TextureViews> views =
-            draw_resources ? draw_resources->TakeViews(serial) : nullptr;
+            draw_resources ? draw_resources->TakeViews(*texture) : nullptr;
         // Its render-target aliases (TargetAlias) were last used with it (SetRenderTargets notes
         // the texture's serial).
         std::vector<std::pair<std::shared_ptr<Texture>, std::shared_ptr<TextureViews>>> aliases;
@@ -1468,13 +1468,13 @@ void Context::Impl::DestroyNow(u64 serial) {
              alias != target_aliases.end() && std::get<0>(alias->first) == serial;
              alias = target_aliases.erase(alias)) {
             std::shared_ptr<TextureViews> alias_views =
-                draw_resources ? draw_resources->TakeViews(alias->second->serial) : nullptr;
+                draw_resources ? draw_resources->TakeViews(*alias->second) : nullptr;
             aliases.emplace_back(std::move(alias->second), std::move(alias_views));
         }
         // So are the views of its scaled twin (Resolution setting), made under a serial of their own.
         if (texture->scaled) {
             std::shared_ptr<TextureViews> twin_views =
-                draw_resources ? draw_resources->TakeViews(texture->scaled->serial) : nullptr;
+                draw_resources ? draw_resources->TakeViews(*texture->scaled) : nullptr;
             aliases.emplace_back(std::move(texture->scaled), std::move(twin_views));
         }
         retired.push_back({after, [texture = std::move(texture), views = std::move(views),

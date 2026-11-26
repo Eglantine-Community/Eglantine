@@ -17,6 +17,7 @@
 #include "shader_recompiler/frontend/ampere/translate/translate.h"
 #include "shader_recompiler/frontend/ampere/translate_program.h"
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
+#include "shader_recompiler/frontend/ir/modifiers.h"
 #include "shader_recompiler/frontend/ir/opcodes.h"
 #include "shader_recompiler/frontend/ir/pred.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
@@ -494,6 +495,17 @@ TEST_CASE("Direct Ampere Tier 2 FP32 ALU, IPA, if-conversion, and IR opts minimi
     CHECK(CountOpcode(direct, Shader::IR::Opcode::FPFma32) <= 1);
     CHECK(CountOpcode(direct, Shader::IR::Opcode::FPRecip32) == 1);
     CHECK(CountOpcode(direct, Shader::IR::Opcode::SetFragColor) == 4);
+
+    // Separate guest operations must keep their rounding points through IR optimization.
+    using Opcode = Shader::IR::Opcode;
+    for (const Opcode opcode : {Opcode::FPAdd32, Opcode::FPMul32, Opcode::FPFma32}) {
+        CAPTURE(static_cast<u32>(opcode));
+        CHECK(std::ranges::any_of(direct.blocks, [opcode](const Shader::IR::Block* block) {
+            return std::ranges::any_of(block->Instructions(), [opcode](const Shader::IR::Inst& inst) {
+                return inst.GetOpcode() == opcode && inst.Flags<Shader::IR::FpControl>().no_contraction;
+            });
+        }));
+    }
 }
 
 TEST_CASE("Direct Ampere SsaRewritePass eliminates self-loop Phis across nested backedges",

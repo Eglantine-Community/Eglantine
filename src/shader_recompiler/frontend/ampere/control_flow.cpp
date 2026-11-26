@@ -350,14 +350,28 @@ void Split(Flow::Block* old_block, Flow::Block* new_block, Maxwell::Location pc)
         return (!(insn.words[2] & ~0x200U) && insn.words[1] <= 32 && dest < 255)
                    ? true
                    : fail("native sign extend mode");
-    case 0x816: case 0x896: {
-        const bool is_uniform = opcode == 0x896;
+    case 0x216: case 0x416: case 0x616: case 0x816: case 0xa16: case 0xc16: case 0xe16:
+    case 0x296: case 0x496: case 0x896: {
+        const bool is_uniform = (opcode & 0x80U) != 0;
         if (is_uniform && (dest > 63 || insn.Bits(24, 8) > 63 || insn.Bits(64, 8) > 63)) {
             return fail("native uniform arithmetic register");
         }
-        return (insn.words[1] <= 0xffffU && (insn.words[2] & ~0xffU) == 0U)
-                   ? true
-                   : fail("native permutation mode");
+        const u32 uniform_bit = is_uniform || form >= 6 ? 0x08000000U : 0U;
+        if (insn.Bits(72, 3) == 7 || (insn.words[2] & ~(0x7ffU | uniform_bit))) {
+            return fail("native permutation mode");
+        }
+        if (form == 3 || form == 5) {
+            return (ValidCbuf(insn) && !(insn.words[1] & ~0x07ffffc0U))
+                       ? true
+                       : fail("native constant buffer address");
+        }
+        if (form == 1 || form >= 6) {
+            const u32 source_limit = is_uniform || form >= 6 ? 63U : 255U;
+            if (insn.words[1] > source_limit) {
+                return fail("native permutation register source");
+            }
+        }
+        return true;
     }
     case 0x300: case 0xd00:
         return ((insn.words[2] & ~(0x600U | (opcode == 0xd00 ? 0x08000000U : 0U))) == 0x000e0000U &&
@@ -567,7 +581,7 @@ struct AmpereBranchTableInfo {
     case 0x2a5: case 0x8a5: // UIMAD.WIDE
     case 0x292: case 0x892: // ULOP3
     case 0x299: case 0x499: case 0x899: // USHF
-    case 0x896:             // UPRMT
+    case 0x296: case 0x496: case 0x896: // UPRMT
     case 0x2bd: case 0x2be: case 0x2bf: // UFLO, UBREV, UPOPC
     case 0x287: case 0x887: // USEL
     case 0x883:             // UP2UR
@@ -1998,7 +2012,7 @@ bool UsesUniformGuardPredicate(u32 opcode) noexcept {
     case 0x882: case 0xc82: // UMOV
     case 0x883: // UP2UR
     case 0x886: // VOTEU
-    case 0x896: // UPRMT
+    case 0x296: case 0x496: case 0x896: // UPRMT
     case 0x89c: // UPLOP3
     case 0xab9: case 0xabb: // ULDC
     case 0x9c3: // S2UR
@@ -2049,7 +2063,8 @@ bool IsDirectTier1Opcode(u32 opcode) noexcept {
     case 0x219: case 0x419: case 0x819: case 0xa19: case 0xc19:
     case 0x299: case 0x499: case 0x899:
     case 0x81a:
-    case 0x816: case 0x896:
+    case 0x216: case 0x416: case 0x616: case 0x816: case 0xa16: case 0xc16: case 0xe16:
+    case 0x296: case 0x496: case 0x896:
     case 0x300: case 0xd00: case 0x2bd:
     case 0x309: case 0xd09: case 0x2bf:
     case 0x301: case 0x2be:
@@ -2154,7 +2169,8 @@ bool CanIfConvertPredicated(const Instruction& insn) noexcept {
     case 0x219: case 0x419: case 0x819: case 0xa19: case 0xc19:
     case 0x299: case 0x499: case 0x899:
     case 0x81a:
-    case 0x816: case 0x896:
+    case 0x216: case 0x416: case 0x616: case 0x816: case 0xa16: case 0xc16: case 0xe16:
+    case 0x296: case 0x496: case 0x896:
     case 0x300: case 0xd00: case 0x2bd:
     case 0x309: case 0xd09: case 0x2bf:
     case 0x301: case 0x2be:

@@ -20,6 +20,7 @@
 #include <array>
 #include <bitset>
 #include <chrono>
+#include <list>
 #include <map>
 #include <optional>
 #include <memory>
@@ -1069,11 +1070,12 @@ private:
     };
     struct CachedFramebuffer {
         std::shared_ptr<vk::Framebuffer> fb;
-        u64 last_used_seq{};
         u64 last_retained_seq{~u64{0}};
+        std::list<FramebufferKey>::iterator order;
     };
     static constexpr size_t FRAMEBUFFER_CACHE_MAX = 128;
     u64 framebuffer_cache_epoch{0};
+    std::list<FramebufferKey> framebuffer_cache_order; ///< newest retained sequence first
     std::unordered_map<FramebufferKey, CachedFramebuffer, FramebufferKeyHash> framebuffer_cache;
     mutable bool pass_key_valid{false};
     mutable RenderPassKey cached_pass_key{};
