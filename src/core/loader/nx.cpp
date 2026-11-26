@@ -661,7 +661,10 @@ struct AppLoader_NX::Impl {
         for (u32 si = owner.first_snapshot; si < owner.first_snapshot + owner.snapshot_count;
              ++si) {
             const auto type = Archive().snapshots()[si].type;
-            if ((type == Update || type == AddOn) && !Archive().snapshots()[si].addon_title_id()) {
+            // Other programs' bases too: OpenDataStorageWithProgramIndex finds them here.
+            const bool other_base = type == Base && si != base && !IsTree(si);
+            if ((type == Update || type == AddOn || other_base) &&
+                !Archive().snapshots()[si].addon_title_id()) {
                 if (auto extra = SnapshotPackage(si)) {
                     native_extras.push_back(std::move(extra));
                 }
@@ -918,6 +921,51 @@ ResultStatus AppLoader_NX::ReadPatchedRomFS(FileSys::VirtualFile& out_file) {
     auto& system = *impl->system;
     const auto content = ContentForGame(system.GetContentProviderUnion(), this);
     const FileSys::PatchManager pm{impl->program_id, system.GetFileSystemController(), content};
+    out_file = pm.PatchRomFS(base_nca.get(), base_nca->GetRomFS(),
+                             FileSys::ContentRecordType::Program, nullptr, false);
+    return out_file != nullptr ? ResultStatus::Success : ResultStatus::ErrorNoRomFS;
+}
+
+ResultStatus AppLoader_NX::ReadProgramRomFS(u64 program_id, FileSys::VirtualFile& out_file) {
+    if (impl->status != ResultStatus::Success) {
+        return impl->status;
+    }
+    if (program_id == impl->program_id) {
+        return ReadRomFS(out_file);
+    }
+    const auto& a = impl->Archive();
+    const auto& owner = a.applications()[impl->app];
+    u32 pi = Absent;
+    for (u32 p = owner.first_program;
+         p != Absent && p < owner.first_program + owner.program_count; ++p) {
+        if (a.programs()[p].id == program_id) {
+            pi = p;
+        }
+    }
+    const u32 si = pi == Absent ? Absent : impl->Latest(pi);
+    if (si == Absent) {
+        return ResultStatus::ErrorNSPMissingProgramNCA;
+    }
+    if (impl->IsTree(si)) {
+        // Like the started program, a tree snapshot is that program's complete updated view.
+        const auto root = FileSys::NxSnapshotDirectory(impl->session, si);
+        const auto romfs = root != nullptr ? root->GetSubdirectory("romfs") : nullptr;
+        out_file = romfs != nullptr ? FileSys::CreateRomFS(romfs) : nullptr;
+        return out_file != nullptr ? ResultStatus::Success : ResultStatus::ErrorNoRomFS;
+    }
+    // Native content: the program's base NCA with its updates from the content provider.
+    const auto package = impl->SnapshotPackage(impl->BaseOf(si));
+    if (package == nullptr) {
+        return ResultStatus::ErrorNSPMissingProgramNCA;
+    }
+    const FileSys::NSP nsp{package, program_id};
+    const auto base_nca = nsp.GetNCA(program_id, FileSys::ContentRecordType::Program);
+    if (base_nca == nullptr || base_nca->GetRomFS() == nullptr) {
+        return ResultStatus::ErrorNoRomFS;
+    }
+    auto& system = *impl->system;
+    const auto content = ContentForGame(system.GetContentProviderUnion(), this);
+    const FileSys::PatchManager pm{program_id, system.GetFileSystemController(), content};
     out_file = pm.PatchRomFS(base_nca.get(), base_nca->GetRomFS(),
                              FileSys::ContentRecordType::Program, nullptr, false);
     return out_file != nullptr ? ResultStatus::Success : ResultStatus::ErrorNoRomFS;

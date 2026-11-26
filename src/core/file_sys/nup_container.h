@@ -114,6 +114,8 @@ public:
         u32 version{};
         PackageKind kind{};
         bool standalone_update{};
+        /// The program to start in a container holding several programs (SPEC §3.1.2).
+        bool launch_program{};
         u32 root_dir{};
         u32 exefs_dir{};
         u32 romfs_dir{};
@@ -133,6 +135,12 @@ public:
 
     /// Quick magic check without a full parse.
     static bool IsNupFile(const VirtualFile& file);
+
+    /// Deletes spill files in `dir` whose owning process ended (and old-format ones over an
+    /// hour old). Runs once per process for the default spill directory.
+    static void RemoveLeftoverSpills(const std::filesystem::path& dir);
+    /// The process ID spill file names start with.
+    static u64 CurrentProcessIdForSpills();
 
     /// Recursively merges overlay into a copy of base; overlay paths win.
     static VirtualDir MergeShadowDirs(const VirtualDir& base, const VirtualDir& overlay);
@@ -154,9 +162,20 @@ public:
 
     std::optional<std::size_t> FindPackage(PackageKind kind,
                                            std::optional<u64> title_id = std::nullopt) const;
-    std::optional<std::size_t> FindBasePackage() const;
-    /// Highest version among Update packages, if any.
-    std::optional<std::size_t> FindBestUpdatePackage() const;
+    /// The programs of the application in this container, by program ID: every base package,
+    /// and the standalone updates of programs without one. One entry for single-program dumps.
+    std::vector<u64> GetProgramIds() const;
+    /// The program to start: the one marked launch_program, else the requested program index,
+    /// else the lowest program index.
+    std::optional<u64> FindLaunchProgram(std::size_t program_index = 0) const;
+    /// The base package of `program_id` (default: the launch program).
+    std::optional<std::size_t> FindBasePackage(std::optional<u64> program_id = std::nullopt) const;
+    /// Highest version among the Update packages of `program_id` (default: the launch program).
+    /// A single-program container applies every update, as v1 readers did.
+    std::optional<std::size_t> FindBestUpdatePackage(
+        std::optional<u64> program_id = std::nullopt) const;
+    /// The RomFS tree `program_id` sees: its base with its newest update overlaid.
+    VirtualDir GetProgramRomFSDir(u64 program_id);
 
     /// Opens a member file by node index; raw extents are zero-copy views into
     /// the container, zstd extents are lazily decompressed, cached in memory
