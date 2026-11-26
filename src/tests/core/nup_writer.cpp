@@ -1092,3 +1092,27 @@ TEST_CASE("NUP removes temporary files that earlier runs left behind", "[nup]") 
     REQUIRE(fs::exists(dir / "fedcba9876543210-8.tmp"));
     REQUIRE(fs::exists(dir / "notes.txt"));
 }
+
+TEST_CASE("NUP extract keeps add-on versions so repacking preserves them", "[nup]") {
+    TempDir t;
+    const auto root = t.path / "Game";
+    Put(root / "base/exefs/main", "main");
+    Put(root / "base/exefs/main.npdm", Npdm(TitleId));
+    Put(root / "base/romfs/file", "rom");
+    Put(root / "dlc/0400ABCD00011001/393216/romfs/addon.bin", "addon v6");
+    const auto archive = t.path / "Game.nup";
+    REQUIRE(FileSys::Nup::PackDump(root, archive) == FileSys::Nup::PackResult::Success);
+
+    const auto out = t.path / "Extracted";
+    REQUIRE(FileSys::Nup::ExtractNup(archive, out) == FileSys::Nup::ExtractResult::Success);
+    REQUIRE(fs::exists(out / "dlc/0400ABCD00011001/393216/romfs/addon.bin"));
+
+    const auto repacked = t.path / "Repacked.nup";
+    REQUIRE(FileSys::Nup::PackDump(out, repacked) == FileSys::Nup::PackResult::Success);
+    FileSys::RealVfsFilesystem real;
+    NupContainer nup{real.OpenFile(repacked.string(), FileSys::OpenMode::Read)};
+    REQUIRE(nup.GetStatus() == Loader::ResultStatus::Success);
+    const auto addon = nup.FindPackage(NupContainer::PackageKind::Addon);
+    REQUIRE(addon.has_value());
+    REQUIRE(nup.GetPackages()[*addon].version == 393216);
+}

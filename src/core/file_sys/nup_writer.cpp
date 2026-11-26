@@ -1838,7 +1838,6 @@ ExtractResult ExtractNup(const std::filesystem::path& archive, const std::filesy
 
         PackProgress progress{};
         std::vector<std::pair<size_t, fs::path>> targets;
-        std::unordered_map<u64, size_t> addon_index;
         for (size_t i = 0; i < packages.size(); ++i) {
             const auto& package = packages[i];
             fs::path dest;
@@ -1850,9 +1849,9 @@ ExtractResult ExtractNup(const std::filesystem::path& archive, const std::filesy
             } else if (package.kind == FileSys::NupContainer::PackageKind::Update) {
                 dest = program_dir(package.title_id) / "updates" / std::to_string(package.version);
             } else {
-                const size_t idx = addon_index[package.title_id]++;
+                // Named by version, which packing reads back from the folder name.
                 dest = out_dir / "dlc" / fmt::format("{:016X}", package.title_id) /
-                       std::to_string(idx);
+                       std::to_string(package.version);
             }
             targets.emplace_back(i, dest);
             u64 files = 0, bytes = 0;
