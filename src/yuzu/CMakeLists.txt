@@ -390,7 +390,7 @@ if (APPLE)
     if (CMAKE_GENERATOR MATCHES "Xcode")
         set(_icons "${_dist}/eglantine.icon")
 
-        set_target_properties(eden PROPERTIES
+        set_target_properties(yuzu PROPERTIES
             XCODE_ATTRIBUTE_ASSETCATALOG_COMPILER_APPICON_NAME eglantine
             MACOSX_BUNDLE_ICON_FILE eglantine
             # Also force xcode to manage signing for us.

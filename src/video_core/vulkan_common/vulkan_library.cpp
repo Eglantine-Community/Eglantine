@@ -27,7 +27,10 @@ std::shared_ptr<Common::DynamicLibrary> OpenLibrary(
     const auto libmoltenvk_filename =
         Common::FS::GetBundleDirectory() / "Contents/Frameworks/libMoltenVK.dylib";
     const char* library_paths[] = {std::getenv("LIBVULKAN_PATH"), libvulkan_filename.c_str(),
-                                   libmoltenvk_filename.c_str()};
+                                   libmoltenvk_filename.c_str(),
+                                   "/opt/homebrew/lib/libvulkan.1.dylib",
+                                   "/opt/homebrew/opt/molten-vk/lib/libMoltenVK.dylib",
+                                   "/usr/local/lib/libvulkan.1.dylib"};
     // Check if a path to a specific Vulkan library has been specified.
     for (const auto& library_path : library_paths) {
         if (library_path && library->Open(library_path)) {

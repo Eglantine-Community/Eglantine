@@ -63,8 +63,6 @@ SPDX-License-Identifier: GPL-2.0-or-later
     <string>public.app-category.games</string>
     <key>LSRequiresCarbon</key>
     <true/>
-    <key>LSApplicationCategoryType</key>
-    <string>public.app-category.games</string>
 
     <!-- NS -->
     <key>NSPrincipalClass</key>
