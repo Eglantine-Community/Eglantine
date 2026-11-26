@@ -160,6 +160,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #ifdef ENABLE_UPDATE_CHECKER
 #include "frontend_common/update_checker.h"
 #include "frontend_common/update_installer.h"
+#include "yuzu/updater/version_manager_dialog.h"
 #endif
 
 // Common //
@@ -203,8 +204,10 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 
 // Video Core //
 #include "video_core/gpu.h"
+#include "video_core/pipeline_cache_backups.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
+#include "video_core/shader_warm/shader_warm_builder.h"
 
 #include <SDL3/SDL.h>
 
@@ -400,16 +403,10 @@ inline static bool isDarkMode() {
 #endif // _WIN32
 
 #ifdef ENABLE_UPDATE_CHECKER
+// Release candidates are part of the Stable (nx2) channel.
 static Settings::UpdateChannel ToSettingsChannel(UpdateChecker::Channel channel) {
-    switch (channel) {
-    case UpdateChecker::Channel::ReleaseCandidate:
-        return Settings::UpdateChannel::ReleaseCandidate;
-    case UpdateChecker::Channel::Daily:
-        return Settings::UpdateChannel::Daily;
-    case UpdateChecker::Channel::Stable:
-        break;
-    }
-    return Settings::UpdateChannel::Stable;
+    return channel == UpdateChecker::Channel::Daily ? Settings::UpdateChannel::Daily
+                                                    : Settings::UpdateChannel::Stable;
 }
 #endif
 
@@ -476,7 +473,12 @@ MainWindow::MainWindow(bool has_broken_vulkan)
 #ifdef ENABLE_UPDATE_CHECKER
     connect(&update_watcher, &QFutureWatcher<UpdateChecker::CheckResult>::finished, this,
             &MainWindow::OnEmulatorUpdateAvailable);
-    if (const auto build_channel = UpdateChecker::BuildChannel()) {
+    // A CI build of a branch follows that branch, like a tester build does.
+    if (TesterLauncher::IsTesterBuild() || Common::g_build_follow_branch[0] != '\0') {
+        tester_monitor = std::make_unique<TesterBuildMonitor>(
+            [this] { return emulation_running; }, this);
+        tester_monitor->Start();
+    } else if (const auto build_channel = UpdateChecker::BuildChannel()) {
         // The first tagged release or daily build to run picks the channel, and it stays until
         // changed.
         if (UISettings::values.update_channel.GetValue() == Settings::UpdateChannel::Unset) {
@@ -1986,6 +1988,8 @@ void MainWindow::ConnectMenuEvents() {
     connect_menu(ui->action_Single_Window_Mode, &MainWindow::ToggleWindowMode);
     connect_menu(ui->action_Show_Filter_Bar, &MainWindow::OnToggleFilterBar);
     connect_menu(ui->action_Show_Status_Bar, &MainWindow::OnToggleStatusBar);
+    connect(ui->action_Customize_Home_Screen, &QAction::triggered, this,
+            [this] { game_list->ShowCustomizePanel(true); });
     connect_menu(ui->action_Show_Performance_Overlay, &MainWindow::OnTogglePerfOverlay);
 #ifdef HAS_RESHADE
     connect_menu(ui->action_Post_Processing_Shaders, &MainWindow::OnPostProcessingShaders);
@@ -2099,8 +2103,10 @@ void MainWindow::ConnectMenuEvents() {
     connect_menu(ui->action_Install_Keys, &MainWindow::OnInstallDecryptionKeys);
 #ifdef ENABLE_UPDATE_CHECKER
     connect_menu(ui->action_Check_For_Updates, &MainWindow::OnCheckForUpdates);
+    connect_menu(ui->action_Version_Manager, &MainWindow::OnVersionManager);
 #else
     ui->action_Check_For_Updates->setVisible(false);
+    ui->action_Version_Manager->setVisible(false);
 #endif
 #if defined(ENABLE_UPDATE_CHECKER) && (defined(__linux__) || defined(_WIN32))
     // In main.ui, so a language change retranslates it; hidden until there is a version to restore.
@@ -2250,6 +2256,8 @@ void MainWindow::OnPrepareForSleep(bool prepare_sleep) {
 
 #ifdef __unix__
 std::array<int, 3> MainWindow::sig_interrupt_fds{0, 0, 0};
+// Set by a SIGTERM until the GUI thread picks it up.
+static std::atomic<bool> sig_term_pending{};
 
 void MainWindow::SetupSigInterrupts() {
     if (sig_interrupt_fds[2] == 1) {
@@ -2261,7 +2269,9 @@ void MainWindow::SetupSigInterrupts() {
     struct sigaction sa;
     sa.sa_handler = &MainWindow::HandleSigInterrupt;
     sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_RESETHAND;
+    // No SA_RESETHAND: a repeated close request (a declined confirmation) must not fall back to
+    // the default kill. The handler does that itself when the GUI thread is not responding.
+    sa.sa_flags = 0;
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
 
@@ -2274,6 +2284,13 @@ void MainWindow::SetupSigInterrupts() {
 void MainWindow::HandleSigInterrupt(int sig) {
     if (sig == SIGINT) {
         _exit(1);
+    }
+
+    if (sig_term_pending.exchange(true)) {
+        // The GUI thread never picked up the last one: it is stuck, so let this one kill.
+        signal(SIGTERM, SIG_DFL);
+        ::raise(SIGTERM);
+        return;
     }
 
     // Calling into Qt directly from a signal handler is not safe,
@@ -2289,6 +2306,7 @@ void MainWindow::OnSigInterruptNotifierActivated() {
     char a;
     int ret = read(sig_interrupt_fds[1], &a, sizeof(a));
     (void)ret;
+    sig_term_pending = false;
 
     sig_interrupt_notifier->setEnabled(true);
 
@@ -3163,7 +3181,19 @@ void MainWindow::OnGameListRemoveFile(u64 program_id, QtCommon::Game::GameListRe
     }
 
     switch (target) {
-    case QtCommon::Game::GameListRemoveTarget::VkShaderCache:
+    case QtCommon::Game::GameListRemoveTarget::VkShaderCache: {
+        // The precache's builds were in the removed driver cache: run it again at the next boot.
+        namespace ShaderWarm = VideoCommon::ShaderWarm;
+        std::error_code ec;
+        std::filesystem::remove(ShaderWarm::WarmMarkerPath(ShaderWarm::ComputeWarmPath(program_id)),
+                                ec);
+        // Caches other builds set aside would otherwise come back at the next boot.
+        VideoCommon::RemovePipelineCacheVersionBackups(
+            Common::FS::GetVulkanPipelineCacheDir(
+                Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir), program_id) /
+            "vulkan.mythos.bin");
+        [[fallthrough]];
+    }
     case QtCommon::Game::GameListRemoveTarget::GlShaderCache:
         QtCommon::Game::RemoveTransferableShaderCache(program_id, target);
         break;
@@ -4162,6 +4192,21 @@ void MainWindow::OpenConfigureDialog(bool select_profiles) {
             &MainWindow::OnLanguageChanged);
     connect(&configure_dialog, &ConfigureDialog::ExternalContentDirsChanged, this,
             &MainWindow::OnGameListRefresh);
+#ifdef ENABLE_UPDATE_CHECKER
+    // Opened once the settings are closed and applied, so it never runs on top of them.
+    connect(&configure_dialog, &ConfigureDialog::OpenVersionManagerRequested, this,
+            [this] { QTimer::singleShot(0, this, &MainWindow::OnVersionManager); });
+    connect(&configure_dialog, &ConfigureDialog::LaunchExperimentalBuildRequested, this,
+            [this](const QString& install_dir) {
+                QTimer::singleShot(0, this, [this, install_dir] {
+                    const auto state = TesterBuild::LoadState(TesterLauncher::StateFile());
+                    TesterLauncher::SwitchAndLaunch(
+                        TesterBuild::ReadInstallInfo(
+                            TesterBuild::PathFromUtf8(install_dir.toStdString()), state),
+                        this);
+                });
+            });
+#endif
 
     if (select_profiles) {
         configure_dialog.SelectProfilesTab();
@@ -5311,25 +5356,28 @@ void MainWindow::CheckForUpdates(bool manual) {
         return;
     }
 
-    switch (UISettings::values.update_channel.GetValue()) {
-    case Settings::UpdateChannel::ReleaseCandidate:
-        update_check_channel = UpdateChecker::Channel::ReleaseCandidate;
-        break;
-    case Settings::UpdateChannel::Daily:
-        update_check_channel = UpdateChecker::Channel::Daily;
-        break;
-    default:
-        update_check_channel = UpdateChecker::Channel::Stable;
-        break;
-    }
+    update_check_channel =
+        UpdateChecker::ChannelOfSetting(UISettings::values.update_channel.GetValue());
     update_check_running = true;
     update_check_manual = manual;
     update_future = QtConcurrent::run(
-        [channel = update_check_channel]() { return UpdateChecker::Check(channel); });
+        [channel = update_check_channel,
+         platform = UpdateChecker::DownloadPlatform(UISettings::values.update_variant.GetValue())]() {
+            return UpdateChecker::Check(channel, platform);
+        });
     update_watcher.setFuture(update_future);
 }
 
+void MainWindow::OnVersionManager() {
+    VersionManagerDialog dialog(this);
+    dialog.exec();
+}
+
 void MainWindow::OnCheckForUpdates() {
+    if (tester_monitor) {
+        tester_monitor->CheckNow();
+        return;
+    }
     if (!UpdateChecker::BuildChannel()) {
         QMessageBox::information(
             this, tr("Check for Updates"),
@@ -5888,9 +5936,18 @@ bool MainWindow::ConfirmClose() {
 
 /// Confirms closing, waits for emulation to stop, then saves state and shuts down.
 void MainWindow::closeEvent(QCloseEvent* event) {
-    if (!close_pending && !ConfirmClose()) {
-        event->ignore();
-        return;
+    if (!close_pending) {
+        // The confirmation runs a nested event loop, where another close request can arrive.
+        if (std::exchange(close_confirming, true)) {
+            event->ignore();
+            return;
+        }
+        const bool confirmed = ConfirmClose();
+        close_confirming = false;
+        if (!confirmed) {
+            event->ignore();
+            return;
+        }
     }
     close_pending = true;
     game_list->SetScanEnabled(false);

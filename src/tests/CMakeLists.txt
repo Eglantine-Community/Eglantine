@@ -85,7 +85,9 @@ add_executable(tests
     video_core/shader_bench.cpp
     video_core/shader_precache.cpp
     video_core/shader_precache_identity.cpp
+    video_core/stage_cache_in_flight.cpp
     video_core/h264_packet.cpp
+    video_core/nx2_video_gpu_fallback.cpp
     video_core/vertex_repack.cpp
     video_core/virtual_range_cache.cpp
     video_core/query_copy.cpp
@@ -179,9 +181,13 @@ create_target_directory_groups(tests)
 if (ENABLE_UPDATE_CHECKER)
     target_sources(tests PRIVATE
         common/update_checker.cpp
+        common/net_heads.cpp
         common/update_installer.cpp
+        common/tester_build.cpp
         ../frontend_common/update_checker.cpp
-        ../frontend_common/update_installer.cpp)
+        ../frontend_common/update_installer.cpp
+        ../frontend_common/tester_build.cpp
+        ${CMAKE_BINARY_DIR}/src/frontend_common/tester_recipe.cpp)
 endif()
 
 target_link_libraries(tests PRIVATE common core input_common video_core Opus::opus)
@@ -201,4 +207,23 @@ if(NOT MSVC)
         $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-unused-variable>
         $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-unused-parameter>
         $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-missing-field-initializers>)
+endif()
+
+if(LINUX AND ENABLE_CUBEB)
+    target_sources(tests PRIVATE audio_core/cubeb_recovery.cpp)
+    target_link_libraries(tests PRIVATE cubeb::cubeb)
+    foreach(function init destroy get_max_channel_count get_min_latency
+                     stream_init stream_destroy stream_start stream_stop)
+        target_link_options(tests PRIVATE "-Wl,--wrap=cubeb_${function}")
+    endforeach()
+endif()
+
+if(LINUX)
+    target_sources(tests PRIVATE audio_core/sdl_recovery.cpp)
+    target_link_libraries(tests PRIVATE SDL3::SDL3)
+    foreach(function WasInit GetAudioPlaybackDevices GetAudioDeviceName OpenAudioDeviceStream
+                     AddEventWatch RemoveEventWatch DestroyAudioStream
+                     ResumeAudioStreamDevice PauseAudioStreamDevice GetAudioStreamFormat)
+        target_link_options(tests PRIVATE "-Wl,--wrap=SDL_${function}")
+    endforeach()
 endif()

@@ -1715,19 +1715,27 @@ void Device::RemoveUnsuitableExtensions() {
     RemoveExtensionFeatureIfUnsuitable(extensions.mesh_shader, features.mesh_shader,
                                        VK_EXT_MESH_SHADER_EXTENSION_NAME);
 
-    // VK_EXT_graphics_pipeline_library, which needs VK_KHR_pipeline_library: only for VTX-HLE's
-    // fast-linked pipelines (the nvn_pipeline_library setting), and only when linking is fast
-    // (otherwise it saves nothing over a monolithic compile) and the vertex and fragment shaders
-    // may disagree on interpolation decorations (libraries are compiled separately).
+    // VK_EXT_graphics_pipeline_library, which needs VK_KHR_pipeline_library: fast-linked
+    // pipelines (the graphics_pipeline_library setting, or VTX-HLE's nvn_pipeline_library), only
+    // when linking is fast (otherwise it saves nothing over a monolithic compile) and the vertex
+    // and fragment shaders may disagree on interpolation decorations (libraries are compiled
+    // separately). Shared library parts outlive the pipeline layout they were compiled with, which
+    // VK_KHR_maintenance4 allows.
     {
+        const char* const gpl_override = std::getenv("EDEN_NX2_GPL");
         const bool gpl_allowed =
-            Settings::values.nvn_pipeline_library.GetValue() && Settings::ResolveNvnHle().hle;
+            gpl_override != nullptr
+                ? gpl_override[0] == '1'
+                : Settings::values.graphics_pipeline_library.GetValue() ||
+                      (Settings::values.nvn_pipeline_library.GetValue() &&
+                       Settings::ResolveNvnHle().hle);
         const auto& gpl_properties = properties.graphics_pipeline_library;
         const bool gpl_usable =
             features.graphics_pipeline_library.graphicsPipelineLibrary &&
             extensions.pipeline_library &&
             gpl_properties.graphicsPipelineLibraryFastLinking &&
-            gpl_properties.graphicsPipelineLibraryIndependentInterpolationDecoration;
+            gpl_properties.graphicsPipelineLibraryIndependentInterpolationDecoration &&
+            features.maintenance4.maintenance4;
         if (gpl_allowed) {
             LOG_INFO(Render_Vulkan,
                      "VK_EXT_graphics_pipeline_library: fast linking {}, independent "
