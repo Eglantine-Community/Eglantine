@@ -20,6 +20,7 @@
 #include <QFileInfo>
 #include <QSettings>
 
+#include "common/fs/file.h"
 #include "common/fs/fs.h"
 #include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
@@ -469,6 +470,15 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::vector<std::fi
                                     GameListDir* parent_dir) {
     const auto process_candidate = [this, target,
                                     parent_dir](const std::filesystem::path& path) {
+        // The VFS opens lazily. Check access before handing a locked copy to the format probes.
+        Common::FS::IOFile readable;
+        readable.Open(path, Common::FS::FileAccessMode::Read, Common::FS::FileType::BinaryFile,
+                      Common::FS::FileShareFlag::ShareReadOnly, false);
+        if (!readable.IsOpen()) {
+            LOG_DEBUG(Frontend, "Skipping unavailable game file: {}",
+                      Common::FS::PathToUTF8String(path));
+            return;
+        }
         const auto physical_name = Common::FS::PathToUTF8String(path);
         const auto file = vfs->OpenFile(physical_name, FileSys::OpenMode::Read);
         if (!file) {
