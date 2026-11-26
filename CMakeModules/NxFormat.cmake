@@ -24,6 +24,16 @@ function(eglantine_find_nxformat)
     set(root "${EGLANTINE_NXFORMAT_ROOT}")
     if (NOT root)
         if (WIN32 AND ARCHITECTURE_x86_64)
+            # The pinned Windows archive is built with MSVC. Its static Rust library needs the
+            # MSVC CRT and RTTI, which MinGW cannot link, so the frontend's converter is left out
+            # of MinGW builds. EGLANTINE_NXFORMAT_ROOT can point at a MinGW-compatible release.
+            if (MINGW)
+                message(WARNING "NX converter disabled: the pinned nxformat Windows library is "
+                                "MSVC-only and cannot be linked into a MinGW build. Loading .nx "
+                                "games is not affected. Set EGLANTINE_NXFORMAT_ROOT to an unpacked "
+                                "MinGW nxformat release to build it.")
+                return()
+            endif()
             set(platform windows-x64)
             set(sha256 198ec14d236d7219fcab0a46ebe1a118f945917e142b51c995da5d1f4809053f)
         elseif (APPLE)
