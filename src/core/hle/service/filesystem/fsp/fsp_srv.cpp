@@ -566,7 +566,12 @@ Result FSP_SRV::OpenDataStorageWithProgramIndex(OutInterface<IStorage> out_inter
 
     if (!patched_romfs) {
         // TODO: Find the right error code to use here
-        LOG_ERROR(Service_FS, "Could not open storage with program_index={}", program_index);
+        LOG_CRITICAL(Service_FS,
+                     "Program {:016X} (index {}) is not in the game file or installed content. "
+                     "Multi-program titles need every program of the application: convert the "
+                     "original dump again with all of its programs",
+                     FileSys::GetBaseTitleIDWithProgramIndex(program_id, program_index),
+                     program_index);
         R_RETURN(ResultUnknown);
     }
 
