@@ -48,6 +48,7 @@
 
 #include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
+#include "common/logging.h"
 #include "core/file_sys/card_image.h"
 #include "core/file_sys/common_funcs.h"
 #include "core/file_sys/decrypted_nca.h"
@@ -1141,6 +1142,9 @@ void NxTools::Start(std::shared_ptr<Job> job) {
 }
 
 void NxTools::ReplyOriginal(Job& job, const QString& text) {
+    job.future.waitForFinished();
+    job.ReleaseSources();
+
     const auto& originals = job.originals;
     QStringList names;
     for (const auto& original : originals) {
@@ -1154,34 +1158,45 @@ void NxTools::ReplyOriginal(Job& job, const QString& text) {
     } else {
         label = tr("Move the original game to the Recycle Bin:\n%1").arg(names.front());
     }
-    QMessageBox box(QMessageBox::Information, job.title, text, QMessageBox::Ok, parent_widget);
+    QMessageBox box(QMessageBox::Information, job.title, text,
+                    QMessageBox::Ok | QMessageBox::Cancel, parent_widget);
     auto* remove = new QCheckBox(label, &box);
     box.setCheckBox(remove);
-    box.exec();
-    if (remove->isChecked() && prepare_write()) {
-        job.ReleaseSources();
-        int failed = 0;
-        for (const auto& name : names) {
-            if (!QFile::moveToTrash(name)) {
-                ++failed;
-            }
-        }
-        emit ArchiveWriteFinished();
-        if (failed > 0) {
-            QMessageBox::warning(
-                parent_widget, job.title,
-                originals.size() > 1
-                    ? tr("%1 of the %2 original packages could not be moved to the Recycle Bin. "
-                         "They may be in use.")
-                          .arg(failed)
-                          .arg(originals.size())
-                    : tr("The original could not be moved to the Recycle Bin:\n%1\n\n"
-                         "It may be in use. You can delete it yourself.")
-                          .arg(names.front()));
-        }
+    if (box.exec() != QMessageBox::Ok || !remove->isChecked()) {
+        emit ArchivesChanged();
         return;
     }
-    emit ArchivesChanged();
+    if (!prepare_write()) {
+        LOG_WARNING(Frontend, "Keeping conversion sources because archive writes are unavailable");
+        emit ArchivesChanged();
+        return;
+    }
+
+    while (!names.isEmpty()) {
+        QStringList failed;
+        QStringList errors;
+        for (const auto& name : names) {
+            QFile original(QDir::fromNativeSeparators(name));
+            if (!original.moveToTrash()) {
+                const auto error = original.errorString();
+                LOG_WARNING(Frontend, "Could not move conversion source {} to the Recycle Bin: {}",
+                            ToUtf8(name), ToUtf8(error));
+                failed.push_back(name);
+                errors.push_back(QStringLiteral("%1\n%2").arg(name, error));
+            }
+        }
+        if (failed.isEmpty() ||
+            QMessageBox::warning(parent_widget, job.title,
+                                 tr("The following originals could not be moved to the Recycle Bin.") +
+                                     QStringLiteral("\n\n") +
+                                     errors.join(QStringLiteral("\n\n")),
+                                 QMessageBox::Retry | QMessageBox::Cancel,
+                                 QMessageBox::Cancel) != QMessageBox::Retry) {
+            break;
+        }
+        names = std::move(failed);
+    }
+    emit ArchiveWriteFinished();
 }
 
 QString NxTools::TimeLeft(double seconds) {
