@@ -162,11 +162,19 @@ std::string MeshLimitExceeded(const Device& device, const Shader::IR::Program& p
     if (!task && program.stage != Shader::Stage::Mesh) {
         return {};
     }
+    const u32 threads = program.workgroup_size[0];
     if (!device.IsExtMeshShaderSupported()) {
-        return "task/mesh programs need VK_EXT_mesh_shader with task and mesh shaders";
+        // Task and mesh programs emulate via compute shaders: validate compute workgroup limits.
+        const auto& limits = device.GetPhysical().GetProperties().limits;
+        const u32 max_threads =
+            (std::min)(limits.maxComputeWorkGroupInvocations, limits.maxComputeWorkGroupSize[0]);
+        if (threads > max_threads) {
+            return fmt::format("{} emulation compute workgroup of {} threads exceeds device's {}",
+                               task ? "task" : "mesh", threads, max_threads);
+        }
+        return {};
     }
     const VkPhysicalDeviceMeshShaderPropertiesEXT& limits = device.MeshShaderProperties();
-    const u32 threads = program.workgroup_size[0];
     const u32 payload = program.mesh.payload_words * static_cast<u32>(sizeof(u32));
     if (payload > limits.maxTaskPayloadSize) {
         return fmt::format("task payload of {} bytes exceeds maxTaskPayloadSize {}", payload,
@@ -241,6 +249,14 @@ u64 HashRuntime(u32 nvn_stage, const Shader::RuntimeInfo& info,
         buf.Add(static_cast<u8>(type));
     }
     buf.Add(info.dual_source_blend);
+    if (info.mesh_as_compute) {
+        buf.Add(info.mesh_as_compute);
+        buf.Add(info.mesh_output_binding);
+        buf.Add(info.mesh_task_payload_binding);
+        buf.Add(info.mesh_task_offsets_binding);
+        buf.Add(info.mesh_task_args_binding);
+        buf.Add(info.mesh_task_payload_stride);
+    }
     return buf.Hash();
 }
 
@@ -1032,15 +1048,76 @@ bool PipelineCache::Impl::Translate(const TranslateInput& in, TranslateOutput& o
     // 3. runtime info, SPIR-V, per-stage records
     const bool has_geometry = !is_compute && in.programs[STAGE_GEOMETRY] != nullptr &&
                               !programs[STAGE_GEOMETRY].is_geometry_passthrough;
+    const bool emulate_mesh =
+        !is_compute && in.programs[STAGE_MESH] != nullptr && !device.IsExtMeshShaderSupported();
+    if (emulate_mesh) {
+        const Shader::MeshInfo& mesh_info = programs[STAGE_MESH].mesh;
+        out.mesh_emulation.has_task = in.programs[STAGE_TASK] != nullptr;
+        out.mesh_emulation.output_binding = layout.binding_count;
+        if (out.mesh_emulation.has_task) {
+            out.mesh_emulation.payload_binding = out.mesh_emulation.output_binding + 1;
+            out.mesh_emulation.offsets_binding = out.mesh_emulation.output_binding + 2;
+            out.mesh_emulation.args_binding = out.mesh_emulation.output_binding + 3;
+            out.mesh_emulation.payload_stride =
+                (std::max)((std::max)(programs[STAGE_TASK].mesh.payload_words,
+                                      mesh_info.payload_words),
+                           u32{2});
+        }
+        out.mesh_emulation.block_words =
+            Shader::Backend::SPIRV::MeshEmulationBlockWords(mesh_info);
+        out.mesh_emulation.max_primitives = mesh_info.max_primitives;
+        out.mesh_emulation.primitive_vertices = mesh_info.PrimitiveVertices();
+        out.mesh_emulation.topology = mesh_info.topology;
+    }
     Shader::Backend::Bindings bindings;
     const Shader::IR::Program* previous = nullptr;
     std::array<u32, STAGE_COUNT> binding_after{};
     std::array<std::shared_ptr<Disk::ShaderRecord>, STAGE_COUNT> records;
+    Shader::Profile guest_warp_profile = translation_profile;
+    guest_warp_profile.max_subgroup_size = GuestWarpSize;
+    if (translation_profile.support_vote) {
+        guest_warp_profile.warp_size_potentially_larger_than_guest = false;
+    }
     for (const u32 stage : order) {
         const StageProgram& source = *in.programs[stage];
         Shader::IR::Program& program = programs[stage];
-        const Shader::RuntimeInfo runtime_info =
+        const bool emulated_mesh_stage = emulate_mesh && (stage == STAGE_TASK || stage == STAGE_MESH);
+        const bool compute_stage = is_compute || emulated_mesh_stage;
+        const bool mesh_uses_guest_warp = emulated_mesh_stage && program.info.UsesWarpOps();
+        const auto workgroup_size = emulated_mesh_stage
+                                        ? std::array<u32, 3>{program.workgroup_size[0], 1, 1}
+                                        : program.workgroup_size;
+        const bool fixed_guest_warp =
+            mesh_uses_guest_warp && device.CanRequireGuestWarpForCompute(workgroup_size);
+        const auto& stage_profile = fixed_guest_warp ? guest_warp_profile : translation_profile;
+        Shader::RuntimeInfo runtime_info =
             MakeRuntimeInfo(stage, program, previous, in.translation, has_geometry);
+        if (emulate_mesh) {
+            if (emulated_mesh_stage) {
+                runtime_info.mesh_as_compute = true;
+                runtime_info.mesh_output_binding = out.mesh_emulation.output_binding;
+                if (out.mesh_emulation.has_task) {
+                    runtime_info.mesh_task_payload_binding = out.mesh_emulation.payload_binding;
+                    runtime_info.mesh_task_offsets_binding = out.mesh_emulation.offsets_binding;
+                    runtime_info.mesh_task_args_binding = out.mesh_emulation.args_binding;
+                    runtime_info.mesh_task_payload_stride = out.mesh_emulation.payload_stride;
+                }
+                if (stage == STAGE_MESH) {
+                    out.mesh_emulation.vertex_spirv =
+                        Shader::Backend::SPIRV::EmitMeshEmulationVertex(
+                            translation_profile, program.mesh, out.mesh_emulation.output_binding,
+                            out.mesh_emulation.has_task ? out.mesh_emulation.args_binding : ~0U,
+                            runtime_info.convert_depth_mode &&
+                                !translation_profile.support_native_ndc,
+                            in.translation != nullptr
+                                ? std::bit_cast<float>(in.translation->point_size_bits)
+                                : 1.0f);
+                }
+            } else if (stage == STAGE_FRAGMENT) {
+                // Emulated mesh outputs per-primitive generics per vertex; use Flat, not MeshEXT.
+                runtime_info.mesh_as_compute = true;
+            }
+        }
         std::vector<u32> spirv;
         u64 runtime_hash{};
         try {
@@ -1061,7 +1138,7 @@ bool PipelineCache::Impl::Translate(const TranslateInput& in, TranslateOutput& o
                 }
             }
             program.info.raw_coverage_program = program.info.raw_coverage ? source.hash : 0;
-            spirv = EmitSPIRV(translation_profile, runtime_info, program, bindings);
+            spirv = EmitSPIRV(stage_profile, runtime_info, program, bindings);
         } catch (const Shader::NotImplementedException& e) {
             reject(source.hash, stage, "emit", std::string{"NotImplemented: "} + e.what());
             return false;
@@ -1126,10 +1203,14 @@ bool PipelineCache::Impl::Translate(const TranslateInput& in, TranslateOutput& o
                 }
             }
         }
-        if (is_compute) {
-            record->workgroup_size = program.workgroup_size;
+        if (compute_stage) {
+            record->workgroup_size = workgroup_size;
             record->shared_memory_size = program.shared_memory_size;
         }
+        record->layout.requires_guest_warp =
+            mesh_uses_guest_warp ||
+            (is_compute && tensor_lowering == VideoCommon::NativeTensorLowering::Compact &&
+             program.info.UsesWarpOps());
         record->spirv = std::move(spirv);
         records[stage] = std::move(record);
     }
@@ -1157,9 +1238,6 @@ bool PipelineCache::Impl::Translate(const TranslateInput& in, TranslateOutput& o
         }
         record.layout.uses_bindless_table = bindless_mask != 0;
         record.layout.bindless_types_mask = bindless_mask;
-        record.layout.requires_guest_warp =
-            is_compute && tensor_lowering == VideoCommon::NativeTensorLowering::Compact &&
-            programs[stage].info.UsesWarpOps();
         for (const VC::DescriptorBinding& binding : layout.bindings) {
             if (static_cast<u32>(binding.stage) != stage) {
                 continue;
@@ -1624,8 +1702,10 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::CompileGraphics(
     TranslationKey translation_key;
     TranslateOutput fresh;
     bool reused = false;
+    const bool emulate_mesh =
+        request.stages[STAGE_MESH].hash != 0 && !device.IsExtMeshShaderSupported();
     const auto translate_start = std::chrono::steady_clock::now();
-    if (GplEnabled()) {
+    if (GplEnabled() && !emulate_mesh) {
         translation_key.hashes = key.hashes;
         translation_key.state = translation_state;
         translation_key.try_switch_hash = key.try_switch_hash;
@@ -1656,7 +1736,8 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::CompileGraphics(
         }
     }
     const auto create_start = std::chrono::steady_clock::now();
-    auto pipeline = AssembleGraphics(request.state, request.targets, stages, gpl_set);
+    auto pipeline = AssembleGraphics(request.state, request.targets, stages, gpl_set, false,
+                                     emulate_mesh ? &fresh.mesh_emulation : nullptr);
     const auto create_end = std::chrono::steady_clock::now();
     if (!pipeline) {
         failure.ir = gpl_set ? gpl_set->translated.ir : std::move(fresh.ir);
@@ -1700,7 +1781,7 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::CompileGraphics(
                     : pipeline->fast_linked ? "graphics fast-linked"
                                             : "graphics whole (gpl)",
                     key.hash, start, create_start - translate_start, create_end - create_start);
-    if (DiskEnabled()) {
+    if (DiskEnabled() && (!emulate_mesh || key.try_switch_hash == 0)) {
         Disk::GraphicsPipelineRecord record;
         for (u32 stage = 0; stage < GRAPHICS_STAGE_COUNT; ++stage) {
             if (stages[stage] != nullptr) {
@@ -1712,6 +1793,9 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::CompileGraphics(
         record.targets = request.targets;
         record.push_constant_size = pipeline->push_constant_size;
         record.viewport_count = pipeline->viewport_count;
+        if (emulate_mesh) {
+            record.emulated_mesh = std::move(fresh.mesh_emulation);
+        }
         PostGraphicsRecord(record);
         ++new_since_vk_write;
         MaybeWriteVkCache();
@@ -2119,6 +2203,10 @@ VkRenderPass PipelineCache::GetRenderPass(const RenderPassKey& key, bool read_on
 
 const Shader::Profile& PipelineCache::Profile() const noexcept {
     return impl->profile;
+}
+
+const MeshEmulationHelpers* PipelineCache::GetMeshEmulationHelpers() {
+    return impl->GetMeshEmulationHelpers();
 }
 
 VertexInputMode PipelineCache::VertexInput() const noexcept {

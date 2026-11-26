@@ -24,6 +24,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -76,6 +77,8 @@ enum class RecordType : u32 {
     Shader = 1,
     GraphicsPipeline = 2,
     ComputePipeline = 3,
+    // Older readers skip this record type; the existing v18 payloads keep their layout.
+    EmulatedMeshPipeline = 4,
 };
 
 /// 128-bit content id of a translated shader: stage, program hash, hash of the runtime info /
@@ -146,12 +149,30 @@ struct ShaderRecord {
     std::vector<TextureQuery> queries;
 };
 
+/// The generated vertex shader and scratch layout that accompany the task/mesh compute stages.
+struct EmulatedMeshArtifact {
+    bool has_task{};
+    u32 output_binding{};
+    u32 payload_binding{~0U};
+    u32 offsets_binding{~0U};
+    u32 args_binding{~0U};
+    u32 payload_stride{};
+    u32 block_words{};
+    u32 max_primitives{};
+    u32 primitive_vertices{};
+    u32 topology{};
+    std::vector<u32> vertex_spirv;
+
+    bool operator==(const EmulatedMeshArtifact&) const = default;
+};
+
 struct GraphicsPipelineRecord {
     std::array<ContentId, GRAPHICS_STAGE_COUNT> shaders{}; ///< by NVNshaderStage, zero = absent
     GraphicsFixedState state{};
     RenderPassKey targets;
     u32 push_constant_size{};
     u32 viewport_count{1};
+    std::optional<EmulatedMeshArtifact> emulated_mesh;
 };
 
 struct ComputePipelineRecord {

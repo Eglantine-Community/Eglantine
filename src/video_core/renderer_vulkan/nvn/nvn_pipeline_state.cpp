@@ -1026,6 +1026,8 @@ Shader::Profile MakeProfile(const Device& device) {
         .has_broken_signed_operations = false,
         .has_broken_fp16_float_controls = driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY,
         .has_broken_fp32_denorm_flush = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY,
+        .has_broken_mesh_global_memory_calls =
+            device.IsNvidia() && device.GetNvidiaArch() <= NvidiaArchitecture::Arch_Pascal,
         .ignore_nan_fp_comparisons = false,
         .has_broken_spirv_subgroup_mask_vector_extract_dynamic =
             driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY &&
@@ -1114,9 +1116,10 @@ void DescribeGraphicsPipeline(const Device& device, const GraphicsPipelineParams
     // Dynamic: no bindings or attributes here, the replay sets the layout per draw with
     // vkCmdSetVertexInputEXT (the key holds no layout). Static: the layout of the key. A task/mesh
     // pipeline has neither vertex input nor input assembly (VK_EXT_mesh_shader).
+    const bool emulated_mesh = params.emulated_mesh_topology.has_value();
     const bool dynamic_vertex_input =
-        !params.mesh && params.vertex_input == VertexInputMode::Dynamic;
-    if (!dynamic_vertex_input && !params.mesh) {
+        !params.mesh && !emulated_mesh && params.vertex_input == VertexInputMode::Dynamic;
+    if (!dynamic_vertex_input && !params.mesh && !emulated_mesh) {
         VertexInput layout;
         BuildVertexInput(device, state, params.attributes_read, layout, issues);
         for (u32 i = 0; i < layout.attribute_count; ++i) {
@@ -1161,7 +1164,8 @@ void DescribeGraphicsPipeline(const Device& device, const GraphicsPipelineParams
     }
 
     // --- input assembly / tessellation ---------------------------------------------------
-    VkPrimitiveTopology topology = ToVkTopology(state.topology);
+    VkPrimitiveTopology topology =
+        emulated_mesh ? *params.emulated_mesh_topology : ToVkTopology(state.topology);
     if (topology == VK_PRIMITIVE_TOPOLOGY_MAX_ENUM) {
         issues.push_back(fmt::format("topology: unknown NVNdrawPrimitive {}", state.topology));
         topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -1183,10 +1187,12 @@ void DescribeGraphicsPipeline(const Device& device, const GraphicsPipelineParams
         .flags = 0,
         .topology = topology,
         .primitiveRestartEnable =
-            (state.primitive_restart != 0 && restart_supported) || device.IsMoltenVK() ? VK_TRUE
-                                                                                       : VK_FALSE,
+            !emulated_mesh &&
+                    ((state.primitive_restart != 0 && restart_supported) || device.IsMoltenVK())
+                ? VK_TRUE
+                : VK_FALSE,
     };
-    if (state.primitive_restart != 0 && !restart_supported) {
+    if (!emulated_mesh && state.primitive_restart != 0 && !restart_supported) {
         issues.push_back("primitive restart: not supported for this topology on the device");
     }
     u32 patch_points = state.patch_vertices;
@@ -1469,8 +1475,8 @@ void DescribeGraphicsPipeline(const Device& device, const GraphicsPipelineParams
         .flags = 0,
         .stageCount = static_cast<u32>(params.stages.size()),
         .pStages = params.stages.data(),
-        .pVertexInputState = params.mesh ? nullptr : &out.vertex_input,
-        .pInputAssemblyState = params.mesh ? nullptr : &out.input_assembly,
+        .pVertexInputState = (params.mesh && !emulated_mesh) ? nullptr : &out.vertex_input,
+        .pInputAssemblyState = (params.mesh && !emulated_mesh) ? nullptr : &out.input_assembly,
         .pTessellationState = params.has_tessellation ? &out.tessellation : nullptr,
         .pViewportState = &out.viewport,
         .pRasterizationState = &out.rasterization,

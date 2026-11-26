@@ -937,7 +937,8 @@ std::shared_ptr<Texture> DrawContext::ScaledTextureFor(Texture& texture, bool gr
     return use_twin ? impl.ScaledTextureOf(texture) : nullptr;
 }
 
-bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool graphics) {
+bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool graphics,
+                                   size_t mesh_buffers) {
     plan.graphics = graphics;
     if (graphics) {
         compute_groups = {};
@@ -974,8 +975,8 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
     for (const VC::DescriptorBinding& binding : layout.bindings) {
         total += binding.count;
     }
-    scratch_writes.reserve(layout.bindings.size());
-    scratch_buffers.reserve(total);
+    scratch_writes.reserve(layout.bindings.size() + mesh_buffers);
+    scratch_buffers.reserve(total + mesh_buffers);
     scratch_images.reserve(total);
     scratch_views.reserve(total);
 
@@ -2485,7 +2486,9 @@ bool DrawContext::PushPlan(PipelineBase& pipe, DrawPlan& plan, VkPipelineBindPoi
     static_assert(Rescale::PUSH_WORDS == 6);
     PassBoundState::PushWords pushed;
     pushed.words = plan.rescale_words.Get();
-    if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS && targets_scaled) {
+    const bool graphics_constants = bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS ||
+                                    (pipe.push_constant_stages & VK_SHADER_STAGE_VERTEX_BIT) != 0;
+    if (graphics_constants && targets_scaled) {
         pushed.down_factor = target_scale.DownFactor();
     }
     if (pipe.descriptors.UsesPushConstants() && pipe.layout &&
@@ -2494,7 +2497,7 @@ bool DrawContext::PushPlan(PipelineBase& pipe, DrawPlan& plan, VkPipelineBindPoi
     } else if (pipe.descriptors.UsesPushConstants() && pipe.layout) {
         using namespace Shader::Backend::SPIRV;
         const VkShaderStageFlags stage_flags = pipe.push_constant_stages;
-        if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+        if (graphics_constants) {
             struct ScalingConstants {
                 std::array<u32, Rescale::PUSH_WORDS> words;
                 f32 down_factor;

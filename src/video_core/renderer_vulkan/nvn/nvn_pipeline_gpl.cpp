@@ -366,6 +366,9 @@ void PipelineCache::Impl::QueueWarmShaderParts(
     size_t count = 0;
     for (auto it = records.rbegin(); it != records.rend() && count < MAX_WARMED_SHADER_SETS;
          ++it) {
+        if (it->emulated_mesh) {
+            continue;
+        }
         Item item;
         bool complete = true;
         std::string identity;

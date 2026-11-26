@@ -322,6 +322,23 @@ TEST_CASE("Mesh fallback distribution pass binds its buffers and constants",
     REQUIRE(has_constants);
 }
 
+TEST_CASE("Mesh fallback distributes tasks into a dedicated output without an arena counter",
+          "[video_core][spirv][mesh_fallback]") {
+    const auto direct =
+        SPIRV::EmitMeshEmulationDistribution(MakeProfile(), SPIRV::MeshDistribution::DedicatedOutput);
+    const auto indirect = SPIRV::EmitMeshEmulationDistribution(
+        MakeProfile(), SPIRV::MeshDistribution::DedicatedOutputIndirect);
+    Dump(direct, "fallback-dedicated-distribution");
+    Dump(indirect, "fallback-dedicated-indirect-distribution");
+    REQUIRE(Bindings(direct) == std::vector<u32>{0, 1, 2});
+    REQUIRE(Bindings(indirect) == std::vector<u32>{0, 1, 2, 3});
+    for (const auto* code : {&direct, &indirect}) {
+        REQUIRE_FALSE(std::ranges::any_of(Instructions(*code), [](const Instruction& inst) {
+            return inst.op == spv::Op::OpAtomicIAdd;
+        }));
+    }
+}
+
 TEST_CASE("Mesh fallback fragment shader omits PerPrimitiveEXT for emulated mesh draws",
           "[video_core][spirv][mesh_fallback]") {
     const auto emit_fragment = [](bool as_compute) {

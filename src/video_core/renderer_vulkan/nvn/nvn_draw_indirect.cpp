@@ -45,6 +45,7 @@ struct IndirectCall {
     u64 count_address;
     /// QUADS whose arguments the GPU rewrites as indexed triangle draws (QuadIndirectGpu).
     bool quads_converted{};
+    bool mesh_emulated{};
 };
 
 /// Resolves the argument and count buffers and checks what the device can do. False = the draw is
@@ -63,10 +64,10 @@ bool ResolveArguments(DrawContext& context, DrawHost& host, const IndirectCall& 
                                 call.mode));
     }
     const bool counted = call.count_address != 0;
-    if (counted && !impl.device.IsKhrDrawIndirectCountSupported()) {
+    if (counted && !call.mesh_emulated && !impl.device.IsKhrDrawIndirectCountSupported()) {
         return drop("a draw count in memory needs VK_KHR_draw_indirect_count");
     }
-    if (call.max_draws > 1 && !impl.device.IsMultiDrawIndirectSupported()) {
+    if (call.max_draws > 1 && !call.mesh_emulated && !impl.device.IsMultiDrawIndirectSupported()) {
         return drop("several indirect draws in one call need the multiDrawIndirect feature");
     }
     if (call.max_draws > 1 &&
@@ -346,6 +347,7 @@ void DrawContext::DrawMeshTasksIndirect(const VC::DrawMeshTasksPayload& p) {
                               "workgroup counts from the driver bank");
         return;
     }
+    const bool emulated = !impl.device.IsExtMeshShaderSupported();
     const IndirectCall call{
         .op = "DrawMeshTasksIndirect",
         .mode = MESH_DRAW_MODE,
@@ -354,6 +356,7 @@ void DrawContext::DrawMeshTasksIndirect(const VC::DrawMeshTasksPayload& p) {
         .stride = p.stride != 0 ? p.stride : MESH_TASKS_1D_COMMAND_SIZE,
         .indirect = p.indirect,
         .count_address = p.count_address,
+        .mesh_emulated = emulated,
     };
     if (call.max_draws == 0) {
         return;
@@ -364,12 +367,13 @@ void DrawContext::DrawMeshTasksIndirect(const VC::DrawMeshTasksPayload& p) {
     if (!ResolveArguments(*this, *host, call, args, count, args_size)) {
         return;
     }
-    MeshIndirectGpu* const converter = impl.MeshIndirect();
-    if (converter == nullptr || args.offset % sizeof(u32) != 0 || call.stride % sizeof(u32) != 0) {
+    MeshIndirectGpu* const converter = emulated ? nullptr : impl.MeshIndirect();
+    if ((!emulated && converter == nullptr) || args.offset % sizeof(u32) != 0 ||
+        call.stride % sizeof(u32) != 0 || (counted && count.offset % sizeof(u32) != 0)) {
         ++counters.draws;
         ++counters.draws_skipped;
         impl.stats.indirect_unsupported.fetch_add(1, std::memory_order_relaxed);
-        host->HostUnsupported(call.op, converter == nullptr
+        host->HostUnsupported(call.op, !emulated && converter == nullptr
                                            ? "the argument conversion shader is unavailable"
                                            : "arguments not aligned to 4 bytes");
         return;
@@ -396,6 +400,29 @@ void DrawContext::DrawMeshTasksIndirect(const VC::DrawMeshTasksPayload& p) {
         }
     }
     OrderIndirectArguments(args, args_size, count, counted, nullptr);
+    if (emulated) {
+        count.range = COUNT_SIZE;
+        for (u32 draw = 0; draw < call.max_draws; ++draw) {
+            if (!host->HostBeginRenderCondition()) {
+                break;
+            }
+            BufferRef record = args;
+            record.offset += static_cast<u64>(draw) * call.stride;
+            record.range = MESH_TASKS_1D_COMMAND_SIZE;
+            const MeshDraw mesh_draw{.arguments = record, .count = count, .draw_index = draw};
+            PreparedDraw prepared;
+            HostIndex host_index;
+            if (PrepareDraw(MESH_DRAW_MODE, 0, nullptr, prepared, host_index, &mesh_draw)) {
+                DrawEmulatedMesh(prepared);
+                impl.stats.indirect_draws.fetch_add(1, std::memory_order_relaxed);
+                if (counted) {
+                    impl.stats.indirect_counted_draws.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            host->HostEndRenderCondition();
+        }
+        return;
+    }
     // NVN's {count, first} records become VkDrawMeshTasksIndirectCommandEXT {count, 1, 1} on the
     // GPU, outside the pass and before conditional rendering begins (nvn_mesh_indirect.comp).
     EndPass(BreakCause::MeshIndirectConvert);

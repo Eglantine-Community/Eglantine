@@ -692,7 +692,9 @@ std::vector<u32> EmitMeshEmulationVertex(const Profile& profile, const MeshInfo&
     return module.Assemble();
 }
 
-std::vector<u32> EmitMeshEmulationDistribution(const Profile& profile) {
+std::vector<u32> EmitMeshEmulationDistribution(const Profile& profile, MeshDistribution mode) {
+    const bool shared_arena = mode == MeshDistribution::SharedArena;
+    const bool indirect_tasks = mode == MeshDistribution::DedicatedOutputIndirect;
     Sirit::Module module{profile.supported_spirv};
     module.AddCapability(spv::Capability::Shader);
     module.SetMemoryModel(spv::AddressingModel::Logical, spv::MemoryModel::GLSL450);
@@ -722,7 +724,8 @@ std::vector<u32> EmitMeshEmulationDistribution(const Profile& profile) {
     const Id payload{define_buffer(0, "payload")};
     const Id offsets{define_buffer(1, "offsets")};
     const Id args{define_buffer(2, "args")};
-    const Id counter{define_buffer(3, "arena_counter")};
+    const Id counter{shared_arena ? define_buffer(3, "arena_counter") : Id{}};
+    const Id indirect_args{indirect_tasks ? define_buffer(3, "indirect_args") : Id{}};
 
     constexpr u32 num_constants{sizeof(MeshEmulationDistributionConstants) / sizeof(u32)};
     std::array<Id, num_constants> members;
@@ -754,7 +757,12 @@ std::vector<u32> EmitMeshEmulationDistribution(const Profile& profile) {
         return module.OpLoad(u32_type, module.OpAccessChain(constant_u32, constants,
                                                             constant(member)));
     };
-    const Id tasks{push(0)};
+    const Id max_tasks{push(0)};
+    const Id tasks{
+        indirect_tasks
+            ? module.OpUMin(u32_type, module.OpLoad(u32_type, word(indirect_args, constant(0))),
+                            max_tasks)
+            : max_tasks};
     const Id payload_words{push(1)};
     const Id capacity_words{push(2)};
     const Id block_words{push(3)};
@@ -784,7 +792,12 @@ std::vector<u32> EmitMeshEmulationDistribution(const Profile& profile) {
                                                   module.OpIMul(u32_type, task, payload_words),
                                                   constant(1))))};
         module.OpStore(word(offsets, task), total);
-        module.OpStore(total_var, module.OpIAdd(u32_type, total, requested));
+        // Keep the offsets ordered even if the guest's total exceeds the argument's width.
+        const Id increment{shared_arena
+                               ? requested
+                               : module.OpUMin(u32_type, requested,
+                                   module.OpISub(u32_type, constant(~0U), total))};
+        module.OpStore(total_var, module.OpIAdd(u32_type, total, increment));
     }
     module.OpBranch(continue_label);
     module.AddLabel(continue_label);
@@ -792,17 +805,18 @@ std::vector<u32> EmitMeshEmulationDistribution(const Profile& profile) {
     module.OpBranch(header);
     module.AddLabel(merge);
 
-    // The draw's blocks are allocated from the arena every draw of the submission shares. The
-    // distribution passes of a render pass's draws run back to back without barriers between
-    // them (mesh-batch), so the allocation is an atomic add: a plain read and write let two
-    // draws take the same blocks and overwrite each other's triangles.
-    // The counter keeps growing past the end, so the host sees how much the submission needed.
     const Id total{module.OpLoad(u32_type, total_var)};
-    const Id base{module.OpAtomicIAdd(u32_type, word(counter, constant(0)),
-                                      constant(static_cast<u32>(spv::Scope::Device)), constant(0),
-                                      module.OpIMul(u32_type, total, block_words))};
-    const Id room{module.OpSelect(u32_type, module.OpULessThan(bool_type, base, capacity_words),
-                                  module.OpISub(u32_type, capacity_words, base), constant(0))};
+    Id base{constant(0)};
+    Id room{capacity_words};
+    if (shared_arena) {
+        // Batched distributions reserve disjoint ranges concurrently. Count past the arena's
+        // end so the host can size it for later submissions.
+        base = module.OpAtomicIAdd(u32_type, word(counter, constant(0)),
+                                  constant(static_cast<u32>(spv::Scope::Device)), constant(0),
+                                  module.OpIMul(u32_type, total, block_words));
+        room = module.OpSelect(u32_type, module.OpULessThan(bool_type, base, capacity_words),
+                               module.OpISub(u32_type, capacity_words, base), constant(0));
+    }
     const Id dispatched{module.OpUMin(
         u32_type, module.OpUMin(u32_type, total, module.OpUDiv(u32_type, room, block_words)),
         max_groups)};
@@ -817,6 +831,95 @@ std::vector<u32> EmitMeshEmulationDistribution(const Profile& profile) {
     module.OpStore(word(args, constant(draw + 3)), constant(0));
     module.OpStore(word(args, constant(MESH_EMULATION_ARGS_BASE)), base);
     module.OpStore(word(args, constant(MESH_EMULATION_ARGS_TASKS)), tasks);
+    module.OpReturn();
+    module.OpFunctionEnd();
+    module.AddEntryPoint(spv::ExecutionModel::GLCompute, main, "main", interfaces);
+    module.AddExecutionMode(main, spv::ExecutionMode::LocalSize, 1U, 1U, 1U);
+    return module.Assemble();
+}
+
+std::vector<u32> EmitMeshEmulationIndirectClamp(const Profile& profile) {
+    Sirit::Module module{profile.supported_spirv};
+    module.AddCapability(spv::Capability::Shader);
+    module.SetMemoryModel(spv::AddressingModel::Logical, spv::MemoryModel::GLSL450);
+    module.AddExtension("SPV_KHR_storage_buffer_storage_class");
+
+    const Id void_type{module.TypeVoid()};
+    const Id bool_type{module.TypeBool()};
+    const Id u32_type{module.TypeInt(32, false)};
+    const auto constant = [&](u32 value) { return module.Constant(u32_type, value); };
+
+    const Id array_type{module.TypeRuntimeArray(u32_type)};
+    module.Decorate(array_type, spv::Decoration::ArrayStride, 4U);
+    const Id struct_type{module.TypeStruct(array_type)};
+    module.Decorate(struct_type, spv::Decoration::Block);
+    module.MemberDecorate(struct_type, 0, spv::Decoration::Offset, 0U);
+    const Id buffer_pointer{module.TypePointer(spv::StorageClass::StorageBuffer, struct_type)};
+    const Id buffer_u32{module.TypePointer(spv::StorageClass::StorageBuffer, u32_type)};
+    std::vector<Id> interfaces;
+    const auto define_buffer = [&](u32 binding, std::string_view name) {
+        const Id buffer{module.AddGlobalVariable(buffer_pointer, spv::StorageClass::StorageBuffer)};
+        module.Decorate(buffer, spv::Decoration::Binding, binding);
+        module.Decorate(buffer, spv::Decoration::DescriptorSet, 0U);
+        module.Name(buffer, name);
+        interfaces.push_back(buffer);
+        return buffer;
+    };
+    const Id in_args{define_buffer(0, "in_args")};
+    const Id out_args{define_buffer(1, "out_args")};
+
+    const Id draw_count{define_buffer(2, "draw_count")};
+    constexpr u32 num_constants{sizeof(MeshEmulationIndirectConstants) / sizeof(u32)};
+    std::array<Id, num_constants> members;
+    members.fill(u32_type);
+    const Id constants_type{module.TypeStruct(std::span<const Id>(members))};
+    module.Decorate(constants_type, spv::Decoration::Block);
+    for (u32 i = 0; i < num_constants; ++i) {
+        module.MemberDecorate(constants_type, i, spv::Decoration::Offset, i * 4);
+    }
+    const Id constants{module.AddGlobalVariable(
+        module.TypePointer(spv::StorageClass::PushConstant, constants_type),
+        spv::StorageClass::PushConstant)};
+    interfaces.push_back(constants);
+    const Id constant_u32{module.TypePointer(spv::StorageClass::PushConstant, u32_type)};
+    if (profile.supported_spirv < 0x00010400) {
+        interfaces.clear();
+    }
+
+    const auto word = [&](Id buffer, Id index) {
+        return module.OpAccessChain(buffer_u32, buffer, constant(0), index);
+    };
+    const auto push = [&](u32 member) {
+        return module.OpLoad(u32_type,
+                             module.OpAccessChain(constant_u32, constants, constant(member)));
+    };
+    const Id main{module.OpFunction(void_type, spv::FunctionControlMask::MaskNone,
+                                    module.TypeFunction(void_type))};
+    module.AddLabel();
+    const Id max_groups{push(0)};
+    const Id vertices_per_group{push(1)};
+    const Id argument_word{push(2)};
+    const Id count_word{push(3)};
+    const Id draw_index{push(4)};
+    const Id counted{push(5)};
+    const Id groups{module.OpLoad(u32_type, word(in_args, argument_word))};
+    const Id first{module.OpLoad(
+        u32_type, word(in_args, module.OpIAdd(u32_type, argument_word, constant(1))))};
+    const Id count{module.OpLoad(u32_type, word(draw_count, count_word))};
+    const Id enabled{module.OpLogicalAnd(
+        bool_type, module.OpIEqual(bool_type, first, constant(0)),
+        module.OpLogicalOr(bool_type, module.OpIEqual(bool_type, counted, constant(0)),
+                           module.OpULessThan(bool_type, draw_index, count)))};
+    const Id clamped{module.OpSelect(u32_type, enabled,
+                                     module.OpUMin(u32_type, groups, max_groups), constant(0))};
+    module.OpStore(word(out_args, constant(0)), clamped);
+    module.OpStore(word(out_args, constant(1)), constant(1));
+    module.OpStore(word(out_args, constant(2)), constant(1));
+    module.OpStore(word(out_args, constant(3)),
+                   module.OpIMul(u32_type, clamped, vertices_per_group));
+    module.OpStore(word(out_args, constant(4)), constant(1));
+    module.OpStore(word(out_args, constant(5)), constant(0));
+    module.OpStore(word(out_args, constant(6)), constant(0));
     module.OpReturn();
     module.OpFunctionEnd();
     module.AddEntryPoint(spv::ExecutionModel::GLCompute, main, "main", interfaces);

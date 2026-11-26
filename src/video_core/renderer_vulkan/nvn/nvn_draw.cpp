@@ -152,6 +152,7 @@ void DrawContext::BeginSubmission(DrawHost& host_, const VC::Submission& submiss
     set_pool.reset();
     set_pool_used = 0;
     last_kept = nullptr;
+    mesh_scratch_kept = nullptr;
     last_compute_kept = nullptr;
     movie_network_input.reset();
     movie_network_skip = 0;
@@ -2962,7 +2963,8 @@ u32 IndexSize(u32 type) {
 } // namespace
 
 bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* index,
-                              PreparedDraw& out, HostIndex& host_index) {
+                              PreparedDraw& out, HostIndex& host_index,
+                              const MeshDraw* mesh_draw) {
     movie_network_input.reset();
     movie_network_skip = 0;
     ++counters.draws;
@@ -3015,6 +3017,14 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
         last_kept = active.get();
     }
 
+    if (active->mesh_emulation) {
+        const bool suspended = host->HostSuspendCondition();
+        EndPass(BreakCause::Dispatch);
+        if (suspended) {
+            host->HostResumeCondition();
+        }
+    }
+
     DrawPlan& plan = draw_plan;
     plan.Clear();
     plan.ranges.insert(plan.ranges.end(), extra_uses.begin(), extra_uses.end());
@@ -3023,7 +3033,11 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
     // A `textures` diag request: the descriptors record stage / slot / sampler, and the textures
     // of this draw are noted (one budget unit per draw).
     diag_bindings = Common::DiagRequest::TextureBudget().Active();
-    const bool descriptors_built = BuildDescriptors(*active, plan, true);
+    size_t mesh_buffers = 0;
+    if (active->mesh_emulation) {
+        mesh_buffers = active->mesh_emulation->has_task ? 4 : 1;
+    }
+    const bool descriptors_built = BuildDescriptors(*active, plan, true, mesh_buffers);
     if (diag_bindings) {
         diag_bindings = false;
         if (descriptors_built) {
@@ -3126,8 +3140,17 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
         if (pass_open && pass_read_only_depth != plan.read_only_depth) {
             EndPass(BreakCause::LayoutChange);
         }
-        const bool ready = PrepareOutsidePass(plan) && BeginPass(plan.read_only_depth);
-        if (suspended) {
+        bool ready = PrepareOutsidePass(plan);
+        bool before_pass = suspended;
+        if (ready && active->mesh_emulation) {
+            if (suspended) {
+                host->HostResumeCondition();
+            }
+            ready = mesh_draw && PrepareEmulatedMesh(*active, plan, *mesh_draw, out);
+            before_pass = host->HostSuspendCondition();
+        }
+        ready = ready && BeginPass(plan.read_only_depth);
+        if (before_pass) {
             host->HostResumeCondition();
         }
         if (!ready) {
