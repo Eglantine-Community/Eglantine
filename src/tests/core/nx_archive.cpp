@@ -271,7 +271,7 @@ TEST_CASE("NX: a standalone update shows its version and can be disabled", "[cor
     CHECK(without != "v131072");
 }
 
-TEST_CASE("NX: an extracted add-on is listed as add-on content after Load", "[core][nx]") {
+TEST_CASE("NX: tree loads the snapshot executable and registers its add-on", "[core][nx]") {
     ScopedSystemTestContext environment;
     Core::System system;
     system.Initialize();
@@ -288,6 +288,7 @@ TEST_CASE("NX: an extracted add-on is listed as add-on content after Load", "[co
     };
     FileSys::ManualContentProvider provider;
     system.RegisterContentProvider(FileSys::ContentProviderUnionSlot::FrontendManual, &provider);
+    REQUIRE(provider.AddEntriesFromContainer(OpenFixture("external_update.nsp")));
     Kernel::KProcess process{kernel};
     Kernel::KAutoObject::Create(&process);
     SCOPE_EXIT {
@@ -295,6 +296,7 @@ TEST_CASE("NX: an extracted add-on is listed as add-on content after Load", "[co
     };
     Loader::AppLoader_NX loader{system, OpenFixture("lichii_synthetic.nx")};
     REQUIRE(loader.Load(process, system).first == Loader::ResultStatus::Success);
+    CHECK(system.GetApplicationProcessBuildID().front() == 0x42);
 
     // As the AoC service lists add-ons and the FS service opens their data.
     constexpr u64 AddOnId = ApplicationId + 0x1001;
@@ -326,12 +328,12 @@ TEST_CASE("NX: a native base supports external updates and version disabling",
             u64 program_id{};
             REQUIRE(loader.ReadProgramId(program_id) == Loader::ResultStatus::Success);
             REQUIRE(program_id == ApplicationId);
-            loader.RegisterContent(provider);
-            const auto base = provider.GetEntry(ApplicationId, FileSys::ContentRecordType::Program);
+            auto content = Loader::AppLoader_NX::ContentForGame(
+                system.GetContentProviderUnion(), &loader);
+            const auto base = content.GetEntry(ApplicationId, FileSys::ContentRecordType::Program);
             REQUIRE(base != nullptr);
             REQUIRE(base->GetStatus() == Loader::ResultStatus::Success);
-            FileSys::RomFSFactory factory{loader, system.GetContentProvider(),
-                                          system.GetFileSystemController()};
+            FileSys::RomFSFactory factory{loader, content, system.GetFileSystemController()};
             const auto data = [&] {
                 const auto romfs = factory.OpenCurrentProcess(ApplicationId);
                 REQUIRE(romfs != nullptr);
@@ -346,7 +348,7 @@ TEST_CASE("NX: a native base supports external updates and version disabling",
                       4096, std::string_view(archive) == "native_external_base.nx" ? 0x11 : 0x22));
             REQUIRE(provider.AddEntriesFromContainer(OpenFixture("external_update.nsp")));
             const FileSys::PatchManager patches{ApplicationId, system.GetFileSystemController(),
-                                                system.GetContentProvider()};
+                                                content};
             const auto build_byte = [&] {
                 const auto exefs = patches.PatchExeFS(base->GetExeFS());
                 REQUIRE(exefs != nullptr);
@@ -381,12 +383,13 @@ TEST_CASE("NX: registering an archive preserves an external NSP add-on", "[core]
                                            &provider);
             REQUIRE(provider.AddEntriesFromContainer(OpenFixture("external_dlc.nsp")));
             Loader::AppLoader_NX loader{system, OpenFixture(archive)};
-            loader.RegisterContent(provider);
-            const auto entries = provider.ListEntriesFilter(
+            const auto content = Loader::AppLoader_NX::ContentForGame(
+                system.GetContentProviderUnion(), &loader);
+            const auto entries = content.ListEntriesFilter(
                 FileSys::TitleType::AOC, FileSys::ContentRecordType::Data, std::nullopt);
             REQUIRE(entries.size() == (std::string_view(archive) == "lichii_synthetic.nx" ? 2U : 1U));
             const auto dlc =
-                provider.GetEntry(ApplicationId + 0x1002, FileSys::ContentRecordType::Data);
+                content.GetEntry(ApplicationId + 0x1002, FileSys::ContentRecordType::Data);
             REQUIRE(dlc != nullptr);
             REQUIRE(dlc->GetStatus() == Loader::ResultStatus::Success);
             const auto tree = FileSys::ExtractRomFS(dlc->GetRomFS());
@@ -396,4 +399,34 @@ TEST_CASE("NX: registering an archive preserves an external NSP add-on", "[core]
             CHECK(file->ReadAllBytes() == std::vector<u8>(8192, 0x44));
         }
     }
+}
+
+TEST_CASE("NX: inspecting another archive of the same game isolates bundled content", "[core][nx]") {
+    ScopedSystemTestContext environment;
+    Core::System system;
+    system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
+    FileSys::ManualContentProvider provider;
+    system.RegisterContentProvider(FileSys::ContentProviderUnionSlot::FrontendManual, &provider);
+    REQUIRE(provider.AddEntriesFromContainer(OpenFixture("external_dlc.nsp")));
+
+    Loader::AppLoader_NX updated{system, OpenFixture("native_embedded_update.nx")};
+    Loader::AppLoader_NX with_dlc{system, OpenFixture("lichii_synthetic.nx")};
+    Loader::AppLoader_NX base{system, OpenFixture("native_external_base.nx")};
+
+    const auto update_id = FileSys::GetUpdateTitleID(ApplicationId);
+    const auto from_update =
+        Loader::AppLoader_NX::ContentForGame(system.GetContentProviderUnion(), &updated);
+    REQUIRE(from_update.HasEntry(update_id, FileSys::ContentRecordType::Program));
+    const auto from_dlc =
+        Loader::AppLoader_NX::ContentForGame(system.GetContentProviderUnion(), &with_dlc);
+    REQUIRE(from_dlc.HasEntry(ApplicationId + 0x1001, FileSys::ContentRecordType::Data));
+
+    // A properties view can be opened while another archive is active.
+    const auto from_base = Loader::AppLoader_NX::ContentForGame(from_update, &base);
+    CHECK_FALSE(from_base.HasEntry(update_id, FileSys::ContentRecordType::Program));
+    const auto from_base_with_external = Loader::AppLoader_NX::ContentForGame(from_dlc, &base);
+    CHECK_FALSE(from_base_with_external.HasEntry(ApplicationId + 0x1001,
+                                                 FileSys::ContentRecordType::Data));
+    CHECK(from_base_with_external.HasEntry(ApplicationId + 0x1002,
+                                           FileSys::ContentRecordType::Data));
 }

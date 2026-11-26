@@ -533,6 +533,9 @@ struct System::Impl {
         FileSys::SetLooseAOC({});
         cheat_engine.reset();
         core_timing.ClearPendingEvents();
+        if (content_provider) {
+            content_provider->SetGameArchive(nullptr);
+        }
         app_loader.reset();
         audio_core.reset();
         gpu_core.reset();

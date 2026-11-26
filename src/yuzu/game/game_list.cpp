@@ -49,6 +49,7 @@
 #include "core/file_sys/patch_manager.h"
 #include "core/file_sys/registered_cache.h"
 #include "core/loader/loader.h"
+#include "core/loader/nx.h"
 #include "qt_common/config/uisettings.h"
 #include "qt_common/game_list/game_list_p.h"
 #include "qt_common/game_list/model.h"
@@ -429,6 +430,9 @@ void GameList::PopulateAsync(QVector<UISettings::GameDir>& game_dirs) {
 
 void GameList::SetScanEnabled(bool enabled) {
     item_model->SetScanEnabled(enabled);
+    if (!enabled && details_pool) {
+        details_pool->waitForDone();
+    }
 }
 
 void GameList::SaveInterfaceLayout() {
@@ -861,10 +865,12 @@ void GameList::RefreshAddOnsRow(u64 program_id, const QString& path) {
         if (!loader) {
             return;
         }
+        const auto content = Loader::AppLoader_NX::ContentForGame(
+            system_.GetContentProviderUnion(), loader.get());
         const FileSys::PatchManager patch_manager{program_id, system_.GetFileSystemController(),
-                                                  system_.GetContentProvider()};
+                                                  content};
         GameListPatchInfo info = ReadGameListPatchInfo(*loader, patch_manager);
-        QMetaObject::invokeMethod(qApp, [guard, program_id, info = std::move(info)] {
+        QMetaObject::invokeMethod(qApp, [guard, program_id, path, info = std::move(info)] {
             if (!guard) {
                 return;
             }
@@ -885,8 +891,8 @@ void GameList::RefreshAddOnsRow(u64 program_id, const QString& path) {
                         continue;
                     }
                     if (child->type() == static_cast<int>(GameListItemType::Game) &&
-                        child->data(GameListItemPath::ProgramIdRole).toULongLong() ==
-                            program_id) {
+                        child->data(GameListItemPath::ProgramIdRole).toULongLong() == program_id &&
+                        child->data(GameListItemPath::FullPathRole).toString() == path) {
                         child->setData(info.version, GameListItemPath::VersionRole);
                         const QString tooltip = child->data(Qt::ToolTipRole).toString();
                         child->setData(QStringLiteral("%1\n%2").arg(
@@ -1045,14 +1051,16 @@ void GameList::LoadGameDetailsExtras(u64 program_id, const QString& path) {
 
         FileSys::VirtualFile update_raw;
         std::vector<std::pair<u64, u32>> packed_add_ons;
-        if (const auto file = Core::GetGameFileFromPath(vfs_, path.toStdString())) {
-            if (const auto loader = Loader::GetLoader(system_, file)) {
-                loader->ReadUpdateRaw(update_raw);
-                loader->ReadAddOnContent(packed_add_ons);
-            }
+        const auto file = Core::GetGameFileFromPath(vfs_, path.toStdString());
+        const auto loader = file ? Loader::GetLoader(system_, file) : nullptr;
+        if (loader) {
+            loader->ReadUpdateRaw(update_raw);
+            loader->ReadAddOnContent(packed_add_ons);
         }
+        const auto content = Loader::AppLoader_NX::ContentForGame(
+            system_.GetContentProviderUnion(), loader.get());
         const FileSys::PatchManager patch_manager{program_id, system_.GetFileSystemController(),
-                                                  system_.GetContentProvider()};
+                                                  content};
         // Same rules as the per-game Add-Ons tab: one update at most is enabled.
         bool has_enabled_update = false;
         for (const auto& patch : patch_manager.GetPatches(update_raw, packed_add_ons)) {

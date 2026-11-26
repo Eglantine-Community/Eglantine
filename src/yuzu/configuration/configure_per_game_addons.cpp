@@ -26,6 +26,7 @@
 #include "core/core.h"
 #include "core/file_sys/patch_manager.h"
 #include "core/loader/loader.h"
+#include "core/loader/nx.h"
 #include "frontend_common/mod_manager.h"
 #include "qt_common/abstract/frontend.h"
 #include "qt_common/config/uisettings.h"
@@ -297,9 +298,13 @@ void ConfigurePerGameAddons::LoadConfiguration() {
         return;
     }
 
-    const FileSys::PatchManager pm{title_id, system.GetFileSystemController(),
-                                   system.GetContentProvider()};
     const auto loader = Loader::GetLoader(system, file);
+    if (!loader) {
+        return;
+    }
+    const auto content =
+        Loader::AppLoader_NX::ContentForGame(system.GetContentProviderUnion(), loader.get());
+    const FileSys::PatchManager pm{title_id, system.GetFileSystemController(), content};
 
     FileSys::VirtualFile update_raw;
     loader->ReadUpdateRaw(update_raw);

@@ -620,7 +620,8 @@ struct AppLoader_NX::Impl {
         // Built on first use: listing the game needs only its metadata.
         tree_romfs_dir = root->GetSubdirectory("romfs");
         LoadNacp(selected);
-        tree_executable = std::make_unique<AppLoader_DeconstructedRomDirectory>(exefs, true);
+        tree_executable = std::make_unique<AppLoader_DeconstructedRomDirectory>(
+            exefs, AppLoader_DeconstructedRomDirectory::ExeFSPatching::ModsOnly);
         tree = true;
         status = ResultStatus::Success;
     }
@@ -802,12 +803,22 @@ u8 AppLoader_NX::ReadPlatform(const FileSys::VirtualFile& nx_file, u64 program_i
     return 0;
 }
 
-void AppLoader_NX::RegisterContent(FileSys::ManualContentProvider& provider) const {
-    if (impl->status != ResultStatus::Success) {
-        return;
+FileSys::ContentProviderUnion AppLoader_NX::ContentForGame(
+    const FileSys::ContentProviderUnion& provider, const AppLoader* loader) {
+    if (loader && loader->GetFileType() == FileType::NX) {
+        const auto& nx_loader = static_cast<const AppLoader_NX&>(*loader);
+        return provider.WithGameArchive(nx_loader.CreateArchiveContent());
     }
+    return provider.WithGameArchive(nullptr);
+}
+
+std::shared_ptr<FileSys::ManualContentProvider> AppLoader_NX::CreateArchiveContent() const {
+    if (impl->status != ResultStatus::Success) {
+        return nullptr;
+    }
+    auto provider = std::make_shared<FileSys::ManualContentProvider>();
     for (const auto& extra : impl->native_extras) {
-        provider.AddEntriesFromContainer(extra, false, impl->program_id);
+        provider->AddEntriesFromContainer(extra, false, impl->program_id);
     }
     // Add-ons converted from NUP packages and extracted dumps have no NCA: their RomFS is
     // served as one.
@@ -823,9 +834,10 @@ void AppLoader_NX::RegisterContent(FileSys::ManualContentProvider& provider) con
             LOG_WARNING(Loader, "NX add-on {:016X} has no romfs folder", *title_id);
             continue;
         }
-        provider.AddEntry(FileSys::TitleType::AOC, FileSys::ContentRecordType::Data, *title_id,
-                          FileSys::BuildAddOnContentNca(*title_id, FileSys::CreateRomFS(romfs)));
+        provider->AddEntry(FileSys::TitleType::AOC, FileSys::ContentRecordType::Data, *title_id,
+                           FileSys::BuildAddOnContentNca(*title_id, FileSys::CreateRomFS(romfs)));
     }
+    return provider;
 }
 
 AppLoader::LoadResult AppLoader_NX::Load(Kernel::KProcess& process, Core::System& system) {
@@ -835,19 +847,19 @@ AppLoader::LoadResult AppLoader_NX::Load(Kernel::KProcess& process, Core::System
     if (impl->status != ResultStatus::Success) {
         return {impl->status, {}};
     }
-    // The frontend owns this provider; the game list fills it the same way.
-    if (const auto* slot = system.GetContentProviderUnion().GetSlotProvider(
-            FileSys::ContentProviderUnionSlot::FrontendManual)) {
-        RegisterContent(*const_cast<FileSys::ManualContentProvider*>(
-            static_cast<const FileSys::ManualContentProvider*>(slot)));
-    }
+    auto& content = system.GetContentProviderUnion();
+    content.SetGameArchive(CreateArchiveContent());
     if (!impl->tree) {
         const auto result = impl->native->Load(process, system);
         is_loaded = result.first == ResultStatus::Success;
+        if (!is_loaded) {
+            content.SetGameArchive(nullptr);
+        }
         return result;
     }
     const auto result = impl->tree_executable->Load(process, system);
     if (result.first != ResultStatus::Success) {
+        content.SetGameArchive(nullptr);
         return result;
     }
     system.GetFileSystemController().RegisterProcess(
@@ -903,15 +915,9 @@ ResultStatus AppLoader_NX::ReadPatchedRomFS(FileSys::VirtualFile& out_file) {
     if (base_nca == nullptr || base_nca->GetRomFS() == nullptr) {
         return ResultStatus::ErrorNoRomFS;
     }
-    // The updates of the archive are found through the frontend provider, as when it runs.
     auto& system = *impl->system;
-    if (const auto* slot = system.GetContentProviderUnion().GetSlotProvider(
-            FileSys::ContentProviderUnionSlot::FrontendManual)) {
-        RegisterContent(*const_cast<FileSys::ManualContentProvider*>(
-            static_cast<const FileSys::ManualContentProvider*>(slot)));
-    }
-    const FileSys::PatchManager pm{impl->program_id, system.GetFileSystemController(),
-                                   system.GetContentProvider()};
+    const auto content = ContentForGame(system.GetContentProviderUnion(), this);
+    const FileSys::PatchManager pm{impl->program_id, system.GetFileSystemController(), content};
     out_file = pm.PatchRomFS(base_nca.get(), base_nca->GetRomFS(),
                              FileSys::ContentRecordType::Program, nullptr, false);
     return out_file != nullptr ? ResultStatus::Success : ResultStatus::ErrorNoRomFS;

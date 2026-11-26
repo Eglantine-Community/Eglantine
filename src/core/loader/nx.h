@@ -10,6 +10,7 @@
 #include "core/loader/loader.h"
 
 namespace FileSys {
+class ContentProviderUnion;
 class ManualContentProvider;
 class NACP;
 } // namespace FileSys
@@ -56,11 +57,12 @@ public:
     /// base RomFS with its newest enabled update applied. Used to dump the RomFS.
     ResultStatus ReadPatchedRomFS(FileSys::VirtualFile& out_file);
 
-    /// Adds the base, update and add-on NCAs of a native archive to a content provider, so the
-    /// patch manager finds them as it does for a base NSP with separate update files.
-    void RegisterContent(FileSys::ManualContentProvider& provider) const;
+    /// Builds a provider for inspecting a game without changing the running game's content.
+    static FileSys::ContentProviderUnion ContentForGame(
+        const FileSys::ContentProviderUnion& provider, const AppLoader* loader);
 
 private:
+    std::shared_ptr<FileSys::ManualContentProvider> CreateArchiveContent() const;
     struct Impl;
     std::unique_ptr<Impl> impl;
 };

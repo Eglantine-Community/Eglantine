@@ -24,7 +24,7 @@ class NxTools : public QObject {
     Q_OBJECT
 
 public:
-    NxTools(FileSys::VirtualFilesystem vfs, QWidget* parent);
+    NxTools(FileSys::VirtualFilesystem vfs, QWidget* parent, std::function<bool()> prepare_write);
     ~NxTools() override;
 
     /// True when ConvertToNx accepts this game list entry.
@@ -37,15 +37,14 @@ public:
     void AddToNx(const std::string& archive_path);
     void RemoveFromNx(const std::string& archive_path);
     /// Sets the title, publisher and icon the game list shows, in place.
-    void EditNxMetadata(const std::string& archive_path,
-                        const std::function<bool()>& prepare_write);
+    void EditNxMetadata(const std::string& archive_path);
 
 signals:
     /// A conversion or an edit started (true) or ended (false).
     void RunningChanged(bool running);
     /// An archive was created or changed: the game list must be refreshed.
     void ArchivesChanged();
-    void MetadataWriteFinished();
+    void ArchiveWriteFinished();
 
 private:
     struct Job;
@@ -56,6 +55,7 @@ private:
 
     FileSys::VirtualFilesystem vfs;
     QWidget* parent_widget;
+    std::function<bool()> prepare_write;
     std::shared_ptr<Job> running;
     QPointer<NupProgressDialog> progress;
 };

@@ -425,6 +425,12 @@ struct NxTools::Job {
     // The new icon given to set-metadata, removed when the job ends.
     std::unique_ptr<QTemporaryFile> icon_file;
 
+    bool WritesArchive() const {
+        const auto& command = args.front();
+        return command == "add" || command == "add-tree" || command == "remove" ||
+               command == "set-metadata";
+    }
+
     // nxformat 1.0.1 fails pack and add when the rebuild recipe cannot be kept (1.0.0 only
     // warned). Such a failure can be run again without the recipe.
     bool CanRetryWithoutRecipe(const QString& error) const {
@@ -527,8 +533,10 @@ QString ListContents(const std::string& archive,
 
 } // namespace
 
-NxTools::NxTools(FileSys::VirtualFilesystem vfs_, QWidget* parent)
-    : QObject(parent), vfs{std::move(vfs_)}, parent_widget{parent} {}
+NxTools::NxTools(FileSys::VirtualFilesystem vfs_, QWidget* parent,
+                 std::function<bool()> prepare_write_)
+    : QObject(parent), vfs{std::move(vfs_)}, parent_widget{parent},
+      prepare_write{std::move(prepare_write_)} {}
 
 NxTools::~NxTools() {
     if (running) {
@@ -697,8 +705,8 @@ void NxTools::AddToNx(const std::string& archive_path) {
         return;
     }
     const QString title = tr("Add to NX");
-    const auto archive = vfs->OpenFile(archive_path, FileSys::OpenMode::Read);
-    const auto platform = archive != nullptr ? Loader::AppLoader_NX::ReadPlatform(archive, 0) : 0;
+    const auto platform = Loader::AppLoader_NX::ReadPlatform(
+        vfs->OpenFile(archive_path, FileSys::OpenMode::Read), 0);
     if (platform == 0) {
         QMessageBox::warning(parent_widget, title, tr("This NX archive cannot be read."));
         return;
@@ -841,8 +849,7 @@ void NxTools::RemoveFromNx(const std::string& archive_path) {
     Start(std::move(job));
 }
 
-void NxTools::EditNxMetadata(const std::string& archive_path,
-                             const std::function<bool()>& prepare_write) {
+void NxTools::EditNxMetadata(const std::string& archive_path) {
     if (running) {
         return;
     }
@@ -1013,7 +1020,7 @@ void NxTools::EditNxMetadata(const std::string& archive_path,
         job->icon_file->close();
         job->args.push_back("icon=" + ToUtf8(job->icon_file->fileName()));
     }
-    if (job->args.size() == 3 || running || !prepare_write()) {
+    if (job->args.size() == 3) {
         return;
     }
     job->done_message = tr("The NX archive metadata was updated.");
@@ -1021,6 +1028,9 @@ void NxTools::EditNxMetadata(const std::string& archive_path,
 }
 
 void NxTools::Start(std::shared_ptr<Job> job) {
+    if (running || (job->WritesArchive() && !prepare_write())) {
+        return;
+    }
     running = job;
     emit RunningChanged(true);
 
@@ -1148,20 +1158,15 @@ void NxTools::ReplyOriginal(Job& job, const QString& text) {
     auto* remove = new QCheckBox(label, &box);
     box.setCheckBox(remove);
     box.exec();
-    if (remove->isChecked()) {
-        // nxformat has returned; close what it read before moving the originals.
+    if (remove->isChecked() && prepare_write()) {
         job.ReleaseSources();
-        // The game list's content provider keeps every package it scanned open, for updates and
-        // DLC. Drop it (the refresh below fills it again), unless a game is running.
-        if (QtCommon::provider != nullptr && !QtCommon::system->IsPoweredOn()) {
-            QtCommon::provider->ClearAllEntries();
-        }
         int failed = 0;
         for (const auto& name : names) {
             if (!QFile::moveToTrash(name)) {
                 ++failed;
             }
         }
+        emit ArchiveWriteFinished();
         if (failed > 0) {
             QMessageBox::warning(
                 parent_widget, job.title,
@@ -1174,6 +1179,7 @@ void NxTools::ReplyOriginal(Job& job, const QString& text) {
                          "It may be in use. You can delete it yourself.")
                           .arg(names.front()));
         }
+        return;
     }
     emit ArchivesChanged();
 }
@@ -1198,9 +1204,9 @@ void NxTools::Finished(std::shared_ptr<Job> job, int code, QString error) {
     }
     running.reset();
     emit RunningChanged(false);
-    const bool metadata_write = job->args.front() == "set-metadata";
-    if (metadata_write) {
-        emit MetadataWriteFinished();
+    const bool archive_write = job->WritesArchive();
+    if (archive_write) {
+        emit ArchiveWriteFinished();
     }
 
     // add keeps the content it committed before a failure or a cancel, also across a retry:
@@ -1233,7 +1239,7 @@ void NxTools::Finished(std::shared_ptr<Job> job, int code, QString error) {
                                  text + QStringLiteral("\n\n") +
                                      job->warnings.join(QLatin1Char('\n')));
         }
-        if (!metadata_write) {
+        if (!archive_write) {
             emit ArchivesChanged();
         }
         break;
@@ -1241,7 +1247,6 @@ void NxTools::Finished(std::shared_ptr<Job> job, int code, QString error) {
     case NXFORMAT_CANCELLED:
         if (changed) {
             QMessageBox::information(parent_widget, job->title, tr("Cancelled.") + kept);
-            emit ArchivesChanged();
         } else if (job->args.front() == "extract") {
             // The target did not exist before. nxformat removes it when the cancel stops the
             // file extraction, and keeps it when the cancel comes later (restoration recipe).
@@ -1283,9 +1288,6 @@ void NxTools::Finished(std::shared_ptr<Job> job, int code, QString error) {
         } else {
             QMessageBox::warning(parent_widget, job->title,
                                  tr("The operation failed:\n%1").arg(error) + kept);
-        }
-        if (changed) {
-            emit ArchivesChanged();
         }
         break;
     }

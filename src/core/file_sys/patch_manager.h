@@ -70,6 +70,7 @@ public:
     // Currently tracked ExeFS patches:
     // - Game Updates
     [[nodiscard]] VirtualDir PatchExeFS(VirtualDir exefs) const;
+    [[nodiscard]] VirtualDir PatchExeFSMods(VirtualDir exefs) const;
 
     // Currently tracked NSO patches:
     // - IPS

@@ -429,7 +429,8 @@ void GameListWorker::AddTitlesToGameList(GameListDir* parent_dir, GameListItemTy
     }
 
     for (const auto& [slot, game] : installed_games) {
-        if (slot == ContentProviderUnionSlot::FrontendManual) {
+        if (slot == ContentProviderUnionSlot::FrontendManual ||
+            slot == ContentProviderUnionSlot::GameArchive) {
             continue;
         }
 
@@ -500,9 +501,6 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::vector<std::fi
                 provider->AddEntry(FileSys::TitleType::Application,
                                    FileSys::GetCRTypeFromNCAType(FileSys::NCA{file}.GetType()),
                                    program_id, file);
-            } else if (file_type == Loader::FileType::NX) {
-                // An archive brings its own updates and add-ons, whatever the setting.
-                static_cast<Loader::AppLoader_NX&>(*loader).RegisterContent(*provider);
             } else if (Settings::values.ext_content_from_game_dirs.GetValue() &&
                        (file_type == Loader::FileType::XCI || file_type == Loader::FileType::XCZ ||
                         file_type == Loader::FileType::NSP || file_type == Loader::FileType::NSZ)) {
@@ -535,8 +533,10 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::vector<std::fi
                                .toStdString();
                 }
 
-                const FileSys::PatchManager patch{id, system.GetFileSystemController(),
-                                                  system.GetContentProvider()};
+                const auto content =
+                    Loader::AppLoader_NX::ContentForGame(system.GetContentProviderUnion(),
+                                                         app_loader.get());
+                const FileSys::PatchManager patch{id, system.GetFileSystemController(), content};
 
                 const bool loose_dump = IsExtractedNCAMain(physical_name);
                 const u64 size = loose_dump ? 0 : Common::FS::GetSize(physical_name);
