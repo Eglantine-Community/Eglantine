@@ -694,6 +694,7 @@ void PipelineCache::Impl::ClearShaders() {
         compute.clear();
         failed_graphics.clear();
         failed_compute.clear();
+        unused_compute_prefetches = 0;
     }
     {
         std::scoped_lock lock{translation_mutex};
@@ -1235,18 +1236,22 @@ void PipelineCache::Impl::NoteNotReady(std::string_view what, std::span<const u6
              count, stages);
 }
 
-void PipelineCache::Impl::AsyncQueued() {
+bool PipelineCache::Impl::AsyncQueued(size_t limit) {
+    std::scoped_lock lock{async_mutex};
+    if (limit != 0 && async_outstanding >= limit) {
+        return false;
+    }
     if (options.shader_notify != nullptr) {
         options.shader_notify->MarkShaderBuilding();
     }
     const u64 now = static_cast<u64>(std::chrono::steady_clock::now().time_since_epoch().count());
     u64 expected = 0;
     stat_async_first_ticks.compare_exchange_strong(expected, now);
-    std::scoped_lock lock{async_mutex};
     ++async_outstanding;
     if (async_outstanding > stat_async_peak.load()) {
         stat_async_peak = async_outstanding;
     }
+    return true;
 }
 
 void PipelineCache::Impl::AsyncDone() {
@@ -1736,6 +1741,8 @@ void PipelineCache::Impl::RunAsyncCompute(AsyncComputeJob& job) {
     AsyncDone();
 }
 
+constexpr u32 MAX_UNUSED_COMPUTE_PREFETCHES = 16;
+
 std::shared_ptr<ComputePipeline> PipelineCache::Impl::GetCompute(
     const ComputeRequest& request, bool* not_ready, const std::function<void(u64)>& look_ahead,
     std::optional<u64> prefetch_skip) {
@@ -1755,13 +1762,17 @@ std::shared_ptr<ComputePipeline> PipelineCache::Impl::GetCompute(
         key.shared_memory_size = *request.environment.compute_shared_memory_size;
     }
     const bool prefetch = prefetch_skip.has_value();
+    const bool before_binding = prefetch && request.oracle == nullptr;
     if (prefetch && (key.hash == *prefetch_skip || !options.prefetch_graphics || !async_workers ||
-                     !loader_queued.load(std::memory_order_acquire))) {
+                     !loader_queued.load(std::memory_order_acquire) ||
+                     (before_binding && ShaderLog::Enabled()))) {
         return nullptr;
     }
+    // An unused program should not delay work found by command lookahead.
+    const size_t queue_limit = before_binding ? 1 : async_worker_count;
     if (prefetch) {
         std::scoped_lock lock{async_mutex};
-        if (async_outstanding >= async_worker_count) {
+        if (async_outstanding >= queue_limit) {
             return nullptr;
         }
     }
@@ -1773,15 +1784,32 @@ std::shared_ptr<ComputePipeline> PipelineCache::Impl::GetCompute(
     bool failed = false;
     const auto search = [&]() -> std::shared_ptr<ComputePipeline> {
         pending.reset();
-        std::scoped_lock lock{pipeline_mutex};
+        std::unique_lock lock{pipeline_mutex};
         if (const auto it = compute.find(key); it != compute.end()) {
             for (const auto& candidate : it->second) {
-                if (candidate->QueriesMatch(oracle)) {
-                    if (!prefetch && candidate->prefetched_unused.exchange(false)) {
-                        ++stat_prefetch_used;
-                    }
+                if (!candidate->QueriesMatch(oracle)) {
+                    continue;
+                }
+                if (prefetch || !candidate->prefetched_unused.exchange(false)) {
                     return candidate;
                 }
+                ++stat_prefetch_used;
+                if (candidate->prefetched_at_creation) {
+                    --unused_compute_prefetches;
+                }
+                if (!candidate->deferred_prefetch_shader) {
+                    return candidate;
+                }
+                const auto hit = candidate;
+                const StageArtifact stage{
+                    std::move(hit->deferred_prefetch_shader),
+                    hit->stages[STAGE_COMPUTE].program_constants,
+                };
+                lock.unlock();
+                if (DiskEnabled()) {
+                    PostComputePipeline(stage, key, *hit);
+                }
+                return hit;
             }
             had_variants = !it->second.empty();
         }
@@ -1790,7 +1818,8 @@ std::shared_ptr<ComputePipeline> PipelineCache::Impl::GetCompute(
         } else if (async && preload_registered) {
             if (failed_compute.contains(key)) {
                 failed = true;
-            } else {
+            } else if (!before_binding ||
+                       unused_compute_prefetches < MAX_UNUSED_COMPUTE_PREFETCHES) {
                 claim = std::make_shared<PendingKey>();
                 claim->speculative = prefetch;
                 claim->outstanding = 1;
@@ -1801,6 +1830,9 @@ std::shared_ptr<ComputePipeline> PipelineCache::Impl::GetCompute(
     };
     if (auto hit = search()) {
         return hit;
+    }
+    if (before_binding && !claim) {
+        return nullptr;
     }
     if (async) {
         const u64 hashes[1]{key.hash};
@@ -1825,8 +1857,11 @@ std::shared_ptr<ComputePipeline> PipelineCache::Impl::GetCompute(
         if (AnyStageRejected(hashes)) {
             return nullptr;
         }
-        std::unique_ptr<TextureOracle> frozen = oracle.Freeze(1u << STAGE_COMPUTE);
-        if (!frozen) {
+        std::unique_ptr<TextureOracle> frozen;
+        if (!before_binding) {
+            frozen = oracle.Freeze(1u << STAGE_COMPUTE);
+        }
+        if (!frozen && !before_binding) {
             if (prefetch) {
                 return nullptr;
             }
@@ -1848,7 +1883,9 @@ std::shared_ptr<ComputePipeline> PipelineCache::Impl::GetCompute(
         job->had_variants = had_variants;
         job->speculative = prefetch;
         job->pending = claim;
-        AsyncQueued();
+        if (!AsyncQueued(prefetch ? queue_limit : 0)) {
+            return nullptr;
+        }
         try {
             async_workers->QueueWork([this, job] { RunAsyncCompute(*job); });
         } catch (...) {
@@ -1925,6 +1962,8 @@ std::shared_ptr<ComputePipeline> PipelineCache::Impl::CompileCompute(const Compu
         return nullptr;
     }
     TranslateInput input;
+    const bool before_binding = speculative && request.oracle == nullptr;
+    input.speculative = before_binding;
     input.programs[STAGE_COMPUTE] = &request.program;
     input.oracle = request.oracle != nullptr ? request.oracle : &DEFAULT_ORACLE;
     input.environment = &request.environment;
@@ -1937,6 +1976,11 @@ std::shared_ptr<ComputePipeline> PipelineCache::Impl::CompileCompute(const Compu
         return nullptr;
     }
     const StageArtifact& stage = translated.stages[STAGE_COMPUTE];
+    if (before_binding && !stage.record->queries.empty()) {
+        // Handles can also come from uniform buffers and the handle bank.
+        failure.armed = false;
+        return nullptr;
+    }
     const auto create_start = std::chrono::steady_clock::now();
     auto pipeline = AssembleCompute(stage, translated.compute_layout);
     const auto create_end = std::chrono::steady_clock::now();
@@ -1946,6 +1990,10 @@ std::shared_ptr<ComputePipeline> PipelineCache::Impl::CompileCompute(const Compu
     }
     {
         std::scoped_lock lock{pipeline_mutex};
+        if (before_binding && unused_compute_prefetches >= MAX_UNUSED_COMPUTE_PREFETCHES) {
+            failure.armed = false;
+            return nullptr;
+        }
         auto& variants = compute[key];
         if (ShaderLog::Enabled()) {
             LogCompileDone(*pipeline, translated,
@@ -1955,26 +2003,27 @@ std::shared_ptr<ComputePipeline> PipelineCache::Impl::CompileCompute(const Compu
                            static_cast<u32>(variants.size()));
         }
         pipeline->prefetched_unused = speculative;
+        pipeline->prefetched_at_creation = before_binding;
+        if (before_binding && DiskEnabled()) {
+            pipeline->deferred_prefetch_shader = stage.record;
+        }
         variants.push_back(pipeline);
+        if (before_binding) {
+            ++unused_compute_prefetches;
+        }
     }
     failure.armed = false;
     ++stat_compiled;
     if (had_variants) {
         ++stat_retranslated;
     }
-    NoteCompileTime(speculative ? "compute prefetch" : "compute", request.program.hash, start,
-                    create_start - translate_start, create_end - create_start);
-    if (DiskEnabled()) {
-        PostShader(stage);
-        Disk::ComputePipelineRecord record;
-        record.shader = stage.record->id;
-        record.push_constant_size = pipeline->push_constant_size;
-        record.environment_flags = key.environment_flags;
-        record.local_memory_size = key.local_memory_size;
-        record.shared_memory_size = key.shared_memory_size;
-        record.compute_layout = translated.compute_layout;
-        PostComputeRecord(record);
-        ++new_since_vk_write;
+    NoteCompileTime(before_binding ? "compute prefetch at program creation"
+                    : speculative  ? "compute prefetch"
+                                   : "compute",
+                    request.program.hash, start, create_start - translate_start,
+                    create_end - create_start);
+    if (!before_binding && DiskEnabled()) {
+        PostComputePipeline(stage, key, *pipeline);
         MaybeWriteVkCache();
     }
     return pipeline;

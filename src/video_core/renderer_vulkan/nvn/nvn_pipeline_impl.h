@@ -536,7 +536,7 @@ struct PipelineCache::Impl {
     /// Drops one claim on `pending` (and the map entry when it was the last), wakes waiters.
     template <typename Map, typename Key>
     void ReleasePending(Map& map, const Key& key, const std::shared_ptr<PendingKey>& pending);
-    void AsyncQueued();
+    bool AsyncQueued(size_t limit = 0);
     void AsyncDone();
 
     // --- shader log (nvn_pipeline_log.cpp; every entry is a no-op unless ShaderLog::Enabled()) --
@@ -568,6 +568,8 @@ struct PipelineCache::Impl {
     void PostShader(const StageArtifact& artifact);
     void PostGraphicsRecord(const Disk::GraphicsPipelineRecord& record);
     void PostComputeRecord(const Disk::ComputePipelineRecord& record);
+    void PostComputePipeline(const StageArtifact& stage, const ComputeKey& key,
+                             const ComputePipeline& pipeline);
     void PostBytes(std::vector<u8> bytes);
     void MaybeWriteVkCache();
     void WriteVkCache();
@@ -678,6 +680,7 @@ struct PipelineCache::Impl {
     /// Keys whose asynchronous compile produced no pipeline (guarded by pipeline_mutex).
     std::unordered_set<GraphicsKey, GraphicsKeyHash, GraphicsKeyEqual> failed_graphics;
     std::unordered_set<ComputeKey, ComputeKeyHash> failed_compute;
+    u32 unused_compute_prefetches{}; ///< Protected by pipeline_mutex.
 
     std::mutex written_mutex;
     std::unordered_set<Disk::ContentId, Disk::ContentIdHash> written_shaders;

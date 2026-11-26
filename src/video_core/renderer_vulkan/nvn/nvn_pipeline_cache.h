@@ -447,6 +447,10 @@ struct ComputeRequest {
 
 struct ComputePipeline : PipelineBase {
     std::atomic<bool> prefetched_unused{};
+    bool prefetched_at_creation{};
+    /// The portable record of a before-binding prefetch, held until its first matching lookup.
+    /// Guarded by the pipeline cache mutex.
+    std::shared_ptr<const Disk::ShaderRecord> deferred_prefetch_shader;
 };
 
 struct PipelineCacheOptions {

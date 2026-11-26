@@ -16,6 +16,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -2626,6 +2627,87 @@ TEST_CASE("Async compile off: nothing is counted as building", "[nvn]") {
     REQUIRE(cache.GetCompute(MakeComputeRequest(program, &oracle)) != nullptr);
     REQUIRE(notify.NumBuildingNoReport() == 0);
     REQUIRE(notify.ShadersBuilding() == 0);
+}
+
+TEST_CASE("Compute prefetch at program creation bounds the number of unused pipelines",
+          "[nvn][pipeline-lookahead]") {
+    const auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    auto options = AsyncOptions(false);
+    options.prefetch_graphics = true;
+    PipelineCache cache{*vulkan->device, options};
+    constexpr u32 MAX_UNUSED = 16;
+    for (u32 i = 0; i < MAX_UNUSED; ++i) {
+        const auto program = MakeAddProgram(5, i);
+        cache.PrefetchCompute(MakeComputeRequest(program, nullptr), 0);
+        cache.Flush();
+    }
+    REQUIRE(cache.Stats().compute_pipelines == MAX_UNUSED);
+
+    const auto next = MakeAddProgram(5, MAX_UNUSED);
+    cache.PrefetchCompute(MakeComputeRequest(next, nullptr), 0);
+    cache.Flush();
+    CHECK(cache.Stats().prefetch_queued == MAX_UNUSED);
+    CHECK(cache.Stats().compute_pipelines == MAX_UNUSED);
+
+    const auto first = MakeAddProgram(5, 0);
+    REQUIRE(cache.GetCompute(MakeComputeRequest(first, nullptr)));
+    cache.PrefetchCompute(MakeComputeRequest(next, nullptr), 0);
+    cache.Flush();
+    CHECK(cache.Stats().prefetch_used == 1);
+    CHECK(cache.Stats().prefetch_queued == MAX_UNUSED + 1);
+    CHECK(cache.Stats().compute_pipelines == MAX_UNUSED + 1);
+}
+
+TEST_CASE("Compute prefetch at program creation persists only when used",
+          "[nvn][pipeline-lookahead]") {
+    const auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    TempDirectory directory;
+    auto options = AsyncOptions(false);
+    options.directory = directory.path;
+    options.driver_cache_file = false;
+    options.prefetch_graphics = true;
+    const auto used = MakeAddProgram(5, 42);
+    const auto unused = MakeAddProgram(5, 43);
+    const auto used_request = MakeComputeRequest(used, nullptr);
+    const auto unused_request = MakeComputeRequest(unused, nullptr);
+    {
+        PipelineCache cold{*vulkan->device, options};
+        cold.Flush();
+        cold.PrefetchCompute(used_request, 0);
+        cold.Flush();
+        cold.PrefetchCompute(unused_request, 0);
+        cold.Flush();
+        REQUIRE(cold.Stats().compiled_at_runtime == 2);
+        CHECK(cold.Stats().disk_entries_written == 0);
+
+        FreezableOracle oracle;
+        cold.PrefetchCompute(MakeComputeRequest(used, &oracle), 0);
+        cold.Flush();
+        CHECK(cold.Stats().disk_entries_written == 0);
+
+        auto lookup = std::async(std::launch::async, [&] { return cold.GetCompute(used_request); });
+        const auto hit = cold.GetCompute(used_request);
+        REQUIRE(hit);
+        CHECK(lookup.get() == hit);
+        cold.Flush();
+        CHECK(cold.Stats().prefetch_used == 1);
+        CHECK(cold.Stats().compiled_at_runtime == 2);
+        CHECK(cold.Stats().disk_entries_written == 2);
+    }
+
+    PipelineCache warm{*vulkan->device, options};
+    warm.Flush();
+    CHECK(warm.Stats().loaded == 1);
+    REQUIRE(warm.GetCompute(used_request));
+    CHECK(warm.Stats().compiled_at_runtime == 0);
+    REQUIRE(warm.GetCompute(unused_request));
+    CHECK(warm.Stats().compiled_at_runtime == 1);
 }
 
 TEST_CASE("Async compile: a rejected program is counted, cached as rejected and never fatal",

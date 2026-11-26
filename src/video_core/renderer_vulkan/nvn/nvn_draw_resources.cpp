@@ -426,6 +426,14 @@ void DrawResources::OnProgramCreated(const std::shared_ptr<const VC::ProgramDesc
     if (!desc.control[STAGE_COMPUTE].empty()) {
         ParsedComputeControl parsed;
         parsed.control = VC::ParseControl(desc.control[STAGE_COMPUTE], parsed.error);
+        if (cache_instance && hashes[STAGE_COMPUTE] != 0 && parsed.control &&
+            parsed.control->has_compute_counts && parsed.control->compute.texture_count == 0 &&
+            parsed.control->compute.image_count == 0) {
+            ComputeRequest request;
+            request.program = {hashes[STAGE_COMPUTE], &desc.control[STAGE_COMPUTE],
+                               &desc.code[STAGE_COMPUTE]};
+            cache_instance->PrefetchCompute(request, 0);
+        }
         compute_controls[desc.serial] = std::move(parsed);
     }
 }

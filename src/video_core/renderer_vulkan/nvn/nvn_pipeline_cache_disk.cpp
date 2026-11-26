@@ -77,6 +77,20 @@ void PipelineCache::Impl::PostComputeRecord(const Disk::ComputePipelineRecord& r
     PostBytes(std::move(bytes));
 }
 
+void PipelineCache::Impl::PostComputePipeline(const StageArtifact& stage, const ComputeKey& key,
+                                              const ComputePipeline& pipeline) {
+    PostShader(stage);
+    PostComputeRecord({
+        .shader = stage.record->id,
+        .push_constant_size = pipeline.push_constant_size,
+        .environment_flags = key.environment_flags,
+        .local_memory_size = key.local_memory_size,
+        .shared_memory_size = key.shared_memory_size,
+        .compute_layout = pipeline.compute_layout,
+    });
+    ++new_since_vk_write;
+}
+
 std::vector<u8> PipelineCache::Impl::ReadVkCacheBlob() const {
     std::ifstream file(vk_cache_path, std::ios::binary | std::ios::ate);
     if (!file.is_open()) {
