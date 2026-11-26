@@ -40,6 +40,9 @@
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/memory.h"
+#ifdef HAS_HYPERVISOR
+#include "core/arm/hypervisor/hv_vm.h"
+#endif
 #include "video_core/gpu.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host1x/host1x.h"
@@ -78,6 +81,25 @@ struct Memory::Impl {
 #else
         host_buffer = std::addressof(system.DeviceMemory().buffer);
 #endif
+
+#ifdef HAS_HYPERVISOR
+        if (process.IsApplication()) {
+            hv_vm = nullptr;
+            // Like the CPU selection (KProcess::InitializeInterfaces): no VM for a 32-bit program
+            // (its 64-bit flag isn't set yet, but its address space is 32-bit), and none while
+            // debugging, which needs single steps the Hypervisor backend doesn't do yet.
+            if (Settings::values.cpu_backend.GetValue() == Settings::CpuBackend::Hypervisor &&
+                process.GetPageTable().GetAddressSpaceWidth() > 32 && !system.DebuggerEnabled()) {
+                hv_vm = HvVm::Create(system);
+                if (hv_vm == nullptr) {
+                    LOG_WARNING(HW_Memory, "Hypervisor unavailable, falling back to Dynarmic");
+                }
+            }
+            if (hv_vm == nullptr) {
+                HvVm::Deactivate();
+            }
+        }
+#endif
     }
 
     void MapMemoryRegion(Common::PageTable& page_table, Common::ProcessAddress base, u64 size,
@@ -93,6 +115,11 @@ struct Memory::Impl {
         if (current_page_table->fastmem_arena) {
             host_buffer->Map(GetInteger(base), GetInteger(target) - DramMemoryMap::Base, size, perms, separate_heap);
         }
+#ifdef HAS_HYPERVISOR
+        if (hv_vm) {
+            hv_vm->Map(GetInteger(base), GetInteger(target) - DramMemoryMap::Base, size, perms);
+        }
+#endif
     }
 
     void UnmapRegion(Common::PageTable& page_table, Common::ProcessAddress base, u64 size,
@@ -105,6 +132,11 @@ struct Memory::Impl {
         if (current_page_table->fastmem_arena) {
             host_buffer->Unmap(GetInteger(base), size, separate_heap);
         }
+#ifdef HAS_HYPERVISOR
+        if (hv_vm) {
+            hv_vm->Unmap(GetInteger(base), size);
+        }
+#endif
     }
 
     void ProtectRegion(Common::PageTable& page_table, VAddr vaddr, u64 size,
@@ -112,9 +144,20 @@ struct Memory::Impl {
         ASSERT_MSG((size & YUZU_PAGEMASK) == 0, "non-page aligned size: {:016X}", size);
         ASSERT_MSG((vaddr & YUZU_PAGEMASK) == 0, "non-page aligned base: {:016X}", vaddr);
 
-        if (!current_page_table->fastmem_arena) {
+        if (!current_page_table->fastmem_arena && !HasHypervisor()) {
             return;
         }
+
+        const auto protect = [&](u64 begin, u64 bytes) {
+            if (current_page_table->fastmem_arena) {
+                host_buffer->Protect(begin, bytes, perms);
+            }
+#ifdef HAS_HYPERVISOR
+            if (hv_vm) {
+                hv_vm->Protect(begin, bytes, perms);
+            }
+#endif
+        };
 
         u64 protect_bytes = 0, protect_begin = 0;
 
@@ -124,7 +167,7 @@ struct Memory::Impl {
             switch (page_type) {
             case Common::PageType::RasterizerCachedMemory:
                 if (protect_bytes > 0) {
-                    host_buffer->Protect(protect_begin, protect_bytes, perms);
+                    protect(protect_begin, protect_bytes);
                     protect_bytes = 0;
                 }
                 break;
@@ -136,8 +179,28 @@ struct Memory::Impl {
         }
 
         if (protect_bytes > 0) {
-            host_buffer->Protect(protect_begin, protect_bytes, perms);
+            protect(protect_begin, protect_bytes);
         }
+    }
+
+    bool HasHypervisor() const {
+#ifdef HAS_HYPERVISOR
+        return hv_vm != nullptr;
+#else
+        return false;
+#endif
+    }
+
+    /// Whether CPU reads of GPU-tracked pages fault so the rasterizer can flush first.
+    bool ReactiveFlushing() const {
+        // EDEN_NX2_NO_REACTIVE=1 drops the read traps on Switch 2 programs. Opt-in: without
+        // them a CPU read of GPU-written memory can see stale data.
+        static const bool nx2_no_reactive = [] {
+            const char* value = std::getenv("EDEN_NX2_NO_REACTIVE");
+            return value != nullptr && value[0] == '1';
+        }();
+        return Settings::values.use_reactive_flushing.GetValue() &&
+               !(nx2_no_reactive && Settings::CurrentProgramIsSwitch2());
     }
 
     [[nodiscard]] u8* GetPointerFromRasterizerCachedMemory(u64 vaddr) const {
@@ -487,71 +550,73 @@ struct Memory::Impl {
             return;
         }
 
-        if (current_page_table->fastmem_arena) {
+        if (current_page_table->fastmem_arena || HasHypervisor()) {
             Common::MemoryPermission perm{};
-            // EDEN_NX2_NO_REACTIVE=1 drops the read traps on Switch 2 programs. Opt-in: without
-            // them a CPU read of GPU-written memory can see stale data.
-            static const bool nx2_no_reactive = [] {
-                const char* value = std::getenv("EDEN_NX2_NO_REACTIVE");
-                return value != nullptr && value[0] == '1';
-            }();
-            const bool reactive_flushing =
-                Settings::values.use_reactive_flushing.GetValue() &&
-                !(nx2_no_reactive && Settings::CurrentProgramIsSwitch2());
-            if (!reactive_flushing || !cached) {
+            if (!ReactiveFlushing() || !cached) {
                 perm |= Common::MemoryPermission::Read;
             }
             if (!cached) {
                 perm |= Common::MemoryPermission::Write;
             }
-            // EDEN_NX2_PROTECT_STATS=1: how many protection changes the tracker makes, and what
-            // they cost, per 5 s (diagnostic).
-            static const bool stats_enabled = std::getenv("EDEN_NX2_PROTECT_STATS") != nullptr;
-            const bool spikes = VideoCommon::Nx2Spikes::Counting();
-            const auto stats_start = stats_enabled || spikes
-                                         ? std::chrono::steady_clock::now()
-                                         : std::chrono::steady_clock::time_point{};
-            host_buffer->Protect(vaddr, size, perm);
-            if (spikes) {
-                VideoCommon::Nx2Spikes::Note(VideoCommon::Nx2Spikes::Event::ProtectChange,
-                                             std::chrono::steady_clock::now() - stats_start,
-                                             size >> YUZU_PAGEBITS);
-            }
-            if (stats_enabled) [[unlikely]] {
-                static std::atomic<u64> calls[2]{}, pages[2]{}, nanos[2]{};
-                static std::atomic<u64> window_start{0};
-                const auto now = std::chrono::steady_clock::now();
-                const u64 now_ns = static_cast<u64>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch())
-                        .count());
-                const int side = cached ? 1 : 0;
-                calls[side].fetch_add(1, std::memory_order_relaxed);
-                pages[side].fetch_add(size >> YUZU_PAGEBITS, std::memory_order_relaxed);
-                nanos[side].fetch_add(
-                    static_cast<u64>(
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(now - stats_start)
-                            .count()),
-                    std::memory_order_relaxed);
-                u64 started = window_start.load(std::memory_order_relaxed);
-                if (started == 0) {
-                    window_start.compare_exchange_strong(started, now_ns);
-                } else if (now_ns - started > 5'000'000'000ULL &&
-                           window_start.compare_exchange_strong(started, now_ns)) {
-                    const double seconds = static_cast<double>(now_ns - started) / 1e9;
-                    LOG_INFO(HW_Memory,
-                             "nx2 protect: to read-only (tracked) {:.0f}/s ({:.0f} pages/s, {:.0f} "
-                             "ms/s), to writable (untracked) {:.0f}/s ({:.0f} pages/s, {:.0f} ms/s)",
-                             static_cast<double>(calls[1].exchange(0)) / seconds,
-                             static_cast<double>(pages[1].exchange(0)) / seconds,
-                             static_cast<double>(nanos[1].exchange(0)) / 1e6 / seconds,
-                             static_cast<double>(calls[0].exchange(0)) / seconds,
-                             static_cast<double>(pages[0].exchange(0)) / seconds,
-                             static_cast<double>(nanos[0].exchange(0)) / 1e6 / seconds);
+            if (current_page_table->fastmem_arena) {
+                // EDEN_NX2_PROTECT_STATS=1: how many protection changes the tracker makes, and what
+                // they cost, per 5 s (diagnostic).
+                static const bool stats_enabled = std::getenv("EDEN_NX2_PROTECT_STATS") != nullptr;
+                const bool spikes = VideoCommon::Nx2Spikes::Counting();
+                const auto stats_start = stats_enabled || spikes
+                                             ? std::chrono::steady_clock::now()
+                                             : std::chrono::steady_clock::time_point{};
+                host_buffer->Protect(vaddr, size, perm);
+                if (spikes) {
+                    VideoCommon::Nx2Spikes::Note(VideoCommon::Nx2Spikes::Event::ProtectChange,
+                                                 std::chrono::steady_clock::now() - stats_start,
+                                                 size >> YUZU_PAGEBITS);
+                }
+                if (stats_enabled) [[unlikely]] {
+                    static std::atomic<u64> calls[2]{}, pages[2]{}, nanos[2]{};
+                    static std::atomic<u64> window_start{0};
+                    const auto now = std::chrono::steady_clock::now();
+                    const u64 now_ns = static_cast<u64>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch())
+                            .count());
+                    const int side = cached ? 1 : 0;
+                    calls[side].fetch_add(1, std::memory_order_relaxed);
+                    pages[side].fetch_add(size >> YUZU_PAGEBITS, std::memory_order_relaxed);
+                    nanos[side].fetch_add(
+                        static_cast<u64>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(now - stats_start)
+                                .count()),
+                        std::memory_order_relaxed);
+                    u64 started = window_start.load(std::memory_order_relaxed);
+                    if (started == 0) {
+                        window_start.compare_exchange_strong(started, now_ns);
+                    } else if (now_ns - started > 5'000'000'000ULL &&
+                               window_start.compare_exchange_strong(started, now_ns)) {
+                        const double seconds = static_cast<double>(now_ns - started) / 1e9;
+                        LOG_INFO(HW_Memory,
+                                 "nx2 protect: to read-only (tracked) {:.0f}/s ({:.0f} pages/s, "
+                                 "{:.0f} ms/s), to writable (untracked) {:.0f}/s ({:.0f} pages/s, "
+                                 "{:.0f} ms/s)",
+                                 static_cast<double>(calls[1].exchange(0)) / seconds,
+                                 static_cast<double>(pages[1].exchange(0)) / seconds,
+                                 static_cast<double>(nanos[1].exchange(0)) / 1e6 / seconds,
+                                 static_cast<double>(calls[0].exchange(0)) / seconds,
+                                 static_cast<double>(pages[0].exchange(0)) / seconds,
+                                 static_cast<double>(nanos[0].exchange(0)) / 1e6 / seconds);
+                    }
+                }
+                if (cached && perm != Common::MemoryPermission{}) {
+                    ProtectArmedPages(vaddr, size);
                 }
             }
-            if (cached && perm != Common::MemoryPermission{}) {
-                ProtectArmedPages(vaddr, size);
+#ifdef HAS_HYPERVISOR
+            if (hv_vm) {
+                hv_vm->ProtectAccess(vaddr, size, perm);
+                if (cached && perm != Common::MemoryPermission{}) {
+                    ProtectArmedPages(vaddr, size);
+                }
             }
+#endif
         }
 
         // Iterate over a contiguous CPU address space, which corresponds to the specified GPU
@@ -621,7 +686,7 @@ struct Memory::Impl {
             const char* value = std::getenv("EDEN_NX2_READ_TRAPS");
             return value != nullptr && value[0] == '0';
         }();
-        return !disabled && current_page_table->fastmem_arena &&
+        return !disabled && (current_page_table->fastmem_arena || HasHypervisor()) &&
                !Settings::values.use_reactive_flushing.GetValue() &&
                Settings::values.cpu_backend.GetValue() != Settings::CpuBackend::Nce;
     }
@@ -643,7 +708,7 @@ struct Memory::Impl {
             if (run_pages > 0) {
                 // Reads that hit a cached read area must not skip the flush of a new trap.
                 read_trap_generation.fetch_add(1, std::memory_order_release);
-                host_buffer->Protect(run_begin << YUZU_PAGEBITS, run_pages << YUZU_PAGEBITS,
+                ProtectReadTrapPages(run_begin << YUZU_PAGEBITS, run_pages << YUZU_PAGEBITS,
                                      Common::MemoryPermission{});
                 run_pages = 0;
             }
@@ -664,6 +729,40 @@ struct Memory::Impl {
         protect_run();
     }
 
+    /// Sets the access of read-trapped pages in whichever host mapping the CPU backend reads
+    /// through: the fastmem arena (Dynarmic) or the Hypervisor's guest page tables.
+    void ProtectReadTrapPages(u64 vaddr, u64 size, Common::MemoryPermission perm) {
+        if (current_page_table->fastmem_arena) {
+            host_buffer->Protect(vaddr, size, perm);
+        }
+#ifdef HAS_HYPERVISOR
+        if (hv_vm) {
+            hv_vm->ProtectAccess(vaddr, size, perm);
+        }
+#endif
+    }
+
+#ifdef HAS_HYPERVISOR
+    /// After a single-stepped access opened a GPU-tracked page, gives it back the access the
+    /// tracker sets (none for an armed read trap). Checked under the trap lock, so a trap armed
+    /// during the step stays armed.
+    void RestoreCachedPageAccess(u64 vaddr) {
+        if (!hv_vm || (vaddr >> current_page_table->GetAddressSpaceBits()) != 0) {
+            return;
+        }
+        const u64 page = vaddr >> YUZU_PAGEBITS;
+        std::scoped_lock lk{read_trap_mutex};
+        if (std::as_const(current_page_table->entries)[page].Type() !=
+            Common::PageType::RasterizerCachedMemory) {
+            return;
+        }
+        const bool readable = !ReactiveFlushing() && !armed_read_traps.contains(page);
+        hv_vm->ProtectAccess(page << YUZU_PAGEBITS, YUZU_PAGESIZE,
+                             readable ? Common::MemoryPermission::Read
+                                      : Common::MemoryPermission{});
+    }
+#endif
+
     /// Takes read permission away again from armed pages that were just cached again.
     void ProtectArmedPages(u64 vaddr, u64 size) {
         if (armed_read_trap_count.load(std::memory_order_relaxed) == 0) {
@@ -673,7 +772,7 @@ struct Memory::Impl {
         const u64 page_end = ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1;
         for (auto it = armed_read_traps.lower_bound(vaddr >> YUZU_PAGEBITS);
              it != armed_read_traps.end() && *it < page_end; ++it) {
-            host_buffer->Protect(*it << YUZU_PAGEBITS, YUZU_PAGESIZE, Common::MemoryPermission{});
+            ProtectReadTrapPages(*it << YUZU_PAGEBITS, YUZU_PAGESIZE, Common::MemoryPermission{});
         }
     }
 
@@ -687,7 +786,7 @@ struct Memory::Impl {
         auto it = armed_read_traps.lower_bound(vaddr >> YUZU_PAGEBITS);
         while (it != armed_read_traps.end() && *it < page_end) {
             // Still cached (this read came through the rasterizer path): writes stay trapped.
-            host_buffer->Protect(*it << YUZU_PAGEBITS, YUZU_PAGESIZE,
+            ProtectReadTrapPages(*it << YUZU_PAGEBITS, YUZU_PAGESIZE,
                                  Common::MemoryPermission::Read);
             it = armed_read_traps.erase(it);
             armed_read_trap_count.fetch_sub(1, std::memory_order_relaxed);
@@ -1019,6 +1118,9 @@ struct Memory::Impl {
     std::array<Common::ScratchBuffer<u32>, Core::Hardware::NUM_CPU_CORES> scratch_buffers{};
     std::span<Core::GPUDirtyMemoryManager> gpu_dirty_managers;
     std::mutex sys_core_guard;
+#ifdef HAS_HYPERVISOR
+    HvVm* hv_vm{};
+#endif
 #ifdef __ANDROID__
     std::optional<Common::HeapTracker> heap_tracker;
     Common::HeapTracker* host_buffer{};
@@ -1215,8 +1317,22 @@ void Memory::RasterizerArmReadTraps(Common::ProcessAddress vaddr, u64 size) {
     impl->RasterizerArmReadTraps(GetInteger(vaddr), size);
 }
 
+bool Memory::CachedPagesReadable() const {
+    return !impl->ReactiveFlushing();
+}
+
+#ifdef HAS_HYPERVISOR
+void Memory::RestoreCachedPageAccess(Common::ProcessAddress vaddr) {
+    impl->RestoreCachedPageAccess(GetInteger(vaddr));
+}
+#endif
+
 void Memory::MarkRegionDebug(Common::ProcessAddress vaddr, u64 size, bool debug) {
     impl->MarkRegionDebug(GetInteger(vaddr), size, debug);
+}
+
+void Memory::DownloadRasterizerRegion(Common::ProcessAddress vaddr, size_t size) {
+    impl->HandleRasterizerDownload(GetInteger(vaddr), size);
 }
 
 bool Memory::InvalidateNCE(Common::ProcessAddress vaddr, size_t size) {

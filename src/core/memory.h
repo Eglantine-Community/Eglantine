@@ -492,6 +492,14 @@ public:
      */
     void RasterizerArmReadTraps(Common::ProcessAddress vaddr, u64 size);
 
+    /// Whether GPU-tracked pages keep read access (reactive flushing is off or opted out).
+    bool CachedPagesReadable() const;
+
+#ifdef HAS_HYPERVISOR
+    /// Gives a GPU-tracked page the access the tracker sets again, after a stepped access.
+    void RestoreCachedPageAccess(Common::ProcessAddress vaddr);
+#endif
+
     /**
      * Marks each page within the specified address range as debug or non-debug.
      * Debug addresses are not accessible from fastmem pointers.
@@ -506,6 +514,9 @@ public:
     void SetGPUDirtyManagers(std::span<Core::GPUDirtyMemoryManager> managers);
 
     bool InvalidateNCE(Common::ProcessAddress vaddr, size_t size);
+
+    /// Makes GPU-modified data in a rasterizer-cached region visible to the CPU before it reads.
+    void DownloadRasterizerRegion(Common::ProcessAddress vaddr, size_t size);
 
     bool InvalidateSeparateHeap(void* fault_address);
 
