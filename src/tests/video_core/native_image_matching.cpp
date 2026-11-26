@@ -142,6 +142,43 @@ TEST_CASE("A single-mip target is level 0 of a single-layer mip chain at the sam
     }
 }
 
+TEST_CASE("A single-layer color mip chain can grow without splitting its backing image",
+          "[video_core][native_image_matching]") {
+    auto short_chain = Surface();
+    short_chain.format = PixelFormat::B10G11R11_FLOAT;
+    short_chain.native_tiling = true;
+    short_chain.resources.levels = 2;
+    short_chain.layer_stride = CalculateLayerStride(short_chain);
+    short_chain.maybe_unaligned_layer_stride = CalculateLayerSize(short_chain);
+    auto long_chain = short_chain;
+    long_chain.resources.levels = 3;
+    long_chain.layer_stride = CalculateLayerStride(long_chain);
+    long_chain.maybe_unaligned_layer_stride = CalculateLayerSize(long_chain);
+    REQUIRE(short_chain.layer_stride != long_chain.layer_stride);
+
+    const ImageBase short_image{short_chain, Address, 0x200000};
+    const ImageBase long_image{long_chain, Address, 0x200000};
+    REQUIRE(short_image.mip_level_offsets[1] == long_image.mip_level_offsets[1]);
+    CHECK(FindSubresource(short_chain, long_image, Address, {}, false, false));
+    const auto merged = ResolveOverlap(long_chain, Address, 0x200000, short_image, true, false, false);
+    REQUIRE(merged);
+    CHECK(merged->resources.levels == 3);
+
+    auto mip_target = short_chain;
+    mip_target.size = {480, 270, 1};
+    mip_target.resources.levels = 1;
+    mip_target.block = MipBlockSize(long_chain, 1);
+    mip_target.layer_stride = CalculateLayerStride(mip_target);
+    mip_target.maybe_unaligned_layer_stride = CalculateLayerSize(mip_target);
+    const auto mip = FindSubresource(mip_target, long_image, Address + long_image.mip_level_offsets[1],
+                                    {}, false, false);
+    REQUIRE(mip);
+    CHECK(mip->level == 1);
+
+    long_chain.resources.layers = 2;
+    CHECK_FALSE(IsLayerStrideCompatible(short_chain, long_chain));
+}
+
 TEST_CASE("An image starting inside a mip chain matches the mip it starts at",
           "[video_core][native_image_matching]") {
     ImageInfo chain;

@@ -1645,9 +1645,12 @@ bool IsLayerStrideCompatible(const ImageInfo& lhs, const ImageInfo& rhs,
     // Mario Kart World renders its bloom input into a 640x360 target and samples the same memory
     // as a 5-level texture; refusing this split them into two images, and the bloom chain never
     // saw the target's writes (a self-feeding loop that turned the screen white).
+    // Two chains of the same base extent can also share their common mip levels.
     if (lhs.type == ImageType::e2D && rhs.type == ImageType::e2D &&
         lhs.resources.layers == 1 && rhs.resources.layers == 1 &&
-        (lhs.resources.levels == 1) != (rhs.resources.levels == 1) && lhs.format == rhs.format &&
+        lhs.resources.levels != rhs.resources.levels &&
+        (lhs.resources.levels == 1 || rhs.resources.levels == 1 || lhs.size == rhs.size) &&
+        lhs.format == rhs.format &&
         lhs.block == rhs.block && lhs.block.depth == 0 &&
         lhs.tile_width_spacing == rhs.tile_width_spacing && lhs.num_samples == rhs.num_samples &&
         lhs.maxwell_gob_layout == rhs.maxwell_gob_layout) {
