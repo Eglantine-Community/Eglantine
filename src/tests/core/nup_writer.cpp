@@ -978,3 +978,89 @@ TEST_CASE("NUP preserves edition control metadata and legacy DLC ownership", "[n
                 SetLe(bytes_, meta, 2, 2); // A short NPDM cannot be accepted as a raw NACP.
             }) == Loader::ResultStatus::ErrorNUPBadFormat);
 }
+
+TEST_CASE("NUP keeps every program of a multi-program application", "[nup]") {
+    // A Switch 2 Edition style title: program index 1 starts and reads program index 0.
+    constexpr u64 Index0 = TitleId;
+    constexpr u64 Index1 = TitleId + 1;
+    TempDir t;
+    const auto root = t.path / "Game";
+    Put(root / "base/exefs/main", "index 1 main");
+    Put(root / "base/exefs/main.npdm", Npdm(Index1));
+    Put(root / "base/romfs/one.bin", "one");
+    Put(root / "updates/65536/exefs/main", "index 1 update");
+    Put(root / "updates/65536/exefs/main.npdm", Npdm(Index1));
+    Put(root / "updates/65536/romfs/one.bin", "one updated");
+    const auto other = root / "programs" / fmt::format("{:016X}", Index0);
+    Put(other / "exefs/main", "index 0 main");
+    Put(other / "exefs/main.npdm", Npdm(Index0));
+    Put(other / "romfs/zero.bin", "zero");
+    Put(other / "romfs/kept.bin", "kept");
+    Put(other / "updates/131072/exefs/main.npdm", Npdm(Index0));
+    Put(other / "updates/131072/romfs/zero.bin", "zero updated");
+    const auto archive = t.path / "Game.nup";
+    std::string error;
+    REQUIRE(FileSys::Nup::PackDump(root, archive, {}, {}, nullptr, &error) ==
+            FileSys::Nup::PackResult::Success);
+    INFO(error);
+
+    FileSys::RealVfsFilesystem real;
+    NupContainer nup{real.OpenFile(archive.string(), FileSys::OpenMode::Read)};
+    REQUIRE(nup.GetStatus() == Loader::ResultStatus::Success);
+    REQUIRE(nup.GetProgramIds() == std::vector<u64>{Index0, Index1});
+    // base/ is the program that starts, even though index 0 sorts first.
+    REQUIRE(nup.FindLaunchProgram() == Index1);
+    REQUIRE(nup.FindLaunchProgram(0) == Index1);
+    const auto base1 = nup.FindBasePackage();
+    REQUIRE(base1.has_value());
+    REQUIRE(nup.GetPackages()[*base1].title_id == Index1);
+    REQUIRE(nup.GetPackages()[*base1].launch_program);
+    // Each program takes only its own updates.
+    REQUIRE(nup.GetPackages()[*nup.FindBestUpdatePackage()].version == 65536);
+    REQUIRE(nup.GetPackages()[*nup.FindBestUpdatePackage(Index0)].version == 131072);
+    REQUIRE(Read(nup.GetProgramRomFSDir(Index1)->GetFile("one.bin")) == "one updated");
+    const auto romfs0 = nup.GetProgramRomFSDir(Index0);
+    REQUIRE(Read(romfs0->GetFile("zero.bin")) == "zero updated");
+    REQUIRE(Read(romfs0->GetFile("kept.bin")) == "kept");
+    REQUIRE(romfs0->GetFile("one.bin") == nullptr);
+
+    Loader::AppLoader_NUP loader{real.OpenFile(archive.string(), FileSys::OpenMode::Read)};
+    u64 started{};
+    REQUIRE(loader.ReadProgramId(started) == Loader::ResultStatus::Success);
+    REQUIRE(started == Index1);
+    std::vector<u64> ids;
+    REQUIRE(loader.ReadProgramIds(ids) == Loader::ResultStatus::Success);
+    REQUIRE(ids == std::vector<u64>{Index1, Index0});
+    FileSys::VirtualFile other_romfs;
+    REQUIRE(loader.ReadProgramRomFS(Index0, other_romfs) == Loader::ResultStatus::Success);
+    REQUIRE(other_romfs != nullptr);
+    FileSys::VirtualFile missing;
+    REQUIRE(loader.ReadProgramRomFS(TitleId + 2, missing) != Loader::ResultStatus::Success);
+
+    // A relaunch with a program index starts that program instead.
+    REQUIRE(nup.FindLaunchProgram(1) == Index1);
+
+    const auto out = t.path / "Extracted";
+    REQUIRE(FileSys::Nup::ExtractNup(archive, out, {}, nullptr, &error) ==
+            FileSys::Nup::ExtractResult::Success);
+    REQUIRE(SourceTree(out / "base/romfs") == SourceTree(root / "base/romfs"));
+    REQUIRE(SourceTree(out / "programs" / fmt::format("{:016X}", Index0) / "romfs") ==
+            SourceTree(other / "romfs"));
+    REQUIRE(SourceTree(out / "programs" / fmt::format("{:016X}", Index0) / "updates/131072") ==
+            SourceTree(other / "updates/131072"));
+}
+
+TEST_CASE("NUP single-program containers apply every update as in v1.0", "[nup]") {
+    TempDir t;
+    const auto root = t.path / "Game";
+    MakeDump(root);
+    const auto archive = t.path / "Game.nup";
+    REQUIRE(FileSys::Nup::PackDump(root, archive) == FileSys::Nup::PackResult::Success);
+    FileSys::RealVfsFilesystem real;
+    NupContainer nup{real.OpenFile(archive.string(), FileSys::OpenMode::Read)};
+    REQUIRE(nup.GetProgramIds() == std::vector<u64>{TitleId});
+    REQUIRE(nup.FindLaunchProgram(1) == TitleId);
+    REQUIRE_FALSE(nup.GetPackages()[0].launch_program);
+    REQUIRE(nup.FindBestUpdatePackage() == std::size_t{2});
+    REQUIRE(nup.FindBestUpdatePackage(0x0400ABCD00010005ULL) == std::size_t{2});
+}

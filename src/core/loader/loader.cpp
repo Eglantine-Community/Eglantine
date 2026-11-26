@@ -484,7 +484,7 @@ static std::unique_ptr<AppLoader> GetFileLoader(Core::System& system, FileSys::V
 
     // NUP (NX Package) container format.
     case FileType::NUP:
-        return std::make_unique<AppLoader_NUP>(std::move(file));
+        return std::make_unique<AppLoader_NUP>(std::move(file), program_index);
 
     // NX game archive.
     case FileType::NX:

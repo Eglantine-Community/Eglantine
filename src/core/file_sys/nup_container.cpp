@@ -63,6 +63,8 @@ constexpr u8 CodecRaw = 0;
 constexpr std::array<u8, 4> ZstdMagic{0x28, 0xB5, 0x2F, 0xFD};
 constexpr u8 CodecZstd = 1;
 constexpr u8 PackageFlagStandaloneUpdate = 0x01;
+// Bit 1 is reserved for .listing retention (SPEC §6.3).
+constexpr u8 PackageFlagLaunchProgram = 0x04;
 constexpr u32 MaxDirDepth = 128;
 
 #pragma pack(push, 1)
@@ -500,7 +502,7 @@ bool NupContainer::Parse() {
         std::memcpy(&record, base + pos, sizeof(record));
         pos += PackageRecordSize;
         if (record.kind > static_cast<u8>(PackageKind::Addon) ||
-            (record.flags & ~PackageFlagStandaloneUpdate) != 0 ||
+            (record.flags & ~(PackageFlagStandaloneUpdate | PackageFlagLaunchProgram)) != 0 ||
             record.root_dir >= header.dir_count ||
             (record.exefs_dir != NoDir && record.exefs_dir >= header.dir_count) ||
             (record.romfs_dir != NoDir && record.romfs_dir >= header.dir_count)) {
@@ -512,6 +514,7 @@ bool NupContainer::Parse() {
         package.version = record.version;
         package.kind = static_cast<PackageKind>(record.kind);
         package.standalone_update = (record.flags & PackageFlagStandaloneUpdate) != 0;
+        package.launch_program = (record.flags & PackageFlagLaunchProgram) != 0;
         package.root_dir = record.root_dir;
         package.exefs_dir = record.exefs_dir;
         package.romfs_dir = record.romfs_dir;
@@ -738,14 +741,72 @@ std::optional<std::size_t> NupContainer::FindPackage(PackageKind kind,
     return std::nullopt;
 }
 
-std::optional<std::size_t> NupContainer::FindBasePackage() const {
-    return FindPackage(PackageKind::Base);
+std::vector<u64> NupContainer::GetProgramIds() const {
+    std::vector<u64> ids;
+    const auto add = [&ids](u64 id) {
+        if (std::ranges::find(ids, id) == ids.end()) {
+            ids.push_back(id);
+        }
+    };
+    for (const auto& package : packages) {
+        if (package.kind == PackageKind::Base) {
+            add(package.title_id);
+        }
+    }
+    // A program without a base boots from its standalone update (update-only dumps).
+    for (const auto& package : packages) {
+        if (package.kind == PackageKind::Update && package.standalone_update &&
+            !FindPackage(PackageKind::Base, package.title_id)) {
+            add(package.title_id);
+        }
+    }
+    std::ranges::sort(ids);
+    return ids;
 }
 
-std::optional<std::size_t> NupContainer::FindBestUpdatePackage() const {
+std::optional<u64> NupContainer::FindLaunchProgram(std::size_t program_index) const {
+    const auto ids = GetProgramIds();
+    if (ids.empty()) {
+        return std::nullopt;
+    }
+    if (program_index != 0) {
+        const u64 target = GetBaseTitleIDWithProgramIndex(ids.front(), program_index);
+        if (std::ranges::find(ids, target) != ids.end()) {
+            return target;
+        }
+    }
+    for (const auto& package : packages) {
+        if (package.launch_program && package.kind != PackageKind::Addon &&
+            std::ranges::find(ids, package.title_id) != ids.end()) {
+            return package.title_id;
+        }
+    }
+    return ids.front();
+}
+
+std::optional<std::size_t> NupContainer::FindBasePackage(std::optional<u64> program_id) const {
+    if (!program_id) {
+        program_id = FindLaunchProgram();
+    }
+    // A single-program container keeps v1's rule: its one base, whatever its title ID.
+    if (GetProgramIds().size() <= 1) {
+        return FindPackage(PackageKind::Base);
+    }
+    return program_id ? FindPackage(PackageKind::Base, *program_id) : std::nullopt;
+}
+
+std::optional<std::size_t> NupContainer::FindBestUpdatePackage(
+    std::optional<u64> program_id) const {
+    if (!program_id) {
+        program_id = FindLaunchProgram();
+    }
+    const bool single_program = GetProgramIds().size() <= 1;
     std::optional<std::size_t> best;
     for (std::size_t i = 0; i < packages.size(); ++i) {
         if (packages[i].kind != PackageKind::Update) {
+            continue;
+        }
+        if (!single_program && packages[i].title_id != program_id) {
             continue;
         }
         if (!best || packages[i].version > packages[*best].version) {
@@ -753,6 +814,13 @@ std::optional<std::size_t> NupContainer::FindBestUpdatePackage() const {
         }
     }
     return best;
+}
+
+VirtualDir NupContainer::GetProgramRomFSDir(u64 program_id) {
+    const auto base = FindBasePackage(program_id);
+    const auto update = FindBestUpdatePackage(program_id);
+    return MergeShadowDirs(base ? GetRomFSDir(*base) : VirtualDir{},
+                           update ? GetRomFSDir(*update) : VirtualDir{});
 }
 
 VirtualFile NupContainer::OpenFile(std::size_t file_index) {
