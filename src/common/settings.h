@@ -254,7 +254,8 @@ struct Values {
 
     // Cpu
     // On Apple Silicon Macs, the Hypervisor backend falls back to Dynarmic where
-    // Hypervisor.framework is unavailable (no entitlement, inside a VM) and for 32-bit programs.
+    // Hypervisor.framework is unavailable (no entitlement, inside a VM), for 32-bit programs and
+    // while debugging.
     SwitchableSetting<CpuBackend, true> cpu_backend{linkage,
 #if defined(HAS_NCE)
                                                     CpuBackend::Nce,

@@ -85,7 +85,11 @@ struct Memory::Impl {
 #ifdef HAS_HYPERVISOR
         if (process.IsApplication()) {
             hv_vm = nullptr;
-            if (Settings::values.cpu_backend.GetValue() == Settings::CpuBackend::Hypervisor) {
+            // Like the CPU selection (KProcess::InitializeInterfaces): no VM for a 32-bit program
+            // (its 64-bit flag isn't set yet, but its address space is 32-bit), and none while
+            // debugging, which needs single steps the Hypervisor backend doesn't do yet.
+            if (Settings::values.cpu_backend.GetValue() == Settings::CpuBackend::Hypervisor &&
+                process.GetPageTable().GetAddressSpaceWidth() > 32 && !system.DebuggerEnabled()) {
                 hv_vm = HvVm::Create(system);
                 if (hv_vm == nullptr) {
                     LOG_WARNING(HW_Memory, "Hypervisor unavailable, falling back to Dynarmic");
@@ -185,6 +189,18 @@ struct Memory::Impl {
 #else
         return false;
 #endif
+    }
+
+    /// Whether CPU reads of GPU-tracked pages fault so the rasterizer can flush first.
+    bool ReactiveFlushing() const {
+        // EDEN_NX2_NO_REACTIVE=1 drops the read traps on Switch 2 programs. Opt-in: without
+        // them a CPU read of GPU-written memory can see stale data.
+        static const bool nx2_no_reactive = [] {
+            const char* value = std::getenv("EDEN_NX2_NO_REACTIVE");
+            return value != nullptr && value[0] == '1';
+        }();
+        return Settings::values.use_reactive_flushing.GetValue() &&
+               !(nx2_no_reactive && Settings::CurrentProgramIsSwitch2());
     }
 
     [[nodiscard]] u8* GetPointerFromRasterizerCachedMemory(u64 vaddr) const {
@@ -536,16 +552,7 @@ struct Memory::Impl {
 
         if (current_page_table->fastmem_arena || HasHypervisor()) {
             Common::MemoryPermission perm{};
-            // EDEN_NX2_NO_REACTIVE=1 drops the read traps on Switch 2 programs. Opt-in: without
-            // them a CPU read of GPU-written memory can see stale data.
-            static const bool nx2_no_reactive = [] {
-                const char* value = std::getenv("EDEN_NX2_NO_REACTIVE");
-                return value != nullptr && value[0] == '1';
-            }();
-            const bool reactive_flushing =
-                Settings::values.use_reactive_flushing.GetValue() &&
-                !(nx2_no_reactive && Settings::CurrentProgramIsSwitch2());
-            if (!reactive_flushing || !cached) {
+            if (!ReactiveFlushing() || !cached) {
                 perm |= Common::MemoryPermission::Read;
             }
             if (!cached) {
@@ -734,6 +741,27 @@ struct Memory::Impl {
         }
 #endif
     }
+
+#ifdef HAS_HYPERVISOR
+    /// After a single-stepped access opened a GPU-tracked page, gives it back the access the
+    /// tracker sets (none for an armed read trap). Checked under the trap lock, so a trap armed
+    /// during the step stays armed.
+    void RestoreCachedPageAccess(u64 vaddr) {
+        if (!hv_vm || (vaddr >> current_page_table->GetAddressSpaceBits()) != 0) {
+            return;
+        }
+        const u64 page = vaddr >> YUZU_PAGEBITS;
+        std::scoped_lock lk{read_trap_mutex};
+        if (std::as_const(current_page_table->entries)[page].Type() !=
+            Common::PageType::RasterizerCachedMemory) {
+            return;
+        }
+        const bool readable = !ReactiveFlushing() && !armed_read_traps.contains(page);
+        hv_vm->ProtectAccess(page << YUZU_PAGEBITS, YUZU_PAGESIZE,
+                             readable ? Common::MemoryPermission::Read
+                                      : Common::MemoryPermission{});
+    }
+#endif
 
     /// Takes read permission away again from armed pages that were just cached again.
     void ProtectArmedPages(u64 vaddr, u64 size) {
@@ -1288,6 +1316,16 @@ void Memory::RasterizerMarkRegionCached(Common::ProcessAddress vaddr, u64 size, 
 void Memory::RasterizerArmReadTraps(Common::ProcessAddress vaddr, u64 size) {
     impl->RasterizerArmReadTraps(GetInteger(vaddr), size);
 }
+
+bool Memory::CachedPagesReadable() const {
+    return !impl->ReactiveFlushing();
+}
+
+#ifdef HAS_HYPERVISOR
+void Memory::RestoreCachedPageAccess(Common::ProcessAddress vaddr) {
+    impl->RestoreCachedPageAccess(GetInteger(vaddr));
+}
+#endif
 
 void Memory::MarkRegionDebug(Common::ProcessAddress vaddr, u64 size, bool debug) {
     impl->MarkRegionDebug(GetInteger(vaddr), size, debug);

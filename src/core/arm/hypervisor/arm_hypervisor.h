@@ -59,8 +59,14 @@ private:
     bool EmulateSystemRegister(u64 esr);
     HaltReason HandleGuestException(Kernel::KThread* thread);
     void FinishTrackedAccess();
+    /// After an access at the faulting PC completed: the next fault there is a new one.
+    void ResetFaultRepeat() {
+        m_fault_repeat = 0;
+        m_last_fault_pc = ~u64{0};
+    }
     /// Performs a load or store to GPU-tracked memory through the emulated memory, as Dynarmic
-    /// does. Returns false for instructions it doesn't decode.
+    /// does. Returns false for instructions it doesn't decode and for accesses that reach a page
+    /// the guest may not access that way.
     bool EmulateTrackedAccess(Kernel::KProcess* process, u64 pc);
     /// Emulates the MTE instructions (STG, STZG, ST2G, STZ2G, STGP, LDG). Returns false for others.
     bool EmulateMemoryTagging(Kernel::KProcess* process, u64 pc);

@@ -114,17 +114,31 @@ bool HvVm::Initialize(System& system) {
         return false;
     }
 
-    if (!MapDram(system)) {
+    // Hypervisor.framework allows one VM per process: a failed setup destroys it (and its
+    // mappings) so a later attempt can create it again.
+    const auto fail = [this] {
+        if (m_tables != nullptr) {
+            munmap(m_tables, TableRegionSize);
+            m_tables = nullptr;
+        }
+        hv_vm_destroy();
         return false;
+    };
+    if (!MapDram(system)) {
+        return fail();
     }
 
-    m_tables = static_cast<u8*>(
-        mmap(nullptr, TableRegionSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-    if (m_tables == MAP_FAILED ||
-        hv_vm_map(m_tables, TableBaseIpa, TableRegionSize,
+    void* const tables =
+        mmap(nullptr, TableRegionSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (tables == MAP_FAILED) {
+        LOG_ERROR(Core_ARM, "Hypervisor: failed to allocate the page table region");
+        return fail();
+    }
+    m_tables = static_cast<u8*>(tables);
+    if (hv_vm_map(m_tables, TableBaseIpa, TableRegionSize,
                   HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC) != HV_SUCCESS) {
         LOG_ERROR(Core_ARM, "Hypervisor: failed to map the page table region");
-        return false;
+        return fail();
     }
 
     Reset();
@@ -279,11 +293,15 @@ void HvVm::ProtectAccess(u64 vaddr, u64 size, Common::MemoryPermission perms) {
     RequestFlush();
 }
 
-bool HvVm::MapFromPageTable(const Common::PageTable& page_table, u64 vaddr) {
+bool HvVm::MapFromPageTable(const Common::PageTable& page_table, u64 vaddr,
+                            bool cached_readable) {
     vaddr &= ~u64{0xFFF};
     if ((vaddr >> page_table.GetAddressSpaceBits()) != 0) {
         return false;
     }
+    // Looked up under the table lock: an unmap clears the software entry and then this leaf, so a
+    // lookup made before the lock could install a page that was just unmapped.
+    std::scoped_lock lk{m_table_mutex};
     const auto [pointer, type, block] = page_table.entries[vaddr >> 12].PointerTypeBlock(true);
     if (type == Common::PageType::Unmapped || pointer == 0) {
         return false;
@@ -294,11 +312,10 @@ bool HvVm::MapFromPageTable(const Common::PageTable& page_table, u64 vaddr) {
     }
 
     const bool cached = type == Common::PageType::RasterizerCachedMemory;
-    std::scoped_lock lk{m_table_mutex};
     if (const u64* pte = EntryFor(vaddr, false); pte != nullptr) {
-        // A GPU-tracked page without access was protected on purpose (reactive flushing): mapping
-        // it here would let the access through without syncing with the rasterizer.
-        if ((*pte & DescValid) != 0 || (cached && (*pte & AddressMask) != 0)) {
+        // Only a missing leaf is filled. One that keeps its address without access was protected
+        // on purpose: a GPU-tracked page (reactive flushing) or one the kernel revoked access to.
+        if ((*pte & DescValid) != 0 || (*pte & AddressMask) != 0) {
             return false;
         }
     }
@@ -309,7 +326,7 @@ bool HvVm::MapFromPageTable(const Common::PageTable& page_table, u64 vaddr) {
     if (cached) {
         perm_bits =
             PermissionBits(Common::MemoryPermission::Read | Common::MemoryPermission::Execute);
-        if (Settings::values.use_reactive_flushing.GetValue()) {
+        if (!cached_readable) {
             perm_bits &= ~DescValid;
         }
     }

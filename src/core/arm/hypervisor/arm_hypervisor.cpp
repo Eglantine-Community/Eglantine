@@ -291,12 +291,7 @@ void ArmHypervisor::FinishTrackedAccess() {
     hv_vcpu_set_sys_reg(m_vcpu, HV_SYS_REG_MDSCR_EL1, 0);
     // Restore the protection RasterizerMarkRegionCached applies, unless the GPU released the page
     // in the meantime.
-    if (IsRasterizerCached(m_step_process, m_step_page)) {
-        const auto perm = Settings::values.use_reactive_flushing.GetValue()
-                              ? Common::MemoryPermission{}
-                              : Common::MemoryPermission::Read;
-        m_vm.ProtectAccess(m_step_page, Memory::YUZU_PAGESIZE, perm);
-    }
+    m_step_process->GetMemory().RestoreCachedPageAccess(m_step_page);
 }
 
 bool ArmHypervisor::EmulateMemoryTagging(Kernel::KProcess* process, u64 pc) {
@@ -543,6 +538,14 @@ bool ArmHypervisor::EmulateTrackedAccess(Kernel::KProcess* process, u64 pc) {
 
     std::array<u8, 32> data{};
     const size_t total = is_pair ? size * 2 : size;
+    // The emulated memory doesn't check guest permissions, and an access (a pair, say) can run
+    // from the tracked page into one that doesn't allow it: leave that to the single step.
+    const u64 last_page = (address + total - 1) & ~u64{0xFFF};
+    for (u64 page = address & ~u64{0xFFF}; page <= last_page; page += 0x1000) {
+        if (!IsRasterizerCached(process, page) && !m_vm.Permits(page, !is_load)) {
+            return false;
+        }
+    }
     if (is_load) {
         memory.ReadBlock(address, data.data(), total);
         write_register(rt, data.data());
@@ -612,7 +615,8 @@ HaltReason ArmHypervisor::HandleGuestException(Kernel::KThread* thread) {
         // A stale TLB entry (the page was unprotected after this vCPU cached it) only needs a
         // flush.
         bool retry = m_fault_repeat < 64 &&
-                     (m_vm.MapFromPageTable(process->GetPageTable().GetImpl(), page) ||
+                     (m_vm.MapFromPageTable(process->GetPageTable().GetImpl(), page,
+                                            process->GetMemory().CachedPagesReadable()) ||
                       m_vm.Permits(page, is_write));
         if (!retry && !is_prefetch && IsRasterizerCached(process, page)) {
             // GPU-tracked memory: like Dynarmic's slow path, perform the access through the
@@ -620,6 +624,7 @@ HaltReason ArmHypervisor::HandleGuestException(Kernel::KThread* thread) {
             FinishTrackedAccess();
             if (EmulateTrackedAccess(process, elr)) {
                 return_to(elr + 4);
+                ResetFaultRepeat();
                 return {};
             }
         }
@@ -782,6 +787,12 @@ HaltReason ArmHypervisor::RunThread(Kernel::KThread* thread) {
                 hr |= HandleGuestException(thread);
             } else if (ec == ExceptionClassSoftwareStepLower) {
                 FinishTrackedAccess();
+                u64 pc{};
+                hv_vcpu_get_reg(m_vcpu, HV_REG_PC, &pc);
+                if (pc < HvVm::VectorsVa || pc >= HvVm::FlushStubVa) {
+                    // The stepped access completed (it didn't fault into the vector again).
+                    ResetFaultRepeat();
+                }
                 // A stepped access that faults again completes the step on the vector's first
                 // instruction: deliver that exception before acting on an interrupt, or the
                 // thread is saved with the vector's PC and resumes there at EL0.

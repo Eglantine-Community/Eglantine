@@ -492,6 +492,14 @@ public:
      */
     void RasterizerArmReadTraps(Common::ProcessAddress vaddr, u64 size);
 
+    /// Whether GPU-tracked pages keep read access (reactive flushing is off or opted out).
+    bool CachedPagesReadable() const;
+
+#ifdef HAS_HYPERVISOR
+    /// Gives a GPU-tracked page the access the tracker sets again, after a stepped access.
+    void RestoreCachedPageAccess(Common::ProcessAddress vaddr);
+#endif
+
     /**
      * Marks each page within the specified address range as debug or non-debug.
      * Debug addresses are not accessible from fastmem pointers.

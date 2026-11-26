@@ -43,8 +43,9 @@ public:
     static void Deactivate();
 
     /// Installs a mapping for vaddr from the emulated page table if it exists there but not in
-    /// the stage-1 tables. Returns true if a mapping that allows access was added.
-    bool MapFromPageTable(const Common::PageTable& page_table, u64 vaddr);
+    /// the stage-1 tables (a GPU-tracked page gets read access only if cached_readable). Returns
+    /// true if a mapping that allows access was added.
+    bool MapFromPageTable(const Common::PageTable& page_table, u64 vaddr, bool cached_readable);
 
     /// Returns whether the current stage-1 entry for vaddr allows the access.
     bool Permits(u64 vaddr, bool write);
