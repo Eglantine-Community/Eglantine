@@ -71,6 +71,8 @@ public:
 
     StagingBufferRef DownloadStagingBuffer(size_t size, bool deferred = false);
 
+    void InvalidateDownloadStagingBuffer(const StagingBufferRef& ref);
+
     void FreeDeferredStagingBuffer(StagingBufferRef& ref);
 
     void TickFrame();

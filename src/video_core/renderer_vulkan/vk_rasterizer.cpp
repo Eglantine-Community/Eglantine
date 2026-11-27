@@ -247,9 +247,30 @@ namespace {
 // EDEN_NX2_DIAG_SAMPLES: the occlusion query pool of the draw probe (created on first use).
 vk::QueryPool* g_diag_pool{};
 } // Anonymous namespace
+void RasterizerVulkan::PrepareMeshProbeReadback(const StagingBufferRef& staging) {
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record([buffer = staging.buffer](vk::CommandBuffer cmdbuf) {
+        const VkBufferMemoryBarrier barrier{
+            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer = buffer,
+            .offset = 0,
+            .size = VK_WHOLE_SIZE,
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                               0, barrier);
+    });
+    scheduler.Finish();
+    staging.Invalidate();
+}
+
 void RasterizerVulkan::ReadMeshEmulationProbe() {
-    const MeshEmulationProbe probe{mesh_probe};
+    MeshEmulationProbe probe{mesh_probe};
     mesh_probe.pending = false;
+    PrepareMeshProbeReadback(probe.staging);
     const size_t num_words{probe.data.size() / sizeof(u32)};
     const auto word = [&](u64 index) -> u32 {
         if (index >= num_words) {
@@ -318,6 +339,7 @@ void RasterizerVulkan::ReadMeshEmulationProbe() {
              "Mesh emulation probe frame {}: {} groups, {} primitives of {} vertices ({} unused "
              "slots), {} with every vertex off screen, {} with a bad index; first primitives:{}",
              probe.frame, probe.groups, triangles, corners, degenerate, outside, bad_index, sample);
+    staging_pool.FreeDeferred(probe.staging);
 }
 
 const RasterizerVulkan::MeshArena& RasterizerVulkan::AcquireMeshArena() {
@@ -986,12 +1008,13 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         } else {
             bytes = (std::max)(u64{groups} * block_bytes, u64{4});
             output = staging_pool.Request(bytes, probe_draw ? MemoryUsage::Download
-                                                            : MemoryUsage::DeviceLocal);
+                                                            : MemoryUsage::DeviceLocal, probe_draw);
             pipeline->SetMeshEmulationOutput(output.buffer, output.offset, bytes, groups);
         }
         mesh_emulation_indirect = {};
         if (mesh_task_probe.pending && scheduler.IsFree(mesh_task_probe.tick)) {
             mesh_task_probe.pending = false;
+            mesh_task_probe.staging.Invalidate();
             std::array<u32, Shader::Backend::SPIRV::MESH_EMULATION_ARGS_WORDS> words{};
             std::memcpy(words.data(), mesh_task_probe.args.data(), sizeof(words));
             LOG_INFO(Render_Vulkan,
@@ -1001,13 +1024,19 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
                      words[Shader::Backend::SPIRV::MESH_EMULATION_ARGS_REQUESTED], words[0],
                      words[Shader::Backend::SPIRV::MESH_EMULATION_ARGS_BASE],
                      mesh_task_probe.capacity);
+            staging_pool.FreeDeferred(mesh_task_probe.staging);
         }
         if (has_task && groups != 0) {
             const bool task_probe{probe && !mesh_task_probe.pending &&
                                   render_trace_frame % 60 == 0};
+            StagingBufferRef task_readback{};
             const auto request = [&](u64 size, MemoryUsage usage = MemoryUsage::DeviceLocal) {
                 size = (std::max)(size, u64{16});
-                const StagingBufferRef ref{staging_pool.Request(size, usage)};
+                const StagingBufferRef ref{
+                    staging_pool.Request(size, usage, usage == MemoryUsage::Download)};
+                if (usage == MemoryUsage::Download) {
+                    task_readback = ref;
+                }
                 return std::make_pair(GraphicsPipeline::MeshEmulationBuffer{ref.buffer, ref.offset,
                                                                             size},
                                       ref.mapped_span.subspan(
@@ -1024,6 +1053,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
             if (task_probe && args_span.size() >= args_bytes) {
                 mesh_task_probe = {
                     .args = args_span,
+                    .staging = task_readback,
                     .tick = scheduler.CurrentTick(),
                     .tasks = groups,
                     .capacity = capacity_words,
@@ -1039,6 +1069,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
             const MeshEmulationSetup& setup{*pipeline->MeshEmulation()};
             mesh_probe = {
                 .data = output.mapped_span.subspan(output.offset, bytes),
+                .staging = output,
                 .tick = scheduler.CurrentTick(),
                 .frame = render_trace_frame,
                 .groups = groups,
@@ -1980,20 +2011,6 @@ void RasterizerVulkan::DispatchCompute() {
         return;
     }
     const auto& qmd{kepler_compute->launch_description};
-    const auto publish_collision_map = [&] {
-        if (native_key != 0x6e0ae200ee9aa220ULL ||
-            (qmd.const_buffer_enable_mask & 1) == 0) {
-            return;
-        }
-        const auto& constants = qmd.const_buffer_config[0];
-        if (constants.size < 0x3c) {
-            return;
-        }
-        // WaterSurfaceCollisionHeightMap exposes its output handle in CB0.
-        const u32 handle = gpu_memory->Read<u32>(constants.Address() + 0x38);
-        const u32 index = Tegra::Texture::TexturePair(handle, qmd.linked_tsc != 0).first;
-        texture_cache.PublishComputeCollisionImage(index);
-    };
     auto indirect_address = kepler_compute->GetIndirectComputeAddress();
     if (frame_dump.Capturing()) {
         const u64 shader_hash = pipeline->ShaderHash();
@@ -2039,6 +2056,7 @@ void RasterizerVulkan::DispatchCompute() {
         .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
     };
     const bool fix = SyncFixEnabled();
+    const std::array<u32, 3> dim{qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z};
     if (indirect_address) {
         // DispatchIndirect
         static constexpr auto sync_info = VideoCommon::ObtainBufferSynchronize::FullSynchronize;
@@ -2059,37 +2077,30 @@ void RasterizerVulkan::DispatchCompute() {
             }
             cmdbuf.DispatchIndirect(indirect_buffer, indirect_offset);
         });
-        if (fix) {
-            scheduler.NoteComputeWrites();
-        }
-        NoteWriterDeps(*pipeline);
-        SubmitNx2ListCopies();
-        publish_collision_map();
-        return;
-    }
-    const std::array<u32, 3> dim{qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z};
-    const std::array<u32, 3> max_dim{device.GetMaxComputeWorkGroupCount()};
-    if (dim[0] > max_dim[0] || dim[1] > max_dim[1] || dim[2] > max_dim[2]) {
-        return;
-    }
-    scheduler.RequestOutsideRenderPassOperationContext();
-    scheduler.Record([pipeline, dim](vk::CommandBuffer cmdbuf) {
-        if (!pipeline->IsBound()) {
+    } else {
+        const std::array<u32, 3> max_dim{device.GetMaxComputeWorkGroupCount()};
+        if (dim[0] > max_dim[0] || dim[1] > max_dim[1] || dim[2] > max_dim[2]) {
             return;
         }
-        cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
-                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, READ_BARRIER);
-        cmdbuf.Dispatch(dim[0], dim[1], dim[2]);
-    });
+        scheduler.RequestOutsideRenderPassOperationContext();
+        scheduler.Record([pipeline, dim](vk::CommandBuffer cmdbuf) {
+            if (!pipeline->IsBound()) {
+                return;
+            }
+            cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, READ_BARRIER);
+            cmdbuf.Dispatch(dim[0], dim[1], dim[2]);
+        });
+    }
     if (fix) {
         scheduler.NoteComputeWrites();
     }
     NoteWriterDeps(*pipeline);
     SubmitNx2ListCopies();
-    publish_collision_map();
+    texture_cache.WritebackComputeImages(pipeline->WrittenImages());
 
     // Log compute dispatch
-    if (GPU::Logging::IsActive() &&
+    if (!indirect_address && GPU::Logging::IsActive() &&
         Settings::values.gpu_log_vulkan_calls.GetValue()) {
         const std::string params = fmt::format("groupCountX={}, groupCountY={}, groupCountZ={}",
             dim[0], dim[1], dim[2]);
@@ -2338,8 +2349,7 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
         }
     }
     if (texture_area) {
-        // The core disarmed the read's pages before asking: the buffer cache arms only pages it
-        // doesn't count as armed, so it must forget these.
+        // The CPU will release these pages after readback. A later buffer write must rearm them.
         std::scoped_lock lock{buffer_cache.mutex};
         buffer_cache.ForgetReadTraps(addr, size);
         return *texture_area;
@@ -3472,16 +3482,30 @@ bool AccelerateDMA::DmaBufferImageCopy(const Tegra::DMA::ImageCopy& copy_info,
                                        const Tegra::DMA::BufferOperand& buffer_operand,
                                        const Tegra::DMA::ImageOperand& image_operand) {
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+    const u64 transfer_size = u64{buffer_operand.pitch} * buffer_operand.height;
+    if (transfer_size == 0 || transfer_size > (std::numeric_limits<u32>::max)()) {
+        return false;
+    }
+    const u32 buffer_size = static_cast<u32>(transfer_size);
+    std::optional<DAddr> download_address;
+    if constexpr (!IS_IMAGE_UPLOAD) {
+        download_address = texture_cache.GetDmaDownloadAddress(buffer_operand.address, buffer_size);
+        if (!download_address) {
+            return false;
+        }
+    }
     const auto image_id = texture_cache.DmaImageId(image_operand, IS_IMAGE_UPLOAD);
     if (image_id == VideoCommon::NULL_IMAGE_ID) {
         return false;
     }
-    const u32 buffer_size = static_cast<u32>(buffer_operand.pitch * buffer_operand.height);
     static constexpr auto sync_info = VideoCommon::ObtainBufferSynchronize::FullSynchronize;
     const auto post_op = IS_IMAGE_UPLOAD ? VideoCommon::ObtainBufferOperation::DoNothing
                                          : VideoCommon::ObtainBufferOperation::MarkAsWritten;
-    const auto [buffer, offset] =
-        buffer_cache.ObtainBuffer(buffer_operand.address, buffer_size, sync_info, post_op);
+    const auto [buffer, offset] = IS_IMAGE_UPLOAD
+                                      ? buffer_cache.ObtainBuffer(buffer_operand.address,
+                                                                  buffer_size, sync_info, post_op)
+                                      : buffer_cache.ObtainCPUBuffer(*download_address,
+                                                                     buffer_size, sync_info, post_op);
 
     const auto [image, copy] = texture_cache.DmaBufferImageCopy(
         copy_info, buffer_operand, image_operand, image_id, IS_IMAGE_UPLOAD);
@@ -3495,7 +3519,7 @@ bool AccelerateDMA::DmaBufferImageCopy(const Tegra::DMA::ImageCopy& copy_info,
             return false;
         }
         texture_cache.DownloadImageIntoBuffer(image, buffer->Handle(), offset, copy_span,
-                                              buffer_operand.address, buffer_size);
+                                              *download_address, buffer_size);
     }
     return true;
 }

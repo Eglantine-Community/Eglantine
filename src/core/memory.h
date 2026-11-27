@@ -43,6 +43,12 @@ namespace Core::Memory {
 
 class PageTracker;
 
+/// Whether fastmem needs explicit read traps on GPU-written pages.
+[[nodiscard]] bool UsesSelectiveRasterizerReadTraps();
+
+/// Whether rasterizer-cached CPU reads can take a coherent slow path.
+[[nodiscard]] bool CanTrapRasterizerReads();
+
 /// Counts unmapped reads on this host thread since the CPU callbacks last checked (debug aid).
 u32& UnmappedReadFlag();
 
@@ -511,7 +517,7 @@ public:
      * Makes the next guest read of each rasterizer cached page in the range take the slow path
      * (fastmem only), so that the read reaches the GPU's reactive flush once.
      */
-    void RasterizerArmReadTraps(Common::ProcessAddress vaddr, u64 size);
+    void RasterizerArmReadTraps(Common::ProcessAddress vaddr, u64 size, u64 generation);
 
     /**
      * Marks each page within the specified address range as debug or non-debug.

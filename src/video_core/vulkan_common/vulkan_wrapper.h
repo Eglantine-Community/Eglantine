@@ -795,6 +795,21 @@ struct MemoryLocation {
 
 class Buffer {
 public:
+    // Non-owning allocation identity, stable across moves of the owning Buffer. Its owner must
+    // remain alive, and GPU writes must have completed, until the host has consumed the data.
+    struct Readback {
+        VmaAllocator allocator{};
+        VmaAllocation allocation{};
+        bool is_coherent{true};
+
+        void Invalidate() const;
+        void Flush() const;
+    };
+
+    Readback HostReadback() const noexcept {
+        return {allocator, allocation, is_coherent};
+    }
+
     explicit Buffer(VkBuffer handle_, VkDevice owner_, VmaAllocator allocator_,
                     VmaAllocation allocation_, std::span<u8> mapped_, bool is_coherent_,
                     MemoryLocation location_, const DeviceDispatch& dld_,

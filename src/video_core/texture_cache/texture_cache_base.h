@@ -32,6 +32,7 @@
 #include "common/hash.h"
 #include "common/literals.h"
 #include "common/lru_cache.h"
+#include "common/range_sets.h"
 #include <ranges>
 #include "common/scratch_buffer.h"
 #include "common/slot_vector.h"
@@ -289,8 +290,8 @@ public:
     /// Get the imageview from the graphics descriptor table in the specified index
     [[nodiscard]] ImageView& GetImageView(u32 index) noexcept;
 
-    // Publish the CPU-readable collision image. Caller holds the cache mutex.
-    bool PublishComputeCollisionImage(u32 index);
+    /// Publish pitch-linear compute outputs when CPU reads cannot flush them on demand.
+    void WritebackComputeImages(std::span<const ImageViewId> views);
 
     /// Mark an image as modified from the GPU
     void MarkModification(ImageId id) noexcept;
@@ -413,13 +414,15 @@ public:
 
     [[nodiscard]] ImageId DmaImageId(const Tegra::DMA::ImageOperand& operand, bool is_upload);
 
+    [[nodiscard]] std::optional<DAddr> GetDmaDownloadAddress(GPUVAddr address, size_t size) const;
+
     [[nodiscard]] std::pair<Image*, BufferImageCopy> DmaBufferImageCopy(
         const Tegra::DMA::ImageCopy& copy_info, const Tegra::DMA::BufferOperand& buffer_operand,
         const Tegra::DMA::ImageOperand& image_operand, ImageId image_id, bool modifies_image);
 
     void DownloadImageIntoBuffer(Image* image, BufferType buffer, size_t buffer_offset,
                                  std::span<const VideoCommon::BufferImageCopy> copies,
-                                 GPUVAddr address = 0, size_t size = 0);
+                                 DAddr device_address, size_t size);
 
     /// Return true when a CPU region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(DAddr addr, size_t size);
@@ -437,6 +440,8 @@ public:
     Common::SpinRecursiveMutex mutex;
 
 private:
+    void DiscardBufferDownloads(DAddr address, size_t size);
+
     /// Iterate over all page indices in a range
     template <typename Func>
     static void ForEachCPUPage(DAddr addr, size_t size, Func&& func) {
@@ -571,8 +576,8 @@ private:
     /// Remove framebuffers using the given image views from the cache
     void RemoveFramebuffers(std::span<const ImageViewId> removed_views);
 
-    /// Mark an image as modified from the GPU
-    void MarkModification(ImageBase& image) noexcept;
+    /// Download the specified images and write their backing in modification order.
+    void DownloadImages(std::span<ImageId> images);
 
     /// Synchronize image aliases, copying data if needed
     void SynchronizeAliases(ImageId image_id);
@@ -657,8 +662,9 @@ private:
     u32 swizzle_slices_per_batch = 0;
 
     struct BufferDownload {
-        GPUVAddr address;
+        DAddr device_address;
         size_t size;
+        std::unique_ptr<Common::RangeSet<DAddr>> valid_ranges{};
     };
 
     using PendingDownload = PendingImageDownload<Image>;

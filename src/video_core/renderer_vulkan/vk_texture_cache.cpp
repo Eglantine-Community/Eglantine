@@ -1246,6 +1246,11 @@ StagingBufferRef TextureCacheRuntime::DownloadStagingBuffer(size_t size, bool de
     return staging_buffer_pool.Request(size, MemoryUsage::Download, deferred);
 }
 
+void TextureCacheRuntime::InvalidateDownloadStagingBuffer(const StagingBufferRef& ref) {
+    ASSERT(ref.usage == MemoryUsage::Download);
+    ref.Invalidate();
+}
+
 void TextureCacheRuntime::FreeDeferredStagingBuffer(StagingBufferRef& ref) {
     staging_buffer_pool.FreeDeferred(ref);
 }
@@ -3223,7 +3228,8 @@ void Image::DownloadMemory(std::span<VkBuffer> buffers_span, std::span<size_t> o
                     .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
                     .pNext = nullptr,
                     .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
-                    .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT |
+                                     VK_ACCESS_HOST_READ_BIT,
                 };
                 const VkImageMemoryBarrier image_write_barrier{
                     .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -3243,7 +3249,8 @@ void Image::DownloadMemory(std::span<VkBuffer> buffers_span, std::span<size_t> o
                         .layerCount = VK_REMAINING_ARRAY_LAYERS,
                     },
                 };
-                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
+                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   vk::PIPELINE_STAGE_GRAPHICS_COMPUTE | VK_PIPELINE_STAGE_HOST_BIT,
                                        0, memory_write_barrier, nullptr, image_write_barrier);
             });
             runtime->ReleaseMsaaScratchImage(temp_vk_image);
@@ -3301,7 +3308,8 @@ void Image::DownloadMemory(std::span<VkBuffer> buffers_span, std::span<size_t> o
                 .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
                 .pNext = nullptr,
                 .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
-                .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT |
+                                     VK_ACCESS_HOST_READ_BIT,
             };
             const VkImageMemoryBarrier image_write_barrier{
                 .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -3321,7 +3329,8 @@ void Image::DownloadMemory(std::span<VkBuffer> buffers_span, std::span<size_t> o
                     .layerCount = VK_REMAINING_ARRAY_LAYERS,
                 },
             };
-            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   vk::PIPELINE_STAGE_GRAPHICS_COMPUTE | VK_PIPELINE_STAGE_HOST_BIT,
                                    0, memory_write_barrier, nullptr, image_write_barrier);
         });
     }

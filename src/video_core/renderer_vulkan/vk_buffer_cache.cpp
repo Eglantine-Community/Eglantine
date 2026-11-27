@@ -442,6 +442,35 @@ VkFormat BufferCacheRuntime::TexelBufferFormat(VideoCore::Surface::PixelFormat f
     return MaxwellToVK::SurfaceFormat(device, FormatType::Buffer, false, format).format;
 }
 
+void BufferCacheRuntime::PrepareDownloadStagingBuffer(const StagingBufferRef& ref) {
+    ASSERT(ref.usage == MemoryUsage::Download);
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record([buffer = ref.buffer](vk::CommandBuffer cmdbuf) {
+        const VkBufferMemoryBarrier barrier{
+            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer = buffer,
+            .offset = 0,
+            .size = VK_WHOLE_SIZE,
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                               barrier);
+    });
+}
+
+void BufferCacheRuntime::InvalidateDownloadStagingBuffer(const StagingBufferRef& ref) {
+    ASSERT(ref.usage == MemoryUsage::Download);
+    ref.Invalidate();
+}
+
+void BufferCacheRuntime::FlushDownloadStagingBuffer(const StagingBufferRef& ref) {
+    ASSERT(ref.usage == MemoryUsage::Download && ref.host_readable);
+    ref.readback.Flush();
+}
+
 void BufferCacheRuntime::FreeDeferredStagingBuffer(StagingBufferRef& ref) {
     staging_pool.FreeDeferred(ref);
 }

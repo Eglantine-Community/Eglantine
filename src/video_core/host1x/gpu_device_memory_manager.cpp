@@ -17,8 +17,8 @@ struct MaxwellDeviceMethods {
     }
 
     static inline void MarkRegionReadTrap(Core::Memory::Memory* interface, VAddr address,
-                                          size_t size) {
-        interface->RasterizerArmReadTraps(address, size);
+                                          size_t size, u64 generation) {
+        interface->RasterizerArmReadTraps(address, size, generation);
     }
 };
 

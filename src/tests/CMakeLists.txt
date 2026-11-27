@@ -103,6 +103,7 @@ add_executable(tests
     video_core/native_macro_fifo.cpp
     video_core/native_image_matching.cpp
     video_core/texture_cache_budget.cpp
+    video_core/texture_download_order.cpp
     video_core/usage_tracker.cpp
     video_core/native_swizzle.cpp
     video_core/image_allocation_pool.cpp

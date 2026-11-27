@@ -15,7 +15,6 @@
 #include <cstring>
 #include <cstdlib>
 #include <mutex>
-#include <set>
 #include <span>
 #include <thread>
 #include <type_traits>
@@ -48,6 +47,38 @@
 #include "video_core/rasterizer_download_area.h"
 
 namespace Core::Memory {
+
+namespace {
+
+bool SelectiveRasterizerReadTrapsEnabled() {
+    static const bool disabled = [] {
+        const char* value = std::getenv("EDEN_NX2_READ_TRAPS");
+        return value != nullptr && value[0] == '0';
+    }();
+    return !disabled;
+}
+
+bool UsesReactiveRasterizerReads() {
+    static const bool nx2_no_reactive = [] {
+        const char* value = std::getenv("EDEN_NX2_NO_REACTIVE");
+        return value != nullptr && value[0] == '1';
+    }();
+    return !Settings::IsNceEnabled() && Settings::values.use_reactive_flushing.GetValue() &&
+           !(nx2_no_reactive && Settings::CurrentProgramIsSwitch2());
+}
+
+} // namespace
+
+bool UsesSelectiveRasterizerReadTraps() {
+    return Settings::IsFastmemEnabled() && !Settings::IsNceEnabled() &&
+           !UsesReactiveRasterizerReads() && SelectiveRasterizerReadTrapsEnabled();
+}
+
+bool CanTrapRasterizerReads() {
+    return !Settings::IsNceEnabled() &&
+           (!Settings::IsFastmemEnabled() || UsesReactiveRasterizerReads() ||
+            SelectiveRasterizerReadTrapsEnabled());
+}
 
 u32& UnmappedReadFlag() {
     thread_local u32 flag{};
@@ -558,18 +589,16 @@ struct Memory::Impl final : PageClaimSink {
     /// flushing or an access trap).
     void MarkRegionClaim(u64 vaddr, u64 size, PageClaim claim, bool trap_locked) {
         const bool cached = claim.Cached();
+        if (!claim.device && !armed_read_traps.Empty()) {
+            std::unique_lock lk{read_trap_mutex, std::defer_lock};
+            if (!trap_locked) {
+                lk.lock();
+            }
+            armed_read_traps.Drop(vaddr >> YUZU_PAGEBITS, (vaddr + size) >> YUZU_PAGEBITS);
+        }
         if (current_page_table->fastmem_arena) {
             Common::MemoryPermission perm{};
-            // EDEN_NX2_NO_REACTIVE=1 drops the read traps on Switch 2 programs. Opt-in: without
-            // them a CPU read of GPU-written memory can see stale data.
-            static const bool nx2_no_reactive = [] {
-                const char* value = std::getenv("EDEN_NX2_NO_REACTIVE");
-                return value != nullptr && value[0] == '1';
-            }();
-            const bool reactive_flushing =
-                Settings::values.use_reactive_flushing.GetValue() &&
-                !(nx2_no_reactive && Settings::CurrentProgramIsSwitch2());
-            if (!claim.access && !(claim.device && reactive_flushing)) {
+            if (!claim.access && !(claim.device && UsesReactiveRasterizerReads())) {
                 perm |= Common::MemoryPermission::Read;
             }
             if (!cached) {
@@ -688,20 +717,10 @@ struct Memory::Impl final : PageClaimSink {
     /// (EDEN_NX2_READ_TRAPS=0 turns them off). Under NCE every fault is taken as a write, so they
     /// are not used there.
     bool ReadTrapsEnabled() const {
-        static const bool disabled = [] {
-            const char* value = std::getenv("EDEN_NX2_READ_TRAPS");
-            return value != nullptr && value[0] == '0';
-        }();
-        return !disabled && current_page_table->fastmem_arena &&
-               !Settings::values.use_reactive_flushing.GetValue() &&
-               Settings::values.cpu_backend.GetValue() != Settings::CpuBackend::Nce;
+        return current_page_table->fastmem_arena && UsesSelectiveRasterizerReadTraps();
     }
 
-    void RasterizerArmReadTraps(u64 vaddr, u64 size) {
-        if (Settings::values.use_reactive_flushing.GetValue()) {
-            // Clean cached read areas also need invalidation when reactive flushing is enabled.
-            read_trap_generation.fetch_add(1, std::memory_order_release);
-        }
+    void RasterizerArmReadTraps(u64 vaddr, u64 size, u64 generation) {
         if (vaddr == 0 || size == 0 || !AddressSpaceContains(*current_page_table, vaddr, size) ||
             !ReadTrapsEnabled()) {
             return;
@@ -712,8 +731,6 @@ struct Memory::Impl final : PageClaimSink {
         u64 run_pages = 0;
         const auto protect_run = [&] {
             if (run_pages > 0) {
-                // Reads that hit a cached read area must not skip the flush of a new trap.
-                read_trap_generation.fetch_add(1, std::memory_order_release);
                 host_buffer->Protect(run_begin << YUZU_PAGEBITS, run_pages << YUZU_PAGEBITS,
                                      Common::MemoryPermission{});
                 run_pages = 0;
@@ -722,11 +739,10 @@ struct Memory::Impl final : PageClaimSink {
         for (u64 page = vaddr >> YUZU_PAGEBITS; page != page_end; ++page) {
             const bool cached = std::as_const(current_page_table->entries)[page].Type() ==
                                 Common::PageType::RasterizerCachedMemory;
-            if (!cached || !armed_read_traps.insert(page).second) {
+            if (!cached || !armed_read_traps.Arm(page, generation)) {
                 protect_run();
                 continue;
             }
-            armed_read_trap_count.fetch_add(1, std::memory_order_relaxed);
             if (run_pages == 0) {
                 run_begin = page;
             }
@@ -737,7 +753,7 @@ struct Memory::Impl final : PageClaimSink {
 
     /// Takes read permission away again from armed pages that were just cached again.
     void ProtectArmedPages(u64 vaddr, u64 size, bool trap_locked) {
-        if (armed_read_trap_count.load(std::memory_order_relaxed) == 0) {
+        if (armed_read_traps.Empty()) {
             return;
         }
         std::unique_lock lk{read_trap_mutex, std::defer_lock};
@@ -745,31 +761,27 @@ struct Memory::Impl final : PageClaimSink {
             lk.lock();
         }
         const u64 page_end = ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1;
-        for (auto it = armed_read_traps.lower_bound(vaddr >> YUZU_PAGEBITS);
-             it != armed_read_traps.end() && *it < page_end; ++it) {
-            host_buffer->Protect(*it << YUZU_PAGEBITS, YUZU_PAGESIZE, Common::MemoryPermission{});
-        }
+        armed_read_traps.ForEach(vaddr >> YUZU_PAGEBITS, page_end, [&](u64 page) {
+            host_buffer->Protect(page << YUZU_PAGEBITS, YUZU_PAGESIZE, Common::MemoryPermission{});
+        });
     }
 
     /// A slow-path read of a cached page: its trap, if any, has done its job.
-    void DisarmReadTraps(u64 vaddr, size_t size) {
-        if (armed_read_trap_count.load(std::memory_order_relaxed) == 0) {
+    void DisarmReadTraps(u64 vaddr, size_t size, u64 generation) {
+        if (armed_read_traps.Empty()) {
             return;
         }
         std::scoped_lock lk{read_trap_mutex};
         const u64 page_end = ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1;
-        auto it = armed_read_traps.lower_bound(vaddr >> YUZU_PAGEBITS);
-        while (it != armed_read_traps.end() && *it < page_end) {
-            // Still cached (this read came through the rasterizer path): writes stay trapped, and
-            // reads too while the page tracker waits for the next access.
-            if (page_tracker_state.Empty() || !page_tracker_state.AccessArmed(*it)) {
-                host_buffer->Protect(*it << YUZU_PAGEBITS, YUZU_PAGESIZE,
+        armed_read_traps.Disarm(vaddr >> YUZU_PAGEBITS, page_end, generation, [&](u64 page) {
+            // Other owners may still require a read trap. A page unmapped or uncached while
+            // waiting for the GPU keeps its new permissions.
+            if (DeviceCached(page) && !page_tracker_state.AccessArmed(page)) {
+                host_buffer->Protect(page << YUZU_PAGEBITS, YUZU_PAGESIZE,
                                      Common::MemoryPermission::Read);
             }
-            it = armed_read_traps.erase(it);
-            armed_read_trap_count.fetch_sub(1, std::memory_order_relaxed);
             VideoCommon::Nx2Spikes::Note(VideoCommon::Nx2Spikes::Event::ReadTrapHit);
-        }
+        });
     }
 
     /**
@@ -791,6 +803,10 @@ struct Memory::Impl final : PageClaimSink {
         const auto end = base + size;
         ASSERT_MSG(end <= page_table.entries.size(), "out of range mapping at {:016X}", base + page_table.entries.size());
 
+        if (&page_table == current_page_table && !armed_read_traps.Empty()) {
+            std::scoped_lock lk{read_trap_mutex};
+            armed_read_traps.Drop(base, end);
+        }
         if (!target) {
             ASSERT_MSG(type != Common::PageType::Memory,
                        "Mapping memory page without a pointer @ {:016x}", base * YUZU_PAGESIZE);
@@ -1087,6 +1103,9 @@ struct Memory::Impl final : PageClaimSink {
     }
 
     void HandleRasterizerDownload(VAddr v_address, size_t size) {
+        if (size == 0) {
+            return;
+        }
         if (!page_tracker_state.Empty()) [[unlikely]] {
             // Access traps call back first. Pages only the tracker caches have nothing for the
             // device caches to flush.
@@ -1094,40 +1113,38 @@ struct Memory::Impl final : PageClaimSink {
                 return;
             }
         }
-        const auto* p = GetPointerImpl(
-            v_address, []() {}, []() {});
         if (!gpu_device_memory) [[unlikely]] {
             gpu_device_memory = &system.Host1x().MemoryManager();
         }
+        const u64 generation = gpu_device_memory->GpuWriteGeneration();
         const size_t core = system.GetCurrentHostThreadID();
-        if (core >= Core::Hardware::NUM_CPU_CORES) {
-            // A service thread has no slot in the arrays below, and it does not use a slot of a
-            // core. It keeps no area, so it asks on each read.
-            if (static std::atomic_flag logged; !logged.test_and_set(std::memory_order_relaxed)) {
-                LOG_INFO(HW_Memory, "Read of cached guest memory from a thread that is not a core");
-            }
-            Common::ScratchBuffer<u32> scratch;
-            gpu_device_memory->ApplyOpOnPointer(p, scratch, [&](DAddr address) {
-                DisarmReadTraps(v_address, size);
-                (void)system.GPU().OnCPURead(address, size);
-            });
-            return;
-        }
-        auto& current_area = rasterizer_read_areas[core];
-        if (const u64 generation = read_trap_generation.load(std::memory_order_acquire);
-            read_area_generations[core] != generation) {
-            current_area = {};
+        Common::ScratchBuffer<u32> service_scratch;
+        VideoCore::RasterizerDownloadArea service_area{};
+        const bool guest_core = core < Core::Hardware::NUM_CPU_CORES;
+        auto& scratch = guest_core ? scratch_buffers[core] : service_scratch;
+        auto& area = guest_core ? rasterizer_read_areas[core] : service_area;
+        if (guest_core && read_area_generations[core] != generation) {
+            area = {};
             read_area_generations[core] = generation;
         }
-        gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
-            const DAddr end_address = address + size;
-            if (current_area.start_address <= address && end_address <= current_area.end_address)
-                [[likely]] {
-                return;
+
+        // Restoring read permission exposes a whole CPU page, including bytes outside this
+        // read. Resolve each page's device aliases before changing its permissions.
+        const u64 first_page = v_address >> YUZU_PAGEBITS;
+        const u64 last_page = (v_address + size - 1) >> YUZU_PAGEBITS;
+        for (u64 page = first_page; page <= last_page; ++page) {
+            const auto* ptr = GetPointerImpl(page << YUZU_PAGEBITS, [] {}, [] {});
+            if (!ptr) {
+                continue;
             }
-            DisarmReadTraps(v_address, size);
-            current_area = system.GPU().OnCPURead(address, size);
-        });
+            gpu_device_memory->ApplyOpOnPointer(ptr, scratch, [&](DAddr address) {
+                if (area.start_address <= address && address + YUZU_PAGESIZE <= area.end_address) {
+                    return;
+                }
+                area = system.GPU().OnCPURead(address, YUZU_PAGESIZE);
+            });
+        }
+        DisarmReadTraps(v_address, size, generation);
     }
 
     void HandleRasterizerWrite(VAddr v_address, size_t size) {
@@ -1203,9 +1220,7 @@ struct Memory::Impl final : PageClaimSink {
 
     std::array<VideoCore::RasterizerDownloadArea, Core::Hardware::NUM_CPU_CORES> rasterizer_read_areas{};
     std::array<u64, Core::Hardware::NUM_CPU_CORES> read_area_generations{};
-    std::atomic<u64> read_trap_generation{};
-    std::set<u64> armed_read_traps;
-    std::atomic<size_t> armed_read_trap_count{};
+    ReadTraps armed_read_traps;
     /// Guards read traps, and page types and the page tracker while the tracker is enabled.
     std::mutex read_trap_mutex;
     std::atomic<bool> page_tracker_enabled{};
@@ -1416,8 +1431,8 @@ void Memory::RasterizerMarkRegionCached(Common::ProcessAddress vaddr, u64 size, 
     impl->RasterizerMarkRegionCached(GetInteger(vaddr), size, cached);
 }
 
-void Memory::RasterizerArmReadTraps(Common::ProcessAddress vaddr, u64 size) {
-    impl->RasterizerArmReadTraps(GetInteger(vaddr), size);
+void Memory::RasterizerArmReadTraps(Common::ProcessAddress vaddr, u64 size, u64 generation) {
+    impl->RasterizerArmReadTraps(GetInteger(vaddr), size, generation);
 }
 
 void Memory::MarkRegionDebug(Common::ProcessAddress vaddr, u64 size, bool debug) {
@@ -1473,7 +1488,7 @@ Memory::ScarletNxFault Memory::ResolveScarletNxFastmemFault(u64 address, bool wr
         std::scoped_lock lock{impl->read_trap_mutex};
         const u64 page = base >> YUZU_PAGEBITS;
         read_trapped =
-            impl->armed_read_traps.contains(page) || impl->page_tracker_state.AccessArmed(page);
+            impl->armed_read_traps.Armed(page, page + 1) || impl->page_tracker_state.AccessArmed(page);
     }
     if (read_trapped) {
         impl->HandleRasterizerDownload(base, YUZU_PAGESIZE);
@@ -1496,7 +1511,7 @@ void Memory::CompleteScarletNxFastmemWrite(u64 address) {
     if (std::as_const(impl->current_page_table->entries)[page].Type() ==
         Common::PageType::RasterizerCachedMemory) {
         const bool read_trapped =
-            impl->armed_read_traps.contains(page) || impl->page_tracker_state.AccessArmed(page);
+            impl->armed_read_traps.Armed(page, page + 1) || impl->page_tracker_state.AccessArmed(page);
         impl->host_buffer->Protect(base, YUZU_PAGESIZE,
                                   read_trapped ? Common::MemoryPermission{}
                                                : Common::MemoryPermission::Read);

@@ -29,6 +29,16 @@ struct StagingBufferRef {
     MemoryUsage usage;
     u32 log2_level;
     u64 index;
+    vk::Buffer::Readback readback{};
+    // A readback snapshot may subsequently be patched by the CPU. Invalidate it only once.
+    mutable bool host_readable{};
+
+    void Invalidate() const {
+        if (!host_readable) {
+            readback.Invalidate();
+            host_readable = true;
+        }
+    }
 };
 
 class StagingBufferPool {
@@ -77,6 +87,7 @@ private:
                 .usage = usage,
                 .log2_level = log2_level,
                 .index = index,
+                .readback = buffer.HostReadback(),
             };
         }
     };

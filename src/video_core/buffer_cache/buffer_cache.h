@@ -456,7 +456,13 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
         buffer.MarkUsage(download.copy.src_offset, download.copy.size);
         runtime.CopyBuffer(download_staging.buffer, buffer, std::span{&download.copy, 1}, true);
     }
+    if constexpr (requires { runtime.PrepareDownloadStagingBuffer(download_staging); }) {
+        runtime.PrepareDownloadStagingBuffer(download_staging);
+    }
     runtime.Finish();
+    if constexpr (requires { runtime.InvalidateDownloadStagingBuffer(download_staging); }) {
+        runtime.InvalidateDownloadStagingBuffer(download_staging);
+    }
     const u8* const mapped_memory = download_staging.mapped_span.data();
     const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
     for (const Download& download : downloads) {
@@ -1000,6 +1006,9 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
         }
     }
     runtime.PostCopyBarrier();
+    if constexpr (requires { runtime.PrepareDownloadStagingBuffer(download_staging); }) {
+        runtime.PrepareDownloadStagingBuffer(download_staging);
+    }
     pending_downloads.emplace_back(std::move(normalized_copies));
     pending_download_ranges.emplace_back(std::move(download_ranges));
     async_buffers.emplace_back(download_staging);
@@ -1276,6 +1285,9 @@ void BufferCache<P>::PopAsyncBuffers() {
     auto& downloads = pending_downloads.front();
     auto& ranges = pending_download_ranges.front();
     auto& async_buffer = async_buffers.front();
+    if constexpr (requires { runtime.InvalidateDownloadStagingBuffer(*async_buffer); }) {
+        runtime.InvalidateDownloadStagingBuffer(*async_buffer);
+    }
     u8* base = async_buffer->mapped_span.data();
     const size_t base_offset = async_buffer->offset;
     // This runs on the fencing thread while the CPU keeps writing: CPU writes collected since the
@@ -2940,6 +2952,9 @@ bool BufferCache<P>::Nx2CopyListPages(u64 tick) {
             };
             buffer.MarkUsage(copy.src_offset, copy.size);
             runtime.CopyBuffer(staging.buffer, buffer, std::span{&copy, 1}, true);
+            if constexpr (requires { runtime.PrepareDownloadStagingBuffer(staging); }) {
+                runtime.PrepareDownloadStagingBuffer(staging);
+            }
             recorded = true;
             std::scoped_lock lock{nx2_list_mutex};
             Nx2ListPage& entry = nx2_list_pages[page];
@@ -2975,6 +2990,9 @@ bool BufferCache<P>::Nx2CopyListPages(u64 tick) {
             }
             if (nx2_writer_trace) {
                 std::scoped_lock lock{nx2_list_mutex};
+                if constexpr (requires { runtime.InvalidateDownloadStagingBuffer(retired.second); }) {
+                    runtime.InvalidateDownloadStagingBuffer(retired.second);
+                }
                 if (nx2_writer_trace->CompleteCopy(
                         reinterpret_cast<uintptr_t>(retired.second.mapped_span.data()),
                         retired.second.mapped_span)) {
@@ -3067,6 +3085,9 @@ auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool 
                     nx2_writer_trace->NoteFrontRead(
                         reinterpret_cast<uintptr_t>(entry.copy->mapped_span.data()), offset, out.size());
                 }
+                if constexpr (requires { runtime.InvalidateDownloadStagingBuffer(*entry.copy); }) {
+                    runtime.InvalidateDownloadStagingBuffer(*entry.copy);
+                }
                 std::memcpy(out.data(), entry.copy->mapped_span.data() + offset, out.size());
                 return Nx2ListRead::Copied;
             }
@@ -3104,6 +3125,9 @@ auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool 
         if (nx2_writer_trace) {
             nx2_writer_trace->NoteFrontRead(
                 reinterpret_cast<uintptr_t>(it->second.copy->mapped_span.data()), offset, out.size());
+        }
+        if constexpr (requires { runtime.InvalidateDownloadStagingBuffer(*it->second.copy); }) {
+            runtime.InvalidateDownloadStagingBuffer(*it->second.copy);
         }
         std::memcpy(out.data(), it->second.copy->mapped_span.data() + offset, out.size());
         return Nx2ListRead::Copied;
@@ -3167,8 +3191,14 @@ void BufferCache<P>::Nx2NoteListHostWrite(DAddr device_addr, u64 size, std::span
                     if (offset_in_page >= entry.copy_begin &&
                         offset_in_page + copy_len <= entry.copy_end &&
                         offset_in_src + copy_len <= data.size()) {
+                        if constexpr (requires { runtime.InvalidateDownloadStagingBuffer(*entry.copy); }) {
+                            runtime.InvalidateDownloadStagingBuffer(*entry.copy);
+                        }
                         std::memcpy(entry.copy->mapped_span.data() + offset_in_page,
                                     data.data() + offset_in_src, copy_len);
+                        if constexpr (requires { runtime.FlushDownloadStagingBuffer(*entry.copy); }) {
+                            runtime.FlushDownloadStagingBuffer(*entry.copy);
+                        }
                         entry.copy_writes = entry.writes;
                     }
                 }
@@ -3803,7 +3833,13 @@ void BufferCache<P>::DownloadBuffersMemory(std::span<const BufferId> buffer_ids)
         buffer.MarkUsage(download.copy.src_offset, download.copy.size);
         runtime.CopyBuffer(download_staging.buffer, buffer, std::span{&download.copy, 1}, true);
     }
+    if constexpr (requires { runtime.PrepareDownloadStagingBuffer(download_staging); }) {
+        runtime.PrepareDownloadStagingBuffer(download_staging);
+    }
     runtime.Finish();
+    if constexpr (requires { runtime.InvalidateDownloadStagingBuffer(download_staging); }) {
+        runtime.InvalidateDownloadStagingBuffer(download_staging);
+    }
     const u8* const mapped_memory = download_staging.mapped_span.data();
     const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
     for (const Download& download : downloads) {
@@ -3867,7 +3903,13 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
             buffer.MarkUsage(copy.src_offset, copy.size);
         }
         runtime.CopyBuffer(download_staging.buffer, buffer, copies_span, true);
+        if constexpr (requires { runtime.PrepareDownloadStagingBuffer(download_staging); }) {
+            runtime.PrepareDownloadStagingBuffer(download_staging);
+        }
         runtime.Finish();
+        if constexpr (requires { runtime.InvalidateDownloadStagingBuffer(download_staging); }) {
+            runtime.InvalidateDownloadStagingBuffer(download_staging);
+        }
         for (const BufferCopy& copy : copies) {
             const DAddr copy_device_addr = buffer.CpuAddr() + copy.src_offset;
             // Undo the modified offset

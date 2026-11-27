@@ -569,10 +569,20 @@ void Buffer::Flush() const {
     }
 }
 
-void Buffer::Invalidate() const {
+void Buffer::Readback::Flush() const {
     if (!is_coherent) {
-        vmaInvalidateAllocation(allocator, allocation, 0, VK_WHOLE_SIZE);
+        Check(vmaFlushAllocation(allocator, allocation, 0, VK_WHOLE_SIZE));
     }
+}
+
+void Buffer::Readback::Invalidate() const {
+    if (!is_coherent) {
+        Check(vmaInvalidateAllocation(allocator, allocation, 0, VK_WHOLE_SIZE));
+    }
+}
+
+void Buffer::Invalidate() const {
+    HostReadback().Invalidate();
 }
 
 void Buffer::SetObjectNameEXT(const char* name) const {

@@ -797,6 +797,14 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedBatch(std::span<const std::pa
 
 template <typename Traits>
 void DeviceMemoryManager<Traits>::ArmReadTraps(DAddr addr, size_t size) {
+    if (size == 0) {
+        return;
+    }
+    const u64 generation = InvalidateCachedReadAreas();
+    if (!Memory::UsesSelectiveRasterizerReadTraps()) {
+        // No per-page permission change is needed for these CPU paths.
+        return;
+    }
     const auto MarkRegionReadTrap = &DeviceMemoryManager<Traits>::DeviceMethods::MarkRegionReadTrap;
     Memory::Memory* run_inter = nullptr;
     u64 run_begin = 0;
@@ -804,7 +812,7 @@ void DeviceMemoryManager<Traits>::ArmReadTraps(DAddr addr, size_t size) {
     const auto release_run = [&] {
         if (run_pages > 0 && run_inter != nullptr) {
             MarkRegionReadTrap(run_inter, run_begin << Memory::YUZU_PAGEBITS,
-                               run_pages << Memory::YUZU_PAGEBITS);
+                               run_pages << Memory::YUZU_PAGEBITS, generation);
         }
         run_pages = 0;
     };

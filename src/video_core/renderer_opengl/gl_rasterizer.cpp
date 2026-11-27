@@ -10,7 +10,9 @@
 #include <algorithm>
 #include <array>
 #include <bitset>
+#include <limits>
 #include <memory>
+#include <optional>
 #include <string_view>
 #include <utility>
 
@@ -527,8 +529,7 @@ VideoCore::RasterizerDownloadArea RasterizerOpenGL::GetFlushArea(DAddr addr, u64
         texture_area = texture_cache.GetFlushArea(addr, size);
     }
     if (texture_area) {
-        // The core disarmed the read's pages before asking: the buffer cache arms only pages it
-        // doesn't count as armed, so it must forget these.
+        // The CPU will release these pages after readback. A later buffer write must rearm them.
         std::scoped_lock lock{buffer_cache.mutex};
         buffer_cache.ForgetReadTraps(addr, size);
         return *texture_area;
@@ -1430,16 +1431,30 @@ bool AccelerateDMA::DmaBufferImageCopy(const Tegra::DMA::ImageCopy& copy_info,
                                        const Tegra::DMA::BufferOperand& buffer_operand,
                                        const Tegra::DMA::ImageOperand& image_operand) {
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+    const u64 transfer_size = u64{buffer_operand.pitch} * buffer_operand.height;
+    if (transfer_size == 0 || transfer_size > (std::numeric_limits<u32>::max)()) {
+        return false;
+    }
+    const u32 buffer_size = static_cast<u32>(transfer_size);
+    std::optional<DAddr> download_address;
+    if constexpr (!IS_IMAGE_UPLOAD) {
+        download_address = texture_cache.GetDmaDownloadAddress(buffer_operand.address, buffer_size);
+        if (!download_address) {
+            return false;
+        }
+    }
     const auto image_id = texture_cache.DmaImageId(image_operand, IS_IMAGE_UPLOAD);
     if (image_id == VideoCommon::NULL_IMAGE_ID) {
         return false;
     }
-    const u32 buffer_size = static_cast<u32>(buffer_operand.pitch * buffer_operand.height);
     static constexpr auto sync_info = VideoCommon::ObtainBufferSynchronize::FullSynchronize;
     const auto post_op = IS_IMAGE_UPLOAD ? VideoCommon::ObtainBufferOperation::DoNothing
                                          : VideoCommon::ObtainBufferOperation::MarkAsWritten;
-    const auto [buffer, offset] =
-        buffer_cache.ObtainBuffer(buffer_operand.address, buffer_size, sync_info, post_op);
+    const auto [buffer, offset] = IS_IMAGE_UPLOAD
+                                      ? buffer_cache.ObtainBuffer(buffer_operand.address,
+                                                                  buffer_size, sync_info, post_op)
+                                      : buffer_cache.ObtainCPUBuffer(*download_address,
+                                                                     buffer_size, sync_info, post_op);
 
     const auto [image, copy] = texture_cache.DmaBufferImageCopy(
         copy_info, buffer_operand, image_operand, image_id, IS_IMAGE_UPLOAD);
@@ -1453,7 +1468,7 @@ bool AccelerateDMA::DmaBufferImageCopy(const Tegra::DMA::ImageCopy& copy_info,
             return false;
         }
         texture_cache.DownloadImageIntoBuffer(image, buffer->Handle(), offset, copy_span,
-                                              buffer_operand.address, buffer_size);
+                                              *download_address, buffer_size);
     }
     return true;
 }

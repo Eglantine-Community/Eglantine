@@ -14,6 +14,7 @@
 #include <boost/container/small_vector.hpp>
 #include <fmt/format.h>
 
+#include "core/memory.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 #include "video_core/renderer_vulkan/pipeline_optimization.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
@@ -208,6 +209,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     if (RecordingSampledTextures() || writer_deps) {
         sampled_images.clear();
     }
+    written_images.clear();
     guest_descriptor_queue.Acquire(scheduler, num_descriptor_entries, uses_descriptor_buffer);
 
     buffer_cache.SetComputeUniformBufferState(info.constant_buffer_mask, &uniform_buffer_sizes);
@@ -313,8 +315,8 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                      state.first, state.second});
             }
         }
-        if (RecordingWrittenImages()) {
-            written_images.clear();
+        if (!info.image_descriptors.empty() &&
+            (RecordingWrittenImages() || !Core::Memory::CanTrapRasterizerReads())) {
             size_t image_index{Shader::NumDescriptors(info.texture_buffer_descriptors) +
                                Shader::NumDescriptors(info.image_buffer_descriptors) +
                                Shader::NumDescriptors(info.texture_descriptors)};
@@ -367,9 +369,6 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         PushImageDescriptors(texture_cache, guest_descriptor_queue, info, rescaling, samplers_it,
                              views_it);
     } else {
-        if (RecordingWrittenImages()) {
-            written_images.clear();
-        }
         buffer_cache.UnbindComputeTextureBuffers();
         buffer_cache.UpdateComputeBuffers();
         buffer_cache.BindHostComputeBuffers();

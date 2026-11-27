@@ -29,6 +29,7 @@
 #include "core/memory.h"
 #include "core/memory/page_tracker.h"
 #include "core/memory/page_tracker_state.h"
+#include "core/memory/read_traps.h"
 #include "tests/core/system_test_context.h"
 #include "video_core/renderer_vulkan/nvn/nvn_line_guard.h"
 
@@ -370,6 +371,26 @@ TEST_CASE("PageTracker: long ranges inserted before shorter owners remain visibl
 
     state.OnWrite(42, 43);
     CHECK(Collect(state, short_range) == Runs{{42, 43}});
+}
+
+TEST_CASE("Rasterizer readback keeps pages dirtied again during a CPU read protected",
+          "[core][cpu_readback]") {
+    Core::Memory::ReadTraps traps;
+    REQUIRE(traps.Arm(2, 10));
+    REQUIRE(traps.Arm(3, 10));
+    CHECK_FALSE(traps.Arm(3, 12));
+    // Two GPU writers can reach the same process in a different order from their generations.
+    CHECK_FALSE(traps.Arm(3, 11));
+    std::vector<u64> readable;
+    const auto release = [&](u64 page) { readable.push_back(page); };
+    traps.Disarm(2, 4, 10, release);
+    CHECK(readable == std::vector<u64>{2});
+    CHECK(traps.Armed(3, 4));
+    traps.Disarm(3, 4, 11, release);
+    CHECK(readable == std::vector<u64>{2});
+    traps.Disarm(3, 4, 12, release);
+    CHECK(readable == std::vector<u64>{2, 3});
+    CHECK(traps.Empty());
 }
 
 TEST_CASE("PageTracker: access traps call back once and survive a re-arm during the callback",

@@ -79,7 +79,7 @@ public:
         return shader_hash;
     }
 
-    /// Storage images written by the last configured dispatch, kept while a frame dump runs.
+    /// Resolved storage outputs for CPU writeback or frame capture.
     [[nodiscard]] std::span<const VideoCommon::ImageViewId> WrittenImages() const noexcept {
         return written_images;
     }
