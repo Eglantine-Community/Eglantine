@@ -71,10 +71,19 @@ std::span<const VkSubpassDependency> RenderPassDependencies(bool sync_diet) {
 // render passes
 // ================================================================================================
 
-VkRenderPass PipelineCache::Impl::GetRenderPass(const RenderPassKey& key) {
+VkRenderPass PipelineCache::Impl::GetRenderPass(const RenderPassKey& key,
+                                                bool read_only_depth, u16 clear_mask) {
     std::scoped_lock lock{render_pass_mutex};
-    if (const auto it = render_passes.find(key); it != render_passes.end()) {
-        return *it->second;
+    if (clear_mask == 0) {
+        auto& passes = read_only_depth ? read_only_depth_passes : render_passes;
+        if (const auto it = passes.find(key); it != passes.end()) {
+            return *it->second;
+        }
+    } else {
+        const ClearRenderPassKey clear_key{key, clear_mask, read_only_depth};
+        if (const auto it = clear_render_passes.find(clear_key); it != clear_render_passes.end()) {
+            return *it->second;
+        }
     }
     const VkSampleCountFlagBits samples =
         static_cast<VkSampleCountFlagBits>(key.samples == 0 ? 1 : key.samples);
@@ -89,11 +98,12 @@ VkRenderPass PipelineCache::Impl::GetRenderPass(const RenderPassKey& key) {
         }
         color_references[slot] = {static_cast<u32>(descriptions.size()),
                                   VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        const bool clear_color = (clear_mask & (1u << slot)) != 0;
         descriptions.push_back({
             .flags = 0,
             .format = format,
             .samples = samples,
-            .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+            .loadOp = clear_color ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
             .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
             .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
             .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
@@ -106,21 +116,31 @@ VkRenderPass PipelineCache::Impl::GetRenderPass(const RenderPassKey& key) {
     VkAttachmentReference depth_reference{};
     const bool has_depth_attachment = depth_format != VK_FORMAT_UNDEFINED;
     if (has_depth_attachment) {
-        depth_reference = {static_cast<u32>(descriptions.size()),
-                           VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+        const VkImageLayout depth_layout = read_only_depth
+            ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+            : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        depth_reference = {static_cast<u32>(descriptions.size()), depth_layout};
         const bool depth = FormatHasDepth(depth_format);
         const bool stencil = FormatHasStencil(depth_format);
+        const bool clear_depth = (clear_mask & RENDER_PASS_CLEAR_DEPTH) != 0;
+        const bool clear_stencil = (clear_mask & RENDER_PASS_CLEAR_STENCIL) != 0;
         descriptions.push_back({
             .flags = 0,
             .format = depth_format,
             .samples = samples,
-            .loadOp = depth ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-            .storeOp = depth ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
-            .stencilLoadOp = stencil ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            .loadOp = !depth      ? VK_ATTACHMENT_LOAD_OP_DONT_CARE
+                      : clear_depth ? VK_ATTACHMENT_LOAD_OP_CLEAR
+                                    : VK_ATTACHMENT_LOAD_OP_LOAD,
+            .storeOp = read_only_depth ? VK_ATTACHMENT_STORE_OP_NONE
+                       : depth ? VK_ATTACHMENT_STORE_OP_STORE
+                               : VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .stencilLoadOp = !stencil      ? VK_ATTACHMENT_LOAD_OP_DONT_CARE
+                             : clear_stencil ? VK_ATTACHMENT_LOAD_OP_CLEAR
+                                             : VK_ATTACHMENT_LOAD_OP_LOAD,
             .stencilStoreOp =
                 stencil ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
-            .initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-            .finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            .initialLayout = depth_layout,
+            .finalLayout = depth_layout,
         });
     }
     const VkSubpassDescription subpass{
@@ -149,7 +169,13 @@ VkRenderPass PipelineCache::Impl::GetRenderPass(const RenderPassKey& key) {
         .pDependencies = dependencies.data(),
     });
     const VkRenderPass handle = *pass;
-    render_passes.emplace(key, std::move(pass));
+    if (clear_mask == 0) {
+        auto& passes = read_only_depth ? read_only_depth_passes : render_passes;
+        passes.emplace(key, std::move(pass));
+    } else {
+        clear_render_passes.emplace(ClearRenderPassKey{key, clear_mask, read_only_depth},
+                                    std::move(pass));
+    }
     return handle;
 }
 // ================================================================================================
@@ -164,27 +190,81 @@ bool PipelineCache::Impl::CanUsePush(u32 descriptor_count) const {
            device.DescriptorBufferProperties().bufferlessPushDescriptors;
 }
 
-PipelineCache::Impl::LayoutObjects PipelineCache::Impl::CreateLayoutObjects(
+std::shared_ptr<const SharedPipelineLayout> PipelineCache::Impl::CreateLayoutObjects(
     const VC::DescriptorLayout& descriptors, bool is_compute, VkShaderStageFlags push_stages) {
-    LayoutObjects out;
     boost::container::small_vector<VkDescriptorSetLayoutBinding, 32> bindings;
+    boost::container::small_vector<VkDescriptorUpdateTemplateEntry, 32> template_entries;
     u32 total = 0;
+    u32 slot_offset = 0;
+    bool can_template = !descriptors.bindings.empty();
     for (const VC::DescriptorBinding& binding : descriptors.bindings) {
+        const VkDescriptorType type = static_cast<VkDescriptorType>(binding.kind);
         bindings.push_back({
             .binding = binding.binding,
-            .descriptorType = static_cast<VkDescriptorType>(binding.kind),
+            .descriptorType = type,
             .descriptorCount = std::max<u32>(binding.count, 1),
             .stageFlags = StageFlagsOf(binding),
             .pImmutableSamplers = nullptr,
         });
         total += std::max<u32>(binding.count, 1);
+        const bool supported_template_kind =
+            binding.count >= 1 && (type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
+                                   type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
+                                   type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
+                                   type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ||
+                                   type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER);
+        if (!supported_template_kind) {
+            can_template = false;
+        } else {
+            template_entries.push_back({
+                .dstBinding = binding.binding,
+                .dstArrayElement = 0,
+                .descriptorCount = binding.count,
+                .descriptorType = type,
+                .offset = static_cast<size_t>(slot_offset) * sizeof(DescriptorTemplateEntry),
+                .stride = sizeof(DescriptorTemplateEntry),
+            });
+            slot_offset += binding.count;
+        }
     }
-    out.push_descriptors = !bindings.empty() && CanUsePush(total);
+    const bool push_descriptors = !bindings.empty() && CanUsePush(total);
+    const bool partially_bound =
+        !bindings.empty() && !push_descriptors && device.IsDescriptorBindingPartiallyBoundSupported();
+    u32 push_constant_size = 0;
+    if (descriptors.UsesPushConstants()) {
+        // As DescriptorLayoutBuilder::CreatePipelineLayout: compute has no down_factor word.
+        const u32 skip = is_compute ? static_cast<u32>(sizeof(RescalingLayout::down_factor)) : 0u;
+        push_constant_size = static_cast<u32>(sizeof(RescalingLayout)) - skip +
+                             static_cast<u32>(sizeof(RenderAreaLayout));
+    }
+
+    std::vector<u32> key;
+    key.reserve(8 + bindings.size() * 4);
+    key.insert(key.end(), {is_compute ? 1u : 0u, push_descriptors ? 1u : 0u,
+                           partially_bound ? 1u : 0u,
+                           descriptors.uses_bindless_table ? 1u : 0u,
+                           can_template ? 1u : 0u,
+                           static_cast<u32>(push_stages), push_constant_size,
+                           static_cast<u32>(bindings.size())});
+    for (const VkDescriptorSetLayoutBinding& entry : bindings) {
+        key.insert(key.end(), {entry.binding, static_cast<u32>(entry.descriptorType),
+                               entry.descriptorCount, static_cast<u32>(entry.stageFlags)});
+    }
+    {
+        std::scoped_lock lock{layout_cache_mutex};
+        if (const auto it = layout_cache.find(key); it != layout_cache.end()) {
+            return it->second;
+        }
+    }
+
+    auto out = std::make_shared<SharedPipelineLayout>();
+    out->push_descriptors = push_descriptors;
+    out->push_constant_size = push_constant_size;
     if (!bindings.empty()) {
         boost::container::small_vector<VkDescriptorBindingFlags, 32> binding_flags;
         VkDescriptorSetLayoutBindingFlagsCreateInfo binding_flags_ci{};
         const void* next = nullptr;
-        if (!out.push_descriptors && device.IsDescriptorBindingPartiallyBoundSupported()) {
+        if (partially_bound) {
             binding_flags.assign(bindings.size(), VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT);
             binding_flags_ci = {
                 .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO,
@@ -194,10 +274,10 @@ PipelineCache::Impl::LayoutObjects PipelineCache::Impl::CreateLayoutObjects(
             };
             next = &binding_flags_ci;
         }
-        out.set_layout = device.GetLogical().CreateDescriptorSetLayout({
+        out->set_layout = device.GetLogical().CreateDescriptorSetLayout({
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
             .pNext = next,
-            .flags = out.push_descriptors
+            .flags = out->push_descriptors
                          ? static_cast<VkDescriptorSetLayoutCreateFlags>(
                                VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR)
                          : VkDescriptorSetLayoutCreateFlags{0},
@@ -208,7 +288,7 @@ PipelineCache::Impl::LayoutObjects PipelineCache::Impl::CreateLayoutObjects(
     if (descriptors.uses_bindless_table) {
         // The table is set BINDLESS_SET: set 0 must exist even when the draw has no descriptors.
         if (bindings.empty()) {
-            out.set_layout = device.GetLogical().CreateDescriptorSetLayout({
+            out->set_layout = device.GetLogical().CreateDescriptorSetLayout({
                 .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
                 .pNext = nullptr,
                 .flags = 0,
@@ -216,24 +296,17 @@ PipelineCache::Impl::LayoutObjects PipelineCache::Impl::CreateLayoutObjects(
                 .pBindings = nullptr,
             });
         }
-        out.bindless_layout = MakeBindlessSetLayout(device);
+        out->bindless_layout = MakeBindlessSetLayout(device);
     }
     VkPushConstantRange range{
         .stageFlags = push_stages,
         .offset = 0,
-        .size = 0,
+        .size = push_constant_size,
     };
-    if (descriptors.UsesPushConstants()) {
-        // As DescriptorLayoutBuilder::CreatePipelineLayout: compute has no down_factor word.
-        const u32 skip = is_compute ? static_cast<u32>(sizeof(RescalingLayout::down_factor)) : 0u;
-        range.size = static_cast<u32>(sizeof(RescalingLayout)) - skip +
-                     static_cast<u32>(sizeof(RenderAreaLayout));
-        out.push_constant_size = range.size;
-    }
     const std::array<VkDescriptorSetLayout, 2> set_handles{
-        *out.set_layout, out.bindless_layout ? *out.bindless_layout : VK_NULL_HANDLE};
-    const u32 set_count = out.bindless_layout ? 2u : (set_handles[0] != VK_NULL_HANDLE ? 1u : 0u);
-    out.layout = device.GetLogical().CreatePipelineLayout({
+        *out->set_layout, out->bindless_layout ? *out->bindless_layout : VK_NULL_HANDLE};
+    const u32 set_count = out->bindless_layout ? 2u : (set_handles[0] != VK_NULL_HANDLE ? 1u : 0u);
+    out->layout = device.GetLogical().CreatePipelineLayout({
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
@@ -242,7 +315,27 @@ PipelineCache::Impl::LayoutObjects PipelineCache::Impl::CreateLayoutObjects(
         .pushConstantRangeCount = range.size != 0 ? 1u : 0u,
         .pPushConstantRanges = range.size != 0 ? &range : nullptr,
     });
-    return out;
+    if (can_template && !template_entries.empty()) {
+        out->update_template = device.GetLogical().CreateDescriptorUpdateTemplate({
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .descriptorUpdateEntryCount = static_cast<u32>(template_entries.size()),
+            .pDescriptorUpdateEntries = template_entries.data(),
+            .templateType = out->push_descriptors
+                                ? VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_PUSH_DESCRIPTORS_KHR
+                                : VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET,
+            .descriptorSetLayout = *out->set_layout,
+            .pipelineBindPoint =
+                is_compute ? VK_PIPELINE_BIND_POINT_COMPUTE : VK_PIPELINE_BIND_POINT_GRAPHICS,
+            .pipelineLayout = *out->layout,
+            .set = 0,
+        });
+        out->template_entry_count = slot_offset;
+    }
+    std::scoped_lock lock{layout_cache_mutex};
+    const auto [it, inserted] = layout_cache.try_emplace(std::move(key), std::move(out));
+    return it->second;
 }
 
 VC::DescriptorLayout PipelineCache::Impl::MergeLayouts(
@@ -261,6 +354,7 @@ VC::DescriptorLayout PipelineCache::Impl::MergeLayouts(
         merged.stores_raw_global_memory |= slice.stores_raw_global_memory;
         merged.requires_guest_warp |= slice.requires_guest_warp;
         merged.uses_bindless_table |= slice.uses_bindless_table;
+        merged.bindless_types_mask |= slice.bindless_types_mask;
         raw_stores_not_through |=
             slice.stores_raw_global_memory && !slice.raw_stores_written_through;
         merged.unsupported_count += slice.unsupported_count;
@@ -344,7 +438,8 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::AssembleGraphics(
                                       VK_SHADER_STAGE_FRAGMENT_BIT}
                  : VkShaderStageFlags{VK_SHADER_STAGE_ALL_GRAPHICS};
         pipeline->descriptors = MergeLayouts(ordered);
-        LayoutObjects layout = CreateLayoutObjects(pipeline->descriptors, false, push_stages);
+        const std::shared_ptr<const SharedPipelineLayout> layout =
+            CreateLayoutObjects(pipeline->descriptors, false, push_stages);
         if (gpl_set) {
             CreateShaderSetObjects(*gpl_set, pipeline->descriptors, push_stages);
         }
@@ -398,9 +493,36 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::AssembleGraphics(
             fragment != nullptr ? fragment->record->outputs_written : 0;
         pipeline->dynamic_vertex_input = !mesh && vertex_input_mode == VertexInputMode::Dynamic;
         pipeline->mesh = mesh;
-        pipeline->dynamic_fixed = gpl_set && gpl_dynamic_fixed;
-        if (pipeline->dynamic_fixed) {
+        u32 color_attachment_count = 0;
+        for (u32 slot = 0; slot < MAX_COLOR_TARGETS; ++slot) {
+            if (targets.color[slot] != VK_FORMAT_UNDEFINED) {
+                color_attachment_count = slot + 1;
+            }
+        }
+        pipeline->color_attachment_count = color_attachment_count;
+        if (options.dedup_dynamic_state) {
+            pipeline->dynamic_fixed = dynamic_caps.fixed;
+            pipeline->dynamic_polygon_mode = dynamic_caps.fixed && dynamic_caps.polygon_mode;
+            pipeline->dynamic_depth_clamp = dynamic_caps.fixed && dynamic_caps.depth_clamp;
+            pipeline->dynamic_provoking_vertex =
+                dynamic_caps.fixed && dynamic_caps.provoking_vertex;
+            pipeline->dynamic_patch_control_points =
+                dynamic_caps.fixed && has_tessellation && dynamic_caps.patch_control_points;
+            pipeline->dynamic_blend = dynamic_caps.blend && color_attachment_count > 0;
+            pipeline->dynamic_alpha_to_coverage = dynamic_caps.alpha_to_coverage;
             pipeline->fixed_values = MakeDynamicFixedState(state);
+        } else {
+            pipeline->dynamic_fixed = gpl_set && gpl_dynamic_fixed;
+            if (pipeline->dynamic_fixed) {
+                pipeline->dynamic_polygon_mode = device.SupportsDynamicState3PolygonMode();
+                pipeline->dynamic_depth_clamp = device.SupportsDynamicState3DepthClampEnable();
+                pipeline->dynamic_provoking_vertex =
+                    device.SupportsDynamicState3ProvokingVertexMode() &&
+                    device.SupportsProvokingVertexLastMode();
+                pipeline->dynamic_patch_control_points =
+                    has_tessellation && device.SupportsDynamicState2PatchControlPoints();
+                pipeline->fixed_values = MakeDynamicFixedState(state);
+            }
         }
 
         std::vector<std::string> issues;
@@ -413,7 +535,7 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::AssembleGraphics(
                 .render_pass = pipeline->render_pass,
                 // The shader parts are compiled with the set's layout (an identically defined
                 // one: the pipeline's own layout is compatible with it).
-                .layout = gpl_set ? *gpl_set->layout.layout : *layout.layout,
+                .layout = gpl_set ? *gpl_set->layout->layout : *layout->layout,
                 .stages = stage_infos,
                 .viewport_count = viewport_count,
                 .attributes_read = pipeline->attributes_read,
@@ -422,6 +544,8 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::AssembleGraphics(
                 .mesh = mesh,
                 .vertex_input = vertex_input_mode,
                 .dynamic_fixed = pipeline->dynamic_fixed,
+                .dynamic_blend = pipeline->dynamic_blend,
+                .dynamic_alpha_to_coverage = pipeline->dynamic_alpha_to_coverage,
             },
             description, issues);
         for (const std::string& issue : issues) {
@@ -455,18 +579,23 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::AssembleGraphics(
                 // Something the parts cannot express (no fragment program, static rasterizer
                 // discard): compiled whole, nothing to optimize later.
                 ++stat_gpl_whole;
-                description.ci.layout = *layout.layout;
+                description.ci.layout = *layout->layout;
             }
         }
         if (!pipeline->pipeline) {
             pipeline->pipeline =
                 device.GetLogical().CreateGraphicsPipeline(description.ci, *vk_cache);
         }
-        pipeline->layout = std::move(layout.layout);
-        pipeline->set_layout = std::move(layout.set_layout);
-        pipeline->bindless_layout = std::move(layout.bindless_layout);
-        pipeline->push_descriptors = layout.push_descriptors;
-        pipeline->push_constant_size = layout.push_constant_size;
+        pipeline->shared_layout = layout;
+        pipeline->layout = *layout->layout;
+        pipeline->set_layout = layout->set_layout ? *layout->set_layout : VK_NULL_HANDLE;
+        pipeline->bindless_layout =
+            layout->bindless_layout ? *layout->bindless_layout : VK_NULL_HANDLE;
+        pipeline->update_template =
+            layout->update_template ? *layout->update_template : VK_NULL_HANDLE;
+        pipeline->push_descriptors = layout->push_descriptors;
+        pipeline->template_entry_count = layout->template_entry_count;
+        pipeline->push_constant_size = layout->push_constant_size;
         pipeline->push_constant_stages = push_stages;
         FillStages(*pipeline, ordered);
         return pipeline;
@@ -488,7 +617,7 @@ std::shared_ptr<ComputePipeline> PipelineCache::Impl::AssembleCompute(
         auto pipeline = std::make_shared<ComputePipeline>();
         const std::array<const StageArtifact*, 1> single{&stage};
         pipeline->descriptors = MergeLayouts(single);
-        LayoutObjects layout =
+        const std::shared_ptr<const SharedPipelineLayout> layout =
             CreateLayoutObjects(pipeline->descriptors, true, VK_SHADER_STAGE_COMPUTE_BIT);
         const Disk::ShaderRecord& record = *stage.record;
         vk::ShaderModule shader_module = device.GetLogical().CreateShaderModule({
@@ -523,16 +652,21 @@ std::shared_ptr<ComputePipeline> PipelineCache::Impl::AssembleCompute(
                         .pName = "main",
                         .pSpecializationInfo = nullptr,
                     },
-                .layout = *layout.layout,
+                .layout = *layout->layout,
                 .basePipelineHandle = VK_NULL_HANDLE,
                 .basePipelineIndex = 0,
             },
             *vk_cache);
-        pipeline->layout = std::move(layout.layout);
-        pipeline->set_layout = std::move(layout.set_layout);
-        pipeline->bindless_layout = std::move(layout.bindless_layout);
-        pipeline->push_descriptors = layout.push_descriptors;
-        pipeline->push_constant_size = layout.push_constant_size;
+        pipeline->shared_layout = layout;
+        pipeline->layout = *layout->layout;
+        pipeline->set_layout = layout->set_layout ? *layout->set_layout : VK_NULL_HANDLE;
+        pipeline->bindless_layout =
+            layout->bindless_layout ? *layout->bindless_layout : VK_NULL_HANDLE;
+        pipeline->update_template =
+            layout->update_template ? *layout->update_template : VK_NULL_HANDLE;
+        pipeline->push_descriptors = layout->push_descriptors;
+        pipeline->template_entry_count = layout->template_entry_count;
+        pipeline->push_constant_size = layout->push_constant_size;
         pipeline->push_constant_stages = VK_SHADER_STAGE_COMPUTE_BIT;
         pipeline->compute_layout = compute_layout;
         FillStages(*pipeline, single);

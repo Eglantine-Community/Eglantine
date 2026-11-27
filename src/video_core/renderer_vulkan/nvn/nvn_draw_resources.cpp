@@ -95,6 +95,7 @@ constexpr u64 SHADOW_CHUNK_SIZE = u64{8} << 20;
 /// created and destroyed a chunk every third frame (F:/eg/results/vertex-stage2, L-new1-b).
 constexpr u32 MAX_FREE_SHADOWS = 32;
 constexpr u64 SHADOW_KEEP_MAX = u64{32} << 20;
+constexpr u32 MAX_FREE_DESCRIPTOR_POOLS = 32;
 constexpr u64 MAX_FREE_SHADOW_BYTES = u64{256} << 20;
 
 /// What a shadow of a storage range is bound as, and copied from and to the pool buffer; staged
@@ -209,12 +210,18 @@ PipelineCache& DrawResources::Cache() {
     if (!cache_instance) {
         std::scoped_lock lock{cache_mutex};
         PipelineCacheOptions options;
+        options.prefetch_graphics = !shader_refresh;
         options.async_compile =
             !shader_refresh && Settings::values.use_asynchronous_shaders.GetValue();
         options.graphics_pipeline_library = Settings::values.nvn_pipeline_library.GetValue();
+        options.gpl_optimize_after_presents = 30;
+        options.dedup_dynamic_state = true;
         options.sync_diet = Settings::values.nvn_sync_diet.GetValue();
         options.shader_notify = impl.options.shader_notify;
         options.load_progress = impl.options.load_progress;
+        // DeferDirectPoolBacking defers >= 16 MiB pools even with host import; keep miss reporting on
+        // so raw-global shaders demand-back only the large pools they actually touch.
+        options.raw_miss_reporting = true;
         cache_instance = std::make_unique<PipelineCache>(impl.device, std::move(options));
     }
     return *cache_instance;
@@ -234,12 +241,17 @@ void DrawResources::OpenCache(u64 title_id) {
     PipelineCacheOptions options;
     options.title_id = title_id;
     options.revision = Common::g_scm_rev;
-    options.prefetch_graphics = title_id == Settings::MarioKartWorldProgramId && !shader_refresh;
+    options.prefetch_graphics = !shader_refresh;
     options.async_compile = !shader_refresh && Settings::values.use_asynchronous_shaders.GetValue();
     options.graphics_pipeline_library = Settings::values.nvn_pipeline_library.GetValue();
+    options.gpl_optimize_after_presents = 30;
+    options.dedup_dynamic_state = true;
     options.sync_diet = Settings::values.nvn_sync_diet.GetValue();
     options.shader_notify = impl.options.shader_notify;
     options.load_progress = impl.options.load_progress;
+    // DeferDirectPoolBacking defers >= 16 MiB pools even with host import; keep miss reporting on
+    // so raw-global shaders demand-back only the large pools they actually touch.
+    options.raw_miss_reporting = true;
     if (options.async_compile) {
         LOG_INFO(Render_Vulkan,
                  "[nvn] asynchronous shaders on: run-time pipeline compiles run on workers; the "
@@ -306,6 +318,13 @@ void DrawResources::OpenCache(u64 title_id) {
     cache_instance = std::move(cache);
 }
 DrawResources::~DrawResources() = default;
+
+void DrawResources::OnPresent() {
+    std::scoped_lock lock{cache_mutex};
+    if (cache_instance) {
+        cache_instance->OnPresent();
+    }
+}
 
 void DrawResources::MaybeRefreshShaders() {
     if (!shader_refresh || !cache_instance) {
@@ -398,23 +417,22 @@ void DrawResources::NoteAsyncSkips(u64 present) {
 void DrawResources::OnProgramCreated(const std::shared_ptr<const VC::ProgramDesc>& program) {
     const VC::ProgramDesc& desc = *program;
     std::array<u64, STAGE_COUNT> hashes{};
-    std::array<StageProgram, STAGE_COUNT> stages{};
     for (u32 stage = 0; stage < STAGE_COUNT; ++stage) {
         if (!desc.control[stage].empty() && !desc.code[stage].empty()) {
             hashes[stage] = HashProgramStage(desc.control[stage], desc.code[stage]);
-            stages[stage] = {hashes[stage], &desc.control[stage], &desc.code[stage]};
         }
     }
     program_hashes[desc.serial] = hashes;
-    PipelineCache* cache{};
-    {
-        std::scoped_lock lock{cache_mutex};
-        cache = cache_instance.get();
+    if (!desc.control[STAGE_COMPUTE].empty()) {
+        ParsedComputeControl parsed;
+        parsed.control = VC::ParseControl(desc.control[STAGE_COMPUTE], parsed.error);
+        compute_controls[desc.serial] = std::move(parsed);
     }
-    if (cache != nullptr && cache->UsesGraphicsPipelineLibrary()) {
-        // The stage pointers stay valid: the cache keeps `program` until it is done.
-        cache->PrepareProgram(stages, program);
-    }
+}
+
+void DrawResources::ReleaseProgram(u64 serial) {
+    program_hashes.erase(serial);
+    compute_controls.erase(serial);
 }
 
 void DrawResources::RefreshSamplerSetting() {
@@ -559,7 +577,8 @@ void DrawResources::ReleaseSampler(u64 serial, u64 after_seq) {
     impl.retired.push_back({after_seq, [variants]() mutable { variants->clear(); }});
 }
 
-VkImageView DrawResources::GetView(const Texture& texture, const ViewKey& key) {
+VkImageView DrawResources::GetView(const Texture& texture, const ViewKey& key,
+                                   bool for_framebuffer) {
     // A stand-in changes BC format when a later upload classifies it differently (smart BC,
     // RefitStandin recreates its image as BC1/BC4/BC5/BC3). A ViewKey made before that (a clear's,
     // an attachment's, one memoised by a caller) still names the old format, and a view of another
@@ -591,6 +610,9 @@ VkImageView DrawResources::GetView(const Texture& texture, const ViewKey& key) {
     }
     for (auto& [existing, view] : views.views) {
         if (existing == key_valid) {
+            if (for_framebuffer) {
+                views.used_in_framebuffer = true;
+            }
             return *view;
         }
     }
@@ -631,6 +653,9 @@ VkImageView DrawResources::GetView(const Texture& texture, const ViewKey& key) {
             },
         });
         views.views.emplace_back(key_valid, std::move(view));
+        if (for_framebuffer) {
+            views.used_in_framebuffer = true;
+        }
         return *views.views.back().second;
     } catch (const vk::Exception& exception) {
         LOG_ERROR(Render_Vulkan,
@@ -644,14 +669,20 @@ VkImageView DrawResources::GetView(const Texture& texture, const ViewKey& key) {
 
 std::vector<vk::ImageView> DrawResources::TakeStorageViews(const Storage& storage) {
     std::vector<vk::ImageView> taken;
+    bool any_framebuffer = false;
     for (auto& [serial, views] : texture_views) {
         if (views.storage.get() != &storage) {
             continue;
         }
+        any_framebuffer |= (!views.views.empty() && views.used_in_framebuffer);
+        views.used_in_framebuffer = false;
         for (auto& [key, view] : views.views) {
             taken.push_back(std::move(view));
         }
         views.views.clear();
+    }
+    if (any_framebuffer) {
+        ++framebuffer_views_epoch;
     }
     return taken;
 }
@@ -661,9 +692,13 @@ std::shared_ptr<TextureViews> DrawResources::TakeViews(u64 serial) {
     if (it == texture_views.end()) {
         return nullptr;
     }
+    const bool was_framebuffer = it->second.used_in_framebuffer;
     auto result = std::make_shared<TextureViews>(std::move(it->second));
     texture_views.erase(it);
     ++views_epoch;
+    if (was_framebuffer) {
+        ++framebuffer_views_epoch;
+    }
     return result;
 }
 
@@ -881,6 +916,58 @@ void DrawResources::ReleaseShadows(std::vector<std::shared_ptr<ShadowChunk>>& ch
         }
     }
     chunks.clear();
+}
+
+std::shared_ptr<vk::DescriptorPool> DrawResources::AcquireDescriptorPool(u32 max_sets) {
+    {
+        std::scoped_lock lock{descriptor_pool_mutex};
+        while (!free_descriptor_pools.empty()) {
+            std::shared_ptr<vk::DescriptorPool> pool = std::move(free_descriptor_pools.back());
+            free_descriptor_pools.pop_back();
+            if (!pool) {
+                continue;
+            }
+            try {
+                pool->Reset();
+                return pool;
+            } catch (const vk::Exception& exception) {
+                LOG_WARNING(Render_Vulkan, "[nvn] descriptor pool reset failed: {}",
+                            exception.what());
+            }
+        }
+    }
+    const std::array<VkDescriptorPoolSize, 6> sizes{{
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, max_sets * 24},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, max_sets * 16},
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, max_sets * 48},
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, max_sets * 8},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, max_sets * 4},
+        {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, max_sets * 4},
+    }};
+    try {
+        return std::make_shared<vk::DescriptorPool>(impl.device.GetLogical().CreateDescriptorPool({
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .maxSets = max_sets,
+            .poolSizeCount = static_cast<u32>(sizes.size()),
+            .pPoolSizes = sizes.data(),
+        }));
+    } catch (const vk::Exception& exception) {
+        LOG_ERROR(Render_Vulkan, "[nvn] descriptor pool creation failed: {}", exception.what());
+        return nullptr;
+    }
+}
+
+void DrawResources::ReleaseDescriptorPools(
+    std::vector<std::shared_ptr<vk::DescriptorPool>>& pools) {
+    std::scoped_lock lock{descriptor_pool_mutex};
+    for (auto& pool : pools) {
+        if (pool && free_descriptor_pools.size() < MAX_FREE_DESCRIPTOR_POOLS) {
+            free_descriptor_pools.push_back(std::move(pool));
+        }
+    }
+    pools.clear();
 }
 
 VkBuffer DrawResources::DummyBuffer() {

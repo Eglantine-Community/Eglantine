@@ -27,41 +27,56 @@ u32 DescriptorTable::Allocate(u32 count) {
     return base;
 }
 
-void DescriptorTable::Release(u32 base) {
+std::vector<u64> DescriptorTable::Release(u32 base) {
     std::lock_guard lock{mutex};
     for (Range& range : ranges) {
         if (range.base == base && range.used) {
             range.used = false;
             const size_t first = std::min<size_t>(base, entries.size());
             const size_t last = std::min<size_t>(static_cast<size_t>(base) + range.span, entries.size());
-            std::fill(entries.begin() + first, entries.begin() + last, u64{0});
+            std::vector<u64> removed;
+            for (size_t i = first; i < last; ++i) {
+                if (entries[i] != 0) {
+                    removed.push_back(entries[i]);
+                    entries[i] = 0;
+                }
+            }
             dirty = true;
-            return;
+            return removed;
         }
     }
+    return {};
 }
 
-void DescriptorTable::Set(u32 base, u32 id, u64 serial) {
+bool DescriptorTable::Set(u32 base, u32 id, u64 serial, u64& previous) {
     std::lock_guard lock{mutex};
     const size_t index = static_cast<size_t>(base) + id;
     if (index >= entries.size()) {
         entries.resize(index + 1, 0);
     }
-    if (entries[index] == serial) {
-        return;
+    previous = entries[index];
+    if (previous == serial) {
+        return false;
     }
     entries[index] = serial;
     dirty = true;
+    return true;
 }
 
-void DescriptorTable::ReplaceSerial(u64 old_serial, u64 new_serial) {
+u32 DescriptorTable::ReplaceSerial(u64 old_serial, u64 new_serial) {
+    if (old_serial == new_serial) {
+        return 0;
+    }
     std::lock_guard lock{mutex};
+    u32 replaced = 0;
     for (u64& serial : entries) {
         if (serial == old_serial) {
             serial = new_serial;
             dirty = true;
+            ++replaced;
         }
     }
+    return replaced;
 }
 
 IdSnapshot DescriptorTable::Snapshot() {
@@ -194,11 +209,71 @@ SinkObject* Recorder::Impl::StateOf(u64 serial) {
     }
 }
 
+SinkObject* Recorder::Impl::PoolRefOwner(u64 serial) {
+    switch (SerialKind(serial)) {
+    case ObjectKind::Texture: {
+        TextureObject* texture = textures.Get(serial);
+        if (!texture) {
+            return nullptr;
+        }
+        return texture->desc.view_of != 0 ? textures.Get(texture->desc.view_of) : texture;
+    }
+    case ObjectKind::Sampler:
+        return samplers.Get(serial);
+    default:
+        return nullptr;
+    }
+}
+
+void Recorder::Impl::AddPoolRef(u64 serial, u32 count) {
+    if (serial == 0 || count == 0) {
+        return;
+    }
+    if (SinkObject* owner = PoolRefOwner(serial)) {
+        owner->pool_refs.fetch_add(count, std::memory_order_acq_rel);
+    }
+}
+
+bool Recorder::Impl::ReleasePoolRef(u64 serial, u32 count) {
+    if (serial == 0 || count == 0) {
+        return false;
+    }
+    bool queued = false;
+    if (SinkObject* owner = PoolRefOwner(serial)) {
+        const u32 prev = owner->pool_refs.fetch_sub(count, std::memory_order_acq_rel);
+        if (prev <= count) {
+            std::lock_guard lock{retire_mutex};
+            if (owner->finalized) {
+                // Any submission whose snapshot still carries this serial must complete first.
+                owner->destroy_after = (std::max)(owner->destroy_after, next_seq.load());
+                if (!owner->in_retire_list &&
+                    owner->pool_refs.load(std::memory_order_acquire) == 0) {
+                    owner->in_retire_list = true;
+                    retire_list.push_back(owner->serial);
+                    retire_pending.store(static_cast<u32>(retire_list.size()),
+                                         std::memory_order_release);
+                    queued = true;
+                }
+            }
+        }
+    }
+    return queued;
+}
+
+bool Recorder::Impl::ReleasePoolRefs(const std::vector<u64>& serials) {
+    bool queued = false;
+    for (const u64 serial : serials) {
+        queued |= ReleasePoolRef(serial);
+    }
+    return queued;
+}
+
 void Recorder::Impl::MarkFinalized(u64 serial) {
     SinkObject* state = StateOf(serial);
     if (!state) {
         return;
     }
+    bool queued = false;
     {
         std::lock_guard lock{retire_mutex};
         if (state->finalized) {
@@ -206,9 +281,17 @@ void Recorder::Impl::MarkFinalized(u64 serial) {
         }
         state->finalized = true;
         state->destroy_after = next_seq.load();
-        retire_list.push_back(serial);
+        if (!state->in_retire_list && state->pool_refs.load(std::memory_order_acquire) == 0) {
+            state->in_retire_list = true;
+            retire_list.push_back(serial);
+            retire_pending.store(static_cast<u32>(retire_list.size()),
+                                 std::memory_order_release);
+            queued = true;
+        }
     }
-    RunRetire();
+    if (queued) {
+        RunRetire();
+    }
 }
 
 void Recorder::Impl::AbandonRecording(CommandBufferObject& cb) {
@@ -234,19 +317,29 @@ void Recorder::Impl::ReleaseRefs(const std::vector<u64>& refs) {
 }
 
 void Recorder::Impl::RunRetire() {
+    if (retire_pending.load(std::memory_order_acquire) == 0) {
+        return;
+    }
     std::vector<u64> ready;
     {
         std::lock_guard lock{retire_mutex};
         const u64 completed = completed_seq.load();
         for (size_t i = 0; i < retire_list.size();) {
             const u64 serial = retire_list[i];
-            const SinkObject* state = StateOf(serial);
+            SinkObject* const state = StateOf(serial);
             if (!state) {
                 retire_list[i] = retire_list.back();
                 retire_list.pop_back();
                 continue;
             }
+            if (state->pool_refs.load(std::memory_order_acquire) != 0) {
+                state->in_retire_list = false;
+                retire_list[i] = retire_list.back();
+                retire_list.pop_back();
+                continue;
+            }
             if (completed >= state->destroy_after && state->list_refs.load() == 0) {
+                state->in_retire_list = false;
                 ready.push_back(serial);
                 retire_list[i] = retire_list.back();
                 retire_list.pop_back();
@@ -254,6 +347,7 @@ void Recorder::Impl::RunRetire() {
             }
             ++i;
         }
+        retire_pending.store(static_cast<u32>(retire_list.size()), std::memory_order_release);
     }
     if (ready.empty()) {
         return;
@@ -328,6 +422,10 @@ bool Recorder::Impl::EnsureProgramLocked(ProgramObject& program, bool force) {
     FlushDestroysLocked();
     sink.CreateProgram(program.desc);
     program.created.store(true);
+    for (u32 stage = 0; stage < PROGRAM_STAGES; ++stage) {
+        std::vector<u8>{}.swap(program.desc.control[stage]);
+        std::vector<u8>{}.swap(program.desc.code[stage]);
+    }
     return true;
 }
 
@@ -897,7 +995,8 @@ TextureHolderCounts Recorder::PublishTextureHolders() {
                 continue;
             }
             const TextureObject* texture = s.textures.Get(serial);
-            if (texture != nullptr && texture->desc.view_of == 0) {
+            if (texture != nullptr && texture->desc.view_of == 0 &&
+                texture->pool_refs.load(std::memory_order_acquire) == 0) {
                 holders.emplace(serial, TextureHolder::Retiring);
             }
         }
@@ -1115,8 +1214,13 @@ u64 Recorder::QueuePresentTexture(u64 queue_va, u64 window_va, u32 slot) {
     queue->last_seq.store(seq);
     window->slot_seq[slot].store(seq);
     ++impl->stats.presents;
-    // The uniform snapshot's "written lately" is this frame or the last.
+    // The uniform snapshot's "written lately" is this frame or the last; re-arm once per present.
+    if (impl->uniform_snapshot.load(std::memory_order_relaxed) != UniformSnapshotMode::Off) {
+        RearmUniformSnapshotPools(impl->snapshot_pools, impl->snapshot_cpu, impl->memory,
+                                  impl->snapshot_scratch.runs, impl->snapshot_cpu.presents + 1);
+    }
     ++impl->snapshot_cpu.presents;
+    impl->snapshot_cpu.last_rearm_presents = impl->snapshot_cpu.presents;
     impl->sink.Present(PresentRequest{seq, queue->index, window->textures[slot], slot,
                                       window->interval, window->crop});
     return seq;
@@ -1306,8 +1410,17 @@ void Recorder::MemoryPoolFinalize(u64 pool_va) {
             impl->ReleaseRefs(list->refs);
         }
     }
+    // Registered texture-pool slots copy descriptors by value on hardware, so TextureFinalize lets
+    // them outlive the CPU struct, but finalizing the backing memory pool unmaps their storage.
+    const std::vector<u64> removed_textures = impl->texture_table.ClearIf([&](u64 tex_serial) {
+        const TextureObject* texture = impl->textures.Get(tex_serial);
+        return texture == nullptr || texture->desc.pool_serial == serial;
+    });
+    const bool queued = impl->ReleasePoolRefs(removed_textures);
     impl->Release(ObjectKind::MemoryPool, pool_va, serial);
-    impl->RunRetire();
+    if (queued) {
+        impl->RunRetire();
+    }
 }
 
 std::optional<PoolInfo> Recorder::GetMemoryPool(u64 pool_va) {
@@ -1352,8 +1465,12 @@ bool Recorder::TexturePoolInitialize(u64 pool_va_of_tp, u64 memory_pool_va, s64 
 void Recorder::TexturePoolFinalize(u64 texture_pool_va) {
     if (const DescriptorPoolObject* object = impl->Lookup(
             impl->texture_pools, ObjectKind::TexturePool, texture_pool_va, __func__)) {
-        impl->texture_table.Release(object->base);
+        const std::vector<u64> removed = impl->texture_table.Release(object->base);
+        const bool queued = impl->ReleasePoolRefs(removed);
         impl->Release(ObjectKind::TexturePool, texture_pool_va, object->serial);
+        if (queued) {
+            impl->RunRetire();
+        }
     }
 }
 
@@ -1370,6 +1487,20 @@ namespace {
 bool PlainView(const TextureViewDesc& view) {
     return !view.set_levels && !view.set_layers && !view.set_format && !view.set_target &&
            !view.set_swizzle && !view.set_dsmode && !view.is_image;
+}
+
+void SetDescriptorSlot(Recorder::Impl& impl, DescriptorTable& table, u32 base, u32 id, u64 serial) {
+    // Take the pool reference before publishing `serial` so a concurrent Release/ClearIf cannot
+    // observe the slot before the reference count is incremented.
+    impl.AddPoolRef(serial);
+    u64 previous = 0;
+    if (table.Set(base, id, serial, previous)) {
+        if (previous != 0 && impl.ReleasePoolRef(previous)) {
+            impl.RunRetire();
+        }
+    } else {
+        static_cast<void>(impl.ReleasePoolRef(serial));
+    }
 }
 } // namespace
 
@@ -1425,7 +1556,7 @@ void RegisterTextureImpl(Recorder::Impl& impl, u64 texture_pool_va, s32 id, u64 
         view.is_image = image ? 1 : 0;
         serial = PlainView(view) ? texture->serial : impl.ViewSerialFor(*texture, view);
     }
-    impl.texture_table.Set(pool->base, static_cast<u32>(id), serial);
+    SetDescriptorSlot(impl, impl.texture_table, pool->base, static_cast<u32>(id), serial);
 }
 } // namespace
 
@@ -1462,8 +1593,12 @@ bool Recorder::SamplerPoolInitialize(u64 sampler_pool_va, u64 memory_pool_va, s6
 void Recorder::SamplerPoolFinalize(u64 sampler_pool_va) {
     if (const DescriptorPoolObject* object = impl->Lookup(
             impl->sampler_pools, ObjectKind::SamplerPool, sampler_pool_va, __func__)) {
-        impl->sampler_table.Release(object->base);
+        const std::vector<u64> removed = impl->sampler_table.Release(object->base);
+        const bool queued = impl->ReleasePoolRefs(removed);
         impl->Release(ObjectKind::SamplerPool, sampler_pool_va, object->serial);
+        if (queued) {
+            impl->RunRetire();
+        }
     }
 }
 
@@ -1496,7 +1631,7 @@ void Recorder::RegisterSampler(u64 sampler_pool_va, s32 id, u64 sampler_va) {
         }
         serial = sampler->serial;
     }
-    impl->sampler_table.Set(pool->base, static_cast<u32>(id), serial);
+    SetDescriptorSlot(*impl, impl->sampler_table, pool->base, static_cast<u32>(id), serial);
 }
 
 void Recorder::RegisterSamplerParams(u64 sampler_pool_va, s32 id, const SamplerDesc& desc) {
@@ -1510,7 +1645,8 @@ void Recorder::RegisterSamplerParams(u64 sampler_pool_va, s32 id, const SamplerD
                          id, pool->count);
         return;
     }
-    impl->sampler_table.Set(pool->base, static_cast<u32>(id), impl->AnonymousSamplerSerial(desc));
+    const u64 serial = impl->AnonymousSamplerSerial(desc);
+    SetDescriptorSlot(*impl, impl->sampler_table, pool->base, static_cast<u32>(id), serial);
 }
 
 // ---- Textures, samplers, buffers ---------------------------------------------------------------------
@@ -1548,10 +1684,22 @@ bool Recorder::TextureInitialize(u64 texture_va, const TextureDesc& desc, u64 me
         // A texture pool entry names the object at its guest address. Reinitializing that address
         // gives it a new serial, so future submissions must resolve the same registrations to the
         // new object (and its views), while old submissions keep their immutable snapshots.
-        impl->texture_table.ReplaceSerial(previous_serial, texture->serial);
+        const auto replace_pool_serial = [&](u64 old_serial, u64 new_serial) {
+            const u32 replaced = impl->texture_table.ReplaceSerial(old_serial, new_serial);
+            if (replaced != 0) {
+                impl->AddPoolRef(new_serial, replaced);
+                return impl->ReleasePoolRef(old_serial, replaced);
+            }
+            return false;
+        };
+        bool queued = replace_pool_serial(previous_serial, texture->serial);
         for (const auto& [view, old_view_serial] : previous_views) {
-            impl->texture_table.ReplaceSerial(old_view_serial,
-                                              impl->ViewSerialFor(*texture, view));
+            if (replace_pool_serial(old_view_serial, impl->ViewSerialFor(*texture, view))) {
+                queued = true;
+            }
+        }
+        if (queued) {
+            impl->RunRetire();
         }
     }
     return true;

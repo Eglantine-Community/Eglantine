@@ -58,6 +58,10 @@ inline constexpr u64 SUB_MIRROR = 3;   ///< guest bytes copied into a mirror poo
 inline constexpr u64 SUB_STORAGE = 4;  ///< guest bytes uploaded into an image
 inline constexpr u64 SUB_SHADOW = 5;   ///< storage shadow copy-in / copy-back (nvn_draw_shadow.cpp)
 inline constexpr u64 SUB_VERTEX = 6;   ///< vertex ranges staged for a pass (nvn_vertex_stage.h)
+inline constexpr u64 SUB_READBACK = 7; ///< GPU-written mirror ranges read back to guest memory
+inline constexpr u64 SUB_COUNTERS = 8; ///< occlusion query resolve and condition predicate compute
+inline constexpr u64 SUB_ALIAS_COPY = 9;   ///< image/buffer copy between same-layout overlapping storages
+inline constexpr u64 SUB_ALIAS_BYTES = 10; ///< compute byte-reinterpretation alias transfer
 
 enum class Kind : u8 {
     Segment,  ///< one command buffer of a submission, start to end
@@ -153,6 +157,9 @@ public:
 
     /// Nesting depth of `Scope`s (only the outermost one measures).
     u32 depth{0};
+    /// Incremented when a segment ends so scopes still alive across a mid-scope flush do not
+    /// stamp an already-ended command buffer.
+    u32 segment_epoch{0};
     /// Submission sequence number (the frame timeline lines name it).
     u64 seq{0};
     /// EDEN_NX2_NVN_COSTSPLIT: the schedule slot the submission was recorded in (-1: none) and
@@ -210,6 +217,7 @@ private:
     Flight* flight_{};
     vk::CommandBuffer cmd_{};
     u32 begin_{NONE};
+    u32 segment_epoch_{0};
     bool outermost_{false};
     u64 units_{};
     u32 split_{};

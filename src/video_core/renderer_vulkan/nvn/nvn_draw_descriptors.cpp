@@ -8,6 +8,9 @@
 #include <algorithm>
 #include <bit>
 #include <cstring>
+#include <mutex>
+#include <set>
+#include <tuple>
 #include <unordered_map>
 
 #include <fmt/format.h>
@@ -18,6 +21,7 @@
 #include "video_core/nvn/shader/nvn_handle_program.h"
 #include "video_core/renderer_vulkan/nvn/nvn_draw.h"
 #include "video_core/renderer_vulkan/nvn/nvn_draw_plan.h"
+#include "video_core/renderer_vulkan/nvn/nvn_pipeline_state.h"
 #include "video_core/renderer_vulkan/nvn/nvn_sampler_aniso.h"
 
 namespace Vulkan::Nvn {
@@ -866,8 +870,8 @@ bool DrawContext::ViewKeyOf(const Texture& texture, const Storage& s, Shader::Te
         if (!own_format && texture.host.storage_view != VK_FORMAT_UNDEFINED) {
             key.format = texture.host.storage_view;
         }
-        if ((s.usage & VK_IMAGE_USAGE_STORAGE_BIT) == 0 || s.astc_gpu ||
-            (!own_format && texture.host.storage_view == VK_FORMAT_UNDEFINED)) {
+        if (((s.usage & VK_IMAGE_USAGE_STORAGE_BIT) == 0 && !s.can_upgrade_storage) ||
+            s.astc_gpu || (!own_format && texture.host.storage_view == VK_FORMAT_UNDEFINED)) {
             compatible = false;
         }
     }
@@ -913,11 +917,37 @@ std::shared_ptr<Texture> DrawContext::ScaledTextureFor(Texture& texture, bool gr
 
 bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool graphics) {
     plan.graphics = graphics;
+    if (graphics) {
+        compute_groups = {};
+        compute_thread_group = {};
+    }
     const VC::DescriptorLayout& layout = pipe.descriptors;
+    static const bool read_only_depth_probe = [] {
+        const char* value = std::getenv("EDEN_NX2_NVN_READ_ONLY_DEPTH");
+        return value == nullptr || value[0] != '0';
+    }();
+    const Storage* depth_attachment =
+        depth_target.texture ? depth_target.texture->storage.get() : nullptr;
+    const bool allow_read_only_depth =
+        graphics && read_only_depth_probe && impl.device.ApiVersion() >= VK_API_VERSION_1_3 &&
+        impl.device.GetDriverID() == VK_DRIVER_ID_MESA_RADV && !targets_scaled &&
+        !depth_target.alias && depth_attachment != nullptr &&
+        depth_attachment->host.format == VK_FORMAT_D32_SFLOAT &&
+        depth_attachment->aspect == VK_IMAGE_ASPECT_DEPTH_BIT &&
+        depth_attachment->samples == VK_SAMPLE_COUNT_1_BIT && depth_attachment->levels == 1 &&
+        depth_attachment->layers == 1 && !layout.stores_raw_global_memory &&
+        !MakeDynamicFixedState(fixed).depth_write_enable &&
+        std::ranges::none_of(layout.bindings, [](const VC::DescriptorBinding& binding) {
+            return binding.is_written;
+        });
+    if (pass_open && pass_read_only_depth && allow_read_only_depth) {
+        plan.read_only_depth = true;
+    }
     scratch_writes.clear();
     scratch_buffers.clear();
     scratch_images.clear();
     scratch_views.clear();
+    scratch_template_ok = pipe.update_template != VK_NULL_HANDLE;
     size_t total = 0;
     for (const VC::DescriptorBinding& binding : layout.bindings) {
         total += binding.count;
@@ -962,9 +992,13 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
         }
     }
     if (layout.uses_raw_global_memory) {
+        InFlight& raw_flight = host->HostFlight();
+        coverage_ring = impl.RawCoverageRingFor(raw_flight.seq);
+        if (coverage_ring != 0) {
+            host->HostNeedHostReadBarrier();
+        }
         raw_table = &impl.RawGlobalMemoryTable();
         impl.stats.raw_global_draws.fetch_add(1, std::memory_order_relaxed);
-        InFlight& raw_flight = host->HostFlight();
         if (raw_noted_seq != raw_flight.seq || raw_noted_generation != raw_table->generation) {
             raw_noted_seq = raw_flight.seq;
             raw_noted_generation = raw_table->generation;
@@ -994,12 +1028,6 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                 if (alias_table->device) {
                     raw_flight.keepalive.push_back(alias_table->device);
                 }
-            }
-        }
-        if (VideoCommon::RawCoverageEnabled()) {
-            coverage_ring = impl.RawCoverageRingFor(raw_flight.seq);
-            if (coverage_ring != 0) {
-                host->HostNeedHostReadBarrier();
             }
         }
     }
@@ -1146,15 +1174,14 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
             }
         }
         const bool misaligned = resolved && uniform && (ref.offset % 256) != 0;
-        const bool may_need_gpu_source =
-            resolved && !write && snapshot_range == UniformSnapshotView::npos &&
-            (misaligned || (overlaps && pass_open));
-        const bool needs_gpu_source =
-            may_need_gpu_source &&
-            (ref.pool->backing == Pool::Backing::DeviceLocal ||
-             HasOverlappingShadow(*ref.pool, ref.pool_offset, ref.pool_offset + size) ||
-             impl.NeedsGpuFlushForUniform(binding.address, binding.address + size, current_seq));
-        if (misaligned && needs_gpu_source) {
+        const auto check_needs_gpu_source = [&] {
+            return resolved && !write && snapshot_range == UniformSnapshotView::npos &&
+                   (ref.pool->backing == Pool::Backing::DeviceLocal ||
+                    HasOverlappingShadow(*ref.pool, ref.pool_offset, ref.pool_offset + size) ||
+                    impl.NeedsGpuFlushForUniform(binding.address, binding.address + size,
+                                                 current_seq));
+        };
+        if (misaligned && check_needs_gpu_source()) {
             const BufferRef copy = AllocArena(size, 256, nullptr);
             if (copy.buffer) {
                 if (overlaps) {
@@ -1173,7 +1200,7 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
         bool flush_inline_to_pool = false;
         if (overlaps && !misaligned && resolved && !write &&
             snapshot_range == UniformSnapshotView::npos) {
-            if (!pass_open || needs_gpu_source) {
+            if (!pass_open || check_needs_gpu_source()) {
                 flush_inline_to_pool = true;
                 plan.flush_inline = true;
             }
@@ -1222,6 +1249,17 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
             note(uniform ? DescReason::UniformUnresolved : DescReason::StorageUnresolved);
             return fallback();
         }
+        if (graphics && !write && !unsized) {
+            if (const BufferRef copy = TryCopyMirrorRangeToArena(
+                    *ref.pool, ref.pool_offset, binding.address, size, uniform ? 256 : 64);
+                copy.buffer) {
+                if (cs_mode != CostSplit::Mode::Count) [[unlikely]] {
+                    CostSplitNote(uniform ? CostSplit::Data::Uniform : CostSplit::Data::Storage,
+                                  ref, size, true);
+                }
+                return VkDescriptorBufferInfo{copy.buffer, copy.offset, size};
+            }
+        }
         // A written storage range of an imported pool lives in host memory: shader stores and
         // atomics would cross PCIe (15-19 ns per atomic measured). A small one is bound through a
         // device-local shadow for as long as nothing else uses the bytes (nvn_draw_shadow.cpp);
@@ -1258,6 +1296,7 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
     for (const VC::DescriptorBinding& binding : layout.bindings) {
         const u32 stage = static_cast<u32>(binding.stage);
         const u32 count = binding.count;
+        scratch_template_ok &= count >= 1;
         VkWriteDescriptorSet write{
             .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
             .pNext = nullptr,
@@ -1278,23 +1317,47 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                 case VC::DescriptorRole::DriverTable: {
                     BufferRef& ref = driver_bank[stage];
                     if (!ref.buffer) {
+                        const u64 seq = host->HostFlight().seq;
+                        const u64 raw_generation = raw_table ? raw_table->generation + 1 : 0;
+                        const void* raw_device = raw_table ? raw_table->device.get() : nullptr;
                         if (binding.stage == VC::ShaderStage::Compute) {
-                            u8* pointer = nullptr;
-                            ref = AllocArena(DRIVER_BANK_SIZE, 256, &pointer);
-                            FillComputeBank(pipe.compute_layout, pointer);
-                            if (raw_table != nullptr) {
-                                WriteRawGlobalTable(raw_table->device.get(), coverage_ring,
-                                                    std::span<u8>{pointer, DRIVER_BANK_SIZE},
-                                                    alias_header);
+                            ComputeBankCache& cache = compute_driver_bank;
+                            if (cache.seq != seq || cache.uniform_gen != compute_uniform_gen ||
+                                cache.storage_gen != storage_gen[STAGE_COMPUTE] ||
+                                cache.handle_gen != handle_gen[STAGE_COMPUTE] ||
+                                cache.push_gen != push_gen[1] || cache.raw_gen != raw_generation ||
+                                cache.raw_device != raw_device ||
+                                cache.coverage_ring != coverage_ring ||
+                                cache.alias_gen != alias_generation ||
+                                cache.groups != compute_groups ||
+                                cache.layout != pipe.compute_layout) {
+                                u8* pointer = nullptr;
+                                cache.ref = AllocArena(DRIVER_BANK_SIZE, 256, &pointer);
+                                ++counters.driver_bank_uploads;
+                                FillComputeBank(pipe.compute_layout, pointer);
+                                if (raw_table != nullptr) {
+                                    WriteRawGlobalTable(raw_table->device.get(), coverage_ring,
+                                                        std::span<u8>{pointer, DRIVER_BANK_SIZE},
+                                                        alias_header);
+                                }
+                                cache.seq = seq;
+                                cache.uniform_gen = compute_uniform_gen;
+                                cache.storage_gen = storage_gen[STAGE_COMPUTE];
+                                cache.handle_gen = handle_gen[STAGE_COMPUTE];
+                                cache.push_gen = push_gen[1];
+                                cache.raw_gen = raw_generation;
+                                cache.raw_device = raw_device;
+                                cache.coverage_ring = coverage_ring;
+                                cache.alias_gen = alias_generation;
+                                cache.groups = compute_groups;
+                                cache.layout = pipe.compute_layout;
                             }
+                            ref = cache.ref;
                         } else {
                             // The arena copy of the last build serves every draw of the
                             // submission until what the bank is made of changes.
                             BankCache& cache = driver_banks[stage];
-                            const u64 seq = host->HostFlight().seq;
-                            const u64 raw_generation = raw_table ? raw_table->generation + 1 : 0;
                             const u64 pool_bases = u64{texture_pool_base} << 32 | sampler_pool_base;
-                            const void* raw_device = raw_table ? raw_table->device.get() : nullptr;
                             if (cache.seq != seq || cache.a != storage_gen[stage] ||
                                 cache.b != push_gen[0] || cache.c != raw_generation ||
                                 cache.d != raw_device || cache.e != mesh_dims_gen ||
@@ -1473,7 +1536,13 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                         Texture* view_texture = texture.get();
                         bool scratch = false;
                         bound = true;
-                        if (graphics && IsBoundTarget(&s)) {
+                        if (allow_read_only_depth && &s == depth_attachment && !is_image &&
+                            !twin && key.format == VK_FORMAT_D32_SFLOAT &&
+                            wanted == VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL) {
+                            plan.read_only_depth = true;
+                            plan.UseImage(texture->storage, wanted, true, false, false, false,
+                                          key.format);
+                        } else if (graphics && IsBoundTarget(&s)) {
                             // A render target of this very draw: the pass writes it, so sample a
                             // copy of it made before the pass (copy-on-read).
                             bound = false;
@@ -1552,8 +1621,11 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                                 }
                             }
                         } else {
+                            const bool write_only_img =
+                                is_image && binding.is_written && !binding.is_read;
                             plan.UseImage(texture->storage, wanted, !is_image,
-                                          is_image && binding.is_written);
+                                          is_image && binding.is_written, write_only_img, is_image,
+                                          key.format);
                         }
                         if (bound) {
                             if (twin) {
@@ -1778,6 +1850,7 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
             if (!usable) {
                 ++counters.descriptors_unsupported;
                 host->HostFailed("Draw", "no arena space for a texture buffer");
+                scratch_template_ok = false;
                 continue;
             }
             write.pTexelBufferView = &scratch_views[first];
@@ -1788,6 +1861,7 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
             ++counters.descriptors_unsupported;
             note(DescReason::TexelBuffer);
             host->HostUnsupported("Draw", "storage texel buffer descriptors are not supported");
+            scratch_template_ok = false;
             continue;
         }
         scratch_writes.push_back(write);
@@ -1934,7 +2008,7 @@ void DrawContext::RecordFeedbackCopies(DrawPlan& plan) {
                                           *scratch.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                           region);
             }
-            host->HostMarkWritten();
+            host->HostMarkTransferWritten();
             ++counters.placeholder_copies;
             continue;
         }
@@ -1951,7 +2025,7 @@ void DrawContext::RecordFeedbackCopies(DrawPlan& plan) {
             };
             host->HostCmd().CopyImage(*source.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                       *scratch.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
-            host->HostMarkWritten();
+            host->HostMarkTransferWritten();
             if (DrawResources::Scratch* record = resources.FindScratch(scratch)) {
                 record->copied.Record(copy.source, this, render_target_epoch.value, {0, 1, 0, 1});
             }
@@ -1978,7 +2052,7 @@ void DrawContext::RecordFeedbackCopies(DrawPlan& plan) {
             host->HostCmd().CopyImage(*source.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                       *scratch.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
         }
-        host->HostMarkWritten();
+        host->HostMarkTransferWritten();
         if (DrawResources::Scratch* record = resources.FindScratch(scratch)) {
             record->copied.Record(copy.source, this, render_target_epoch.value,
                                   {copy.level, copy.levels, copy.layer, copy.layers});
@@ -2015,18 +2089,60 @@ void DrawContext::PruneFreshFeedback(DrawPlan& plan) {
 bool DrawContext::PrepareOutsidePass(DrawPlan& plan) {
     bool need = false;
     BreakCause cause = BreakCause::FeedbackCopy;
-    // A counter report of the open pass is written when the pass ends. A draw that writes its
-    // bytes (or any pool through raw global memory) must come after it; a draw that reads them
-    // only once a game barrier ordered the report (pass_reports_ordered, see Op::Barrier): before
-    // that the read is not ordered after the report on the console either.
-    if (pass_open && host->HostReportsPending()) {
-        bool uses_report = plan.raw_global_writes || (pass_reports_ordered && plan.raw_global);
-        for (const DrawPlan::RangeUse& use : plan.ranges) {
-            uses_report = uses_report ||
-                          ((use.write || pass_reports_ordered) &&
-                           host->HostReportPending(*use.pool, use.offset, use.size));
+    if (!pass_open && pending_clears.Any()) {
+        const auto storage_range = [](const Storage& st, u64& serial, u64& lo, u64& hi) {
+            const Storage& base = st.scale_owner ? *st.scale_owner : st;
+            serial = base.pool_serial;
+            lo = base.pool_offset;
+            hi = base.pool_offset + base.layout.size;
+        };
+        const auto target_overlaps_plan = [&](const TargetBinding& target) {
+            if (!target.texture || !target.texture->storage) {
+                return false;
+            }
+            u64 t_serial = 0, t_lo = 0, t_hi = 0;
+            storage_range(*target.texture->storage, t_serial, t_lo, t_hi);
+            for (const DrawPlan::ImageUse& use : plan.images) {
+                if (!use.owner) {
+                    continue;
+                }
+                u64 u_serial = 0, u_lo = 0, u_hi = 0;
+                storage_range(*use.owner, u_serial, u_lo, u_hi);
+                if (u_serial == t_serial && u_lo < t_hi && t_lo < u_hi) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        bool flush_clears = !plan.feedback.empty() || target_overlaps_plan(depth_target);
+        for (u32 i = 0; !flush_clears && i < color_target_count; ++i) {
+            flush_clears = target_overlaps_plan(color_targets[i]);
         }
-        if (uses_report) {
+        if (flush_clears) {
+            FlushPendingClears(BreakCause::FeedbackCopy);
+        }
+    }
+    // A pending counter report is written in batch order once needed outside a pass or by an
+    // ordered reader. A draw that writes its bytes (or any pool through raw global memory) must
+    // come after it; a draw inside an open pass that reads an in-pass report only once a game
+    // barrier ordered the report (HostOrderedReportsPending, see Op::Barrier).
+    bool resolve_reports = false;
+    if (host->HostReportsPending()) {
+        const bool ordered = !pass_open || host->HostOrderedReportsPending();
+        const bool ordered_only = pass_open;
+        resolve_reports = plan.raw_global_writes || (ordered && plan.raw_global);
+        for (const DrawPlan::RangeUse& use : plan.ranges) {
+            if (resolve_reports) {
+                break;
+            }
+            if (use.write) {
+                resolve_reports = host->HostReportPending(*use.pool, use.offset, use.size);
+            } else if (ordered) {
+                resolve_reports =
+                    host->HostReportPending(*use.pool, use.offset, use.size, ordered_only);
+            }
+        }
+        if (resolve_reports && pass_open) {
             cause = BreakCause::ReportRead;
             need = true;
         }
@@ -2035,18 +2151,50 @@ bool DrawContext::PrepareOutsidePass(DrawPlan& plan) {
     // its contents record commands" answered BEFORE the pass is begun or continued.
     for (DrawPlan::ImageUse& use : plan.images) {
         Storage& s = *use.owner;
-        use.needs_contents = host->HostNeedsCommands(s, false);
+        bool overwrite = false;
+        if (!plan.graphics && use.write_only && s.levels == 1 && s.layers == 1 &&
+            s.type == VK_IMAGE_TYPE_2D && !s.sparse && !host->HostIsCpuReadablePool(s)) {
+            const u64 gx = static_cast<u64>(compute_groups[0]) * compute_thread_group[0];
+            const u64 gy = static_cast<u64>(compute_groups[1]) * compute_thread_group[1];
+            const u64 gz = (std::max<u64>)(
+                static_cast<u64>(compute_groups[2]) * compute_thread_group[2], 1);
+            if (gx * gy * gz >= static_cast<u64>(s.extent.width) * s.extent.height) {
+                overwrite = true;
+            }
+        }
+        use.will_overwrite = overwrite;
+        use.needs_upgrade_storage =
+            use.is_storage_image && (s.usage & VK_IMAGE_USAGE_STORAGE_BIT) == 0 &&
+            s.can_upgrade_storage;
+        use.needs_upgrade_formats =
+            s.pending_unrestricted_formats || use.view_format_needs_unrestricted ||
+            (use.view_format != VK_FORMAT_UNDEFINED && !s.FormatListAllows(use.view_format));
+        if ((use.needs_upgrade_storage || use.needs_upgrade_formats) && !s.image) {
+            host->HostUpgradeImageCaps(s, use.needs_upgrade_storage, use.needs_upgrade_formats);
+            use.needs_upgrade_storage = false;
+            use.needs_upgrade_formats = false;
+        }
+        const bool layout_only_ready =
+            use.layout_only && s.image && s.contents_valid && !s.force_upload;
+        use.needs_contents =
+            layout_only_ready ? false : host->HostNeedsCommands(s, use.will_overwrite);
         use.skip = !s.image;
         if (!use.skip && s.current_layout != use.layout &&
             (s.current_layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL ||
-             s.current_layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL) &&
+             s.current_layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL ||
+             s.current_layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL ||
+             s.current_layout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) &&
             (use.layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL ||
              use.layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL)) {
             NoteFlipTarget(use.owner, use.layout);
         }
-        if (!use.skip && (use.needs_contents || s.current_layout != use.layout)) {
+        if (!use.skip && (use.needs_contents || s.current_layout != use.layout ||
+                          use.needs_upgrade_storage || use.needs_upgrade_formats)) {
             if (!need) {
-                cause = use.needs_contents ? BreakCause::ContentsUpload : BreakCause::LayoutChange;
+                cause = (use.needs_contents && !use.needs_upgrade_storage &&
+                         !use.needs_upgrade_formats)
+                            ? BreakCause::ContentsUpload
+                            : BreakCause::LayoutChange;
                 if (pass_open && Debug::Get().op_log &&
                     Debug::FrameSelected(impl.presents_recorded + 1)) {
                     LOG_INFO(Render_Vulkan,
@@ -2068,6 +2216,17 @@ bool DrawContext::PrepareOutsidePass(DrawPlan& plan) {
                 cause = BreakCause::MirrorUpload;
             }
             need = true;
+        }
+    }
+    if (plan.raw_global && !impl.raw_table.mirror_pools.empty()) {
+        for (Pool* const mp : impl.raw_table.mirror_pools) {
+            if (host->HostMirrorNeedsUpload(*mp, 0, mp->size)) {
+                if (!need) {
+                    cause = BreakCause::MirrorUpload;
+                }
+                need = true;
+                break;
+            }
         }
     }
     if ((plan.flush_inline && !inline_updates.empty()) || !plan.uniform_copies.empty()) {
@@ -2107,6 +2266,9 @@ bool DrawContext::PrepareOutsidePass(DrawPlan& plan) {
         EndPass(cause);
     }
     if (!pass_open) {
+        if (resolve_reports) {
+            host->HostResolveCounterBatch();
+        }
         if (plan.flush_inline && !inline_updates.empty()) {
             FlushInlineUpdates();
         }
@@ -2118,9 +2280,20 @@ bool DrawContext::PrepareOutsidePass(DrawPlan& plan) {
             }
             Storage& s = *use.owner;
             host->HostNoteTouched(use.owner);
-            if (use.needs_contents) {
-                host->HostEnsureContents(s, false);
+            if (use.needs_upgrade_storage || use.needs_upgrade_formats) {
+                if (!host->HostUpgradeImageCaps(s, use.needs_upgrade_storage,
+                                                use.needs_upgrade_formats)) {
+                    use.skip = true;
+                    continue;
+                }
             }
+            if (use.needs_contents || use.will_overwrite) {
+                const char* const caller = use.from_bindless_prime
+                                               ? "BindlessPrime"
+                                               : (plan.graphics ? "Draw" : "Compute");
+                host->HostEnsureContents(s, use.will_overwrite, caller);
+            }
+            bool need_transition = true;
             if (use.sample_only) {
                 // Sampled in GENERAL only where the image is (BuildDescriptors): when loading the
                 // contents moved it out, it is sampled read-only.
@@ -2128,18 +2301,33 @@ bool DrawContext::PrepareOutsidePass(DrawPlan& plan) {
                     s.current_layout != VK_IMAGE_LAYOUT_GENERAL) {
                     use.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
                 }
-                if (s.current_layout == use.layout) {
-                    continue;
-                }
+                need_transition = s.current_layout != use.layout;
             }
-            transition_scratch.emplace_back(&s, use.layout);
+            if (need_transition) {
+                transition_scratch.emplace_back(&s, use.layout);
+            }
+            if (use.from_bindless_prime && (use.needs_contents || use.will_overwrite) &&
+                host->HostUploadEarlySubmitDue()) {
+                if (!transition_scratch.empty()) {
+                    host->HostTransitionMany(transition_scratch, false);
+                    transition_scratch.clear();
+                }
+                host->HostSubmitUploadPiece();
+            }
         }
         host->HostTransitionMany(transition_scratch, false);
+        mirror_upload_scratch.clear();
         for (const DrawPlan::RangeUse& use : plan.ranges) {
             if (use.pool->backing == Pool::Backing::Mirror) {
-                host->HostUploadRange(*use.pool, use.offset, use.size);
+                mirror_upload_scratch.push_back({use.pool, use.offset, use.size});
             }
         }
+        if (plan.raw_global) {
+            for (Pool* const mp : impl.raw_table.mirror_pools) {
+                mirror_upload_scratch.push_back({mp, 0, mp->size});
+            }
+        }
+        host->HostUploadRanges(mirror_upload_scratch);
         if (shadow.any) {
             ApplyShadows(plan, true);
         }
@@ -2153,7 +2341,7 @@ bool DrawContext::PrepareOutsidePass(DrawPlan& plan) {
                 };
                 host->HostCmd().CopyBuffer(copy.src, copy.dst, region);
             }
-            host->HostMarkWritten();
+            host->HostMarkTransferWritten();
         }
         // A dispatch orders after earlier dispatches only as NVN does (behind a game barrier);
         // the replay's own commands above flushed for themselves.
@@ -2179,6 +2367,20 @@ bool DrawContext::PrepareOutsidePass(DrawPlan& plan) {
             if (use.redirected) {
                 host->HostNoteShadowedWrite(*use.pool, use.offset, use.size);
             } else {
+                if (use.pool->backing == Pool::Backing::Mirror && use.size >= (u64{1} << 20)) {
+                    static std::mutex ssbo_diag_mutex;
+                    static std::set<std::tuple<u64, u64, u64>> ssbo_diag_seen;
+                    std::scoped_lock lock{ssbo_diag_mutex};
+                    if (ssbo_diag_seen.size() < 8 &&
+                        ssbo_diag_seen.emplace(use.pool->serial, use.offset, use.size).second) {
+                        LOG_INFO(Render_Vulkan,
+                                 "[nvn] large mirror ssbo write #{}: {} prog={:016x} "
+                                 "pool={:#x} off={:#x} sz={:#x} flags={:#x}",
+                                 ssbo_diag_seen.size(), plan.graphics ? "graphics" : "compute",
+                                 ProfStageHash(plan.graphics ? 1u : STAGE_COMPUTE),
+                                 use.pool->serial, use.offset, use.size, use.pool->flags);
+                    }
+                }
                 host->HostNotePoolWrite(*use.pool, use.offset, use.size);
             }
         }
@@ -2247,10 +2449,10 @@ bool DrawContext::PushPlan(PipelineBase& pipe, DrawPlan& plan, VkPipelineBindPoi
     if (cs_mode == CostSplit::Mode::NoBind && bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS &&
         pipe.layout) [[unlikely]] {
         // The pass's first class draw pushed for this layout: its descriptors and constants stay.
-        if (cs_draw_index > 0 && *pipe.layout == cs_pushed_layout) {
+        if (cs_draw_index > 0 && pipe.layout == cs_pushed_layout) {
             return true;
         }
-        cs_pushed_layout = *pipe.layout;
+        cs_pushed_layout = pipe.layout;
     }
     // Inside an open pass a draw skips what the pass has recorded already (nvn_pass_state.h).
     const bool track = bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS && pass_open &&
@@ -2270,21 +2472,34 @@ bool DrawContext::PushPlan(PipelineBase& pipe, DrawPlan& plan, VkPipelineBindPoi
     } else if (pipe.descriptors.UsesPushConstants() && pipe.layout) {
         using namespace Shader::Backend::SPIRV;
         const VkShaderStageFlags stage_flags = pipe.push_constant_stages;
-        cmd.PushConstants(*pipe.layout, stage_flags, RESCALING_LAYOUT_WORDS_OFFSET,
-                          sizeof(pushed.words), pushed.words.data());
-        cmd.PushConstants(*pipe.layout, stage_flags, RESCALING_LAYOUT_DOWN_FACTOR_OFFSET,
-                          sizeof(pushed.down_factor), &pushed.down_factor);
+        if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+            struct ScalingConstants {
+                std::array<u32, Rescale::PUSH_WORDS> words;
+                f32 down_factor;
+            };
+            static_assert(RESCALING_LAYOUT_DOWN_FACTOR_OFFSET ==
+                          RESCALING_LAYOUT_WORDS_OFFSET + offsetof(ScalingConstants, down_factor));
+            const ScalingConstants constants{pushed.words, pushed.down_factor};
+            cmd.PushConstants(pipe.layout, stage_flags, RESCALING_LAYOUT_WORDS_OFFSET,
+                              sizeof(constants), &constants);
+        } else {
+            cmd.PushConstants(pipe.layout, stage_flags, RESCALING_LAYOUT_WORDS_OFFSET,
+                              sizeof(pushed.words), pushed.words.data());
+        }
         if (pipe.descriptors.uses_render_area) {
             const std::array<f32, 4> area{static_cast<f32>(framebuffer_extent.width),
                                           static_cast<f32>(framebuffer_extent.height), 0.0f, 0.0f};
-            cmd.PushConstants(*pipe.layout, stage_flags, RENDERAREA_LAYOUT_OFFSET, sizeof(area),
+            cmd.PushConstants(pipe.layout, stage_flags, RENDERAREA_LAYOUT_OFFSET, sizeof(area),
                               area.data());
         }
     }
     if (scratch_writes.empty() || !pipe.set_layout) {
         return true;
     }
-    const bool need_sigs = track || !pipe.push_descriptors;
+    const bool use_template = scratch_template_ok && pipe.update_template != VK_NULL_HANDLE &&
+                              scratch_writes.size() == pipe.descriptors.bindings.size();
+    const bool need_sigs =
+        (track && (!use_template || !scratch_views.empty())) || !pipe.push_descriptors;
     bool comparable = false;
     if (need_sigs) {
         comparable = true;
@@ -2298,18 +2513,55 @@ bool DrawContext::PushPlan(PipelineBase& pipe, DrawPlan& plan, VkPipelineBindPoi
         for (const VkDescriptorImageInfo& info : scratch_images) {
             scratch_image_sigs.push_back({info.sampler, info.imageView, info.imageLayout});
         }
-        if (track) {
-            if (!comparable) {
-                bound_state.ForgetDescriptors();
-            } else if (bound_state.TakeDescriptors(*pipe.layout, scratch_write_sigs,
-                                                   scratch_buffers, scratch_image_sigs)) {
+    }
+    if (track) {
+        if (use_template && scratch_views.empty()) {
+            if (bound_state.TakeTemplateDescriptors(pipe.layout, scratch_buffers, scratch_images)) {
                 ++counters.elided_descriptors;
                 return true;
             }
+        } else if (!comparable) {
+            bound_state.ForgetDescriptors();
+        } else if (bound_state.TakeDescriptors(pipe.layout, scratch_write_sigs, scratch_buffers,
+                                               scratch_image_sigs)) {
+            ++counters.elided_descriptors;
+            return true;
+        }
+    }
+    bool template_ready = false;
+    if (use_template) {
+        scratch_template_entries.clear();
+        scratch_template_entries.reserve(pipe.template_entry_count);
+        for (const VkWriteDescriptorSet& write : scratch_writes) {
+            if (write.pBufferInfo != nullptr) {
+                for (u32 i = 0; i < write.descriptorCount; ++i) {
+                    DescriptorTemplateEntry entry{};
+                    entry.buffer = write.pBufferInfo[i];
+                    scratch_template_entries.push_back(entry);
+                }
+            } else if (write.pImageInfo != nullptr) {
+                for (u32 i = 0; i < write.descriptorCount; ++i) {
+                    DescriptorTemplateEntry entry{};
+                    entry.image = write.pImageInfo[i];
+                    scratch_template_entries.push_back(entry);
+                }
+            } else if (write.pTexelBufferView != nullptr) {
+                for (u32 i = 0; i < write.descriptorCount; ++i) {
+                    DescriptorTemplateEntry entry{};
+                    entry.texel_view = write.pTexelBufferView[i];
+                    scratch_template_entries.push_back(entry);
+                }
+            }
+        }
+        template_ready = scratch_template_entries.size() == pipe.template_entry_count;
+        if (template_ready && pipe.push_descriptors) {
+            cmd.PushDescriptorSetWithTemplateKHR(pipe.update_template, pipe.layout, 0,
+                                                 scratch_template_entries.data());
+            return true;
         }
     }
     if (pipe.push_descriptors) {
-        cmd.PushDescriptorSetKHR(bind_point, *pipe.layout, 0, scratch_writes);
+        cmd.PushDescriptorSetKHR(bind_point, pipe.layout, 0, scratch_writes);
         return true;
     }
     // An allocated set, kept alive by the submission. Reuse an identical set allocated earlier in
@@ -2325,7 +2577,7 @@ bool DrawContext::PushPlan(PipelineBase& pipe, DrawPlan& plan, VkPipelineBindPoi
             h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
             return h;
         };
-        cache_hash = mix(0, std::bit_cast<u64>(*pipe.set_layout));
+        cache_hash = mix(0, std::bit_cast<u64>(pipe.set_layout));
         for (const PassBoundState::WriteSig& w : scratch_write_sigs) {
             cache_hash = mix(cache_hash, (static_cast<u64>(w.binding) << 32) |
                                              (static_cast<u64>(w.type) << 16) | w.count);
@@ -2342,71 +2594,58 @@ bool DrawContext::PushPlan(PipelineBase& pipe, DrawPlan& plan, VkPipelineBindPoi
         }
         cache_slot = &desc_set_cache[static_cast<size_t>(cache_hash) & (desc_set_cache.size() - 1)];
         if (cache_slot->seq == flight_seq && cache_slot->hash == cache_hash &&
-            cache_slot->set_layout == *pipe.set_layout && cache_slot->set != VK_NULL_HANDLE &&
+            cache_slot->set_layout == pipe.set_layout && cache_slot->set != VK_NULL_HANDLE &&
             cache_slot->writes == scratch_write_sigs &&
             cache_slot->buffers.size() == scratch_buffers.size() &&
             (scratch_buffers.empty() ||
              std::memcmp(cache_slot->buffers.data(), scratch_buffers.data(),
                          scratch_buffers.size() * sizeof(VkDescriptorBufferInfo)) == 0) &&
             cache_slot->images == scratch_image_sigs) {
-            cmd.BindDescriptorSets(bind_point, *pipe.layout, 0, std::span{&cache_slot->set, 1}, {});
+            cmd.BindDescriptorSets(bind_point, pipe.layout, 0, std::span{&cache_slot->set, 1}, {});
             return true;
         }
     }
-    const VkDescriptorSet set = AllocateSet(*pipe.set_layout);
+    const VkDescriptorSet set = AllocateSet(pipe.set_layout);
     if (!set) {
         bound_state.ForgetDescriptors();
         host->HostFailed("Draw", "descriptor set allocation failed");
         return false;
     }
-    for (VkWriteDescriptorSet& write : scratch_writes) {
-        write.dstSet = set;
+    if (template_ready) {
+        impl.device.GetLogical().UpdateDescriptorSet(set, pipe.update_template,
+                                                     scratch_template_entries.data());
+    } else {
+        for (VkWriteDescriptorSet& write : scratch_writes) {
+            write.dstSet = set;
+        }
+        impl.dld.vkUpdateDescriptorSets(impl.logical, static_cast<u32>(scratch_writes.size()),
+                                        scratch_writes.data(), 0, nullptr);
     }
-    impl.dld.vkUpdateDescriptorSets(impl.logical, static_cast<u32>(scratch_writes.size()),
-                                    scratch_writes.data(), 0, nullptr);
     if (cache_slot != nullptr) {
         cache_slot->seq = flight_seq;
         cache_slot->hash = cache_hash;
-        cache_slot->set_layout = *pipe.set_layout;
+        cache_slot->set_layout = pipe.set_layout;
         cache_slot->set = set;
         cache_slot->writes = scratch_write_sigs;
         cache_slot->buffers = scratch_buffers;
         cache_slot->images = scratch_image_sigs;
     }
-    cmd.BindDescriptorSets(bind_point, *pipe.layout, 0, std::span{&set, 1}, {});
+    cmd.BindDescriptorSets(bind_point, pipe.layout, 0, std::span{&set, 1}, {});
     return true;
 }
 
 VkDescriptorSet DrawContext::AllocateSet(VkDescriptorSetLayout layout) {
     constexpr u32 SETS_PER_POOL = 256;
     // A pool can run out of one descriptor type before SETS_PER_POOL sets: start a new one and
-    // retry once (the old pool stays alive in its flight's keepalive).
+    // retry once (the old pool stays in the flight until completion, then resets for reuse).
     for (u32 attempt = 0; attempt < 2; ++attempt) {
         const bool fresh = !set_pool || set_pool_used >= SETS_PER_POOL;
         if (fresh) {
-            const std::array<VkDescriptorPoolSize, 6> sizes{{
-                {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SETS_PER_POOL * 24},
-                {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, SETS_PER_POOL * 16},
-                {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, SETS_PER_POOL * 48},
-                {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, SETS_PER_POOL * 8},
-                {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, SETS_PER_POOL * 4},
-                {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, SETS_PER_POOL * 4},
-            }};
-            try {
-                set_pool = std::make_shared<vk::DescriptorPool>(impl.device.GetLogical().CreateDescriptorPool({
-                    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-                    .pNext = nullptr,
-                    .flags = 0,
-                    .maxSets = SETS_PER_POOL,
-                    .poolSizeCount = static_cast<u32>(sizes.size()),
-                    .pPoolSizes = sizes.data(),
-                }));
-            } catch (const vk::Exception& exception) {
-                LOG_ERROR(Render_Vulkan, "[nvn] descriptor pool creation failed: {}", exception.what());
-                set_pool.reset();
+            set_pool = resources.AcquireDescriptorPool(SETS_PER_POOL);
+            if (!set_pool) {
                 return VK_NULL_HANDLE;
             }
-            host->HostFlight().keepalive.push_back(set_pool);
+            host->HostFlight().descriptor_pools.push_back(set_pool);
             set_pool_used = 0;
         }
         const VkDescriptorSetAllocateInfo info{

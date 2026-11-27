@@ -220,11 +220,13 @@ private:
 // ---- Host objects ---------------------------------------------------------------------------------
 
 /// State of objects the sink knows (pools, textures, samplers, programs): they are destroyed in the
-/// sink only after the game finalized them, no recorded list references them and every submission
-/// made before the finalize completed.
+/// sink only after the game finalized them, no recorded list or descriptor pool slot references
+/// them, and every submission made before the finalize or unregistration completed.
 struct SinkObject : Object {
     std::atomic<u32> list_refs{0};
+    std::atomic<u32> pool_refs{0};
     bool finalized = false;
+    bool in_retire_list = false;
     u64 destroy_after = 0;
 };
 
@@ -352,11 +354,28 @@ struct CommandBufferObject : Object {
 class DescriptorTable {
 public:
     u32 Allocate(u32 count);
-    /// Releases the range and clears its entries.
-    void Release(u32 base);
-    void Set(u32 base, u32 id, u64 serial);
-    /// Replaces every pool registration of an object serial after its address is reinitialized.
-    void ReplaceSerial(u64 old_serial, u64 new_serial);
+    /// Releases the range, clears its entries, and returns the non-zero serials cleared.
+    [[nodiscard]] std::vector<u64> Release(u32 base);
+    /// Writes `serial` at `base + id`, returning true if the slot changed (`previous` receives the
+    /// prior value).
+    bool Set(u32 base, u32 id, u64 serial, u64& previous);
+    /// Replaces every pool registration of an object serial after its address is reinitialized and
+    /// returns how many slots changed.
+    u32 ReplaceSerial(u64 old_serial, u64 new_serial);
+    /// Clears every non-zero entry matching `predicate` and returns the removed serials.
+    template <typename Predicate>
+    [[nodiscard]] std::vector<u64> ClearIf(Predicate&& predicate) {
+        std::lock_guard lock{mutex};
+        std::vector<u64> removed;
+        for (u64& entry : entries) {
+            if (entry != 0 && predicate(entry)) {
+                removed.push_back(entry);
+                entry = 0;
+                dirty = true;
+            }
+        }
+        return removed;
+    }
     /// Entries up to the last non-empty one.
     [[nodiscard]] IdSnapshot Snapshot();
 
@@ -492,6 +511,7 @@ struct Recorder::Impl {
     // Object retirement
     std::mutex retire_mutex;
     std::vector<u64> retire_list;
+    std::atomic<u32> retire_pending{0};
     /// Textures whose guest object was initialized again while they were alive (under
     /// retire_mutex). Nothing finalizes them, so they are never destroyed; the ones finalized
     /// through a copy of the object, or gone, are pruned.
@@ -548,6 +568,10 @@ struct Recorder::Impl {
 
     // ---- retirement ---------------------------------------------------------------------------
     [[nodiscard]] SinkObject* StateOf(u64 serial);
+    [[nodiscard]] SinkObject* PoolRefOwner(u64 serial);
+    void AddPoolRef(u64 serial, u32 count = 1);
+    bool ReleasePoolRef(u64 serial, u32 count = 1);
+    bool ReleasePoolRefs(const std::vector<u64>& serials);
     void MarkFinalized(u64 serial);
     void ReleaseRefs(const std::vector<u64>& refs);
     void RunRetire();

@@ -61,19 +61,25 @@ void MirrorPages::InvalidateAll() {
     std::ranges::fill(valid, u64{0});
 }
 
-void MirrorPages::Set(u64 offset, u64 length) {
+bool MirrorPages::Set(u64 offset, u64 length) {
     u64 first = 0;
     u64 last = 0;
     if (!PageSpan(offset, length, first, last)) {
-        return;
+        return false;
     }
+    bool changed = false;
     for (u64 page = first; page <= last;) {
+        const u64 word = page / 64;
         const u64 bit = page % 64;
         const u64 count = (std::min)(64 - bit, last - page + 1);
         const u64 mask = (count == 64 ? ~u64{0} : ((u64{1} << count) - 1)) << bit;
-        valid[page / 64] |= mask;
+        if ((valid[word] & mask) != mask) {
+            valid[word] |= mask;
+            changed = true;
+        }
         page += count;
     }
+    return changed;
 }
 
 void MirrorPages::TakeInvalidWithin(const MirrorPages& wanted,
@@ -394,17 +400,10 @@ void Context::Impl::MirrorMarkPrefetch(Pool& pool, u64 offset, u64 size) {
     if (mirror == nullptr) {
         return;
     }
-    if (!mirror->wanted) {
-        mirror->wanted = std::make_unique<MirrorPages>(pool.size);
-    }
     if (!mirror->prefetch) {
-        mirror->prefetch = true;
         vram_prefetch_mirrors.push_back({&pool, mirror, mirror->write_epoch.get()});
     }
-    if (!mirror->wanted->AllValid(offset, size)) {
-        mirror->wanted->Set(offset, size);
-        mirror->wanted_dirty = true;
-    }
+    mirror->MarkWanted(pool.size, offset, size);
 }
 
 void Context::Impl::MirrorTakeStaleWanted(Pool& pool, std::vector<std::pair<u64, u64>>& runs) {
@@ -412,17 +411,20 @@ void Context::Impl::MirrorTakeStaleWanted(Pool& pool, std::vector<std::pair<u64,
     if (mirror == nullptr || !mirror->wanted) {
         return;
     }
-    if (mirror->write_epoch &&
-        mirror->write_epoch->load(std::memory_order_acquire) == mirror->epoch_clean &&
-        !mirror->wanted_dirty) {
+    if (!mirror->wanted_dirty && mirror->write_epoch &&
+        mirror->write_epoch->load(std::memory_order_acquire) == mirror->epoch_clean) {
         return;
     }
     VC::GuestMemory* const memory = guest.load(std::memory_order_acquire);
     MirrorCollectCpuWrites(pool, *mirror, 0, pool.size);
+    if (!mirror->wanted_dirty) {
+        return;
+    }
     const size_t first_new = runs.size();
     mirror->pages.TakeInvalidWithin(*mirror->wanted, runs);
     mirror->wanted_dirty = false;
     MirrorArmRuns(pool, *mirror, memory, first_new, runs);
+    mirror->wanted_dirty = false;
 }
 
 void Context::Impl::MirrorArmRuns(Pool& pool, PoolMirror& mirror, VC::GuestMemory* memory,

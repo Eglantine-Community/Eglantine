@@ -417,6 +417,44 @@ BcGpuEncoder* Context::Impl::BcEncoder() {
     return bc_encoder.get();
 }
 
+std::shared_ptr<BcScratch> Context::Impl::AcquireBcScratchFrom(std::shared_ptr<BcScratch>& slot,
+                                                               u64 budget, u32 width, u32 height,
+                                                               u32 layers) {
+    const bool bc7 = astc_standin == AstcStandin::Bc7;
+    if (slot && slot->Fits(width, height, layers, bc7)) {
+        return slot;
+    }
+    const auto texel_bytes = [](u32 w, u32 h, u32 l) { return u64{w} * h * l * 4; };
+    u32 w = width;
+    u32 h = height;
+    u32 l = layers;
+    if (slot) {
+        // Grow to cover both shapes while that stays in the budget, else take the new shape.
+        const u32 grown_w = (std::max)(slot->width, width);
+        const u32 grown_h = (std::max)(slot->height, height);
+        const u32 grown_l = (std::max)(slot->layers, layers);
+        if (texel_bytes(grown_w, grown_h, grown_l) <= budget) {
+            w = grown_w;
+            h = grown_h;
+            l = grown_l;
+        }
+    }
+    try {
+        auto scratch = MakeBcScratch(device, *allocator, w, h, l, bc7);
+        if (texel_bytes(w, h, l) <= budget) {
+            slot = scratch;
+        }
+        return scratch;
+    } catch (const vk::Exception& exception) {
+        if (!bc_scratch_failed_logged) {
+            bc_scratch_failed_logged = true;
+            LOG_ERROR(Render_Vulkan, "[nvn] BC stand-in scratch {}x{}x{} failed: {}", w, h, l,
+                      exception.what());
+        }
+        return nullptr;
+    }
+}
+
 std::shared_ptr<BcScratch> Context::Impl::AcquireBcScratch(u32 width, u32 height, u32 layers) {
     const bool bc7 = astc_standin == AstcStandin::Bc7;
     for (size_t i = 0; i < bc_scratches.size(); ++i) {
@@ -466,6 +504,12 @@ std::shared_ptr<BcScratch> Context::Impl::AcquireBcScratch(u32 width, u32 height
         }
         return nullptr;
     }
+}
+
+std::shared_ptr<BcScratch> Context::Impl::AcquireBcScratchSlot(size_t slot, u32 width, u32 height,
+                                                               u32 layers) {
+    return AcquireBcScratchFrom(bc_scratch_ring[slot], BC_SMALL_SCRATCH_MAX_BYTES, width, height,
+                                layers);
 }
 
 void Context::Impl::CompleteBcTimes(const BcUploadTimes& times) {
@@ -634,7 +678,7 @@ Context::Impl::~Impl() {
     // The raw coverage diagnostic's run summary; the GPU is idle, so the last, unfinished
     // window's misses can be counted. The rings go before the allocator they came from.
     if (raw_coverage) {
-        if (raw_coverage->Valid()) {
+        if (VideoCommon::RawCoverageEnabled() && raw_coverage->Valid()) {
             for (const std::string& line :
                  raw_coverage_report.Summary(raw_coverage->TailMisses(), true)) {
                 LOG_INFO(HW_GPU, "{}", line);
@@ -652,6 +696,7 @@ Context::Impl::~Impl() {
     commands.clear();
     inflight.clear();
     draw_contexts.clear();
+    bindless_layout_dirty.clear();
     draw_resources.reset();
     storage_index.clear();
     storage_cache.clear();
@@ -667,6 +712,11 @@ Context::Impl::~Impl() {
         sparse_pages.reset();
     }
     import_chunks.clear(); // after the pool buffers bound into them
+    {
+        std::scoped_lock lock{imported_ranges_mutex};
+        imported_guest_ranges.clear();
+        has_imported_guest_ranges.store(false, std::memory_order_release);
+    }
     clear_render_passes.clear();
     counters_published.store(nullptr);
     counters_engine.reset();
@@ -687,8 +737,11 @@ Context::Impl::~Impl() {
     final_fsr.reset();
     upscaler_fsr.reset();
     mirror_merge_stats = {}; // allocator-owned, like the pool buffers above
+    bc_scratch_ring = {};
     bc_scratches.clear();
     staging_cache = {};
+    large_staging_cache = {};
+    download_cache = {};
     quad_indirect.reset();
     allocator.reset();
     command_buffer_allocations.clear();
@@ -824,42 +877,69 @@ void Context::Impl::Dispatch(Command& command) {
                          "exact buffer lookup cache and lazy raw mirror invalidation active");
             }
             impl.mkw_coalesce_early_submit =
-                impl.mario_kart_world && std::getenv("EDEN_NX2_NVN_EARLY_SUBMIT_US") == nullptr &&
+                c.title_id != 0 && std::getenv("EDEN_NX2_NVN_EARLY_SUBMIT_US") == nullptr &&
                 std::getenv("EDEN_NX2_NVN_EARLY_FIRST_US") == nullptr &&
                 std::getenv("EDEN_NX2_NVN_EARLY_PASS_US") == nullptr;
             if (impl.mkw_coalesce_early_submit && impl.options.early_submit) {
-                LOG_INFO(Render_Vulkan, "[nvn] Mario Kart World: early submit at most twice per "
-                                        "submission; live passes and shadows use the pass budget");
+                LOG_INFO(Render_Vulkan, "[nvn] title {:#018x}: early submit coalesced; live "
+                                        "passes, shadows, and queued GPU work avoid extra splits",
+                         c.title_id);
             }
-            if (!impl.options.barrier_merge &&
-                std::getenv("EDEN_NX2_TRY_BARRIER_MERGE") == nullptr) {
-                impl.barrier_merge = BarrierMergeMask(impl.mario_kart_world ? 1 : 0);
+            if (c.title_id != 0) {
+                if (!impl.options.barrier_merge &&
+                    std::getenv("EDEN_NX2_TRY_BARRIER_MERGE") == nullptr) {
+                    impl.barrier_merge = BarrierMergeMask(1);
+                }
+                if (!impl.options.dispatch_order_by_barriers &&
+                    std::getenv("EDEN_NX2_TRY_DISPATCH_ORDER") == nullptr) {
+                    impl.dispatch_order_by_barriers = true;
+                }
+                if (!impl.options.ubo_mirror &&
+                    std::getenv("EDEN_NX2_TRY_UBO_MIRROR") == nullptr &&
+                    impl.pool_mirror_mode != 0) {
+                    impl.ubo_mirror = true;
+                }
             }
             if (!impl.options.dispatch_order_by_barriers.has_value() &&
                 std::getenv("EDEN_NX2_TRY_DISPATCH_ORDER") == nullptr) {
                 impl.dispatch_order_by_barriers = impl.mario_kart_world;
             }
-            if (impl.mario_kart_world && !impl.options.storage_trim_age_presents.has_value() &&
+            if (c.title_id != 0 && !impl.options.storage_trim_age_presents.has_value() &&
                 std::getenv("EDEN_NX2_NVN_TRIM_AGE_PRESENTS") == nullptr &&
                 impl.trim_age_presents == 0) {
                 impl.trim_age_presents = 300;
                 LOG_INFO(Render_Vulkan,
-                         "[nvn] Mario Kart World: aging idle render targets after {} presents "
+                         "[nvn] title {:#018x}: aging idle render targets after {} presents "
                          "(EDEN_NX2_NVN_TRIM_AGE_PRESENTS)",
-                         impl.trim_age_presents);
+                         c.title_id, impl.trim_age_presents);
             }
-            if (impl.mario_kart_world && !impl.options.storage_cache_budget_bytes.has_value() &&
+            if (c.title_id != 0 && !impl.options.storage_cache_budget_bytes.has_value() &&
                 Debug::Get().storage_budget_bytes == 0) {
                 if (const u64 device_budget = impl.device.GetDeviceMemoryBudget();
                     device_budget != 0) {
-                    const u64 scaled = device_budget / 10 * 6;
-                    if (scaled > impl.storage_cache_budget) {
+                    const u64 pct = device_budget <= (u64{6144} << 20) ? 45 : 60;
+                    const u64 scaled = (std::min)(device_budget * pct / 100, u64{4096} << 20);
+                    if (scaled != impl.storage_cache_budget) {
                         impl.storage_cache_budget = scaled;
                         LOG_INFO(Render_Vulkan,
-                                 "[nvn] Mario Kart World: storage cache budget {} MiB (60% of {} "
+                                 "[nvn] title {:#018x}: storage cache budget {} MiB ({}% of {} "
                                  "MiB device budget; EDEN_NX2_NVN_STORAGE_BUDGET_MIB overrides)",
-                                 impl.storage_cache_budget >> 20, device_budget >> 20);
+                                 c.title_id, impl.storage_cache_budget >> 20, pct,
+                                 device_budget >> 20);
                     }
+                }
+            }
+            if (impl.HostImportEnabled()) {
+                std::string probe_error;
+                VkResult probe_result = VK_SUCCESS;
+                if (!impl.importer->ProbeSharedMapping(impl.pool_usage, probe_error,
+                                                       probe_result) &&
+                    probe_result == VK_ERROR_INVALID_EXTERNAL_HANDLE_KHR) {
+                    impl.host_import_disabled.store(true, std::memory_order_release);
+                    LOG_INFO(Render_Vulkan,
+                             "[nvn] host import rejected for shared guest RAM ({}, {}); "
+                             "disabling host import and backing CPU pools on demand",
+                             probe_error, static_cast<int>(probe_result));
                 }
             }
             impl.draw_resources->OpenCache(c.title_id);
@@ -1248,10 +1328,52 @@ vk::Buffer Context::Impl::AcquireStaging(u64 size) {
                 return std::move(buffer);
             }
         }
+    } else if (size > STAGING_CHUNK && size <= (u64{128} << 20)) {
+        std::scoped_lock lock{staging_cache_mutex};
+        size_t best = large_staging_cache.size();
+        u64 best_size = ~u64{0};
+        for (size_t i = 0; i < large_staging_cache.size(); ++i) {
+            if (!large_staging_cache[i]) {
+                continue;
+            }
+            const u64 buf_size = large_staging_cache[i].Mapped().size();
+            if (buf_size >= size && buf_size <= size * 2 && buf_size < best_size) {
+                best = i;
+                best_size = buf_size;
+            }
+        }
+        if (best < large_staging_cache.size()) {
+            stats.staging_chunks_reused.fetch_add(1, std::memory_order_relaxed);
+            return std::move(large_staging_cache[best]);
+        }
     }
     // GPU untile and ASTC decode can read the staged GOBs directly.
     return CreateHostBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                             MemoryUsage::Upload, AllocationKind::Staging);
+}
+
+vk::Buffer Context::Impl::AcquireDownload(u64 size) {
+    const u64 alloc_size = (std::max)(size, u64{64} << 10);
+    const u64 max_reuse = (std::max)(size * 2, u64{1} << 20);
+    {
+        std::scoped_lock lock{download_cache_mutex};
+        size_t best = download_cache.size();
+        u64 best_size = ~u64{0};
+        for (size_t i = 0; i < download_cache.size(); ++i) {
+            if (!download_cache[i]) {
+                continue;
+            }
+            const u64 buf_size = download_cache[i].Mapped().size();
+            if (buf_size >= size && buf_size <= max_reuse && buf_size < best_size) {
+                best = i;
+                best_size = buf_size;
+            }
+        }
+        if (best < download_cache.size()) {
+            return std::move(download_cache[best]);
+        }
+    }
+    return CreateHostBuffer(alloc_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, MemoryUsage::Download);
 }
 
 void Context::Impl::CompleteMain() {
@@ -1341,6 +1463,7 @@ void Context::Impl::CompleteMain() {
                     } else {
                         landed.assign(1, {0, readback.pool->size}); // not taken for long: all
                     }
+                    readback.pool->has_landed_writebacks.store(true, std::memory_order_release);
                 }
             }
         }
@@ -1434,14 +1557,32 @@ void Context::Impl::CompleteMain() {
             std::scoped_lock lock{staging_cache_mutex};
             auto free = staging_cache.begin();
             for (auto& buffer : flight->staging) {
-                if (buffer.Mapped().size() != STAGING_CHUNK) {
-                    continue;
+                const u64 buf_size = buffer.Mapped().size();
+                if (buf_size == STAGING_CHUNK) {
+                    free = std::find_if(free, staging_cache.end(),
+                                        [](const auto& slot) { return !slot; });
+                    if (free != staging_cache.end()) {
+                        *free++ = std::move(buffer);
+                    }
+                } else if (buf_size > STAGING_CHUNK && buf_size <= (u64{128} << 20)) {
+                    size_t target = large_staging_cache.size();
+                    u64 smallest = ~u64{0};
+                    for (size_t i = 0; i < large_staging_cache.size(); ++i) {
+                        if (!large_staging_cache[i]) {
+                            target = i;
+                            break;
+                        }
+                        const u64 cur_size = large_staging_cache[i].Mapped().size();
+                        if (cur_size < smallest) {
+                            smallest = cur_size;
+                            target = i;
+                        }
+                    }
+                    if (target < large_staging_cache.size() &&
+                        (!large_staging_cache[target] || buf_size > smallest)) {
+                        large_staging_cache[target] = std::move(buffer);
+                    }
                 }
-                free = std::find_if(free, staging_cache.end(), [](const auto& slot) { return !slot; });
-                if (free == staging_cache.end()) {
-                    break;
-                }
-                *free++ = std::move(buffer);
             }
         }
         flight->staging.clear();
@@ -1450,6 +1591,27 @@ void Context::Impl::CompleteMain() {
         }
         if (!flight->shadow.empty()) {
             draw_resources->ReleaseShadows(flight->shadow);
+        }
+        if (!flight->scratch_shadows.empty()) {
+            draw_resources->ReleaseShadows(flight->scratch_shadows);
+        }
+        if (!flight->descriptor_pools.empty()) {
+            if ((gpu_complete || flight->semaphore == VK_NULL_HANDLE) &&
+                !device_lost.load(std::memory_order_acquire)) {
+                draw_resources->ReleaseDescriptorPools(flight->descriptor_pools);
+            } else {
+                flight->descriptor_pools.clear();
+            }
+        }
+        if (gpu_complete && flight->download && !device_lost.load(std::memory_order_acquire) &&
+            flight->download.Mapped().size() <= (u64{16} << 20)) {
+            std::scoped_lock lock{download_cache_mutex};
+            for (auto& slot : download_cache) {
+                if (!slot) {
+                    slot = std::move(flight->download);
+                    break;
+                }
+            }
         }
         flight->download.reset();
         flight->keepalive.clear();
@@ -1966,6 +2128,27 @@ std::string Context::DescribeMemory() const {
                                      sizeof(older))) {
                 private_bytes = older.PrivateUsage;
             }
+        }
+#elif defined(__linux__)
+        if (std::FILE* const status_file = std::fopen("/proc/self/status", "r")) {
+            char line[256];
+            u64 rss_anon = 0;
+            u64 rss_shmem = 0;
+            u64 vm_swap = 0;
+            while (std::fgets(line, sizeof(line), status_file)) {
+                unsigned long long kib = 0;
+                if (std::sscanf(line, "RssAnon: %llu kB", &kib) == 1) {
+                    rss_anon = static_cast<u64>(kib) << 10;
+                } else if (std::sscanf(line, "RssShmem: %llu kB", &kib) == 1) {
+                    rss_shmem = static_cast<u64>(kib) << 10;
+                } else if (std::sscanf(line, "VmSwap: %llu kB", &kib) == 1) {
+                    vm_swap = static_cast<u64>(kib) << 10;
+                }
+            }
+            std::fclose(status_file);
+            private_ws = rss_anon;
+            private_bytes = rss_anon + vm_swap;
+            shared_commit = rss_shmem;
         }
 #endif
         text += fmt::format("process private {} MiB, private working set {} MiB, shared commit "

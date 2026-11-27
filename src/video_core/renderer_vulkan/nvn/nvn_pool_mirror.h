@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <memory>
 #include <span>
@@ -17,11 +18,20 @@ namespace Vulkan::Nvn {
 
 enum class MirrorWriteCoverage { None, Partial, Full };
 
+struct MirrorWriteCursor {
+    bool snapshot_ready{};
+    std::pair<u64, u64> full_range{};
+};
+
 /// Pending GPU writes own these mirror bytes until completion writes them back to the guest.
 [[nodiscard]] inline MirrorWriteCoverage ClassifyMirrorWrites(
-    u64 begin, u64 end, std::span<const std::pair<u64, u64>> pending) {
+    u64 begin, u64 end, std::span<const std::pair<u64, u64>> pending,
+    std::pair<u64, u64>& full_range) {
     if (begin >= end) {
         return MirrorWriteCoverage::None;
+    }
+    if (full_range.first <= begin && end <= full_range.second) {
+        return MirrorWriteCoverage::Full;
     }
     auto coverage = MirrorWriteCoverage::None;
     for (const auto& [lo, hi] : pending) {
@@ -29,11 +39,61 @@ enum class MirrorWriteCoverage { None, Partial, Full };
             continue;
         }
         if (lo <= begin && hi >= end) {
+            full_range = {lo, hi};
             return MirrorWriteCoverage::Full;
         }
         coverage = MirrorWriteCoverage::Partial;
     }
     return coverage;
+}
+
+/// Sorts non-empty half-open ranges `[begin, end)` and merges overlapping or adjacent spans.
+inline void MergePendingWrites(std::vector<std::pair<u64, u64>>& ranges) {
+    std::erase_if(ranges, [](const auto& range) { return range.first >= range.second; });
+    if (ranges.size() <= 1) {
+        return;
+    }
+    std::ranges::sort(ranges);
+    size_t out = 0;
+    for (size_t i = 1; i < ranges.size(); ++i) {
+        if (ranges[i].first <= ranges[out].second) {
+            ranges[out].second = (std::max)(ranges[out].second, ranges[i].second);
+        } else {
+            ranges[++out] = ranges[i];
+        }
+    }
+    ranges.resize(out + 1);
+}
+
+/// Subtracts sorted disjoint intervals `subtract` from sorted disjoint intervals `parts` in O(P + D).
+inline void SubtractSortedRanges(std::span<const std::pair<u64, u64>> parts,
+                                 std::span<const std::pair<u64, u64>> subtract,
+                                 std::vector<std::pair<u64, u64>>& out) {
+    out.clear();
+    size_t j = 0;
+    for (const auto& [part_begin, part_end] : parts) {
+        u64 cur = part_begin;
+        if (cur >= part_end) {
+            continue;
+        }
+        while (j < subtract.size() && subtract[j].second <= cur) {
+            ++j;
+        }
+        while (j < subtract.size() && subtract[j].first < part_end) {
+            if (subtract[j].first > cur) {
+                out.emplace_back(cur, subtract[j].first);
+            }
+            if (subtract[j].second >= part_end) {
+                cur = part_end;
+                break;
+            }
+            cur = (std::max)(cur, subtract[j].second);
+            ++j;
+        }
+        if (cur < part_end) {
+            out.emplace_back(cur, part_end);
+        }
+    }
 }
 
 /// Which 4 KiB pages of a pool mirror hold the pool's bytes (DESIGN.md "Pool mirrors"). A valid
@@ -57,8 +117,9 @@ public:
     /// Marks the pages [offset, offset + length) touches invalid (clamped to the pool).
     void Invalidate(u64 offset, u64 length);
     void InvalidateAll();
-    /// Marks the pages [offset, offset + length) touches valid (clamped to the pool).
-    void Set(u64 offset, u64 length);
+    /// Marks the pages [offset, offset + length) touches valid (clamped to the pool); true when
+    /// any page changed from 0 to 1.
+    bool Set(u64 offset, u64 length);
     /// As TakeInvalid over the whole pool, for the pages `wanted` has set (a Set-only bitmap of
     /// the same pool size) that are invalid here.
     void TakeInvalidWithin(const MirrorPages& wanted, std::vector<std::pair<u64, u64>>& out);
@@ -124,6 +185,20 @@ struct PoolMirror {
     /// first use).
     std::unique_ptr<MirrorPages> wanted;
     bool wanted_dirty{true};
+    bool ubo_dynamic{false};
+    u64 ubo_thrash_present{~u64{0}};
+    u64 ubo_thrash_epoch{0};
+    u32 ubo_thrash_streak{0};
+
+    void MarkWanted(u64 pool_size, u64 offset, u64 size) {
+        prefetch = true;
+        if (!wanted) {
+            wanted = std::make_unique<MirrorPages>(pool_size);
+        }
+        if (wanted->Set(offset, size) || !pages.AllValid(offset, size)) {
+            wanted_dirty = true;
+        }
+    }
     /// The tracker's write counter of the pool's registration (GuestMemory::WriteEpoch) and its
     /// value from before the last whole-pool collect of CPU writes: while they are equal no page
     /// of the pool is dirty, and the currency checks skip the tracker.

@@ -58,6 +58,7 @@ struct ViewKey {
 struct TextureViews {
     std::shared_ptr<Storage> storage;
     std::vector<std::pair<ViewKey, vk::ImageView>> views;
+    bool used_in_framebuffer{false};
 };
 
 struct DummyImage {
@@ -374,6 +375,8 @@ struct DrawResources {
     std::chrono::steady_clock::time_point last_shader_refresh{};
     /// Called at present boundaries; existing flights keep their pipelines until GPU completion.
     void MaybeRefreshShaders();
+    /// Advances the pipeline cache present counter for deferred background optimization.
+    void OnPresent();
     ClearPipelines clears;
     DrawCounters counters;
     /// Called once per present (replay thread): logs the draws skipped awaiting an asynchronous
@@ -398,9 +401,15 @@ struct DrawResources {
     // --- programs ---
     /// Content hash per stage of every program (0 = stage absent), by program serial.
     std::unordered_map<u64, std::array<u64, STAGE_COUNT>> program_hashes;
+    struct ParsedComputeControl {
+        std::optional<VC::NvnControl> control;
+        std::string error;
+    };
+    std::unordered_map<u64, ParsedComputeControl> compute_controls;
     /// Records the stage hashes of a program the game created; on the GPL path the cache also
     /// lowers its stages now (PipelineCache::PrepareProgram), ahead of its first draw.
     void OnProgramCreated(const std::shared_ptr<const VC::ProgramDesc>& program);
+    void ReleaseProgram(u64 serial);
     /// Content hashes of the compute programs dispatched so far (logged once each).
     std::unordered_set<u64> compute_programs;
 
@@ -432,9 +441,10 @@ struct DrawResources {
     // --- views ---
     std::unordered_map<u64, TextureViews> texture_views;
     u64 views_epoch{1}; ///< Bumped when a texture_views node is erased (Texture::view_slot dies).
+    u64 framebuffer_views_epoch{1}; ///< Bumped when any cached image view is destroyed or detached.
     u64 samplers_epoch{1}; ///< Bumped when a sampler is released (DrawContext::sampler_slots).
     /// Image view of a texture object for `key`, created on first use. Null on failure.
-    VkImageView GetView(const Texture& texture, const ViewKey& key);
+    VkImageView GetView(const Texture& texture, const ViewKey& key, bool for_framebuffer = false);
     /// Detaches the views of a destroyed texture so they can be released after its last use.
     std::shared_ptr<TextureViews> TakeViews(u64 serial);
     /// Detaches the views of every texture over `storage`, whose image is being replaced, so they
@@ -477,6 +487,12 @@ struct DrawResources {
     /// A chunk of at least `min_size` bytes (null when device memory ran out).
     std::shared_ptr<ShadowChunk> AcquireShadow(u64 min_size);
     void ReleaseShadows(std::vector<std::shared_ptr<ShadowChunk>>& chunks);
+
+    // --- descriptor pools ---
+    std::mutex descriptor_pool_mutex;
+    std::vector<std::shared_ptr<vk::DescriptorPool>> free_descriptor_pools;
+    std::shared_ptr<vk::DescriptorPool> AcquireDescriptorPool(u32 max_sets);
+    void ReleaseDescriptorPools(std::vector<std::shared_ptr<vk::DescriptorPool>>& pools);
 
 
     // --- dummies for unbound descriptors ---

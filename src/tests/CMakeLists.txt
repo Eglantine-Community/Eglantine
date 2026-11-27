@@ -10,6 +10,8 @@
 add_executable(tests
     core/nx2_frame_interval.cpp
     video_core/upload_batch.cpp
+    video_core/end_renderpass_barriers.cpp
+    video_core/download_coalesce.cpp
     video_core/texture_swizzle.cpp
     core/nx2_oot_time.cpp
     core/address_space.cpp
@@ -95,6 +97,7 @@ add_executable(tests
     video_core/virtual_range_cache.cpp
     video_core/query_copy.cpp
     video_core/ampere_lowering.cpp
+    video_core/ampere_direct.cpp
     video_core/spirv_software_matrix.cpp
     video_core/ampere_geometry.cpp
     video_core/ampere_i2f.cpp
@@ -111,6 +114,9 @@ add_executable(tests
     video_core/plain_unswizzle.cpp
     video_core/uniform_stream_reuse.cpp
     video_core/shader_invalidation.cpp
+    video_core/vertex_input_cache.cpp
+    video_core/pipeline_layout_cache.cpp
+    video_core/nx2_backx.cpp
     video_core/descriptor_table.cpp
     video_core/global_address_tracking.cpp
     video_core/global_atomic_routing.cpp
@@ -124,6 +130,7 @@ add_executable(tests
     input_common/calibration_configuration_job.cpp
     common/vtx_hle_settings.cpp
     nvn/ampere_exec.cpp
+    nvn/ampere_direct_exec.cpp
     nvn/astc_bc.cpp
     nvn/astc_gpu.cpp
     nvn/backing_log.cpp

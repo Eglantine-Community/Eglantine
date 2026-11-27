@@ -7,7 +7,7 @@
 // The replay (nvn_exec.cpp / nvn_draw.cpp) tracks the NVN state of a draw, fills a
 // GraphicsRequest and asks the cache for a pipeline. The cache owns everything between the guest
 // shader bytes and a VkPipeline:
-//   LowerNvnProgram -> NvnEnvironment + TranslateNvnStage -> ConvertLegacyToGeneric + EmitSPIRV
+//   PrepareNvnProgram -> NvnEnvironment + TranslateNvnStage -> ConvertLegacyToGeneric + EmitSPIRV
 //   -> descriptor layout (BuildDescriptorLayout) -> VkShaderModule / VkPipeline.
 // Compute pipelines go through the same module (GetCompute).
 //
@@ -33,6 +33,7 @@
 #include <array>
 #include <atomic>
 #include <cstddef>
+#include <cstring>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -191,7 +192,36 @@ struct DynamicFixedState {
     bool stencil_test_enable{};
     StencilFace front;
     StencilFace back;
+    VkPolygonMode polygon_mode{VK_POLYGON_MODE_FILL};
+    bool depth_clamp_enable{};
+    VkProvokingVertexModeEXT provoking_vertex_mode{VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT};
+    u32 patch_control_points{1};
     [[nodiscard]] bool operator==(const DynamicFixedState&) const = default;
+};
+
+/// Color blend, channel write mask and logic-op values set dynamically per draw when EDS3 blending
+/// + EDS3 logicOpEnable + EDS2 logicOp are supported (`MakeDynamicBlendState`, nvn_pipeline_state.h).
+struct DynamicBlendState {
+    u32 attachment_count{};
+    bool logic_op_enable{};
+    VkLogicOp logic_op{VK_LOGIC_OP_COPY};
+    std::array<VkBool32, MAX_COLOR_TARGETS> blend_enable{};
+    std::array<VkColorBlendEquationEXT, MAX_COLOR_TARGETS> equations{};
+    std::array<VkColorComponentFlags, MAX_COLOR_TARGETS> write_masks{};
+
+    [[nodiscard]] bool operator==(const DynamicBlendState& o) const noexcept {
+        if (attachment_count != o.attachment_count || logic_op_enable != o.logic_op_enable ||
+            logic_op != o.logic_op) {
+            return false;
+        }
+        for (u32 i = 0; i < attachment_count; ++i) {
+            if (blend_enable[i] != o.blend_enable[i] || write_masks[i] != o.write_masks[i] ||
+                std::memcmp(&equations[i], &o.equations[i], sizeof(VkColorBlendEquationEXT)) != 0) {
+                return false;
+            }
+        }
+        return true;
+    }
 };
 struct PipelineBase;
 namespace Disk {
@@ -301,16 +331,42 @@ struct PipelineLogInfo {
 };
 
 
+/// Flat descriptor entry passed to vkCmdPushDescriptorSetWithTemplateKHR /
+/// vkUpdateDescriptorSetWithTemplate in binding declaration order.
+union DescriptorTemplateEntry {
+    VkDescriptorBufferInfo buffer;
+    VkDescriptorImageInfo image;
+    VkBufferView texel_view;
+};
+static_assert(sizeof(DescriptorTemplateEntry) == sizeof(VkDescriptorBufferInfo));
+
+/// Descriptor set layout, pipeline layout and descriptor update template shared across
+/// pipelines with an identical descriptor signature.
+struct SharedPipelineLayout {
+    vk::DescriptorSetLayout set_layout;
+    /// Set BINDLESS_SET of the layout when a stage samples through the bindless table.
+    vk::DescriptorSetLayout bindless_layout;
+    vk::PipelineLayout layout;
+    vk::DescriptorUpdateTemplate update_template;
+    bool push_descriptors{};
+    u32 push_constant_size{};
+    u32 template_entry_count{};
+};
+
 /// A created pipeline. Immutable after creation (but for a GPL pipeline's `optimized` handle,
 /// see GraphicsPipeline); shared_ptr so in-flight submissions keep it alive.
 struct PipelineBase {
     vk::Pipeline pipeline;
-    vk::PipelineLayout layout;
-    vk::DescriptorSetLayout set_layout; ///< null when the pipeline has no descriptors
+    std::shared_ptr<const SharedPipelineLayout> shared_layout;
+    VkPipelineLayout layout{VK_NULL_HANDLE};
+    VkDescriptorSetLayout set_layout{VK_NULL_HANDLE}; ///< null when the pipeline has no descriptors
     /// Set BINDLESS_SET of the layout when a stage samples through the bindless table.
-    vk::DescriptorSetLayout bindless_layout;
-    /// The descriptor set is pushed with vkCmdPushDescriptorSetKHR; otherwise it is allocated.
+    VkDescriptorSetLayout bindless_layout{VK_NULL_HANDLE};
+    VkDescriptorUpdateTemplate update_template{VK_NULL_HANDLE};
+    /// The descriptor set is pushed with vkCmdPushDescriptorSetWithTemplateKHR / KHR; otherwise
+    /// it is allocated.
     bool push_descriptors{};
+    u32 template_entry_count{};
     /// Descriptor bindings of every stage in pipeline order, numbered as in the SPIR-V.
     VC::DescriptorLayout descriptors;
     /// Push-constant range size in bytes (rescaling / render-area words), 0 if none.
@@ -353,6 +409,13 @@ struct GraphicsPipeline : PipelineBase {
     /// The pipeline declares the states of DynamicFixedState dynamic (GPL path): the replay sets
     /// `fixed_values` after binding it.
     bool dynamic_fixed{};
+    bool dynamic_polygon_mode{};
+    bool dynamic_depth_clamp{};
+    bool dynamic_provoking_vertex{};
+    bool dynamic_patch_control_points{};
+    bool dynamic_blend{};
+    bool dynamic_alpha_to_coverage{};
+    u32 color_attachment_count{};
     DynamicFixedState fixed_values;
     /// GPL path: `pipeline` was fast-linked from VK_EXT_graphics_pipeline_library parts.
     /// `optimized` is the same pipeline compiled whole in the background (same layout, render
@@ -361,6 +424,9 @@ struct GraphicsPipeline : PipelineBase {
     /// in flight may use it) until the pipeline is destroyed.
     bool fast_linked{};
     std::atomic<bool> prefetched_unused{};
+    std::atomic<bool> optimize_deferred{false};
+    std::atomic<u64> optimize_last_present{0};
+    u32 optimize_present_count{0};
     vk::Pipeline optimized;
     std::atomic<VkPipeline> optimized_handle{VK_NULL_HANDLE};
 
@@ -379,7 +445,9 @@ struct ComputeRequest {
     VC::NvnEnvironmentOptions environment;
 };
 
-struct ComputePipeline : PipelineBase {};
+struct ComputePipeline : PipelineBase {
+    std::atomic<bool> prefetched_unused{};
+};
 
 struct PipelineCacheOptions {
     /// Directory of the per-title files (`nvn_pipelines.k<key>.bin`, `nvn_pipelines.vkcache`);
@@ -420,6 +488,9 @@ struct PipelineCacheOptions {
     /// translated stages and the shader parts. Ignored when the device does not have the
     /// extension with fast linking (vulkan_device.cpp enables it only when a renderer asks for it).
     bool graphics_pipeline_library{false};
+    /// Number of distinct presents a fast-linked GPL pipeline must be drawn in before background
+    /// LTO (`QueueOptimize`) starts. 0 optimizes immediately after fast-linking.
+    u32 gpl_optimize_after_presents{0};
     /// Settings nvn_sync_diet: the render passes (GetRenderPass) carry no external dependencies
     /// (RenderPassDependencies); the replay's explicit barrier between a pass and the next op is
     /// the one sync at the boundary, and passes begun outside BeginPass flush it themselves
@@ -436,6 +507,14 @@ struct PipelineCacheOptions {
     /// LoadDiskResources), then Complete; nothing when the cache file holds no pipelines. Null:
     /// nothing is reported.
     VideoCore::LoadProgressSink* load_progress{};
+    /// Emit raw-global miss reporting instructions so unbacked mirror pools can be demand-promoted
+    /// when host memory import is disabled or unavailable.
+    bool raw_miss_reporting{false};
+    /// Strip device-supported dynamic state fields (cull/depth/stencil/polygon/clamp/provoking/
+    /// patch/blend/alpha-to-coverage) and unread vertex input slots from GraphicsKey so draws
+    /// differing only in dynamic state share one VkPipeline. Requires the replay to emit dynamic
+    /// state from live draw state rather than `GraphicsPipeline::fixed_values`.
+    bool dedup_dynamic_state{false};
 };
 
 struct PipelineCacheStats {
@@ -465,6 +544,13 @@ struct PipelineCacheStats {
     u64 lowered_programs{}; ///< lowered stage programs held now
 };
 
+/// Attachment clear bits passed to `PipelineCache::GetRenderPass` to turn `LOAD_OP_LOAD` into
+/// `LOAD_OP_CLEAR` while keeping render-pass compatibility with `clear_mask == 0` pipelines.
+/// Bits 0..7 select color attachment slots 0..7; `RENDER_PASS_CLEAR_DEPTH` and
+/// `RENDER_PASS_CLEAR_STENCIL` select depth and stencil.
+inline constexpr u16 RENDER_PASS_CLEAR_DEPTH = 1u << 8;
+inline constexpr u16 RENDER_PASS_CLEAR_STENCIL = 1u << 9;
+
 /// Thread-safety: see the file comment.
 class PipelineCache {
 public:
@@ -489,8 +575,10 @@ public:
                                                                 bool* not_ready = nullptr,
                 const std::function<void(u64)>& look_ahead = {});
     void PrefetchGraphics(const GraphicsRequest& request, u64 current_key);
-    [[nodiscard]] std::shared_ptr<ComputePipeline> GetCompute(const ComputeRequest& request,
-                                                              bool* not_ready = nullptr);
+    void PrefetchCompute(const ComputeRequest& request, u64 skip_hash);
+    [[nodiscard]] std::shared_ptr<ComputePipeline> GetCompute(
+        const ComputeRequest& request, bool* not_ready = nullptr,
+        const std::function<void(u64)>& look_ahead = {});
     /// Shader log only (call when `ShaderLog::Enabled()`): the compute program of `request` was
     /// not compiled because the replay substituted its own implementation (`reason`, e.g. the
     /// NDSR upscale stand-in). Logs the program (bytes, control) and a Fallback pipeline record
@@ -502,6 +590,10 @@ public:
     /// on a background thread now, so the draw that first uses the program does not lower them.
     void PrepareProgram(const std::array<StageProgram, STAGE_COUNT>& stages,
                         std::shared_ptr<const void> owner);
+    /// Advances the cache's present generation for deferred GPL optimization scheduling.
+    void OnPresent();
+    /// Notifies the cache that `pipeline` was used in the current present for deferred LTO.
+    void NoteGraphicsUsed(GraphicsPipeline& pipeline);
     /// The cache fast-links graphics pipelines from VK_EXT_graphics_pipeline_library parts.
     [[nodiscard]] bool UsesGraphicsPipelineLibrary() const noexcept;
     /// The render passes have no external dependencies (PipelineCacheOptions::sync_diet).
@@ -510,7 +602,9 @@ public:
     /// The render pass pipelines of this key are created for and that the replay begins with
     /// (attachments LOAD/STORE, color attachments in COLOR_ATTACHMENT_OPTIMAL, depth/stencil in
     /// DEPTH_STENCIL_ATTACHMENT_OPTIMAL for the whole pass). Owned by the cache.
-    [[nodiscard]] VkRenderPass GetRenderPass(const RenderPassKey& key);
+    [[nodiscard]] VkRenderPass GetRenderPass(const RenderPassKey& key,
+                                             bool read_only_depth = false,
+                                             u16 clear_mask = 0);
 
     /// The Shader::Profile / HostTranslateInfo built from the device (as vk_pipeline_cache.cpp).
     [[nodiscard]] const Shader::Profile& Profile() const noexcept;

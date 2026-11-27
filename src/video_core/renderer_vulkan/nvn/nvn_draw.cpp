@@ -10,6 +10,7 @@
 #include <fmt/format.h>
 
 #include "common/boot_counter.h"
+#include "common/cityhash.h"
 #include "common/diag_request.h"
 #include "common/logging.h"
 #include "common/scope_exit.h"
@@ -118,6 +119,17 @@ DrawContext::DrawContext(Context::Impl& impl_, u32 queue_)
 
 DrawContext::~DrawContext() {
     impl.uniform_snapshots.Deactivate(usnap);
+    for (const BindlessState::Entry& entry : bindless.entries) {
+        if (const std::shared_ptr<Storage> s = entry.storage_ref.lock()) {
+            --s->bindless_tracked_count;
+            if (entry.any) {
+                --s->bindless_active_count;
+            }
+        }
+    }
+    bindless.entries.clear();
+    bindless.storage_slots.clear();
+    bindless.serial_slots.clear();
 }
 
 void DrawContext::BeginSubmission(DrawHost& host_, const VC::Submission& submission_) {
@@ -132,6 +144,7 @@ void DrawContext::BeginSubmission(DrawHost& host_, const VC::Submission& submiss
     bound_pipeline = VK_NULL_HANDLE;
     vertex_input_set = false;
     inline_updates.clear();
+    pending_clears.Reset();
     shadows.clear();
     staged_vertex.clear();
     stage_covered_end = nullptr;
@@ -140,7 +153,12 @@ void DrawContext::BeginSubmission(DrawHost& host_, const VC::Submission& submiss
     set_pool_used = 0;
     last_kept = nullptr;
     last_compute_kept = nullptr;
+    movie_network_input.reset();
+    movie_network_skip = 0;
+    compute_groups = {};
+    compute_thread_group = {};
     last_framebuffer.handle = VK_NULL_HANDLE;
+    pass_key_valid = false;
     resources.RefreshSamplerSetting();
 }
 
@@ -151,6 +169,7 @@ void DrawContext::EndSubmission() {
     usnap.Reset(nullptr);
     pass_open = false;
     inline_updates.clear();
+    pending_clears.Reset();
     shadows.clear();
     staged_vertex.clear();
     stage_covered_end = nullptr;
@@ -170,7 +189,8 @@ void DrawContext::OnSegmentBegin(bool keep_shadows) {
     pass_open = false;
     pass_shader_writes = false;
     pass_buffer_writes = false;
-    pass_reports_ordered = false;
+    pass_has_color = false;
+    pass_has_depth = false;
     pipeline_dirty = true;
     vertex_dirty = true;
     dynamic_dirty = ~0u;
@@ -182,6 +202,10 @@ void DrawContext::OnSegmentBegin(bool keep_shadows) {
     bound_pipeline = VK_NULL_HANDLE;
     bound_state.Reset();
     vertex_input_set = false;
+    fixed_state_set = false;
+    patch_control_points_set = false;
+    blend_state_set = false;
+    alpha_to_coverage_set = false;
 }
 
 void DrawContext::OnSegmentEnd() {
@@ -381,11 +405,14 @@ bool DrawContext::Handle(const VC::RecordHeader* header) {
                     host->HostMarkWritten();
                 } else {
                     if (NvnBarrierOrders(bits) && host->HostReportsPending()) {
-                        pass_reports_ordered = true;
+                        host->HostMarkReportsOrdered();
                     }
                     ++counters.barriers_kept;
                 }
             } else if (NvnBarrierOrdersAllWork(bits) || !impl.dispatch_order_by_barriers) {
+                if (host->HostReportsPending()) {
+                    host->HostMarkReportsOrdered();
+                }
                 host->HostMarkWritten();
             } else {
                 // ORDER_FRAGMENTS / ORDER_FRAGMENTS_TILED / invalidations alone outside a pass:
@@ -393,6 +420,9 @@ bool DrawContext::Handle(const VC::RecordHeader* header) {
                 // behind the pending barrier already. Earlier dispatches stay unordered for later
                 // dispatches, as on the console; every other consumer still flushes their writes
                 // (HostFlushBarrierBeforeDispatch / FlushPending).
+                if (NvnBarrierOrders(bits) && host->HostReportsPending()) {
+                    host->HostMarkReportsOrdered();
+                }
                 ++counters.barriers_without_wait;
             }
         }
@@ -426,14 +456,15 @@ bool DrawContext::Handle(const VC::RecordHeader* header) {
     case Op::SetDepthClamp:
         if (fits(sizeof(VC::EnablePayload))) {
             const u32 value = VC::RecordPayload<VC::EnablePayload>(header)->enable ? 1u : 0u;
-            pipeline_dirty |= ReplaceState(fixed.depth_clamp, value, impl.mario_kart_world);
+            pipeline_dirty |= ReplaceState(fixed.depth_clamp, value, !Debug::Get().no_state_elide);
         }
         return true;
     case Op::SetAlphaRef:
         if (fits(sizeof(VC::SetAlphaRefPayload))) {
             const u32 value =
                 std::bit_cast<u32>(VC::RecordPayload<VC::SetAlphaRefPayload>(header)->reference);
-            pipeline_dirty |= ReplaceState(fixed.alpha_ref_bits, value, impl.mario_kart_world);
+            pipeline_dirty |=
+                ReplaceState(fixed.alpha_ref_bits, value, !Debug::Get().no_state_elide);
         }
         return true;
     case Op::PushConstants:
@@ -451,8 +482,10 @@ bool DrawContext::Handle(const VC::RecordHeader* header) {
             const auto* p = VC::RecordPayload<VC::SetPrimitiveRestartPayload>(header);
             const u32 enabled = p->enable ? 1u : 0u;
             const u32 index = p->enable ? p->index : 0u;
-            pipeline_dirty |= ReplaceState(fixed.primitive_restart, enabled, impl.mario_kart_world);
-            pipeline_dirty |= ReplaceState(fixed.restart_index, index, impl.mario_kart_world);
+            pipeline_dirty |=
+                ReplaceState(fixed.primitive_restart, enabled, !Debug::Get().no_state_elide);
+            pipeline_dirty |=
+                ReplaceState(fixed.restart_index, index, !Debug::Get().no_state_elide);
         }
         return true;
     case Op::SetViewportSwizzles:
@@ -466,27 +499,30 @@ bool DrawContext::Handle(const VC::RecordHeader* header) {
     case Op::SetRasterizerDiscard:
         if (fits(sizeof(VC::EnablePayload))) {
             const u32 value = VC::RecordPayload<VC::EnablePayload>(header)->enable ? 1u : 0u;
-            pipeline_dirty |= ReplaceState(fixed.rasterizer_discard, value, impl.mario_kart_world);
+            pipeline_dirty |=
+                ReplaceState(fixed.rasterizer_discard, value, !Debug::Get().no_state_elide);
         }
         return true;
     case Op::SetSampleMask:
         if (fits(sizeof(VC::U32Payload))) {
             const u32 value = VC::RecordPayload<VC::U32Payload>(header)->value;
-            pipeline_dirty |= ReplaceState(fixed.sample_mask, value, impl.mario_kart_world);
+            pipeline_dirty |= ReplaceState(fixed.sample_mask, value, !Debug::Get().no_state_elide);
         }
         return true;
     case Op::SetProvokingVertex:
         if (fits(sizeof(VC::U32Payload))) {
             const u32 last = VC::RecordPayload<VC::U32Payload>(header)->value & 1;
             const u32 value = last != 0 ? 0u : 1u;
-            pipeline_dirty |= ReplaceState(fixed.provoking_first, value, impl.mario_kart_world);
+            pipeline_dirty |=
+                ReplaceState(fixed.provoking_first, value, !Debug::Get().no_state_elide);
         }
         return true;
     case Op::SetPointSize:
         if (fits(sizeof(VC::F32Payload))) {
             const u32 value =
                 std::bit_cast<u32>(VC::RecordPayload<VC::F32Payload>(header)->value);
-            pipeline_dirty |= ReplaceState(fixed.point_size_bits, value, impl.mario_kart_world);
+            pipeline_dirty |=
+                ReplaceState(fixed.point_size_bits, value, !Debug::Get().no_state_elide);
         }
         return true;
     case Op::SetLineWidth:
@@ -517,7 +553,7 @@ void DrawContext::SetProgram(const VC::BindProgramPayload& p) {
             stages[stage].program_serial = p.program_serial;
         }
     }
-    pipeline_dirty |= !impl.mario_kart_world || changed;
+    pipeline_dirty |= Debug::Get().no_state_elide || changed;
 }
 
 void DrawContext::BindState(const VC::RecordHeader* header) {
@@ -529,8 +565,9 @@ void DrawContext::BindState(const VC::RecordHeader* header) {
                          fmt::format("bad state object (kind {}, size {})", p->kind, p->size));
         return;
     }
+    const bool elide = !Debug::Get().no_state_elide;
     const auto assign = [&](auto& destination, const auto& value) {
-        return ReplaceState(destination, value, impl.mario_kart_world);
+        return ReplaceState(destination, value, elide);
     };
     bool changed = false;
     switch (static_cast<VC::StateKind>(p->kind)) {
@@ -582,7 +619,7 @@ void DrawContext::BindVertexAttribs(const VC::RecordHeader* header) {
     for (u32 i = 0; i < words.size() && i < MAX_VERTEX_ATTRIBUTES; ++i) {
         attributes[i] = words[i];
     }
-    if (impl.mario_kart_world && fixed.attributes == attributes) {
+    if (!Debug::Get().no_state_elide && fixed.attributes == attributes) {
         return;
     }
     fixed.attributes = attributes;
@@ -600,7 +637,7 @@ void DrawContext::BindVertexStreams(const VC::RecordHeader* header) {
         strides[i] = values[i].stride;
         divisors[i] = values[i].divisor;
     }
-    if (impl.mario_kart_world && fixed.stream_stride == strides &&
+    if (!Debug::Get().no_state_elide && fixed.stream_stride == strides &&
         fixed.stream_divisor == divisors) {
         return;
     }
@@ -633,7 +670,11 @@ void DrawContext::BindBuffers(const VC::RecordHeader* header, bool uniform) {
                    table[p->first + i].size != ranges[i].size;
         table[p->first + i] = {ranges[i].address, ranges[i].size};
     }
-    if (!uniform && (!impl.mario_kart_world || changed)) {
+    if (uniform) {
+        if (p->stage == STAGE_COMPUTE && (Debug::Get().no_state_elide || changed)) {
+            compute_uniform_gen = ++bank_clock;
+        }
+    } else if (Debug::Get().no_state_elide || changed) {
         storage_gen[p->stage] = ++bank_clock;
     }
 }
@@ -676,7 +717,7 @@ void DrawContext::BindHandles(const VC::RecordHeader* header, VC::Op op) {
             break;
         }
     }
-    if (!impl.mario_kart_world || changed) {
+    if (Debug::Get().no_state_elide || changed) {
         handle_gen[p->stage] = ++bank_clock;
     }
 }
@@ -717,7 +758,7 @@ void DrawContext::PushConstantsOp(const VC::RecordHeader* header) {
                                           size, PUSH_CONSTANT_BLOCK_SIZE));
         return;
     }
-    if (impl.mario_kart_world &&
+    if (!Debug::Get().no_state_elide &&
         std::memcmp(block.data() + p->offset, reinterpret_cast<const u8*>(p + 1), size) == 0) {
         return;
     }
@@ -809,6 +850,7 @@ void DrawContext::SetRenderTargets(const VC::RecordHeader* header) {
 }
 
 void DrawContext::DecideTargetScale() {
+    pass_key_valid = false;
     targets_scaled = false;
     const Rescale::Factor factor = impl.RescaleFactor();
     if (!factor.Active()) {
@@ -895,6 +937,16 @@ AttachmentFormat FormatOf(const Device& device, const Texture& texture,
         result.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
     }
     return result;
+}
+
+[[nodiscard]] Storage* CanonicalTargetStorage(const std::shared_ptr<Texture>& texture,
+                                              const std::shared_ptr<Texture>& native) noexcept {
+    const Texture* const tex = native ? native.get() : texture.get();
+    if (!tex || !tex->storage) {
+        return nullptr;
+    }
+    Storage* const st = tex->storage.get();
+    return st->scale_owner != nullptr ? st->scale_owner : st;
 }
 
 } // namespace
@@ -1068,12 +1120,23 @@ void DrawContext::RevertTargetScale() {
         depth_target.texture = std::move(depth_target.native);
     }
     targets_scaled = false;
+    pass_key_valid = false;
 }
 
-bool DrawContext::BeginPass() {
+bool DrawContext::BeginPass(bool read_only_depth) {
+    movie_network_input.reset();
+    movie_network_skip = 0;
+    if (pass_open && pass_read_only_depth != read_only_depth) {
+        EndPass(BreakCause::LayoutChange);
+    }
     if (pass_open) {
         return true;
     }
+    if (read_only_depth && (pending_clears.clear_depth || pending_clears.clear_stencil)) {
+        FlushPendingClears(BreakCause::LayoutChange);
+    }
+    const PendingClears clears = pending_clears;
+    pending_clears.Reset();
     if (targets_scaled) {
         bool made = true;
         for (u32 i = 0; i < color_target_count; ++i) {
@@ -1098,6 +1161,8 @@ bool DrawContext::BeginPass() {
     };
     std::array<Attachment, MAX_COLOR_TARGETS + 1> attachments{};
     u32 attachment_count = 0;
+    u16 clear_mask = 0;
+    std::array<VkClearValue, MAX_COLOR_TARGETS + 1> clear_values{};
     VkExtent2D extent{~0u, ~0u};
     VkExtent2D native_extent{~0u, ~0u}; ///< the same in the game's pixels (differs when scaled)
     u32 layers = ~0u;
@@ -1126,6 +1191,18 @@ bool DrawContext::BeginPass() {
         layers = (std::min)(layers, shape.layer_count);
         samples = static_cast<u32>(storage.samples);
         (is_depth ? key.depth : key.color[slot]) = static_cast<s32>(shape.format);
+        if (is_depth) {
+            if (clears.clear_depth && storage.host.depth) {
+                clear_mask |= RENDER_PASS_CLEAR_DEPTH;
+            }
+            if (clears.clear_stencil && storage.host.stencil) {
+                clear_mask |= RENDER_PASS_CLEAR_STENCIL;
+            }
+            clear_values[attachment_count].depthStencil = {clears.depth, clears.stencil};
+        } else if ((clears.color_mask & (1u << slot)) != 0) {
+            clear_mask |= static_cast<u16>(1u << slot);
+            clear_values[attachment_count].color = clears.color[slot];
+        }
         attachments[attachment_count++] = {&texture, &storage, shape, VK_NULL_HANDLE};
         return true;
     };
@@ -1169,13 +1246,24 @@ bool DrawContext::BeginPass() {
             // Drawing at the guest size into an image whose twin may be the newer one.
             host->HostMakeNativeCurrent(*attachment.storage);
         }
+        if (attachment.storage->pending_unrestricted_formats ||
+            !attachment.storage->FormatListAllows(attachment.shape.key.format)) {
+            if (!host->HostUpgradeImageCaps(*attachment.storage, false, true)) {
+                host->HostFailed("SetRenderTargets", fmt::format("no image for render target {:#x}",
+                                                                 attachment.texture->serial));
+                return false;
+            }
+        }
         if (!host->HostEnsureAttachmentContents(*attachment.storage)) {
             host->HostFailed("SetRenderTargets", fmt::format("no image for render target {:#x}",
                                                              attachment.texture->serial));
             return false;
         }
+        const VkImageLayout depth_layout = read_only_depth
+            ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+            : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         transition_scratch.emplace_back(attachment.storage,
-                                        is_depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+                                        is_depth ? depth_layout
                                                  : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     }
     // Storages that flip between attachment and sampled use go to their sampled layout now, in
@@ -1187,10 +1275,12 @@ bool DrawContext::BeginPass() {
             continue;
         }
         const size_t index = i++;
-        const bool attached =
+        const bool needs_flip =
             flip->current_layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL ||
-            flip->current_layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-        if (!flip->image || !attached) {
+            flip->current_layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL ||
+            flip->current_layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL ||
+            flip->current_layout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        if (!flip->image || !needs_flip) {
             continue;
         }
         // Rendered to since it was last sampled: still in use.
@@ -1217,7 +1307,7 @@ bool DrawContext::BeginPass() {
     // The views need the images, which exist now.
     for (u32 i = 0; i < attachment_count; ++i) {
         Attachment& attachment = attachments[i];
-        attachment.view = resources.GetView(*attachment.texture, attachment.shape.key);
+        attachment.view = resources.GetView(*attachment.texture, attachment.shape.key, true);
         if (!attachment.view) {
             host->HostFailed("SetRenderTargets",
                              fmt::format("no image view for {:#x}", attachment.texture->serial));
@@ -1229,9 +1319,16 @@ bool DrawContext::BeginPass() {
         }
     }
 
-    const VkRenderPass render_pass = resources.Cache().GetRenderPass(key);
-    if (!render_pass) {
+    const VkRenderPass base_render_pass = resources.Cache().GetRenderPass(key, read_only_depth, 0);
+    if (!base_render_pass) {
         host->HostFailed("SetRenderTargets", "render pass creation failed");
+        return false;
+    }
+    const VkRenderPass render_pass =
+        clear_mask != 0 ? resources.Cache().GetRenderPass(key, read_only_depth, clear_mask)
+                        : base_render_pass;
+    if (!render_pass) {
+        host->HostFailed("SetRenderTargets", "clear render pass creation failed");
         return false;
     }
     std::array<VkImageView, MAX_COLOR_TARGETS + 1> views{};
@@ -1239,25 +1336,57 @@ bool DrawContext::BeginPass() {
         views[i] = attachments[i].view;
     }
     try {
+        const u64 fb_epoch = resources.framebuffer_views_epoch;
+        if (framebuffer_cache_epoch != fb_epoch) {
+            framebuffer_cache.clear();
+            framebuffer_cache_epoch = fb_epoch;
+            last_framebuffer.handle = VK_NULL_HANDLE;
+        }
+        const u64 seq = host->HostFlight().seq;
         VkFramebuffer framebuffer = last_framebuffer.handle;
-        if (!framebuffer || last_framebuffer.pass != render_pass ||
+        if (!framebuffer || last_framebuffer.epoch != fb_epoch ||
+            last_framebuffer.retained_seq != seq || last_framebuffer.pass != base_render_pass ||
             last_framebuffer.extent.width != extent.width ||
             last_framebuffer.extent.height != extent.height || last_framebuffer.layers != layers ||
-            last_framebuffer.views != views) {
-            auto created = std::make_shared<vk::Framebuffer>(device.GetLogical().CreateFramebuffer({
-                .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-                .pNext = nullptr,
-                .flags = 0,
-                .renderPass = render_pass,
-                .attachmentCount = attachment_count,
-                .pAttachments = views.data(),
-                .width = extent.width,
-                .height = extent.height,
-                .layers = layers,
-            }));
-            framebuffer = **created;
-            host->HostFlight().keepalive.push_back(std::move(created));
-            last_framebuffer = {render_pass, framebuffer, extent, layers, views};
+            last_framebuffer.count != attachment_count || last_framebuffer.views != views) {
+            const FramebufferKey fb_key{base_render_pass, extent, layers, attachment_count, views};
+            auto it = framebuffer_cache.find(fb_key);
+            if (it != framebuffer_cache.end()) {
+                CachedFramebuffer& cached = it->second;
+                cached.last_used_seq = seq;
+                if (cached.last_retained_seq != seq) {
+                    host->HostFlight().keepalive.push_back(cached.fb);
+                    cached.last_retained_seq = seq;
+                }
+                framebuffer = **cached.fb;
+            } else {
+                if (framebuffer_cache.size() >= FRAMEBUFFER_CACHE_MAX) {
+                    auto victim = framebuffer_cache.begin();
+                    for (auto iter = std::next(victim); iter != framebuffer_cache.end(); ++iter) {
+                        if (iter->second.last_used_seq < victim->second.last_used_seq) {
+                            victim = iter;
+                        }
+                    }
+                    framebuffer_cache.erase(victim);
+                }
+                auto created =
+                    std::make_shared<vk::Framebuffer>(device.GetLogical().CreateFramebuffer({
+                        .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+                        .pNext = nullptr,
+                        .flags = 0,
+                        .renderPass = base_render_pass,
+                        .attachmentCount = attachment_count,
+                        .pAttachments = views.data(),
+                        .width = extent.width,
+                        .height = extent.height,
+                        .layers = layers,
+                    }));
+                framebuffer = **created;
+                host->HostFlight().keepalive.push_back(created);
+                framebuffer_cache.emplace(fb_key, CachedFramebuffer{std::move(created), seq, seq});
+            }
+            last_framebuffer = {base_render_pass, framebuffer, extent,           layers,
+                                views,            attachment_count, fb_epoch, seq};
         }
         const VkRenderPassBeginInfo begin{
             .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
@@ -1265,8 +1394,8 @@ bool DrawContext::BeginPass() {
             .renderPass = render_pass,
             .framebuffer = framebuffer,
             .renderArea = {{0, 0}, extent},
-            .clearValueCount = 0,
-            .pClearValues = nullptr,
+            .clearValueCount = clear_mask != 0 ? attachment_count : 0u,
+            .pClearValues = clear_mask != 0 ? clear_values.data() : nullptr,
         };
         if (impl.gpu_profiler) {
             ProfBeginPass(key, extent, layers, samples);
@@ -1277,6 +1406,28 @@ bool DrawContext::BeginPass() {
         return false;
     }
     pass_open = true;
+    pass_read_only_depth = read_only_depth;
+    pass_has_color = false;
+    pass_has_depth = false;
+    const u64 rt_frame = impl.stats.presents.load(std::memory_order_relaxed) + 1;
+    for (u32 i = 0; i < attachment_count; ++i) {
+        Storage& raw_storage = *attachments[i].storage;
+        Storage& storage = raw_storage.scale_owner != nullptr ? *raw_storage.scale_owner
+                                                              : raw_storage;
+        if (storage.last_rt_frame != rt_frame) {
+            const u64 delta = storage.last_rt_frame != 0 && rt_frame >= storage.last_rt_frame
+                                  ? (rt_frame - storage.last_rt_frame)
+                                  : ~u64{0};
+            storage.consecutive_rt_frames = delta <= 4 ? (storage.consecutive_rt_frames + 1) : 1u;
+            storage.last_rt_frame = rt_frame;
+        }
+        const bool is_depth = raw_storage.host.depth || raw_storage.host.stencil;
+        if (is_depth) {
+            pass_has_depth = pass_has_depth || !read_only_depth || raw_storage.host.stencil;
+        } else {
+            pass_has_color = true;
+        }
+    }
     ++counters.pass_begins;
     if (VideoCommon::Nvn::TimestampTraceEnabled()) {
         resources.TracePass(extent.width, extent.height);
@@ -1303,6 +1454,11 @@ void DrawContext::EndPass(BreakCause cause) {
     if (!host) {
         return;
     }
+    if (!pass_open && pending_clears.Any()) {
+        if (impl.device_lost.load(std::memory_order_acquire) || !BeginPass(false)) {
+            pending_clears.Reset();
+        }
+    }
     // Anything but the break of a feedback copy (which copies right away) may be followed by a
     // write to a sampled render target: copies made so far are not current any more.
     render_target_epoch.OnPassEnd(cause == BreakCause::FeedbackCopy);
@@ -1324,10 +1480,14 @@ void DrawContext::EndPass(BreakCause cause) {
         if (prof) {
             ProfAfterEndPass(*prof);
         }
+        const bool had_color = pass_has_color;
+        const bool had_depth = pass_has_depth;
+        const bool had_shader = pass_shader_writes;
         pass_open = false;
         pass_buffer_writes = false;
         pass_shader_writes = false;
-        pass_reports_ordered = false;
+        pass_has_color = false;
+        pass_has_depth = false;
         if (Debug::Tracing()) {
             DebugOnPassEnd();
         }
@@ -1336,7 +1496,7 @@ void DrawContext::EndPass(BreakCause cause) {
         }
         ++counters.pass_breaks;
         ++counters.break_causes[static_cast<size_t>(cause)];
-        host->HostMarkWritten();
+        host->HostMarkPassWritten(had_color, had_depth, had_shader);
         bound_pipeline = VK_NULL_HANDLE;
         bound_state.Reset();
         host->HostPassEnded();
@@ -1403,6 +1563,16 @@ void DrawContext::FlushInlineUpdates() {
     }
     // Earlier draws may still read the old contents, and the resolves may have written shadows
     // back over these bytes: order the copies after both.
+    if (host->HostReportsPending()) {
+        for (size_t i = 0; i < targets.size(); ++i) {
+            const BufferRef& target = targets[i];
+            if (target.pool && !superseded_at(i) &&
+                host->HostReportPending(*target.pool, target.pool_offset, target.range)) {
+                host->HostResolveCounterBatch();
+                break;
+            }
+        }
+    }
     host->HostMarkWritten();
     host->HostFlushBarrier();
     const auto overlaps = [](const BufferRef& a, const BufferRef& b) {
@@ -1455,7 +1625,7 @@ void DrawContext::FlushInlineUpdates() {
         }
     }
     inline_updates.clear();
-    host->HostMarkWritten();
+    host->HostMarkTransferWritten();
 }
 
 void DrawContext::OnPoolWrite(const Pool& pool, u64 offset, u64 size) {
@@ -1866,6 +2036,66 @@ VkRect2D DrawContext::HostRect(VkRect2D guest) const {
     return {{x0, y0}, {static_cast<u32>(x1 - x0), static_cast<u32>(y1 - y0)}};
 }
 
+bool DrawContext::TargetNativeExtent(VkExtent2D& out) const {
+    VkExtent2D extent{~0u, ~0u};
+    bool any = false;
+    const auto accumulate = [&](const TargetBinding& target) {
+        if (!target.texture) {
+            return true;
+        }
+        const Texture* const guest_tex = target.native ? target.native.get() : target.texture.get();
+        if (!guest_tex->storage || guest_tex->storage->image_failed) {
+            return false;
+        }
+        const Storage& guest = *guest_tex->storage;
+        const u32 level = target.ref.texture.level;
+        if (level >= guest.levels) {
+            return false;
+        }
+        extent.width = (std::min)(extent.width, Mip(guest.extent.width, level));
+        extent.height = (std::min)(extent.height, Mip(guest.extent.height, level));
+        any = true;
+        return true;
+    };
+    for (u32 slot = 0; slot < color_target_count; ++slot) {
+        if (!accumulate(color_targets[slot])) {
+            return false;
+        }
+    }
+    if (!accumulate(depth_target)) {
+        return false;
+    }
+    if (!any) {
+        return false;
+    }
+    out = extent;
+    return true;
+}
+
+bool DrawContext::ScissorCoversFullTarget(VkExtent2D native_extent) const {
+    if (native_extent.width == 0 || native_extent.height == 0) {
+        return false;
+    }
+    if ((scissors_set & 1) == 0) {
+        return true;
+    }
+    const VC::ScissorRect& s = scissors[0];
+    return s.x <= 0 && s.y <= 0 && s.width > 0 && s.height > 0 &&
+           s64{s.x} + s64{s.width} >= static_cast<s64>(native_extent.width) &&
+           s64{s.y} + s64{s.height} >= static_cast<s64>(native_extent.height);
+}
+
+void DrawContext::FlushPendingClears(BreakCause cause) {
+    if (pass_open || !pending_clears.Any()) {
+        return;
+    }
+    if (BeginPass(false)) {
+        EndPass(cause);
+    } else {
+        pending_clears.Reset();
+    }
+}
+
 void DrawContext::ClearColor(const VC::ClearColorPayload& p) {
     if (!host->HostBeginRenderCondition()) {
         return;
@@ -1875,6 +2105,22 @@ void DrawContext::ClearColor(const VC::ClearColorPayload& p) {
         !color_targets[p.index].texture) {
         host->HostFailed("ClearColor", fmt::format("no render target in slot {}", p.index));
         return finish();
+    }
+    if ((p.mask & 0xF) == 0) {
+        return finish();
+    }
+    if (!pass_open && !host->HostConditional() && (p.mask & 0xF) == 0xF && TargetsUsable()) {
+        VkExtent2D native_extent{};
+        if (TargetNativeExtent(native_extent) && ScissorCoversFullTarget(native_extent)) {
+            if (Storage* const st = CanonicalTargetStorage(color_targets[p.index].texture,
+                                                           color_targets[p.index].native)) {
+                st->last_full_clear_frame =
+                    impl.stats.presents.load(std::memory_order_relaxed) + 1;
+            }
+            pending_clears.color_mask |= static_cast<u8>(1u << p.index);
+            std::memcpy(pending_clears.color[p.index].uint32, p.color, sizeof(p.color));
+            return finish();
+        }
     }
     {
         const bool suspended = host->HostSuspendCondition();
@@ -1886,9 +2132,6 @@ void DrawContext::ClearColor(const VC::ClearColorPayload& p) {
             ++counters.draws_skipped;
             return finish();
         }
-    }
-    if ((p.mask & 0xF) == 0) {
-        return finish();
     }
     // Attachment index inside the (compact) render pass.
     u32 attachment = 0;
@@ -1919,6 +2162,13 @@ void DrawContext::ClearColor(const VC::ClearColorPayload& p) {
         .layerCount = framebuffer_layers,
     };
     host->HostCmd().ClearAttachments(std::span{&clear, 1}, std::span{&clear_rect, 1});
+    if (rect.offset.x == 0 && rect.offset.y == 0 && rect.extent.width == host_extent.width &&
+        rect.extent.height == host_extent.height) {
+        if (Storage* const st = CanonicalTargetStorage(color_targets[p.index].texture,
+                                                       color_targets[p.index].native)) {
+            st->last_full_clear_frame = impl.stats.presents.load(std::memory_order_relaxed) + 1;
+        }
+    }
     finish();
 }
 
@@ -1930,6 +2180,30 @@ void DrawContext::ClearDepthStencil(const VC::ClearDepthStencilPayload& p) {
     if (!depth_target.texture) {
         host->HostFailed("ClearDepthStencil", "no depth target");
         return finish();
+    }
+    const Storage* st = depth_target.texture->storage.get();
+    const u32 stencil_bits = static_cast<u32>(p.stencil_mask) & 0xFF;
+    if (!pass_open && !host->HostConditional() && st != nullptr && !st->image_failed &&
+        TargetsUsable() && !(stencil_bits != 0 && stencil_bits != 0xFF && st->host.stencil)) {
+        VkExtent2D native_extent{};
+        if (TargetNativeExtent(native_extent) && ScissorCoversFullTarget(native_extent)) {
+            if ((p.depth_mask && st->host.depth) || (stencil_bits == 0xFF && st->host.stencil)) {
+                if (Storage* const canon =
+                        CanonicalTargetStorage(depth_target.texture, depth_target.native)) {
+                    canon->last_full_clear_frame =
+                        impl.stats.presents.load(std::memory_order_relaxed) + 1;
+                }
+            }
+            if (p.depth_mask && st->host.depth) {
+                pending_clears.clear_depth = true;
+                pending_clears.depth = p.depth;
+            }
+            if (stencil_bits == 0xFF && st->host.stencil) {
+                pending_clears.clear_stencil = true;
+                pending_clears.stencil = static_cast<u32>(p.stencil) & 0xFF;
+            }
+            return finish();
+        }
     }
     {
         const bool suspended = host->HostSuspendCondition();
@@ -1943,7 +2217,6 @@ void DrawContext::ClearDepthStencil(const VC::ClearDepthStencilPayload& p) {
         }
     }
     const Storage& storage = *depth_target.texture->storage;
-    const u32 stencil_bits = static_cast<u32>(p.stencil_mask) & 0xFF;
     VkImageAspectFlags aspects = 0;
     if (p.depth_mask && storage.host.depth) {
         aspects |= VK_IMAGE_ASPECT_DEPTH_BIT;
@@ -1965,6 +2238,14 @@ void DrawContext::ClearDepthStencil(const VC::ClearDepthStencilPayload& p) {
             .layerCount = framebuffer_layers,
         };
         host->HostCmd().ClearAttachments(std::span{&clear, 1}, std::span{&clear_rect, 1});
+        if (rect.offset.x == 0 && rect.offset.y == 0 && rect.extent.width == host_extent.width &&
+            rect.extent.height == host_extent.height) {
+            if (Storage* const canon =
+                    CanonicalTargetStorage(depth_target.texture, depth_target.native)) {
+                canon->last_full_clear_frame =
+                    impl.stats.presents.load(std::memory_order_relaxed) + 1;
+            }
+        }
     }
     if (stencil_bits != 0 && stencil_bits != 0xFF && storage.host.stencil) {
         const bool gated = host->HostSuspendCondition();
@@ -2004,6 +2285,9 @@ private:
 } // namespace
 
 RenderPassKey DrawContext::MakePassKey() const {
+    if (pass_key_valid) {
+        return cached_pass_key;
+    }
     RenderPassKey key{};
     const Device& device = impl.device;
     for (u32 slot = 0; slot < color_target_count; ++slot) {
@@ -2017,6 +2301,8 @@ RenderPassKey DrawContext::MakePassKey() const {
         key.depth = static_cast<s32>(FormatOf(device, *depth_target.texture, depth_target.ref).format);
         key.samples = static_cast<u32>(depth_target.texture->storage->samples);
     }
+    cached_pass_key = key;
+    pass_key_valid = true;
     return key;
 }
 
@@ -2095,6 +2381,8 @@ std::shared_ptr<GraphicsPipeline> DrawContext::ResolvePipeline(u32 mode, u32 ele
         bound_pipeline = VK_NULL_HANDLE;
         bound_state.Reset();
         last_kept = nullptr;
+        compute_memo = {};
+        last_compute_kept = nullptr;
         shader_generation = generation;
     }
     const DrawOracle oracle{*this};
@@ -2229,8 +2517,32 @@ std::shared_ptr<GraphicsPipeline> DrawContext::ResolvePipeline(u32 mode, u32 ele
         resources.Cache().PrefetchGraphics(request, lookahead->skip_key);
         return nullptr;
     }
+    bool targets_per_frame = false;
+    {
+        bool has_target = false;
+        const u64 rt_frame = impl.stats.presents.load(std::memory_order_relaxed) + 1;
+        const auto check_target = [&](const TargetBinding& target) {
+            Storage* const st = CanonicalTargetStorage(target.texture, target.native);
+            if (!st) {
+                return true;
+            }
+            has_target = true;
+            if (st->last_rt_frame == 0 || rt_frame < st->last_rt_frame ||
+                (rt_frame - st->last_rt_frame) > 4) {
+                return false;
+            }
+            const bool cleared_this_frame = st->last_full_clear_frame == rt_frame;
+            const u32 min_consecutive = cleared_this_frame ? 4u : 8u;
+            return st->consecutive_rt_frames >= min_consecutive;
+        };
+        bool all_ok = check_target(depth_target);
+        for (u32 i = 0; i < color_target_count && all_ok; ++i) {
+            all_ok = check_target(color_targets[i]);
+        }
+        targets_per_frame = all_ok && has_target;
+    }
     // Only a draw that may be skipped asks without waiting for a compile on a worker.
-    const bool may_skip = !impl.mario_kart_world &&
+    const bool may_skip = !impl.mario_kart_world && targets_per_frame &&
                           MaySkipUnbuiltDraw(StoresGlobalMemory(request),
                                              depth_target.texture != nullptr, element_count);
     std::shared_ptr<GraphicsPipeline> result =
@@ -2256,7 +2568,8 @@ std::shared_ptr<GraphicsPipeline> DrawContext::ResolvePipeline(u32 mode, u32 ele
     return result;
 }
 
-void DrawContext::PrefetchUpcomingGraphics(u32 current_mode, u64 current_key) {
+void DrawContext::PrefetchUpcomingGraphics(u32 current_mode, u64 current_key,
+                                           u64 skip_compute_hash) {
     auto records = host->HostRecordsAhead();
     if (records.empty() || VideoCommon::ShaderLog::Enabled()) {
         return;
@@ -2279,8 +2592,8 @@ void DrawContext::PrefetchUpcomingGraphics(u32 current_mode, u64 current_key) {
         vertex_layout_dirty = saved_layout_dirty;
     };
 
-    constexpr size_t MAX_COMMANDS = 192;
-    constexpr size_t MAX_DRAWS = 8;
+    constexpr size_t MAX_COMMANDS = 512;
+    constexpr size_t MAX_DRAWS = 24;
     size_t draws = 0;
     u32 previous_mode = current_mode;
     bool changed = false;
@@ -2366,6 +2679,13 @@ void DrawContext::PrefetchUpcomingGraphics(u32 current_mode, u64 current_key) {
             }
             mode = MESH_DRAW_MODE;
             break;
+        case Op::Dispatch:
+            if (bytes < sizeof(VC::DispatchPayload)) {
+                return;
+            }
+            PrefetchBoundCompute(skip_compute_hash);
+            ++draws;
+            continue;
         default:
             return;
         }
@@ -2446,12 +2766,23 @@ void DrawContext::ApplyDynamicState(const GraphicsPipeline& active) {
         cmd.SetBlendConstants(blend_color);
     }
     if (dynamic_dirty & DIRTY_STENCIL) {
-        for (u32 face = 0; face < 2; ++face) {
-            const VkStencilFaceFlags flag =
-                face == 0 ? VK_STENCIL_FACE_FRONT_BIT : VK_STENCIL_FACE_BACK_BIT;
-            cmd.SetStencilCompareMask(flag, stencil[face].value_mask);
-            cmd.SetStencilWriteMask(flag, stencil[face].write_mask);
-            cmd.SetStencilReference(flag, stencil[face].reference);
+        if (stencil[0].value_mask == stencil[1].value_mask) {
+            cmd.SetStencilCompareMask(VK_STENCIL_FACE_FRONT_AND_BACK, stencil[0].value_mask);
+        } else {
+            cmd.SetStencilCompareMask(VK_STENCIL_FACE_FRONT_BIT, stencil[0].value_mask);
+            cmd.SetStencilCompareMask(VK_STENCIL_FACE_BACK_BIT, stencil[1].value_mask);
+        }
+        if (stencil[0].write_mask == stencil[1].write_mask) {
+            cmd.SetStencilWriteMask(VK_STENCIL_FACE_FRONT_AND_BACK, stencil[0].write_mask);
+        } else {
+            cmd.SetStencilWriteMask(VK_STENCIL_FACE_FRONT_BIT, stencil[0].write_mask);
+            cmd.SetStencilWriteMask(VK_STENCIL_FACE_BACK_BIT, stencil[1].write_mask);
+        }
+        if (stencil[0].reference == stencil[1].reference) {
+            cmd.SetStencilReference(VK_STENCIL_FACE_FRONT_AND_BACK, stencil[0].reference);
+        } else {
+            cmd.SetStencilReference(VK_STENCIL_FACE_FRONT_BIT, stencil[0].reference);
+            cmd.SetStencilReference(VK_STENCIL_FACE_BACK_BIT, stencil[1].reference);
         }
     }
     if (dynamic_dirty & DIRTY_BIAS) {
@@ -2486,6 +2817,35 @@ BufferRef DrawContext::AllocArena(u64 size, u64 alignment, u8** pointer) {
     }
     chunk.used += size;
     return ref;
+}
+
+BufferRef DrawContext::TryCopyMirrorRangeToArena(Pool& pool, u64 pool_offset, u64 address, u64 size,
+                                                u64 alignment) {
+    constexpr u64 MAX_INPASS_MIRROR_ARENA_BYTES = 65536;
+    const u64 current_seq = host->HostFlight().seq;
+    if (!pass_open || size == 0 || size > MAX_INPASS_MIRROR_ARENA_BYTES ||
+        pool.backing != Pool::Backing::Mirror || InlineUpdatePending(address, size) ||
+        HasOverlappingShadow(pool, pool_offset, pool_offset + size) ||
+        impl.NeedsGpuFlushForUniform(address, address + size, current_seq) ||
+        host->HostMirrorHasPendingGpuWrites(pool, pool_offset, size) ||
+        !host->HostMirrorNeedsUpload(pool, pool_offset, size)) {
+        return {};
+    }
+    u8* pointer = nullptr;
+    const BufferRef copy = AllocArena(size, alignment, &pointer);
+    if (!copy.buffer) {
+        return {};
+    }
+    if (pool.host) {
+        std::memcpy(pointer, pool.host + pool_offset, size);
+    } else if (const u8* source = impl.GuestPointer(address, size)) {
+        std::memcpy(pointer, source, size);
+    } else if (VC::GuestMemory* memory = impl.guest.load(std::memory_order_acquire);
+               !memory || !memory->Read(address, pointer, size)) {
+        std::memset(pointer, 0, size);
+    }
+    impl.ApplyPendingInlineWrites(address, pointer, size, current_seq);
+    return copy;
 }
 
 bool DrawContext::ResolveBuffer(u64 address, u64 size, bool write, BufferRef& out,
@@ -2547,7 +2907,16 @@ std::optional<u32> DrawContext::ReadUniformWord(u32 stage, u32 slot, u32 byte_of
     }
     if (!read_ok) {
         VC::GuestMemory* memory = impl.guest.load(std::memory_order_acquire);
-        if (!memory || !memory->Read(address, &value, sizeof(value))) {
+        if (!memory) {
+            return std::nullopt;
+        }
+        if ((address & 0xFFFu) <= 0xFFCu) {
+            if (const u8* ptr = memory->Pointer(address)) {
+                std::memcpy(&value, ptr, sizeof(value));
+            } else if (!memory->Read(address, &value, sizeof(value))) {
+                return std::nullopt;
+            }
+        } else if (!memory->Read(address, &value, sizeof(value))) {
             return std::nullopt;
         }
     }
@@ -2572,6 +2941,8 @@ u32 IndexSize(u32 type) {
 
 bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* index,
                               PreparedDraw& out, HostIndex& host_index) {
+    movie_network_input.reset();
+    movie_network_skip = 0;
     ++counters.draws;
     CostSplitWork cost_split{costsplit ? CostSplitBeginDraw() : nullptr, false};
     if (!TargetsUsable()) {
@@ -2608,6 +2979,9 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
         }
         return false;
     }
+    if (active->optimize_deferred.load(std::memory_order_relaxed)) {
+        resources.Cache().NoteGraphicsUsed(*active);
+    }
     out = {};
     out.pipeline = active.get();
     out.host_topology = mode;
@@ -2638,7 +3012,10 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
         ++counters.draws_skipped;
         return false;
     }
-    if (active->descriptors.uses_bindless_table && !BindlessPrepare(plan)) {
+    const u32 bindless_mask = active->descriptors.bindless_types_mask != 0
+                                  ? active->descriptors.bindless_types_mask
+                                  : ~u32{0};
+    if (active->descriptors.uses_bindless_table && !BindlessPrepare(plan, bindless_mask)) {
         ++counters.draws_skipped;
         host->HostUnsupported("Draw", "the bindless texture table cannot be created");
         return false;
@@ -2661,25 +3038,42 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
         }
     }
     // Vertex buffers of the streams the attributes read.
+    const auto try_inpass_mirror_arena = [&](BufferRef& ref, u64 address, u64 size) -> bool {
+        if (ref.pool == nullptr) {
+            return false;
+        }
+        const BufferRef copy = TryCopyMirrorRangeToArena(*ref.pool, ref.pool_offset, address, size, 16);
+        if (!copy.buffer) {
+            return false;
+        }
+        ref = copy;
+        return true;
+    };
     std::array<BufferRef, MAX_VERTEX_STREAMS> vertex{};
     const u32 used_streams = active->mesh ? 0u : vertex_input.used_streams;
+    u32 inpass_arena_streams = 0;
     for (u32 s = 0; s < MAX_VERTEX_STREAMS; ++s) {
         if (!((used_streams >> s) & 1)) {
             continue;
         }
         const VC::BufferRange& range = vertex_buffers[s];
+        bool vertex_arena = false;
         if (!ResolveBuffer(range.address, range.size, false, vertex[s], ShadowPolicy::Defer)) {
             NoteFallback(true, DescReason::VertexUnresolved);
             vertex[s] = {resources.DummyBuffer(), 0, 0, nullptr, 0};
+        } else if (try_inpass_mirror_arena(vertex[s], range.address, range.size)) {
+            inpass_arena_streams |= 1u << s;
+            vertex_arena = true;
         } else {
             plan.UseRange(vertex[s].pool, vertex[s].pool_offset, range.size, false);
         }
         if (cs_mode != CostSplit::Mode::Count) [[unlikely]] {
-            CostSplitNote(CostSplit::Data::Vertex, vertex[s], range.size);
+            CostSplitNote(CostSplit::Data::Vertex, vertex[s], range.size, vertex_arena);
             CostSplitToRing(CostSplit::Data::Vertex, vertex[s], range.address, range.size);
         }
     }
     BufferRef index_ref;
+    bool inpass_arena_index = false;
     if (index) {
         if (!ResolveBuffer(index->address, index->bytes, false, index_ref, ShadowPolicy::Defer)) {
             ++counters.draws_skipped;
@@ -2687,11 +3081,19 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
                 "Draw", fmt::format("index buffer {:#x} is not in a pool", index->address));
             return false;
         }
-        if (!index->uploaded || index_ref.pool->backing == Pool::Backing::Imported) {
+        bool index_arena = false;
+        if (!index->uploaded) {
+            if (try_inpass_mirror_arena(index_ref, index->address, index->bytes)) {
+                inpass_arena_index = true;
+                index_arena = true;
+            } else {
+                plan.UseRange(index_ref.pool, index_ref.pool_offset, index->bytes, false);
+            }
+        } else if (index_ref.pool->backing == Pool::Backing::Imported) {
             plan.UseRange(index_ref.pool, index_ref.pool_offset, index->bytes, false);
         }
         if (cs_mode != CostSplit::Mode::Count) [[unlikely]] {
-            CostSplitNote(CostSplit::Data::Index, index_ref, index->bytes);
+            CostSplitNote(CostSplit::Data::Index, index_ref, index->bytes, index_arena);
             CostSplitToRing(CostSplit::Data::Index, index_ref, index->address, index->bytes);
         }
     }
@@ -2699,7 +3101,10 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
     {
         // A conditional-rendering region cannot straddle a render pass begin or end.
         const bool suspended = host->HostSuspendCondition();
-        const bool ready = PrepareOutsidePass(plan) && BeginPass();
+        if (pass_open && pass_read_only_depth != plan.read_only_depth) {
+            EndPass(BreakCause::LayoutChange);
+        }
+        const bool ready = PrepareOutsidePass(plan) && BeginPass(plan.read_only_depth);
         if (suspended) {
             host->HostResumeCondition();
         }
@@ -2736,10 +3141,16 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
             return true;
         };
         for (u32 s = 0; s < MAX_VERTEX_STREAMS; ++s) {
-            if (!((used_streams >> s) & 1) || vertex[s].pool == nullptr) {
+            if (!((used_streams >> s) & 1)) {
                 continue;
             }
             const u64 size = vertex_buffers[s].size;
+            if (vertex[s].pool == nullptr) {
+                if (impl.vtxcov_diag && ((inpass_arena_streams >> s) & 1)) {
+                    impl.NoteVtxCov(false, VtxCov::Device, size);
+                }
+                continue;
+            }
             if (vertex[s].pool->backing != Pool::Backing::Imported) {
                 if (impl.vtxcov_diag) {
                     impl.NoteVtxCov(false, VtxCov::Device, size);
@@ -2757,8 +3168,12 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
                 impl.NoteVtxCov(false, reason, size);
             }
         }
-        if (index && index_ref.pool != nullptr) {
-            if (index_ref.pool->backing != Pool::Backing::Imported) {
+        if (index) {
+            if (index_ref.pool == nullptr) {
+                if (impl.vtxcov_diag && inpass_arena_index) {
+                    impl.NoteVtxCov(true, VtxCov::Device, index->bytes);
+                }
+            } else if (index_ref.pool->backing != Pool::Backing::Imported) {
                 if (impl.vtxcov_diag) {
                     impl.NoteVtxCov(true, VtxCov::Device, index->bytes);
                 }
@@ -2808,25 +3223,131 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
             // Unknown predecessor, or static cull/depth/stencil state replaced the dynamic one.
             fixed_state_set = false;
         }
+        if (bound_pipeline == VK_NULL_HANDLE || !active->dynamic_patch_control_points) {
+            patch_control_points_set = false;
+        }
+        if (bound_pipeline == VK_NULL_HANDLE || !active->dynamic_blend) {
+            blend_state_set = false;
+        }
+        if (bound_pipeline == VK_NULL_HANDLE || !active->dynamic_alpha_to_coverage) {
+            alpha_to_coverage_set = false;
+        }
         bound_pipeline = handle;
         vertex_dirty = true;
-        bound_state.OnPipelineBind(*active->layout, active->descriptors.UsesPushConstants());
+        bound_state.OnPipelineBind(active->layout, active->descriptors.UsesPushConstants());
     }
-    if (active->dynamic_fixed && (!fixed_state_set || fixed_state != active->fixed_values)) {
-        const DynamicFixedState& v = active->fixed_values;
-        cmd.SetCullModeEXT(v.cull_mode);
-        cmd.SetFrontFaceEXT(v.front_face);
-        cmd.SetDepthBiasEnableEXT(v.depth_bias_enable);
-        cmd.SetDepthTestEnableEXT(v.depth_test_enable);
-        cmd.SetDepthWriteEnableEXT(v.depth_write_enable);
-        cmd.SetDepthCompareOpEXT(v.depth_compare_op);
-        cmd.SetStencilTestEnableEXT(v.stencil_test_enable);
-        cmd.SetStencilOpEXT(VK_STENCIL_FACE_FRONT_BIT, v.front.fail, v.front.pass,
-                            v.front.depth_fail, v.front.compare);
-        cmd.SetStencilOpEXT(VK_STENCIL_FACE_BACK_BIT, v.back.fail, v.back.pass, v.back.depth_fail,
-                            v.back.compare);
-        fixed_state = v;
-        fixed_state_set = true;
+    if (active->dynamic_fixed) {
+        const DynamicFixedState v = MakeDynamicFixedState(fixed);
+        if (!fixed_state_set || fixed_state != v) {
+            const bool all = !fixed_state_set;
+            if (all || fixed_state.cull_mode != v.cull_mode) {
+                cmd.SetCullModeEXT(v.cull_mode);
+            }
+            if (all || fixed_state.front_face != v.front_face) {
+                cmd.SetFrontFaceEXT(v.front_face);
+            }
+            if (all || fixed_state.depth_bias_enable != v.depth_bias_enable) {
+                cmd.SetDepthBiasEnableEXT(v.depth_bias_enable);
+            }
+            if (all || fixed_state.depth_test_enable != v.depth_test_enable) {
+                cmd.SetDepthTestEnableEXT(v.depth_test_enable);
+            }
+            if (all || fixed_state.depth_write_enable != v.depth_write_enable) {
+                cmd.SetDepthWriteEnableEXT(v.depth_write_enable);
+            }
+            if (all || fixed_state.depth_compare_op != v.depth_compare_op) {
+                cmd.SetDepthCompareOpEXT(v.depth_compare_op);
+            }
+            if (all || fixed_state.stencil_test_enable != v.stencil_test_enable) {
+                cmd.SetStencilTestEnableEXT(v.stencil_test_enable);
+            }
+            if (active->dynamic_polygon_mode &&
+                (all || fixed_state.polygon_mode != v.polygon_mode)) {
+                cmd.SetPolygonModeEXT(v.polygon_mode);
+            }
+            if (active->dynamic_depth_clamp &&
+                (all || fixed_state.depth_clamp_enable != v.depth_clamp_enable)) {
+                cmd.SetDepthClampEnableEXT(v.depth_clamp_enable);
+            }
+            if (active->dynamic_provoking_vertex &&
+                (all || fixed_state.provoking_vertex_mode != v.provoking_vertex_mode)) {
+                cmd.SetProvokingVertexModeEXT(v.provoking_vertex_mode);
+            }
+            const bool front_changed = all || fixed_state.front != v.front;
+            const bool back_changed = all || fixed_state.back != v.back;
+            if (front_changed && back_changed && v.front == v.back) {
+                cmd.SetStencilOpEXT(VK_STENCIL_FACE_FRONT_AND_BACK, v.front.fail, v.front.pass,
+                                    v.front.depth_fail, v.front.compare);
+            } else {
+                if (front_changed) {
+                    cmd.SetStencilOpEXT(VK_STENCIL_FACE_FRONT_BIT, v.front.fail, v.front.pass,
+                                        v.front.depth_fail, v.front.compare);
+                }
+                if (back_changed) {
+                    cmd.SetStencilOpEXT(VK_STENCIL_FACE_BACK_BIT, v.back.fail, v.back.pass,
+                                        v.back.depth_fail, v.back.compare);
+                }
+            }
+            fixed_state = v;
+            fixed_state_set = true;
+        }
+    }
+    if (active->dynamic_patch_control_points) {
+        const u32 patch_points = fixed.patch_vertices != 0 ? fixed.patch_vertices : 1u;
+        if (!patch_control_points_set || bound_patch_control_points != patch_points) {
+            cmd.SetPatchControlPointsEXT(patch_points);
+            bound_patch_control_points = patch_points;
+            patch_control_points_set = true;
+        }
+    }
+    if (active->dynamic_alpha_to_coverage) {
+        const bool a2c = (active->color_outputs_written & 1u) != 0 &&
+                         VC::MultisampleState::AlphaToCoverage(fixed.multisample.data());
+        if (!alpha_to_coverage_set || bound_alpha_to_coverage != a2c) {
+            cmd.SetAlphaToCoverageEnableEXT(a2c);
+            bound_alpha_to_coverage = a2c;
+            alpha_to_coverage_set = true;
+        }
+    }
+    if (active->dynamic_blend && active->color_attachment_count > 0) {
+        DynamicBlendState live_blend = MakeDynamicBlendState(fixed, MakePassKey());
+        if (live_blend.attachment_count > 0 && (!blend_state_set || blend_state != live_blend)) {
+            const bool all =
+                !blend_state_set || blend_state.attachment_count != live_blend.attachment_count;
+            if (all || blend_state.logic_op_enable != live_blend.logic_op_enable) {
+                cmd.SetLogicOpEnableEXT(live_blend.logic_op_enable);
+            }
+            if (all || blend_state.logic_op != live_blend.logic_op) {
+                cmd.SetLogicOpEXT(live_blend.logic_op);
+            }
+            bool enable_changed = all;
+            bool eq_changed = all;
+            bool mask_changed = all;
+            for (u32 i = 0;
+                 i < live_blend.attachment_count && !(enable_changed && eq_changed && mask_changed);
+                 ++i) {
+                enable_changed |= blend_state.blend_enable[i] != live_blend.blend_enable[i];
+                mask_changed |= blend_state.write_masks[i] != live_blend.write_masks[i];
+                eq_changed |= std::memcmp(&blend_state.equations[i], &live_blend.equations[i],
+                                          sizeof(VkColorBlendEquationEXT)) != 0;
+            }
+            if (enable_changed) {
+                cmd.SetColorBlendEnableEXT(0, vk::Span<VkBool32>{live_blend.blend_enable.data(),
+                                                                 live_blend.attachment_count});
+            }
+            if (eq_changed) {
+                cmd.SetColorBlendEquationEXT(
+                    0, vk::Span<VkColorBlendEquationEXT>{live_blend.equations.data(),
+                                                         live_blend.attachment_count});
+            }
+            if (mask_changed) {
+                cmd.SetColorWriteMaskEXT(
+                    0, vk::Span<VkColorComponentFlags>{live_blend.write_masks.data(),
+                                                       live_blend.attachment_count});
+            }
+            blend_state = live_blend;
+            blend_state_set = true;
+        }
     }
     if (active->dynamic_vertex_input && !vertex_input_set) {
         // Strides and divisors are in the binding descriptions (no vkCmdBindVertexBuffers2).

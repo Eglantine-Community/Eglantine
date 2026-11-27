@@ -85,6 +85,42 @@ void DrawContext::FillComputeBank(const VC::ComputeDriverLayout& layout, u8* out
     VC::FillComputeDriverBank(layout, inputs, std::span<u8>{out, DRIVER_BANK_SIZE});
 }
 
+void DrawContext::PrefetchBoundCompute(u64 skip_hash) {
+    const StageBindings& bound = stages[STAGE_COMPUTE];
+    const auto program_it = impl.programs.find(bound.program_serial);
+    const auto hash_it = resources.program_hashes.find(bound.program_serial);
+    if (bound.program_serial == 0 || program_it == impl.programs.end() ||
+        hash_it == resources.program_hashes.end()) {
+        return;
+    }
+    const u64 program_hash = hash_it->second[STAGE_COMPUTE];
+    if (program_hash == 0 || program_hash == skip_hash) {
+        return;
+    }
+    const VC::ProgramDesc& program = *program_it->second;
+    auto ctrl_it = resources.compute_controls.find(bound.program_serial);
+    if (ctrl_it == resources.compute_controls.end()) {
+        DrawResources::ParsedComputeControl parsed;
+        parsed.control = VC::ParseControl(program.control[STAGE_COMPUTE], parsed.error);
+        ctrl_it = resources.compute_controls.emplace(bound.program_serial, std::move(parsed)).first;
+    }
+    const std::optional<VC::NvnControl>& control = ctrl_it->second.control;
+    if (!control || !control->has_compute_counts) {
+        return;
+    }
+    if (movie_network_skip > 0 ||
+        ComputeProgramUsesTensorMath(program_hash, program.code[STAGE_COMPUTE],
+                                     control->inst_bytes)) {
+        return;
+    }
+    const ComputeOracle oracle{*this, control->compute.HandleTables()};
+    ComputeRequest request;
+    request.program = {program_hash, &program.control[STAGE_COMPUTE], &program.code[STAGE_COMPUTE]};
+    request.oracle = &oracle;
+    request.inputs = &oracle;
+    resources.Cache().PrefetchCompute(request, skip_hash);
+}
+
 void DrawContext::Dispatch(const VC::DispatchPayload& p) {
     ++counters.dispatches;
     const bool indirect = p.indirect != 0;
@@ -119,9 +155,14 @@ void DrawContext::Dispatch(const VC::DispatchPayload& p) {
         return;
     }
     const VC::ProgramDesc& program = *program_it->second;
-    std::string error;
-    const std::optional<VC::NvnControl> control =
-        VC::ParseControl(program.control[STAGE_COMPUTE], error);
+    auto ctrl_it = resources.compute_controls.find(bound.program_serial);
+    if (ctrl_it == resources.compute_controls.end()) {
+        DrawResources::ParsedComputeControl parsed;
+        parsed.control = VC::ParseControl(program.control[STAGE_COMPUTE], parsed.error);
+        ctrl_it = resources.compute_controls.emplace(bound.program_serial, std::move(parsed)).first;
+    }
+    const std::optional<VC::NvnControl>& control = ctrl_it->second.control;
+    const std::string& error = ctrl_it->second.error;
     if (!control || !control->has_compute_counts) {
         skipped();
         host->HostUnsupported("Dispatch", fmt::format("compute control section: {}",
@@ -167,10 +208,6 @@ void DrawContext::Dispatch(const VC::DispatchPayload& p) {
                                static_cast<u32>(Settings::values.anti_aliasing.GetValue()));
         });
     }
-    if (replacement_wanted) {
-        // The compute chain behind a game's upscaling network: kept only while one may be replaced.
-        NoteComputeChain();
-    }
     static const bool dlss_trace = std::getenv("EDEN_NX2_DLSS_TRACE") != nullptr;
     if (dlss_trace) {
         static Common::BootCounter boot;
@@ -205,10 +242,148 @@ void DrawContext::Dispatch(const VC::DispatchPayload& p) {
                      output ? static_cast<u32>(output->host.format) : 0);
         }
     }
+    const u64 program_hash = hash_it->second[STAGE_COMPUTE];
+    const bool uses_tensor = ComputeProgramUsesTensorMath(program_hash, program.code[STAGE_COMPUTE],
+                                                          control->inst_bytes);
+    static const bool movie_network_replace = [] {
+        const char* value = std::getenv("EDEN_NX2_UPSCALE_REPLACE");
+        return value == nullptr || std::string_view{value} != "0";
+    }();
+    const auto is_movie_colour = [](const std::shared_ptr<Texture>& tex) {
+        return tex && tex->storage &&
+               (tex->storage->aspect & VK_IMAGE_ASPECT_COLOR_BIT) != 0 && !tex->host.depth &&
+               !VideoCore::Surface::IsPixelFormatInteger(tex->host.pixel_format) &&
+               tex->storage->type == VK_IMAGE_TYPE_2D &&
+               tex->storage->samples == VK_SAMPLE_COUNT_1_BIT;
+    };
+    if (movie_network_skip > 0) {
+        if (!movie_network_input) {
+            movie_network_skip = 0;
+        } else {
+            std::shared_ptr<Texture> output;
+            if (control->compute.image_count > 0) {
+                const u64 in_w = movie_network_input->desc.width;
+                const u64 in_h = movie_network_input->desc.height;
+                const size_t img_limit =
+                    (std::min<size_t>)(control->compute.image_count, bound.image.size());
+                for (size_t i = 0; i < img_limit; ++i) {
+                    const u64 handle = bound.image[i];
+                    if (handle == 0) {
+                        continue;
+                    }
+                    auto cand =
+                        TextureOfId(VideoCommon::Nvn::TextureIdOf(static_cast<u32>(handle)));
+                    if (!is_movie_colour(cand) || cand->serial == movie_network_input->serial) {
+                        continue;
+                    }
+                    const u64 out_w = cand->desc.width;
+                    const u64 out_h = cand->desc.height;
+                    const u64 cross_a = out_w * in_h;
+                    const u64 cross_b = out_h * in_w;
+                    if (out_w > in_w && out_h > in_h && out_w <= in_w * 4 &&
+                        (cross_a > cross_b ? cross_a - cross_b : cross_b - cross_a) * 32 <=
+                            cross_a) {
+                        output = std::move(cand);
+                        break;
+                    }
+                }
+            }
+            if (output) {
+                auto input_tex = std::move(movie_network_input);
+                movie_network_skip = 0;
+                if (UpscaleMovieNetwork(*input_tex, *output)) {
+                    host->HostCmd().ForgetComputePipeline();
+                    skipped();
+                    return;
+                }
+            } else if (!uses_tensor) {
+                movie_network_input.reset();
+                movie_network_skip = 0;
+            } else {
+                --movie_network_skip;
+                if (movie_network_skip == 0) {
+                    movie_network_input.reset();
+                }
+                skipped();
+                return;
+            }
+        }
+    } else if (movie_network_replace && replacement_wanted && uses_tensor &&
+               control->thread_group == std::array<u32, 3>{32, 1, 1} &&
+               control->compute.image_count == 0) {
+        const size_t tex_limit =
+            (std::min<size_t>)(control->compute.texture_count, bound.combined.size());
+        const auto recently_compute_written = [&](const Texture& tex) {
+            const u64 serial =
+                VideoCore::Upscaler::NetworkTextureSerial(tex.serial, tex.desc.view_of);
+            const u32 chain_size = static_cast<u32>(impl.compute_chain.size());
+            const u32 check_count = (std::min<u32>)(impl.compute_chain_count, 4u);
+            for (u32 i = 0; i < check_count; ++i) {
+                const auto& entry =
+                    impl.compute_chain[(impl.compute_chain_next + chain_size - 1 - i) % chain_size];
+                for (const u64 written : entry.written) {
+                    if (written != 0 && written == serial) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        };
+        std::shared_ptr<Texture> fallback_tex;
+        std::shared_ptr<Texture> input_tex;
+        size_t chosen_slot = 0;
+        size_t fallback_slot = 0;
+        for (size_t i = 0; i < tex_limit; ++i) {
+            const u64 handle = bound.combined[i];
+            if (handle == 0) {
+                continue;
+            }
+            auto tex = TextureOfId(VideoCommon::Nvn::TextureIdOf(static_cast<u32>(handle)));
+            if (!is_movie_colour(tex) || !tex->storage->image || tex->desc.width < 640 ||
+                tex->desc.height < 360) {
+                continue;
+            }
+            if (recently_compute_written(*tex)) {
+                input_tex = std::move(tex);
+                chosen_slot = i;
+                break;
+            }
+            if (!fallback_tex) {
+                fallback_tex = std::move(tex);
+                fallback_slot = i;
+            }
+        }
+        if (!input_tex && fallback_tex) {
+            input_tex = std::move(fallback_tex);
+            chosen_slot = fallback_slot;
+        }
+        if (input_tex) {
+            static Common::BootCounter boot;
+            static std::unordered_set<u64> logged;
+            if (boot.First()) {
+                logged.clear();
+            }
+            if (logged.insert(program_hash).second) {
+                LOG_INFO(Render_Vulkan,
+                         "[nvn] movie tensor network detected (hash={:016x}, slot={}, input={}x{}); "
+                         "replacing chain with HLE upscale",
+                         program_hash, chosen_slot, input_tex->desc.width, input_tex->desc.height);
+            }
+            movie_network_input = std::move(input_tex);
+            movie_network_skip = 16;
+            skipped();
+            return;
+        }
+    }
+
+    if (replacement_wanted) {
+        // The compute chain behind a game's upscaling network: kept only while one may be replaced.
+        NoteComputeChain();
+    }
+
     const bool ndsr_shape = VideoCore::Upscaler::IsNdsrDispatchShape(
         control->thread_group, control->compute.texture_count, control->compute.image_count,
         push_constants[1].size());
-    const u64 program_hash = hash_it->second[STAGE_COMPUTE];
     if (replacement_wanted && !ndsr_shape) {
         log_skip(program_hash, "dispatch shape", [&] {
             return fmt::format("hash={:016x} threads={}x{}x{} textures={} images={} push_bytes={}",
@@ -217,9 +392,7 @@ void DrawContext::Dispatch(const VC::DispatchPayload& p) {
                                control->compute.image_count, push_constants[1].size());
         });
     }
-    const bool tensor = ndsr_shape && !bound.combined.empty() &&
-                        ComputeProgramUsesTensorMath(program_hash, program.code[STAGE_COMPUTE],
-                                                     control->inst_bytes);
+    const bool tensor = ndsr_shape && !bound.combined.empty() && uses_tensor;
     if (replacement_wanted && ndsr_shape && bound.combined.empty()) {
         log_skip(program_hash, "no sampled texture", [&] { return fmt::format("hash={:016x}", program_hash); });
     } else if (replacement_wanted && ndsr_shape && !tensor) {
@@ -279,6 +452,7 @@ void DrawContext::Dispatch(const VC::DispatchPayload& p) {
                         words[6], words[7], input->desc.width, input->desc.height);
                 });
             } else if (UpscaleNetwork(input_rect, output_rect, output_id)) {
+                host->HostCmd().ForgetComputePipeline();
                 if (VideoCommon::ShaderLog::Enabled()) {
                     // The game's own program is never translated or run: log its bytes and the
                     // inputs it would have read.
@@ -304,33 +478,58 @@ void DrawContext::Dispatch(const VC::DispatchPayload& p) {
     }
 
     const ComputeOracle oracle{*this, control->compute.HandleTables()};
-    ComputeRequest request;
-    request.program = {hash_it->second[STAGE_COMPUTE], &program.control[STAGE_COMPUTE],
-                       &program.code[STAGE_COMPUTE]};
-    request.oracle = &oracle;
-    request.inputs = &oracle;
-    // Only the first lookup of a program is timed (it is the one that translates and compiles).
-    const bool first_dispatch = !resources.compute_programs.contains(request.program.hash);
-    const auto compile_start =
-        first_dispatch ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    // A dispatch is never skipped while its pipeline compiles (use_asynchronous_shaders): the
-    // lookup waits for a compile in flight, as the emulated path's ComputePipeline::Configure
-    // waits for its build. A skipped dispatch leaves the buffers and images it writes stale for
-    // every later draw (one-time setup, GPU-driven culling), not one frame of geometry.
-    const std::shared_ptr<ComputePipeline> compute = resources.Cache().GetCompute(request);
-    if (first_dispatch) {
-        const auto compile_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                    std::chrono::steady_clock::now() - compile_start)
-                                    .count();
-        resources.compute_programs.insert(request.program.hash);
-        // Once per distinct program: what DK dispatches and what its first lookup cost (a
-        // translation and pipeline compile unless the disk cache had it).
-        LOG_INFO(Render_Vulkan,
-                 "[nvn] compute program {:016x}: group {}x{}x{}, {} push words, {} B shared, first "
-                 "dispatch {} ms ({})",
-                 request.program.hash, control->thread_group[0], control->thread_group[1],
-                 control->thread_group[2], control->compute.push_constant_words,
-                 control->shared_memory_bytes, compile_ms, compute ? "ok" : "rejected");
+    const u64 generation = resources.Cache().ShaderGeneration();
+    if (shader_generation != generation) {
+        pipeline.reset();
+        pipeline_memo = {};
+        pipeline_dirty = true;
+        bound_pipeline = VK_NULL_HANDLE;
+        bound_state.Reset();
+        last_kept = nullptr;
+        compute_memo = {};
+        last_compute_kept = nullptr;
+        shader_generation = generation;
+    }
+    ComputeMemo& memo = compute_memo[static_cast<size_t>(bound.program_serial) &
+                                     (compute_memo.size() - 1)];
+    std::shared_ptr<ComputePipeline> compute;
+    if (memo.pipeline && memo.serial == bound.program_serial &&
+        memo.program_hash == program_hash && memo.pipeline->QueriesMatch(oracle)) {
+        compute = memo.pipeline;
+    } else {
+        ComputeRequest request;
+        request.program = {program_hash, &program.control[STAGE_COMPUTE],
+                           &program.code[STAGE_COMPUTE]};
+        request.oracle = &oracle;
+        request.inputs = &oracle;
+        // Only the first lookup of a program is timed (it is the one that translates and compiles).
+        const bool first_dispatch = !resources.compute_programs.contains(request.program.hash);
+        const auto compile_start =
+            first_dispatch ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
+        // A dispatch is never skipped while its pipeline compiles (use_asynchronous_shaders): the
+        // lookup waits for a compile in flight, as the emulated path's ComputePipeline::Configure
+        // waits for its build. A skipped dispatch leaves the buffers and images it writes stale for
+        // every later draw (one-time setup, GPU-driven culling), not one frame of geometry.
+        compute = resources.Cache().GetCompute(
+            request, nullptr, [this](u64 hash) { PrefetchUpcomingGraphics(last_mode, 0, hash); });
+        if (first_dispatch) {
+            const auto compile_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        std::chrono::steady_clock::now() - compile_start)
+                                        .count();
+            resources.compute_programs.insert(request.program.hash);
+            // Once per distinct program: what DK dispatches and what its first lookup cost (a
+            // translation and pipeline compile unless the disk cache had it).
+            LOG_INFO(Render_Vulkan,
+                     "[nvn] compute program {:016x}: group {}x{}x{}, {} push words, {} B shared, "
+                     "first dispatch {} ms ({})",
+                     request.program.hash, control->thread_group[0], control->thread_group[1],
+                     control->thread_group[2], control->compute.push_constant_words,
+                     control->shared_memory_bytes, compile_ms, compute ? "ok" : "rejected");
+        }
+        if (compute) {
+            memo = {bound.program_serial, program_hash, compute};
+        }
     }
     if (!compute) {
         // The cache counted and logged why (unsupported rows, `shader:`).
@@ -493,6 +692,7 @@ void DrawContext::Dispatch(const VC::DispatchPayload& p) {
                                        : nullptr,
                              true};
     compute_groups = indirect ? std::array<u32, 3>{} : std::array<u32, 3>{p.x, p.y, p.z};
+    compute_thread_group = indirect ? std::array<u32, 3>{} : control->thread_group;
     if (!BindDescriptors(*compute, VK_PIPELINE_BIND_POINT_COMPUTE)) {
         skipped();
         return;

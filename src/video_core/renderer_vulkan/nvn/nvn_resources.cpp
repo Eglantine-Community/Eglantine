@@ -8,9 +8,11 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_set>
 
 #include <fmt/format.h>
 
+#include "common/cityhash.h"
 #include "common/diag_request.h"
 #include "common/settings.h"
 
@@ -60,6 +62,23 @@ bool IsLayered(TexTarget target) {
     default:
         return false;
     }
+}
+
+/// True when a pool should not eagerly allocate its full-size VkBuffer on creation/background
+/// backing: compressible texture/RT pools, shader-code pools, GPU-no-access pools, and CPU pools
+/// without zero-copy host import (allocated lazily only if buffer or raw-global access occurs).
+[[nodiscard]] bool DeferDirectPoolBacking(u32 flags, u64 size,
+                                          bool host_import_available) noexcept {
+    if ((flags & (PoolFlag::Compressible | PoolFlag::ShaderCode | PoolFlag::GpuNoAccess)) != 0) {
+        return true;
+    }
+    if (size >= (u64{16} << 20)) {
+        return true;
+    }
+    if (!host_import_available && (flags & PoolFlag::CpuNoAccess) == 0) {
+        return true;
+    }
+    return false;
 }
 
 } // Anonymous namespace
@@ -169,7 +188,42 @@ bool Context::Impl::ImportSplitRuns(Pool& pool, std::string& error) {
         return false;
     }
     pool.split_runs = std::move(runs);
+    for (const Pool::SplitRun& run : pool.split_runs) {
+        NoteImportedGuestRange(pool.address + run.offset, run.size);
+    }
     return true;
+}
+
+void Context::Impl::NoteImportedGuestRange(u64 begin, u64 size) {
+    if (begin == 0 || size == 0) {
+        return;
+    }
+    const u64 end =
+        (size <= (std::numeric_limits<u64>::max)() - begin)
+            ? (begin + size)
+            : (std::numeric_limits<u64>::max)();
+    {
+        std::scoped_lock lock{imported_ranges_mutex};
+        imported_guest_ranges.emplace_back(begin, end);
+    }
+    has_imported_guest_ranges.store(true, std::memory_order_release);
+}
+
+bool Context::Impl::OverlapsImportedGuestRange(u64 begin, u64 size) const {
+    if (size == 0 || !has_imported_guest_ranges.load(std::memory_order_acquire)) {
+        return false;
+    }
+    const u64 end =
+        (size <= (std::numeric_limits<u64>::max)() - begin)
+            ? (begin + size)
+            : (std::numeric_limits<u64>::max)();
+    std::scoped_lock lock{imported_ranges_mutex};
+    for (const auto& [lo, hi] : imported_guest_ranges) {
+        if (begin < hi && lo < end) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void Context::Impl::ImmediateSubmit(const std::function<void(vk::CommandBuffer)>& record) {
@@ -211,24 +265,18 @@ void Context::Impl::ImmediateSubmit(const std::function<void(vk::CommandBuffer)>
 
 bool Context::Impl::ResolveBuffer(u64 address, u64 size, Pool*& pool, u64& offset) const {
     const u64 generation = pool_generation.load(std::memory_order_acquire);
-    ExactResolveSlot* exact = nullptr;
-    if (mario_kart_world) {
-        const u64 key = ((address >> 4) ^ (size * 0xd6e8feb86659fd93ULL)) *
-                        0x9e3779b97f4a7c15ULL;
-        exact = &mkw_resolve_cache[key >> 52];
-        if (exact->generation == generation && exact->mappings == mkw_mapping_generation &&
-            exact->address == address && exact->size == size) {
-            pool = exact->pool;
-            offset = exact->offset;
-            ++mkw_resolve_hits;
-            return true;
-        }
-        ++mkw_resolve_misses;
+    const u64 key = ((address >> 4) ^ (size * 0xd6e8feb86659fd93ULL)) * 0x9e3779b97f4a7c15ULL;
+    ExactResolveSlot* const exact = &mkw_resolve_cache[key >> 52];
+    if (exact->generation == generation && exact->mappings == mkw_mapping_generation &&
+        exact->address == address && exact->size == size) {
+        pool = exact->pool;
+        offset = exact->offset;
+        ++mkw_resolve_hits;
+        return true;
     }
+    ++mkw_resolve_misses;
     const auto remember = [&] {
-        if (exact) {
-            *exact = {generation, mkw_mapping_generation, address, size, pool, offset};
-        }
+        *exact = {generation, mkw_mapping_generation, address, size, pool, offset};
     };
     for (const ResolveSlot& slot : resolve_cache) {
         if (slot.generation == generation && address >= slot.begin && address < slot.end) {
@@ -300,7 +348,12 @@ void Context::Impl::CreatePoolNow(const VC::PoolDesc& desc) {
     if (desc.flags & PoolFlag::CpuNoAccess) {
         stats.pools_device_local.fetch_add(1, std::memory_order_relaxed);
     }
-    if (options.background_backing) {
+    const bool host_import_available = HostImportEnabled();
+    // Without host import, backing CPU-accessible pools in the background turns every untouched
+    // texture pool into a gigabyte-scale device-local mirror; compressibles/shader-code/GPU-no-access
+    // pools likewise defer their full-pool VkBuffer until an actual buffer or raw-global access.
+    if (options.background_backing &&
+        !DeferDirectPoolBacking(desc.flags, desc.size, host_import_available)) {
         {
             std::scoped_lock lock{backing_queue_mutex};
             backing_queue.push_back(pool);
@@ -311,7 +364,7 @@ void Context::Impl::CreatePoolNow(const VC::PoolDesc& desc) {
 
 std::optional<Context::Impl::ChunkWindow> Context::Impl::ImportWindow(u64 address, u64 size,
                                                                       u8* host) const {
-    constexpr u64 ChunkSize = u64{256} << 20;
+    constexpr u64 ChunkSize = u64{16} << 20;
     const u64 align = importer->Alignment();
     VC::GuestMemory* memory = guest.load(std::memory_order_acquire);
     // Guest and host addresses must differ by a multiple of the import alignment.
@@ -320,13 +373,16 @@ std::optional<Context::Impl::ChunkWindow> Context::Impl::ImportWindow(u64 addres
     }
     const auto align_down = [align](u64 v) { return v & ~(align - 1); };
     const auto align_up = [align](u64 v) { return (v + align - 1) & ~(align - 1); };
-    // Up to half a chunk of guest space on each side of the pool (so pools next to each other,
-    // whichever side of any fixed grid line they are on, land in one chunk), cut down to the
-    // contiguous run of mapped pages that contains the pool.
+    const u64 window_gran = (std::max)(ChunkSize, align);
+    // Grid-align the chunk window on 16 MiB boundaries around the pool, cut down to the
+    // contiguous run of mapped pages and clipped against existing chunks so windows never overlap.
     const u64 pool_begin = align_down(address);
     const u64 pool_end = align_up(address + size);
-    const u64 window_begin = pool_begin > ChunkSize / 2 ? align_down(pool_begin - ChunkSize / 2) : 0;
-    const u64 window_end = pool_end + ChunkSize / 2;
+    const u64 window_begin = align_down(pool_begin & ~(window_gran - 1));
+    const u64 window_end =
+        pool_end <= (std::numeric_limits<u64>::max)() - (window_gran - 1)
+            ? align_up((pool_end + window_gran - 1) & ~(window_gran - 1))
+            : pool_end;
     u8* const base = host - (address - pool_begin);
     const auto mapped_like_base = [&](u64 page) {
         // Signed: pages below the pool lie before `base`.
@@ -341,6 +397,29 @@ std::optional<Context::Impl::ChunkWindow> Context::Impl::ImportWindow(u64 addres
     u64 high = pool_end;
     while (high < window_end && mapped_like_base(high)) {
         high += align;
+    }
+    const uintptr_t h_pool_low = reinterpret_cast<uintptr_t>(base);
+    const uintptr_t h_pool_high = h_pool_low + (pool_end - pool_begin);
+    uintptr_t h_low = h_pool_low - (pool_begin - low);
+    uintptr_t h_high = h_pool_low + (high - pool_begin);
+    for (const auto& candidate : import_chunks) {
+        const uintptr_t c_low = reinterpret_cast<uintptr_t>(candidate->host);
+        const uintptr_t c_high = c_low + candidate->size;
+        if (c_high <= h_low || c_low >= h_high) {
+            continue;
+        }
+        if (c_high <= h_pool_low) {
+            h_low = (std::max)(h_low, c_high);
+        } else if (c_low >= h_pool_high) {
+            h_high = (std::min)(h_high, c_low);
+        } else {
+            return std::nullopt;
+        }
+    }
+    low = align_up(pool_begin - static_cast<u64>(h_pool_low - h_low));
+    high = align_down(pool_begin + static_cast<u64>(h_high - h_pool_low));
+    if (low > pool_begin || high < pool_end || high <= low) {
+        return std::nullopt;
     }
     return ChunkWindow{base - static_cast<std::ptrdiff_t>(pool_begin - low), low, high - low};
 }
@@ -360,6 +439,9 @@ VkResult Context::Impl::ImportPoolBuffer(Pool& pool, u8* host, std::string& erro
                                  .count()),
             std::memory_order_relaxed);
         chunk_import_bytes.fetch_add(size, std::memory_order_relaxed);
+        if (result == VK_SUCCESS) {
+            NoteImportedGuestRange(address, size);
+        }
         return result;
     };
     // Guest and host addresses must differ by a multiple of the import alignment.
@@ -409,6 +491,7 @@ VkResult Context::Impl::ImportPoolBuffer(Pool& pool, u8* host, std::string& erro
         import_chunks.push_back(chunk);
         import_chunks_live.fetch_add(1, std::memory_order_relaxed);
         import_chunks_live_bytes.fetch_add(high - low, std::memory_order_relaxed);
+        NoteImportedGuestRange(low, high - low);
     }
     const VkResult result = importer->CreateBufferInChunk(
         *chunk, static_cast<u64>(host - chunk->host), size, pool_usage,
@@ -455,9 +538,9 @@ void Context::Impl::EnsureBacking(Pool& pool) {
             try {
                 pool.buffer = CreateHostBuffer(pool.size, pool_usage, MemoryUsage::DeviceLocal,
                                                AllocationKind::PoolBuffer);
-                pool.mirror_pages.assign(
-                    static_cast<size_t>((pool.size + Pool::MIRROR_PAGE - 1) / Pool::MIRROR_PAGE),
-                    Pool::MirrorPage{});
+                pool.InitMirrorPages(
+                    static_cast<size_t>((pool.size + Pool::MIRROR_PAGE - 1) / Pool::MIRROR_PAGE));
+                ++pool_generation;
                 if (!pool.split_runs.empty()) {
                     split_alias_generation.fetch_add(1, std::memory_order_release);
                 }
@@ -510,6 +593,9 @@ void Context::Impl::BackingMain() {
                 pool->released.load(std::memory_order_relaxed)) {
                 return true; // used (and backed) already, or destroyed
             }
+            if (DeferDirectPoolBacking(pool->flags, pool->size, HostImportEnabled())) {
+                return true; // wait until a draw, copy, or raw miss uses it
+            }
             // A pool inside a chunk imported since needs no buffer of its own.
             const u8* host = (pool->flags & PoolFlag::CpuNoAccess)
                                  ? nullptr
@@ -519,14 +605,14 @@ void Context::Impl::BackingMain() {
         if (skip()) {
             continue;
         }
-        if (!(pool->flags & PoolFlag::CpuNoAccess) && options.allow_host_import && importer &&
-            importer->Available()) {
+        if (!(pool->flags & PoolFlag::CpuNoAccess) && HostImportEnabled()) {
             // The pages of the chunk the import will cover get their host pages now, without
             // backing_mutex (the replay thread may build the raw global table meanwhile): see
             // HostImporter::MakeResident. The import below then finds them resident.
             u8* const host = const_cast<u8*>(GuestPointer(pool->address, pool->size));
-            if (const auto window = host ? ImportWindow(pool->address, pool->size, host)
-                                         : std::nullopt) {
+            if (const auto window = (host && !InImportedChunk(host, pool->size))
+                                        ? ImportWindow(pool->address, pool->size, host)
+                                        : std::nullopt) {
                 lock.unlock();
                 HostImporter::MakeResident(window->host, window->size);
                 lock.lock();
@@ -590,7 +676,7 @@ void Context::Impl::BackPoolLocked(Pool& pool_ref) {
             pool->host = host;
             std::string import_error = "not attempted";
             VkResult import_result = VK_NOT_READY;
-            if (host && options.allow_host_import && importer && importer->Available()) {
+            if (host && HostImportEnabled()) {
                 t = Clock::now();
                 import_result = ImportPoolBuffer(*pool, host, import_error);
                 ns_import = since(t);
@@ -601,6 +687,13 @@ void Context::Impl::BackPoolLocked(Pool& pool_ref) {
                     return;
                 }
                 stats.host_import_failures.fetch_add(1, std::memory_order_relaxed);
+                if (import_result == VK_ERROR_INVALID_EXTERNAL_HANDLE_KHR &&
+                    stats.pools_imported.load(std::memory_order_relaxed) == 0 &&
+                    !host_import_disabled.exchange(true, std::memory_order_acq_rel)) {
+                    LOG_WARNING(Render_Vulkan,
+                                "[nvn] host import failed with VK_ERROR_INVALID_EXTERNAL_HANDLE_KHR; "
+                                "disabling host import and backing remaining CPU pools on demand");
+                }
                 LOG_WARNING(Render_Vulkan,
                             "[nvn] host import of pool {:#x} ({:#x} bytes) failed: {} ({}); using "
                             "a device-local mirror",
@@ -617,7 +710,7 @@ void Context::Impl::BackPoolLocked(Pool& pool_ref) {
                 // succeeds, defer allocating the full DeviceLocal mirror buffer until first buffer
                 // use (texture-only asset pools never need one).
                 if (raw_split_import.load(std::memory_order_relaxed)) {
-                    if (options.allow_host_import && importer && importer->Available()) {
+                    if (HostImportEnabled()) {
                         const auto split_begin = Clock::now();
                         if (ImportSplitRuns(*pool, split_error)) {
                             pool->backing = Pool::Backing::Mirror;
@@ -650,9 +743,8 @@ void Context::Impl::BackPoolLocked(Pool& pool_ref) {
             ns_buffer = since(t);
             path = "mirror";
             pool->backing = Pool::Backing::Mirror;
-            pool->mirror_pages.assign(static_cast<size_t>((desc.size + Pool::MIRROR_PAGE - 1) /
-                                                          Pool::MIRROR_PAGE),
-                                      Pool::MirrorPage{});
+            pool->InitMirrorPages(
+                static_cast<size_t>((desc.size + Pool::MIRROR_PAGE - 1) / Pool::MIRROR_PAGE));
             stats.pools_mirrored.fetch_add(1, std::memory_order_relaxed);
             if (host == nullptr) {
                 stats.pools_mirrored_discontiguous.fetch_add(1, std::memory_order_relaxed);
@@ -704,6 +796,12 @@ void Context::Impl::UploadWholePools(std::span<Pool* const> targets) {
             pool->backing = Pool::Backing::None;
         }
         stats.pools_unsupported.fetch_add(targets.size(), std::memory_order_relaxed);
+    } else {
+        for (Pool* const pool : targets) {
+            if (pool->size >= (u64{64} << 10)) {
+                HintColdGuestSpan(*pool, 0, pool->size);
+            }
+        }
     }
 }
 
@@ -743,6 +841,11 @@ bool Context::Impl::UploadPoolRanges(std::span<const PoolUpload> ranges, bool in
             const auto wait_begin = Clock::now();
             staging.Flush();
             ImmediateSubmit([&](vk::CommandBuffer cmd) {
+                const VkPipelineStageFlags user_stages =
+                    vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER |
+                    (device.IsExtConditionalRendering()
+                         ? VkPipelineStageFlags{VK_PIPELINE_STAGE_CONDITIONAL_RENDERING_BIT_EXT}
+                         : VkPipelineStageFlags{0});
                 // A pool the replay already uses: earlier submissions may still read or write the
                 // range, later ones read the new bytes.
                 const VkMemoryBarrier before{
@@ -752,8 +855,7 @@ bool Context::Impl::UploadPoolRanges(std::span<const PoolUpload> ranges, bool in
                     .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
                 };
                 if (in_use) {
-                    cmd.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, before);
+                    cmd.PipelineBarrier(user_stages, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, before);
                 }
                 for (const Copy& copy : copies) {
                     if (copy.zero) {
@@ -773,8 +875,7 @@ bool Context::Impl::UploadPoolRanges(std::span<const PoolUpload> ranges, bool in
                     .dstAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT,
                 };
                 if (in_use) {
-                    cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, after);
+                    cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, user_stages, 0, after);
                 }
             });
             wait_ns += static_cast<u64>(
@@ -842,47 +943,64 @@ bool Context::Impl::MkwBc3AtlasSupported() {
     if (mkw_bc3_atlas_supported) {
         return *mkw_bc3_atlas_supported;
     }
-    bool supported = astc_standin != AstcStandin::Rgba8 &&
-                     device.IsSparseResidencyImageSupported(VK_IMAGE_TYPE_2D) &&
-                     device.CanUseUnbackedSparseImages();
-    for (VkFormat format : {VK_FORMAT_BC3_UNORM_BLOCK, VK_FORMAT_BC3_SRGB_BLOCK}) {
-        if (!supported) {
-            break;
+    const bool sparse_device = device.IsSparseResidencyImageSupported(VK_IMAGE_TYPE_2D) &&
+                               device.CanUseUnbackedSparseImages();
+    bool supported = astc_standin != AstcStandin::Rgba8;
+    if (supported && sparse_device) {
+        for (VkFormat format : {VK_FORMAT_BC3_UNORM_BLOCK, VK_FORMAT_BC3_SRGB_BLOCK}) {
+            if (!supported) {
+                break;
+            }
+            auto image = allocator->CreateUnbackedImage({
+                .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
+                .imageType = VK_IMAGE_TYPE_2D,
+                .format = format,
+                .extent = {8192, 8192, 1},
+                .mipLevels = 14,
+                .arrayLayers = 68,
+                .samples = VK_SAMPLE_COUNT_1_BIT,
+                .tiling = VK_IMAGE_TILING_OPTIMAL,
+                .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                         VK_IMAGE_USAGE_SAMPLED_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            });
+            supported = static_cast<bool>(image);
+            if (image) {
+                const auto requirements =
+                    device.GetLogical().GetImageSparseMemoryRequirements(*image);
+                const auto memory = device.GetLogical().GetImageMemoryRequirements(*image);
+                supported =
+                    memory.alignment == SPARSE_TILE_BYTES &&
+                    std::ranges::any_of(requirements, [](const auto& requirement) {
+                        const auto& props = requirement.formatProperties;
+                        return props.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT &&
+                               props.imageGranularity.width == 256 &&
+                               props.imageGranularity.height == 256 &&
+                               props.imageGranularity.depth == 1 &&
+                               !(props.flags & VK_SPARSE_IMAGE_FORMAT_SINGLE_MIPTAIL_BIT);
+                    });
+            }
         }
-        auto image = allocator->CreateUnbackedImage({
-            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-            .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
-            .imageType = VK_IMAGE_TYPE_2D,
-            .format = format,
-            .extent = {8192, 8192, 1},
-            .mipLevels = 14,
-            .arrayLayers = 68,
-            .samples = VK_SAMPLE_COUNT_1_BIT,
-            .tiling = VK_IMAGE_TILING_OPTIMAL,
-            .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                     VK_IMAGE_USAGE_SAMPLED_BIT,
-            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-        });
-        supported = static_cast<bool>(image);
-        if (image) {
-            const auto requirements = device.GetLogical().GetImageSparseMemoryRequirements(*image);
-            const auto memory = device.GetLogical().GetImageMemoryRequirements(*image);
-            supported = memory.alignment == SPARSE_TILE_BYTES &&
-                        std::ranges::any_of(requirements, [](const auto& requirement) {
-                            const auto& props = requirement.formatProperties;
-                            return props.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT &&
-                                   props.imageGranularity.width == 256 &&
-                                   props.imageGranularity.height == 256 &&
-                                   props.imageGranularity.depth == 1 &&
-                                   !(props.flags & VK_SPARSE_IMAGE_FORMAT_SINGLE_MIPTAIL_BIT);
-                        });
+    } else if (supported) {
+        constexpr VkFormatFeatureFlags FEATURES = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                                                  VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+                                                  VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+        for (VkFormat format : {VK_FORMAT_BC3_UNORM_BLOCK, VK_FORMAT_BC3_SRGB_BLOCK}) {
+            if (!device.IsFormatSupported(format, FEATURES, FormatType::Optimal)) {
+                supported = false;
+                break;
+            }
         }
     }
     mkw_bc3_atlas_supported = supported;
-    LOG_INFO(Render_Vulkan, "[nvn] Mario Kart World: sparse ASTC 8x8 atlas backing {}",
-             supported ? "BC3 (one quarter of RGBA8 backing, full guest dimensions)"
-                       : "RGBA8 (BC3 sparse format/usage unavailable or recompression disabled)");
+    LOG_INFO(Render_Vulkan, "[nvn] Mario Kart World: ASTC 8x8 {} backing {}",
+             sparse_device ? "sparse atlas" : "non-sparse",
+             supported ? (sparse_device
+                              ? "BC3 (one quarter of RGBA8 backing, full guest dimensions)"
+                              : "BC3 (one quarter of RGBA8 backing, optimal tiling)")
+                       : "RGBA8 (BC3 format/usage unavailable or recompression disabled)");
     return supported;
 }
 
@@ -903,6 +1021,14 @@ std::shared_ptr<Texture> Context::Impl::BuildTexture(const VC::TextureDesc& d) {
         if (d.view.set_format) {
             if (const auto host = ResolveHostFormat(device, d.view.format)) {
                 texture->host = *host;
+                if (texture->storage && !texture->storage->FormatListAllows(texture->host.format)) {
+                    if (!texture->storage->image) {
+                        texture->storage->view_format_count = 0;
+                    } else {
+                        texture->storage->pending_unrestricted_formats = true;
+                        NoteBindlessStorageChanged(*texture->storage);
+                    }
+                }
                 // An ASTC view of a BC stand-in reads it as that BC format (its own sRGB-ness).
                 if (texture->storage && texture->storage->host.bc_standin) {
                     Storage& s = *texture->storage;
@@ -1051,15 +1177,6 @@ std::shared_ptr<Texture> Context::Impl::BuildTexture(const VC::TextureDesc& d) {
                               ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
                               : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     }
-    if (host->storage) {
-        storage->usage |= VK_IMAGE_USAGE_STORAGE_BIT;
-    } else if (host->storage_view != VK_FORMAT_UNDEFINED || host->storage_alias) {
-        // Storage-image views use the UNORM format of the same bits (HostFormat::storage_view) or
-        // the format of an NVN view of the same texel size (HostFormat::storage_alias): the
-        // image's own format cannot claim the usage.
-        storage->usage |= VK_IMAGE_USAGE_STORAGE_BIT;
-        storage->create_flags |= VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
-    }
     if (astc_gpu_enabled && host->needs_transcode &&
         VideoCore::Surface::IsPixelFormatASTC(host->pixel_format) &&
         (host->format == VK_FORMAT_A8B8G8R8_SRGB_PACK32 ||
@@ -1112,6 +1229,51 @@ std::shared_ptr<Texture> Context::Impl::BuildTexture(const VC::TextureDesc& d) {
                      d.width, d.height, storage->layers, storage->levels, d.format, d.flags,
                      layout.size / 1048576.0, d.pool_serial, begin, reason);
         }
+    }
+
+    // Defer STORAGE_BIT and restrict initial view formats to {UNORM, SRGB} on color attachments
+    // without TexFlag::Image so drivers (e.g. RADV DCC) can keep framebuffers hardware-compressed
+    // unless a storage image binding or incompatible view actually arrives (Recorder::UpgradeImageCaps).
+    const bool wants_storage =
+        host->storage || host->storage_view != VK_FORMAT_UNDEFINED || host->storage_alias;
+    const bool defer_storage =
+        wants_storage && host->attachable && !host->depth && !host->stencil &&
+        !host->needs_transcode && !storage->astc_gpu && !storage->sparse &&
+        (d.flags & TexFlag::Image) == 0;
+    if (defer_storage) {
+        storage->can_upgrade_storage = true;
+        if (device.IsKhrImageFormatListSupported()) {
+            switch (host->format) {
+            case VK_FORMAT_A8B8G8R8_UNORM_PACK32:
+            case VK_FORMAT_A8B8G8R8_SRGB_PACK32:
+                storage->view_formats = {VK_FORMAT_A8B8G8R8_UNORM_PACK32,
+                                         VK_FORMAT_A8B8G8R8_SRGB_PACK32};
+                storage->view_format_count = 2;
+                break;
+            case VK_FORMAT_R8G8B8A8_UNORM:
+            case VK_FORMAT_R8G8B8A8_SRGB:
+                storage->view_formats = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SRGB};
+                storage->view_format_count = 2;
+                break;
+            case VK_FORMAT_B8G8R8A8_UNORM:
+            case VK_FORMAT_B8G8R8A8_SRGB:
+                storage->view_formats = {VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_SRGB};
+                storage->view_format_count = 2;
+                break;
+            default:
+                storage->view_formats = {host->format, VK_FORMAT_UNDEFINED};
+                storage->view_format_count = 1;
+                break;
+            }
+        }
+    } else if (host->storage) {
+        storage->usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+    } else if (host->storage_view != VK_FORMAT_UNDEFINED || host->storage_alias) {
+        // Storage-image views use the UNORM format of the same bits (HostFormat::storage_view) or
+        // the format of an NVN view of the same texel size (HostFormat::storage_alias): the
+        // image's own format cannot claim the usage.
+        storage->usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+        storage->create_flags |= VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
     }
 
     // Every MKW ASTC 8x8 copy source and atlas uses the same fixed BC3 format. Smart per-image
@@ -1323,7 +1485,16 @@ void Context::Impl::DestroyNow(u64 serial) {
                            }});
         return;
     }
-    if (samplers.erase(serial) != 0 || programs.erase(serial) != 0) {
+    if (samplers.erase(serial) != 0) {
+        if (draw_resources) {
+            draw_resources->ReleaseSampler(serial, after);
+        }
+        return;
+    }
+    if (programs.erase(serial) != 0) {
+        if (draw_resources) {
+            draw_resources->ReleaseProgram(serial);
+        }
         return;
     }
     if (syncs.contains(serial)) {
@@ -1341,6 +1512,13 @@ const Context::Impl::RawGlobalTable& Context::Impl::RawGlobalMemoryTable() {
     // The backing thread backs pools (and bumps the generation) only under this lock: the pools,
     // the chunks and the generation the table is built from are one consistent state.
     std::scoped_lock backing_lock{backing_mutex};
+    const bool host_import_available = HostImportEnabled();
+    // Without host import, backing a CPU-accessible pool creates a Mirror that the raw table
+    // skips anyway (unless demand-promoted via PromoteRawMirrorPool); never eagerly back CPU,
+    // compressible, shader-code, or GPU-no-access pools during a raw table rebuild.
+    const auto defer = [host_import_available](const Pool& pool) {
+        return DeferDirectPoolBacking(pool.flags, pool.size, host_import_available);
+    };
     const auto has_own_buffer = [](const Pool& pool) {
         return (pool.backing == Pool::Backing::Imported && !pool.chunk) ||
                pool.backing == Pool::Backing::DeviceLocal;
@@ -1362,6 +1540,9 @@ const Context::Impl::RawGlobalTable& Context::Impl::RawGlobalMemoryTable() {
             continue;
         }
         if (pool->pending) {
+            if (defer(*pool)) {
+                continue;
+            }
             if (!(pool->flags & PoolFlag::CpuNoAccess)) {
                 const u8* host = GuestPointer(pool->address, pool->size);
                 if (host != nullptr && InImportedChunk(host, pool->size)) {
@@ -1424,6 +1605,19 @@ const Context::Impl::RawGlobalTable& Context::Impl::RawGlobalMemoryTable() {
             ++split_pools;
             continue;
         }
+        if (pool->backing == Pool::Backing::Mirror && pool->raw_mirror_enabled && pool->buffer &&
+            (pool_usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0) {
+            if (pool->device_address == 0) {
+                pool->device_address = device.GetLogical().GetBufferDeviceAddress(pool->Handle());
+            }
+            sources.push_back({pool->address, pool->device_address, pool->size, 1});
+            table.pool_serials.push_back(pool->serial);
+            table.pools.push_back(pool.get());
+            table.mirror_pools.push_back(pool.get());
+            ++own_pools;
+            own_bytes += pool->size;
+            continue;
+        }
         if (pool->backing == Pool::Backing::Mirror || pool->backing == Pool::Backing::None) {
             // A non-VRAM mirror pool's GPU copy is not the guest memory.
             ++skipped;
@@ -1463,6 +1657,17 @@ const Context::Impl::RawGlobalTable& Context::Impl::RawGlobalMemoryTable() {
                 continue;
             }
             if (physical->pending) {
+                // Physical pools always carry PoolFlag::GpuNoAccess from StoredPoolFlags: when
+                // reached via a virtual mapping, only defer CPU pools (without host import) and
+                // compressible / shader-code pools, keeping plain CpuNoAccess physical pools backed.
+                const bool defer_physical =
+                    (!host_import_available && (!(physical->flags & PoolFlag::CpuNoAccess) ||
+                                                physical->size >= (u64{16} << 20))) ||
+                    (physical->flags & (PoolFlag::Compressible | PoolFlag::ShaderCode)) != 0;
+                if (defer_physical) {
+                    ++skipped;
+                    continue;
+                }
                 BackPoolLocked(*physical);
             }
             if (physical->upload_pending) {
@@ -1491,8 +1696,11 @@ const Context::Impl::RawGlobalTable& Context::Impl::RawGlobalMemoryTable() {
                 table.pools.push_back(physical);
                 continue;
             }
+            const bool usable_raw_mirror =
+                physical->backing == Pool::Backing::Mirror && physical->raw_mirror_enabled &&
+                physical->buffer && (pool_usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0;
             if (physical->backing != Pool::Backing::Imported &&
-                physical->backing != Pool::Backing::DeviceLocal) {
+                physical->backing != Pool::Backing::DeviceLocal && !usable_raw_mirror) {
                 ++skipped;
                 continue;
             }
@@ -1504,6 +1712,9 @@ const Context::Impl::RawGlobalTable& Context::Impl::RawGlobalMemoryTable() {
                                physical->device_address + run.physical_offset, run.size, 1});
             table.pool_serials.push_back(physical->serial);
             table.pools.push_back(physical);
+            if (usable_raw_mirror) {
+                table.mirror_pools.push_back(physical);
+            }
         }
         table.pool_serials.push_back(virtual_pool->serial);
         table.pools.push_back(virtual_pool);
@@ -1538,6 +1749,9 @@ const Context::Impl::RawGlobalTable& Context::Impl::RawGlobalMemoryTable() {
         }
     }
 
+    std::ranges::sort(table.mirror_pools);
+    const auto dup = std::ranges::unique(table.mirror_pools);
+    table.mirror_pools.erase(dup.begin(), dup.end());
     table.entries = FlattenRawGlobalRanges(std::move(sources));
     const size_t total_ranges = table.entries.size();
     table.device = UploadRawTable(table.entries);
@@ -1603,7 +1817,8 @@ const Context::Impl::RawWriteThroughTable& Context::Impl::RawStoreAliasTable() {
             sources.push_back({pool, {pool->address, target, pool->size}});
         }
     }
-    if (read_only_enabled && (pool_usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0) {
+    std::vector<std::pair<Pool*, bool>> prev_split_alias;
+    if ((pool_usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0) {
         for (const auto& [serial, entry] : pools) {
             static_cast<void>(serial);
             Pool* const pool = entry.get();
@@ -1611,8 +1826,10 @@ const Context::Impl::RawWriteThroughTable& Context::Impl::RawStoreAliasTable() {
                 pool->backing != Pool::Backing::Mirror || pool->split_runs.empty()) {
                 continue;
             }
+            const bool was_written_through = pool->raw_written_through;
             pool->raw_written_through = false;
-            if (!pool->buffer || pool->size == 0) {
+            prev_split_alias.emplace_back(pool, was_written_through);
+            if (!read_only_enabled || !pool->buffer || pool->size == 0) {
                 continue;
             }
             if (pool->device_address == 0) {
@@ -1658,6 +1875,11 @@ const Context::Impl::RawWriteThroughTable& Context::Impl::RawStoreAliasTable() {
             table.pools.push_back(pool);
         }
     }
+    for (const auto& [pool, was_written_through] : prev_split_alias) {
+        if (was_written_through && !pool->raw_written_through && !pool->split_runs.empty()) {
+            pool->ClearAllMirrorTrusted();
+        }
+    }
     stats.vram_raw_alias_rebuilds.fetch_add(1, std::memory_order_relaxed);
     raw_write_through_table = std::move(table);
     return raw_write_through_table;
@@ -1672,7 +1894,7 @@ std::shared_ptr<RawTableBuffer> Context::Impl::UploadRawTable(
         auto table = std::make_shared<RawTableBuffer>();
         const VkDeviceSize bytes = entries.size() * sizeof(RawGlobalRange);
         table->count = static_cast<u32>(entries.size());
-        if (mario_kart_world) {
+        {
             const VkPhysicalDeviceMemoryProperties* properties{};
             vmaGetMemoryProperties(vma, &properties);
             constexpr VkMemoryPropertyFlags mapped_local =
@@ -1720,8 +1942,8 @@ std::shared_ptr<RawTableBuffer> Context::Impl::UploadRawTable(
                 .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
                 .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
             };
-            cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                0, barrier, {}, {});
+            cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                vk::PIPELINE_STAGE_GRAPHICS_COMPUTE, 0, barrier, {}, {});
         });
         return table;
     } catch (const vk::Exception& exception) {
@@ -1882,6 +2104,183 @@ const char* RawTableGapReason(const Pool& pool) {
 
 } // Anonymous namespace
 
+u32 Context::Impl::PromoteMissedRawPools(const VideoCommon::RawCoverageRing& window) {
+    u32 promoted = 0;
+    std::unordered_set<Pool*> visited;
+    for (const VideoCommon::RawCoverageMiss& miss : window.misses) {
+        if (miss.guest < VideoCommon::RAW_COVERAGE_NULL_LIMIT) {
+            continue;
+        }
+        auto it = pools_by_address.upper_bound(miss.guest);
+        if (it == pools_by_address.begin()) {
+            continue;
+        }
+        Pool& candidate = *std::prev(it)->second;
+        if (miss.guest - candidate.address >= candidate.size) {
+            continue;
+        }
+        Pool* target = &candidate;
+        if (candidate.IsVirtual()) {
+            const u64 offset = miss.guest - candidate.address;
+            const auto run_it = candidate.virtual_runs.upper_bound(offset);
+            if (run_it == candidate.virtual_runs.begin()) {
+                continue;
+            }
+            const auto& [run_offset, run] = *std::prev(run_it);
+            if (offset - run_offset >= run.size) {
+                continue;
+            }
+            const auto phys_it = pools.find(run.physical_serial);
+            if (phys_it == pools.end() || !phys_it->second) {
+                continue;
+            }
+            target = phys_it->second.get();
+        }
+        if (!visited.insert(target).second) {
+            continue;
+        }
+        if (target->IsVirtual()) {
+            continue;
+        }
+        if ((target->flags & PoolFlag::CpuNoAccess) != 0) {
+            if (target->pending.load(std::memory_order_acquire)) {
+                EnsureBacking(*target);
+                if (target->backing == Pool::Backing::DeviceLocal) {
+                    LOG_INFO(Render_Vulkan,
+                             "[nvn] raw global memory: backed deferred GPU-only pool {:#x} "
+                             "({:.2f} MiB, flags {:#x}) on raw miss at {:#x}",
+                             target->address, target->size / 1048576.0, target->flags, miss.guest);
+                    ++promoted;
+                }
+            }
+            continue;
+        }
+        if ((target->flags & PoolFlag::GpuNoAccess) != 0 || target->raw_mirror_enabled ||
+            target->raw_mirror_refused) {
+            continue;
+        }
+        if (target->pending.load(std::memory_order_acquire) && HostImportEnabled()) {
+            EnsureBacking(*target);
+            if (target->backing == Pool::Backing::Imported ||
+                target->backing == Pool::Backing::DeviceLocal || !target->split_runs.empty()) {
+                LOG_INFO(Render_Vulkan,
+                         "[nvn] raw global memory: backed deferred pool {:#x} ({:.2f} MiB, "
+                         "flags {:#x}) on raw miss at {:#x}",
+                         target->address, static_cast<double>(target->size) / 1048576.0,
+                         target->flags, miss.guest);
+                ++promoted;
+                continue;
+            }
+        }
+        if (!target->pending.load(std::memory_order_acquire) &&
+            (target->backing == Pool::Backing::Imported ||
+             target->backing == Pool::Backing::DeviceLocal || !target->split_runs.empty())) {
+            continue;
+        }
+        if (PromoteRawMirrorPool(*target, miss.guest)) {
+            ++promoted;
+        }
+    }
+    return promoted;
+}
+
+bool Context::Impl::PromoteRawMirrorPool(Pool& pool, u64 miss_address) {
+    EnsureBacking(pool);
+    if (pool.backing != Pool::Backing::Mirror || !pool.buffer || pool.mirror_pages.empty()) {
+        pool.raw_mirror_refused = true;
+        return false;
+    }
+    const bool tracked = TakePoolCpuWrites(pool);
+    std::vector<std::pair<u64, u64>> gpu_dirty;
+    {
+        std::scoped_lock lock{pool.dirty_mutex};
+        gpu_dirty.reserve(pool.gpu_dirty.size());
+        for (const Pool::Dirty& d : pool.gpu_dirty) {
+            gpu_dirty.emplace_back(d.begin, d.end);
+        }
+    }
+    const auto overlaps_gpu_dirty = [&](u64 begin, u64 end) {
+        return std::ranges::any_of(
+            gpu_dirty, [&](const auto& range) { return range.first < end && begin < range.second; });
+    };
+    std::vector<std::pair<u64, u64>> page_runs;
+    const u64 page_count = static_cast<u64>(pool.mirror_pages.size());
+    for (u64 p = 0; p < page_count; ++p) {
+        if (pool.mirror_pages[static_cast<size_t>(p)].valid) {
+            continue;
+        }
+        const u64 begin = p * Pool::MIRROR_PAGE;
+        const u64 end = (std::min)(begin + Pool::MIRROR_PAGE, pool.size);
+        if (overlaps_gpu_dirty(begin, end)) {
+            continue;
+        }
+        if (!page_runs.empty() && page_runs.back().second + 1 == p) {
+            page_runs.back().second = p;
+        } else {
+            page_runs.emplace_back(p, p);
+        }
+    }
+    if (!page_runs.empty()) {
+        std::vector<PoolUpload> uploads;
+        uploads.reserve(page_runs.size());
+        for (const auto& [first_p, last_p] : page_runs) {
+            if (tracked) {
+                ArmPoolMirrorPages(pool, first_p, last_p);
+            }
+            const u64 byte_begin = first_p * Pool::MIRROR_PAGE;
+            const u64 byte_end = (std::min)((last_p + 1) * Pool::MIRROR_PAGE, pool.size);
+            uploads.push_back({&pool, byte_begin, byte_end - byte_begin});
+        }
+        if (!UploadPoolRanges(uploads, true)) {
+            pool.raw_mirror_refused = true;
+            return false;
+        }
+        VC::GuestMemory* const memory = guest.load(std::memory_order_acquire);
+        std::array<u8, Pool::MIRROR_PAGE> hash_scratch{};
+        for (const auto& [first_p, last_p] : page_runs) {
+            for (u64 p = first_p; p <= last_p; ++p) {
+                Pool::MirrorPage& mp = pool.mirror_pages[static_cast<size_t>(p)];
+                mp.valid = true;
+                mp.checked = 0;
+                mp.raw_epoch = mirror_raw_write_epoch;
+                if (tracked) {
+                    mp.hash_valid = false;
+                    pool.SetMirrorPageTrusted(static_cast<size_t>(p), true);
+                } else {
+                    const u64 page_begin = p * Pool::MIRROR_PAGE;
+                    const u64 page_len = (std::min)(Pool::MIRROR_PAGE, pool.size - page_begin);
+                    const u8* bytes = pool.host ? pool.host + page_begin
+                                                : GuestPointer(pool.address + page_begin, page_len);
+                    if (bytes == nullptr) {
+                        if (!memory || !memory->Read(pool.address + page_begin, hash_scratch.data(),
+                                                     page_len)) {
+                            mp.hash_valid = false;
+                            pool.SetMirrorPageTrusted(static_cast<size_t>(p), false);
+                            continue;
+                        }
+                        bytes = hash_scratch.data();
+                    }
+                    mp.hash = Common::CityHash64(reinterpret_cast<const char*>(bytes),
+                                                 static_cast<size_t>(page_len));
+                    mp.hash_valid = true;
+                    pool.SetMirrorPageTrusted(static_cast<size_t>(p), false);
+                }
+            }
+        }
+    }
+    pool.raw_mirror_enabled = true;
+    ++pool_generation;
+    ++raw_mirror_promoted_pools;
+    raw_mirror_promoted_bytes += pool.size;
+    LOG_INFO(Render_Vulkan,
+             "[nvn] raw global memory: promoted mirror pool {:#x} ({:.2f} MiB, flags {:#x}) on "
+             "raw miss at {:#x} (total promoted: {}, {:.1f} MiB)",
+             pool.address, static_cast<double>(pool.size) / 1048576.0, pool.flags, miss_address,
+             raw_mirror_promoted_pools,
+             static_cast<double>(raw_mirror_promoted_bytes) / 1048576.0);
+    return true;
+}
+
 u64 Context::Impl::RawCoverageRingFor(u64 seq) {
     if (!raw_coverage) {
         raw_coverage.emplace(device, *allocator, "hle");
@@ -1890,21 +2289,41 @@ u64 Context::Impl::RawCoverageRingFor(u64 seq) {
         return 0;
     }
     FlightCoverageQueue flights{completed_seq, seq};
-    if (const auto* const window = raw_coverage->Poll(std::chrono::steady_clock::now(), flights)) {
+    const bool demand_backing = true;
+    const auto now = std::chrono::steady_clock::now();
+    const bool force_swap =
+        demand_backing && raw_coverage->HasNonNullMisses() && now >= raw_miss_next_swap;
+    if (const auto* const window = raw_coverage->Poll(now, flights, force_swap)) {
         VideoCommon::ParseRawCoverageRing(window->bytes, raw_coverage_window);
-        // Classified against the table and the pools of now, up to a window after the accesses
-        // (an address the table holds by now is `late`).
-        std::vector<VideoCommon::RawGlobalRange> ranges;
-        ranges.reserve(raw_table.entries.size());
-        for (const RawGlobalRange& entry : raw_table.entries) {
-            ranges.push_back({entry.guest, entry.device, entry.size});
+        if (VideoCommon::RawCoverageEnabled()) {
+            // Classified against the table and the pools of now, up to a window after the
+            // accesses (an address the table holds by now is `late`).
+            std::vector<VideoCommon::RawGlobalRange> ranges;
+            ranges.reserve(raw_table.entries.size());
+            for (const RawGlobalRange& entry : raw_table.entries) {
+                ranges.push_back({entry.guest, entry.device, entry.size});
+            }
+            const auto classify = [&](u64 guest_address) {
+                return ClassifyHleRawMiss(guest_address, ranges, pools_by_address, pools);
+            };
+            for (const std::string& line : raw_coverage_report.AddWindow(
+                     raw_coverage_window, window->dispatches, window->seconds, classify)) {
+                LOG_INFO(HW_GPU, "{}", line);
+            }
         }
-        const auto classify = [&](u64 guest_address) {
-            return ClassifyHleRawMiss(guest_address, ranges, pools_by_address, pools);
-        };
-        for (const std::string& line : raw_coverage_report.AddWindow(
-                 raw_coverage_window, window->dispatches, window->seconds, classify)) {
-            LOG_INFO(HW_GPU, "{}", line);
+        if (demand_backing) {
+            const u32 promoted = PromoteMissedRawPools(raw_coverage_window);
+            if (promoted > 0) {
+                raw_miss_next_swap = std::chrono::steady_clock::time_point::min();
+            } else {
+                const bool had_non_null = std::ranges::any_of(
+                    raw_coverage_window.misses, [](const VideoCommon::RawCoverageMiss& miss) {
+                        return miss.guest >= VideoCommon::RAW_COVERAGE_NULL_LIMIT;
+                    });
+                if (had_non_null) {
+                    raw_miss_next_swap = now + std::chrono::milliseconds(250);
+                }
+            }
         }
         raw_coverage->Recycle();
     }

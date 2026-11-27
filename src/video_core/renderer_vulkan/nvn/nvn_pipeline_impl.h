@@ -318,8 +318,11 @@ struct PipelineCache::Impl {
                                                   u64& key_hash,
                                                   const std::function<void(u64)>& look_ahead = {},
                                                   std::optional<u64> prefetch_skip = {});
-    std::shared_ptr<ComputePipeline> GetCompute(const ComputeRequest& request, bool* not_ready);
-    VkRenderPass GetRenderPass(const RenderPassKey& key);
+    std::shared_ptr<ComputePipeline> GetCompute(const ComputeRequest& request, bool* not_ready,
+                                                const std::function<void(u64)>& look_ahead = {},
+                                                std::optional<u64> prefetch_skip = {});
+    VkRenderPass GetRenderPass(const RenderPassKey& key, bool read_only_depth = false,
+                               u16 clear_mask = 0);
     void Flush();
     void ClearShaders();
     PipelineCacheStats Stats() const;
@@ -369,18 +372,10 @@ struct PipelineCache::Impl {
                                         const TranslationState* translation, bool has_geometry);
 
     // --- Vulkan objects -----------------------------------------------------------------------
-    struct LayoutObjects {
-        vk::DescriptorSetLayout set_layout;
-        /// Set BINDLESS_SET when a stage samples through the table (nvn_bindless.h).
-        vk::DescriptorSetLayout bindless_layout;
-        vk::PipelineLayout layout;
-        bool push_descriptors{};
-        u32 push_constant_size{};
-    };
     bool CanUsePush(u32 descriptor_count) const;
     /// `push_stages`: the stages of the push-constant range (PipelineBase::push_constant_stages).
-    LayoutObjects CreateLayoutObjects(const VC::DescriptorLayout& descriptors, bool is_compute,
-                                      VkShaderStageFlags push_stages);
+    std::shared_ptr<const SharedPipelineLayout> CreateLayoutObjects(
+        const VC::DescriptorLayout& descriptors, bool is_compute, VkShaderStageFlags push_stages);
     VC::DescriptorLayout MergeLayouts(std::span<const StageArtifact* const> stages);
     struct ShaderSet;
     /// Without `gpl_set` the pipeline is compiled whole from modules made for the call. With it
@@ -406,7 +401,7 @@ struct PipelineCache::Impl {
         TranslateOutput translated;
         std::once_flag created; ///< `modules` and `layout` exist once it is set
         std::array<vk::ShaderModule, GRAPHICS_STAGE_COUNT> modules; ///< by NVNshaderStage
-        LayoutObjects layout; ///< the layout the shader parts are compiled with
+        std::shared_ptr<const SharedPipelineLayout> layout; ///< layout the shader parts are compiled with
         /// True when `oracle` still answers every texture query of the stages as it did.
         [[nodiscard]] bool QueriesMatch(const TextureOracle& oracle) const;
     };
@@ -490,6 +485,10 @@ struct PipelineCache::Impl {
     /// published in `GraphicsPipeline::optimized_handle`.
     void QueueOptimize(std::shared_ptr<GraphicsPipeline> pipeline, std::shared_ptr<ShaderSet> set,
                        const GraphicsFixedState& state, const RenderPassKey& targets);
+    void DeferOptimize(std::shared_ptr<GraphicsPipeline> pipeline, std::shared_ptr<ShaderSet> set,
+                       const GraphicsFixedState& state, const RenderPassKey& targets);
+    void NoteGraphicsUsed(GraphicsPipeline& pipeline);
+    void OnPresent();
     void PrepareProgram(const std::array<StageProgram, STAGE_COUNT>& stages,
                         std::shared_ptr<const void> owner);
 
@@ -500,7 +499,8 @@ struct PipelineCache::Impl {
                                                       const GraphicsKey& key, bool had_variants,
                                                       bool speculative = false);
     std::shared_ptr<ComputePipeline> CompileCompute(const ComputeRequest& request,
-                                                    const ComputeKey& key, bool had_variants);
+                                                    const ComputeKey& key, bool had_variants,
+                                                    bool speculative = false);
 
     // --- asynchronous compiles (PipelineCacheOptions::async_compile) ---------------------------
     /// Deep copies of the program bytes of a request, owned by the job.
@@ -523,6 +523,7 @@ struct PipelineCache::Impl {
         std::unique_ptr<TextureOracle> oracle;
         ComputeKey key;
         bool had_variants{};
+        bool speculative{};
         std::shared_ptr<PendingKey> pending;
     };
     [[nodiscard]] bool AsyncEnabled(const bool* not_ready) const noexcept {
@@ -597,6 +598,7 @@ struct PipelineCache::Impl {
     /// Decided once from the device (and PipelineCacheOptions); part of every key form and of
     /// the disk header's profile hash.
     VertexInputMode vertex_input_mode{VertexInputMode::Static};
+    DynamicStateCaps dynamic_caps{};
     bool must_emulate_scaled_formats{};
     /// How the title's compute programs lower their matrix multiplies (decided once, part of the
     /// translation key).
@@ -644,6 +646,25 @@ struct PipelineCache::Impl {
 
     std::mutex render_pass_mutex;
     std::unordered_map<RenderPassKey, vk::RenderPass, RenderPassKeyHash> render_passes;
+    std::unordered_map<RenderPassKey, vk::RenderPass, RenderPassKeyHash> read_only_depth_passes;
+    struct ClearRenderPassKey {
+        RenderPassKey key{};
+        u16 clear_mask{};
+        bool read_only_depth{};
+        [[nodiscard]] bool operator==(const ClearRenderPassKey&) const = default;
+    };
+    struct ClearRenderPassKeyHash {
+        size_t operator()(const ClearRenderPassKey& k) const noexcept {
+            const u64 h = RenderPassKeyHash{}(k.key);
+            const u64 extra = (static_cast<u64>(k.clear_mask) << 1) | (k.read_only_depth ? 1u : 0u);
+            return static_cast<size_t>(h ^ (extra * 0x9E3779B97F4A7C15ULL));
+        }
+    };
+    std::unordered_map<ClearRenderPassKey, vk::RenderPass, ClearRenderPassKeyHash>
+        clear_render_passes;
+
+    std::mutex layout_cache_mutex;
+    std::map<std::vector<u32>, std::shared_ptr<const SharedPipelineLayout>> layout_cache;
 
     mutable std::mutex pipeline_mutex;
     std::unordered_map<GraphicsKey, std::vector<std::shared_ptr<GraphicsPipeline>>, GraphicsKeyHash,
@@ -715,10 +736,18 @@ struct PipelineCache::Impl {
     std::atomic<u64> stat_gpl_optimize_ns{};
     std::atomic<u64> stat_gpl_optimize_slow{}; ///< optimized compiles over 50 ms (background)
     std::atomic<u64> stat_prepared{};
+    struct DeferredOptimize {
+        std::shared_ptr<GraphicsPipeline> pipeline;
+        std::shared_ptr<ShaderSet> set;
+        GraphicsFixedState state;
+        RenderPassKey targets;
+    };
+    std::atomic<u64> present_counter{1};
     /// Optimize jobs and program preparations queued and not finished (guarded by gpl_mutex).
     std::mutex gpl_mutex;
     std::condition_variable gpl_cv;
     u64 gpl_outstanding{};
+    std::unordered_map<const GraphicsPipeline*, DeferredOptimize> deferred_optimizes;
     /// Compiles the shader parts of one link side by side (the calling thread waits for them).
     std::unique_ptr<Common::ThreadWorker> part_workers;
     /// Whole compiles of fast-linked pipelines (background priority).

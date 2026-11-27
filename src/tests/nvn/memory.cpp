@@ -30,10 +30,12 @@
 #include "common/literals.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#include "video_core/nvn/guest_layouts.h"
 #include "video_core/nvn/guest_memory.h"
 #include "video_core/nvn/record.h"
 #include "video_core/nvn/sink.h"
 #include "video_core/renderer_vulkan/nvn/nvn_context.h"
+#include "video_core/renderer_vulkan/nvn/nvn_draw_resources.h"
 #include "video_core/renderer_vulkan/nvn/nvn_format.h"
 #include "video_core/renderer_vulkan/nvn/nvn_impl.h"
 #include "video_core/renderer_vulkan/nvn/nvn_pool_mirror.h"
@@ -72,17 +74,38 @@ TEST_CASE("Mirror page ownership requires complete coverage of the actual page",
     using Nvn::ClassifyMirrorWrites;
     using Nvn::MirrorWriteCoverage;
     const std::array<std::pair<u64, u64>, 2> full{{{0, 8192}, {16384, 32768}}};
-    CHECK(ClassifyMirrorWrites(0, 4096, full) == MirrorWriteCoverage::Full);
-    CHECK(ClassifyMirrorWrites(4096, 8192, full) == MirrorWriteCoverage::Full);
-    CHECK(ClassifyMirrorWrites(8192, 12288, full) == MirrorWriteCoverage::None);
-    CHECK(ClassifyMirrorWrites(4096, 12288, full) == MirrorWriteCoverage::Partial);
-    CHECK(ClassifyMirrorWrites(32768, 36864, full) == MirrorWriteCoverage::None);
-    CHECK(ClassifyMirrorWrites(8192, 8192, full) == MirrorWriteCoverage::None);
-    CHECK(ClassifyMirrorWrites(16384, 16512, full) == MirrorWriteCoverage::Full);
+    std::pair<u64, u64> full_range{};
+    CHECK(ClassifyMirrorWrites(0, 4096, full, full_range) == MirrorWriteCoverage::Full);
+    CHECK(ClassifyMirrorWrites(4096, 8192, full, full_range) == MirrorWriteCoverage::Full);
+    CHECK(ClassifyMirrorWrites(8192, 12288, full, full_range) == MirrorWriteCoverage::None);
+    CHECK(ClassifyMirrorWrites(4096, 12288, full, full_range) == MirrorWriteCoverage::Partial);
+    CHECK(ClassifyMirrorWrites(32768, 36864, full, full_range) == MirrorWriteCoverage::None);
+    CHECK(ClassifyMirrorWrites(8192, 8192, full, full_range) == MirrorWriteCoverage::None);
+    CHECK(ClassifyMirrorWrites(16384, 16512, full, full_range) == MirrorWriteCoverage::Full);
+    CHECK(ClassifyMirrorWrites(16000, 16512, full, full_range) == MirrorWriteCoverage::Partial);
     const std::array<std::pair<u64, u64>, 2> hole{{{4096, 5000}, {6000, 8192}}};
-    CHECK(ClassifyMirrorWrites(4096, 8192, hole) == MirrorWriteCoverage::Partial);
-    CHECK(ClassifyMirrorWrites(5000, 6000, hole) == MirrorWriteCoverage::None);
-    CHECK(ClassifyMirrorWrites(4096, 8192, {}) == MirrorWriteCoverage::None);
+    full_range = {};
+    CHECK(ClassifyMirrorWrites(4096, 8192, hole, full_range) == MirrorWriteCoverage::Partial);
+    CHECK(ClassifyMirrorWrites(5000, 6000, hole, full_range) == MirrorWriteCoverage::None);
+    full_range = {};
+    CHECK(ClassifyMirrorWrites(4096, 8192, {}, full_range) == MirrorWriteCoverage::None);
+}
+
+TEST_CASE("MergePendingWrites and SubtractSortedRanges coalesce and clip spans", "[nvn][mirror]") {
+    std::vector<std::pair<u64, u64>> dirty{
+        {200, 300}, {100, 100}, {500, 400}, {50, 150}, {150, 210}, {600, 700},
+    };
+    Nvn::MergePendingWrites(dirty);
+    REQUIRE(dirty == std::vector<std::pair<u64, u64>>{{50, 300}, {600, 700}});
+
+    const std::array<std::pair<u64, u64>, 3> parts{{{0, 4096}, {4096, 8192}, {12288, 16384}}};
+    const std::array<std::pair<u64, u64>, 3> subtract{{{100, 200}, {3000, 5000}, {12288, 17000}}};
+    std::vector<std::pair<u64, u64>> out;
+    Nvn::SubtractSortedRanges(parts, subtract, out);
+    REQUIRE(out == std::vector<std::pair<u64, u64>>{{0, 100}, {200, 3000}, {5000, 8192}});
+
+    Nvn::SubtractSortedRanges(parts, {}, out);
+    REQUIRE(out == std::vector<std::pair<u64, u64>>{{0, 4096}, {4096, 8192}, {12288, 16384}});
 }
 
 // --- helpers ----------------------------------------------------------------------------------
@@ -184,6 +207,21 @@ public:
         return Find(va, 1);
     }
 
+    void HintCold(u64 va, u64 size) override {
+        std::scoped_lock lock{regions_mutex};
+        cold_hints.emplace_back(va, size);
+    }
+
+    [[nodiscard]] std::vector<std::pair<u64, u64>> ColdHints() {
+        std::scoped_lock lock{regions_mutex};
+        return cold_hints;
+    }
+
+    void ClearColdHints() {
+        std::scoped_lock lock{regions_mutex};
+        cold_hints.clear();
+    }
+
 private:
     struct Region {
         u64 base{};
@@ -207,6 +245,7 @@ private:
     // Regions never move: the vector holds them by value but `data` points into `raw`'s heap
     // block, which survives a vector reallocation (std::vector<u8> moves keep their buffer).
     std::vector<Region> regions;
+    std::vector<std::pair<u64, u64>> cold_hints;
     std::mutex regions_mutex;
 };
 
@@ -595,6 +634,101 @@ bool AllTexels(const std::vector<u8>& texels, u8 r, u8 g, u8 b, u8 a) {
     }
     return !texels.empty();
 }
+
+/// GuestMemory with lazy page-tracking callbacks (Arm / DisarmWritten / WriteEpoch), modeling
+/// how PageTracker traps CPU writes only on pages explicitly armed by the replay.
+class TrackedMemory final : public VC::GuestMemory {
+public:
+    explicit TrackedMemory(FakeMemory& inner_) : inner{inner_} {}
+    bool Read(u64 va, void* dst, size_t size) override {
+        return inner.Read(va, dst, size);
+    }
+    bool Write(u64 va, const void* src, size_t size) override {
+        return inner.Write(va, src, size);
+    }
+    u8* Pointer(u64 va) override {
+        return inner.Pointer(va);
+    }
+    u64 Track(u64 va, u64 size) override {
+        static_cast<void>(va);
+        static_cast<void>(size);
+        tracked = true;
+        return 1;
+    }
+    void Arm(u64 id, u64 va, u64 size) override {
+        static_cast<void>(id);
+        ++arm_calls;
+        for (u64 page = va >> 12; page < (va + size + 0xFFF) >> 12; ++page) {
+            armed_pages.insert(page);
+            dirty_pages.erase(page);
+        }
+    }
+    void TakeWritten(u64 id, u64 va, u64 size,
+                     std::vector<std::pair<u64, u64>>& runs) override {
+        static_cast<void>(id);
+        for (u64 page = va >> 12; page < (va + size + 0xFFF) >> 12; ++page) {
+            if (dirty_pages.erase(page) == 0) {
+                continue;
+            }
+            const u64 page_va = page << 12;
+            if (!runs.empty() && runs.back().second == page_va) {
+                runs.back().second += 4096;
+            } else {
+                runs.emplace_back(page_va, page_va + 4096);
+            }
+        }
+    }
+    bool SupportsDisarmWritten() const override {
+        return true;
+    }
+    void DisarmWritten(u64 id, u64 va, u64 size,
+                       std::vector<std::pair<u64, u64>>& runs) override {
+        static_cast<void>(id);
+        for (u64 page = va >> 12; page < (va + size + 0xFFF) >> 12; ++page) {
+            if (dirty_pages.erase(page) == 0) {
+                continue;
+            }
+            armed_pages.erase(page);
+            const u64 page_va = page << 12;
+            if (!runs.empty() && runs.back().second == page_va) {
+                runs.back().second += 4096;
+            } else {
+                runs.emplace_back(page_va, page_va + 4096);
+            }
+        }
+    }
+    std::shared_ptr<const std::atomic<u64>> WriteEpoch(u64 id) override {
+        static_cast<void>(id);
+        return epoch;
+    }
+    void CpuWriteBytes(u64 va, const void* src, size_t size) {
+        REQUIRE(inner.Write(va, src, size));
+        if (!tracked || size == 0) {
+            return;
+        }
+        const u64 first_page = va >> 12;
+        const u64 last_page = (va + size - 1) >> 12;
+        bool any_dirty = false;
+        for (u64 page = first_page; page <= last_page; ++page) {
+            if (armed_pages.contains(page) && dirty_pages.insert(page).second) {
+                any_dirty = true;
+            }
+        }
+        if (any_dirty) {
+            epoch->fetch_add(1, std::memory_order_release);
+        }
+    }
+    void CpuWrite(u64 va, u32 value) {
+        CpuWriteBytes(va, &value, sizeof(value));
+    }
+
+    FakeMemory& inner;
+    bool tracked{false};
+    size_t arm_calls{0};
+    std::unordered_set<u64> armed_pages;
+    std::unordered_set<u64> dirty_pages;
+    std::shared_ptr<std::atomic<u64>> epoch{std::make_shared<std::atomic<u64>>(0)};
+};
 
 } // Anonymous namespace
 
@@ -2110,6 +2244,145 @@ private:
 
 } // namespace
 
+TEST_CASE("nvn memory: cold hints, resource cleanup, and linux memory description",
+          "[nvn][memory][cold-hint]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+
+    const auto has_cold_cover = [](const std::vector<std::pair<u64, u64>>& hints, u64 va,
+                                   u64 min_size) {
+        return std::ranges::any_of(hints, [&](const auto& h) {
+            return h.first <= va && h.first + h.second >= va + min_size;
+        });
+    };
+
+    {
+        constexpr u64 BUFFER_POOL_VA = 0x3000'0000;
+        constexpr u64 TEX_POOL_VA = 0x4000'0000;
+        constexpr u64 RAW_POOL_VA = 0x5000'0000;
+
+        FakeMemory memory;
+        u8* const buf = memory.Add(BUFFER_POOL_VA, 512_KiB);
+        u8* const tex = memory.Add(TEX_POOL_VA, 512_KiB);
+        u8* const raw = memory.Add(RAW_POOL_VA, 256_KiB);
+        std::memset(buf, 0, 512_KiB);
+        std::memset(tex, 0x3C, 512_KiB);
+        std::memset(raw, 0x5A, 256_KiB);
+
+        const auto layout =
+            MakeStorage(NVN_FORMAT_RGBA8, 256, 256, 1, PixelFormat::A8B8G8R8_UNORM,
+                        VK_FORMAT_A8B8G8R8_UNORM_PACK32)
+                .layout;
+        REQUIRE(layout.size >= 256_KiB);
+
+        Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr, {});
+        context.SetGuestMemory(&memory);
+        context.CreatePool({.serial = 1,
+                            .guest_address = BUFFER_POOL_VA,
+                            .size = 512_KiB,
+                            .flags = POOL_CPU_CACHED});
+        context.CreatePool({.serial = 2,
+                            .guest_address = TEX_POOL_VA,
+                            .size = 512_KiB,
+                            .flags = POOL_CPU_NO_ACCESS});
+        context.CreatePool({.serial = 3,
+                            .guest_address = RAW_POOL_VA,
+                            .size = 256_KiB,
+                            .flags = POOL_CPU_NO_ACCESS});
+        context.CreateTexture(MakeTexture(10, 2, 0, NVN_FORMAT_RGBA8, 256, 256));
+
+        u64 seq = 0;
+        {
+            std::vector<u64> list;
+            Push(list, VC::Op::CopyTextureToBuffer,
+                 CopyToBuffer(BUFFER_POOL_VA, 10, 256, 256));
+            Run(context, seq, std::move(list));
+        }
+        CHECK(has_cold_cover(memory.ColdHints(), TEX_POOL_VA, layout.size));
+
+        memory.ClearColdHints();
+        {
+            std::vector<u64> list;
+            const VC::CopyBufferToBufferPayload copy{
+                .src = RAW_POOL_VA, .dst = BUFFER_POOL_VA, .size = 4096};
+            Push(list, VC::Op::CopyBufferToBuffer, copy);
+            Run(context, seq, std::move(list));
+        }
+        CHECK(has_cold_cover(memory.ColdHints(), RAW_POOL_VA, 256_KiB));
+
+        const std::string mem_desc = context.DescribeMemory();
+        CHECK(mem_desc.find("process private ") != std::string::npos);
+        CHECK(mem_desc.find("private working set ") != std::string::npos);
+    }
+
+    {
+        Nvn::Context::Impl impl(*vulkan->device, vulkan->submit_mutex, nullptr, {});
+        REQUIRE(impl.draw_resources != nullptr);
+
+        VC::SamplerDesc sampler{};
+        sampler.serial = 50;
+        sampler.min_filter = 2;
+        impl.samplers[50] = sampler;
+        REQUIRE(impl.draw_resources->GetSampler(50, false) != VK_NULL_HANDLE);
+        CHECK(impl.draw_resources->samplers.contains(50));
+
+        std::vector<u8> control(0x100, 0);
+        const auto put32 = [&](size_t off, u32 v) { std::memcpy(&control[off], &v, 4); };
+        put32(0, VC::NVN2_CONTROL_MAGIC);
+        put32(4, VC::NVN2_CONTROL_VERSION);
+        put32(0x38, 64);
+        put32(0x40, 64);
+        put32(0x44, 64);
+        control[0x56] = 5;
+        put32(0x58, 1);
+        put32(0x5c, 1);
+        put32(0x60, 1);
+        VC::ProgramDesc program{};
+        program.serial = 51;
+        program.stage_mask = 1u << 5;
+        program.control[5] = std::move(control);
+        program.code[5] = std::vector<u8>(64, 0);
+        auto prog_ptr = std::make_shared<VC::ProgramDesc>(std::move(program));
+        impl.programs[51] = prog_ptr;
+        impl.draw_resources->OnProgramCreated(prog_ptr);
+        CHECK(impl.draw_resources->program_hashes.contains(51));
+        CHECK(impl.draw_resources->compute_controls.contains(51));
+
+        const u64 epoch_before = impl.draw_resources->samplers_epoch;
+        impl.DestroyNow(50);
+        impl.DestroyNow(51);
+        CHECK(impl.draw_resources->samplers_epoch > epoch_before);
+        CHECK_FALSE(impl.draw_resources->samplers.contains(50));
+        CHECK_FALSE(impl.draw_resources->program_hashes.contains(51));
+        CHECK_FALSE(impl.draw_resources->compute_controls.contains(51));
+
+        FakeMemory import_guard_mem;
+        impl.guest.store(&import_guard_mem, std::memory_order_release);
+        SCOPE_EXIT {
+            impl.guest.store(nullptr, std::memory_order_release);
+        };
+        impl.NoteImportedGuestRange(0x6000'0000, 256_KiB);
+        CHECK(impl.OverlapsImportedGuestRange(0x6000'1000, 4096));
+        CHECK_FALSE(impl.OverlapsImportedGuestRange(0x7000'0000, 4096));
+
+        Nvn::Pool imported_span_pool{};
+        imported_span_pool.address = 0x6000'0000;
+        imported_span_pool.size = 256_KiB;
+        imported_span_pool.backing = Nvn::Pool::Backing::DeviceLocal;
+        impl.HintColdGuestSpan(imported_span_pool, 0, 256_KiB);
+        CHECK(import_guard_mem.ColdHints().empty());
+
+        Nvn::Pool unimported_span_pool{};
+        unimported_span_pool.address = 0x7000'0000;
+        unimported_span_pool.size = 256_KiB;
+        unimported_span_pool.backing = Nvn::Pool::Backing::DeviceLocal;
+        impl.HintColdGuestSpan(unimported_span_pool, 0, 256_KiB);
+        CHECK(has_cold_cover(import_guard_mem.ColdHints(), 0x7000'0000, 256_KiB));
+    }
+}
+
 TEST_CASE("NVN present keeps the previous picture until the new source has pixels",
           "[nvn][present-filter]") {
     auto vulkan = MakeHeadlessVulkan();
@@ -2407,7 +2680,7 @@ TEST_CASE("MKW buffer lookup cache follows pool replacement and virtual remaps",
     };
     resolve(0x10120, 64, 1, 0x120);
     resolve(0x10120, 64, 1, 0x120);
-    CHECK(impl->mkw_resolve_hits == (impl->mario_kart_world ? 1u : 0u));
+    CHECK(impl->mkw_resolve_hits == 1u);
     impl->CreatePoolNow({.serial = 4, .guest_address = 0x10100, .size = 0x100});
     resolve(0x10120, 64, 4, 0x20);
     impl->DestroyNow(4);
@@ -2468,4 +2741,972 @@ TEST_CASE("SparsePagePool tracks stale shared pages, IsShared, and full-budget k
     REQUIRE(priv != Nvn::SparsePagePool::NoPage);
     CHECK_FALSE(pool.IsShared(priv));
     pool.Free(priv);
+}
+
+TEST_CASE("NVN mirror pools retain partial-page GPU writes, trust full-page writes, and prefetch "
+          "conditions",
+          "[nvn][mirror]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+
+    SECTION("partial-page GPU writes avoid repeated uploads and preserve GPU and guest bytes") {
+        constexpr u64 POOL_VA = 0x1000'0000;
+        FakeMemory memory;
+        u8* data = memory.Add(POOL_VA, 64_KiB);
+        std::memset(data, 0x11, 64_KiB);
+        Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr,
+                             {.allow_host_import = false, .background_backing = false});
+        context.SetGuestMemory(&memory);
+        context.CreatePool(
+            {.serial = 1, .guest_address = POOL_VA, .size = 64_KiB, .flags = POOL_CPU_CACHED});
+
+        u64 seq = 0;
+        {
+            std::vector<u64> list;
+            Push(list, VC::Op::CopyBufferToBuffer,
+                 VC::CopyBufferToBufferPayload{
+                     .src = POOL_VA, .dst = POOL_VA + 0x4000, .size = 4_KiB});
+            Run(context, seq, std::move(list));
+        }
+        const u64 uploads_before = context.Stats().mirror_uploads;
+
+        for (u64 iter = 0; iter < 4; ++iter) {
+            std::vector<u64> list;
+            if (iter == 0) {
+                Push(list, VC::Op::ReportValue,
+                     VC::ReportValuePayload{.address = POOL_VA + 0x100, .value = 0xCAFEBABEu});
+            }
+            Push(list, VC::Op::CopyBufferToBuffer,
+                 VC::CopyBufferToBufferPayload{
+                     .src = POOL_VA, .dst = POOL_VA + 0x4000 + iter * 4_KiB, .size = 4_KiB});
+            PushEnd(list);
+            context.Submit(MakeSubmission(++seq, std::move(list)));
+        }
+        REQUIRE(context.Wait(seq, 30s));
+
+        const u64 uploads_after_partial = context.Stats().mirror_uploads;
+        CHECK(uploads_after_partial - uploads_before <= 2);
+
+        // On untracked memory, the completed write-back updates guest RAM, so the first check
+        // after Wait may upload once to refresh the page hash; subsequent uses stay clean.
+        {
+            std::vector<u64> list;
+            Push(list, VC::Op::CopyBufferToBuffer,
+                 VC::CopyBufferToBufferPayload{
+                     .src = POOL_VA, .dst = POOL_VA + 0x9000, .size = 4_KiB});
+            Run(context, seq, std::move(list));
+        }
+        const u64 uploads_after_settle = context.Stats().mirror_uploads;
+        CHECK(uploads_after_settle - uploads_after_partial <= 1);
+
+        {
+            std::vector<u64> list;
+            Push(list, VC::Op::CopyBufferToBuffer,
+                 VC::CopyBufferToBufferPayload{
+                     .src = POOL_VA, .dst = POOL_VA + 0xA000, .size = 4_KiB});
+            Run(context, seq, std::move(list));
+        }
+        CHECK(context.Stats().mirror_uploads == uploads_after_settle);
+
+        const auto word_at = [&](u64 offset) {
+            u32 v = 0;
+            std::memcpy(&v, data + offset, sizeof(v));
+            return v;
+        };
+        for (const u64 dst :
+             {u64{0x4000}, u64{0x5000}, u64{0x6000}, u64{0x7000}, u64{0x9000}, u64{0xA000}}) {
+            CHECK(word_at(dst) == 0x11111111u);
+            CHECK(word_at(dst + 0x100) == 0xCAFEBABEu);
+            CHECK(word_at(dst + 0x200) == 0x11111111u);
+        }
+        CHECK(context.Stats().ops_failed == 0);
+    }
+
+    SECTION("full-page GPU write stays trusted on tracked mirror until guest CPU writes") {
+        constexpr u64 POOL_VA = 0x2000'0000;
+        FakeMemory backing;
+        u8* data = backing.Add(POOL_VA, 16_KiB);
+        std::memset(data, 0x22, 16_KiB);
+        TrackedMemory tracked{backing};
+        Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr,
+                             {.allow_host_import = false, .background_backing = false});
+        context.SetGuestMemory(&tracked);
+        context.CreatePool(
+            {.serial = 1, .guest_address = POOL_VA, .size = 16_KiB, .flags = POOL_CPU_CACHED});
+        CHECK(tracked.arm_calls == 0); // lazy arm-on-trust: no upfront pool-wide Arm
+
+        u64 seq = 0;
+        {
+            std::vector<u64> list;
+            Push(list, VC::Op::CopyBufferToBuffer,
+                 VC::CopyBufferToBufferPayload{.src = POOL_VA + 4_KiB, .dst = POOL_VA, .size = 4_KiB});
+            Run(context, seq, std::move(list));
+        }
+        CHECK(tracked.armed_pages.contains((POOL_VA >> 12) + 0));
+        CHECK(tracked.armed_pages.contains((POOL_VA >> 12) + 1));
+        CHECK_FALSE(tracked.armed_pages.contains((POOL_VA >> 12) + 3)); // untouched page stays disarmed
+        const u64 uploads_before = context.Stats().mirror_uploads;
+        const u64 hashed_before = context.Stats().mirror_pages_hashed;
+        {
+            std::vector<u64> list;
+            Push(list, VC::Op::CopyBufferToBuffer,
+                 VC::CopyBufferToBufferPayload{
+                     .src = POOL_VA, .dst = POOL_VA + 8_KiB, .size = 4_KiB});
+            Run(context, seq, std::move(list));
+        }
+        CHECK(context.Stats().mirror_uploads == uploads_before);
+        CHECK(context.Stats().mirror_pages_hashed == hashed_before);
+
+        const size_t arms_before_cpu_write = tracked.arm_calls;
+        tracked.CpuWrite(POOL_VA + 0x40, 0xDEADBEEFu);
+        {
+            std::vector<u64> list;
+            Push(list, VC::Op::CopyBufferToBuffer,
+                 VC::CopyBufferToBufferPayload{
+                     .src = POOL_VA, .dst = POOL_VA + 12_KiB, .size = 4_KiB});
+            Run(context, seq, std::move(list));
+        }
+        CHECK(tracked.arm_calls > arms_before_cpu_write);
+        CHECK(tracked.armed_pages.contains((POOL_VA >> 12) + 0));
+        CHECK(context.Stats().mirror_uploads > uploads_before);
+        // After DisarmWritten on a trusted page that isn't re-trusted/re-read? Above upload re-trusted
+        // page 0. Writing page 0 again while untrusted (before next trust) wouldn't arm on pure disarm.
+        u32 read_word = 0;
+        std::memcpy(&read_word, data + 12_KiB + 0x40, sizeof(read_word));
+        CHECK(read_word == 0xDEADBEEFu);
+        std::memcpy(&read_word, data + 12_KiB + 0x80, sizeof(read_word));
+        CHECK(read_word == 0x22222222u);
+        CHECK(context.Stats().ops_failed == 0);
+    }
+
+    SECTION("SetRenderCondition prefetches on mirrored pools and evaluates accurately") {
+        if (!vulkan->device->IsExtConditionalRendering()) {
+            SKIP("VK_EXT_conditional_rendering is not available");
+        }
+        constexpr u64 POOL_VA = 0x3000'0000;
+        constexpr u64 TEX_POOL_VA = 0x4000'0000;
+        FakeMemory memory;
+        u8* data = memory.Add(POOL_VA, 32_KiB);
+        std::memset(data, 0, 32_KiB);
+        memory.Add(TEX_POOL_VA, 1_MiB);
+        const auto put_pair = [&](u64 offset, u64 a, u64 b) {
+            std::memcpy(data + offset, &a, sizeof(a));
+            std::memcpy(data + offset + 16, &b, sizeof(b));
+        };
+        put_pair(0x00, 5, 5); // equal
+        put_pair(0x20, 5, 9); // not equal
+        put_pair(0x40, 7, 7); // equal
+
+        Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr,
+                             {.allow_host_import = false, .background_backing = false});
+        context.SetGuestMemory(&memory);
+        context.CreatePool(
+            {.serial = 1, .guest_address = POOL_VA, .size = 32_KiB, .flags = POOL_CPU_CACHED});
+        context.CreatePool({.serial = 2,
+                            .guest_address = TEX_POOL_VA,
+                            .size = 1_MiB,
+                            .flags = POOL_CPU_NO_ACCESS});
+        for (u32 i = 0; i < 3; ++i) {
+            context.CreateTexture(
+                MakeTexture(10 + i, 2, i * 4_KiB, NVN_FORMAT_RGBA8, 8, 8));
+        }
+
+        const auto push_targets = [&](std::vector<u64>& list) {
+            const std::array<VC::RenderTargetRef, 3> refs{{
+                {.texture = {.serial = 10, .level = 0, .layer = 0}},
+                {.texture = {.serial = 11, .level = 0, .layer = 0}},
+                {.texture = {.serial = 12, .level = 0, .layer = 0}},
+            }};
+            const VC::SetRenderTargetsPayload p{.color_count = 3, .has_depth = 0};
+            const size_t total_bytes = sizeof(VC::RecordHeader) + sizeof(p) + sizeof(refs);
+            const size_t words = (total_bytes + 7) / 8;
+            const size_t at = list.size();
+            list.resize(at + words, 0);
+            auto* header = reinterpret_cast<VC::RecordHeader*>(&list[at]);
+            header->op = static_cast<u16>(VC::Op::SetRenderTargets);
+            header->size = static_cast<u32>(words * 8);
+            std::memcpy(&list[at + 1], &p, sizeof(p));
+            std::memcpy(reinterpret_cast<u8*>(&list[at + 1]) + sizeof(p), refs.data(),
+                        sizeof(refs));
+        };
+        const auto clear_slot = [&](std::vector<u64>& list, s32 index, f32 r, f32 g, f32 b) {
+            VC::ClearColorPayload clear{};
+            clear.index = index;
+            clear.mask = 0xF;
+            const f32 color[4]{r, g, b, 1.0f};
+            std::memcpy(clear.color, color, sizeof(color));
+            Push(list, VC::Op::ClearColor, clear);
+        };
+
+        std::vector<u64> list;
+        push_targets(list);
+        for (s32 i = 0; i < 3; ++i) {
+            clear_slot(list, i, 0.0f, 0.0f, 0.0f);
+        }
+        // Conditional 0: 5 == 5 with RenderIfEqual (0) -> writes red
+        Push(list, VC::Op::SetRenderCondition,
+             VC::SetRenderConditionPayload{.kind = 0, .mode = 0, .address = POOL_VA + 0x00});
+        clear_slot(list, 0, 1.0f, 0.0f, 0.0f);
+        Push(list, VC::Op::SetRenderCondition, VC::SetRenderConditionPayload{.kind = 1});
+        // Conditional 1: 5 != 9 with RenderIfEqual (0) -> skipped, stays black
+        Push(list, VC::Op::SetRenderCondition,
+             VC::SetRenderConditionPayload{.kind = 0, .mode = 0, .address = POOL_VA + 0x20});
+        clear_slot(list, 1, 0.0f, 1.0f, 0.0f);
+        Push(list, VC::Op::SetRenderCondition, VC::SetRenderConditionPayload{.kind = 1});
+        // Conditional 2: 7 == 7 with RenderIfNotEqual (1) -> skipped, stays black
+        Push(list, VC::Op::SetRenderCondition,
+             VC::SetRenderConditionPayload{.kind = 0, .mode = 1, .address = POOL_VA + 0x40});
+        clear_slot(list, 2, 0.0f, 0.0f, 1.0f);
+        Push(list, VC::Op::SetRenderCondition, VC::SetRenderConditionPayload{.kind = 1});
+        for (u32 i = 0; i < 3; ++i) {
+            Push(list, VC::Op::CopyTextureToBuffer, CopyToBuffer(POOL_VA + 0x1000 + i * 4_KiB, 10 + i, 8, 8));
+        }
+        u64 seq = 0;
+        Run(context, seq, std::move(list));
+
+        const Nvn::ContextStats stats = context.Stats();
+        CHECK(stats.pools_imported == 0);
+        CHECK(stats.render_conditions_cpu == 0);
+        CHECK(stats.render_conditions_prefetched == 2);
+        CHECK(stats.ops_failed == 0);
+        CHECK(data[0x1000 + 0] == 255);
+        CHECK(data[0x1000 + 1] == 0);
+        CHECK(data[0x2000 + 0] == 0);
+        CHECK(data[0x2000 + 1] == 0);
+        CHECK(data[0x3000 + 0] == 0);
+        CHECK(data[0x3000 + 2] == 0);
+    }
+}
+
+TEST_CASE("nvn memory: initial texture upload arms lazy tracked pages for later CPU writes",
+          "[nvn]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    constexpr u64 TEX_POOL_VA = 0x1000'0000;
+    constexpr u64 READ_POOL_VA = 0x2000'0000;
+    constexpr u32 SIZE = 64; // 64x64 RGBA8 = 16 KiB (4 tracked pages)
+
+    FakeMemory backing;
+    u8* tex_mem = backing.Add(TEX_POOL_VA, 64_KiB);
+    u8* read_mem = backing.Add(READ_POOL_VA, 64_KiB);
+    TrackedMemory tracked{backing};
+    Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr,
+                         {.allow_host_import = false,
+                          .background_backing = false,
+                          .flush_tracked = true,
+                          .mirror_hash_tracked = true});
+    context.SetGuestMemory(&tracked);
+    context.CreatePool(
+        {.serial = 1, .guest_address = TEX_POOL_VA, .size = 64_KiB, .flags = POOL_CPU_CACHED});
+    context.CreatePool(
+        {.serial = 2, .guest_address = READ_POOL_VA, .size = 64_KiB, .flags = POOL_CPU_CACHED});
+    context.CreateTexture(MakeTexture(10, 1, 0, NVN_FORMAT_RGBA8, SIZE, SIZE));
+
+    Nvn::Storage reference = MakeStorage(NVN_FORMAT_RGBA8, SIZE, SIZE, 1, PixelFormat::A8B8G8R8_UNORM,
+                                         VK_FORMAT_A8B8G8R8_UNORM_PACK32);
+    const std::vector<u8> initial_texels = Gradient(SIZE, SIZE, 1);
+    const std::vector<u8> initial_guest = SwizzleLevel0(reference, initial_texels, 4, SIZE, SIZE);
+    std::memcpy(tex_mem, initial_guest.data(), initial_guest.size());
+
+    u64 seq = 0;
+    const auto read_back = [&](u64 dst_va) {
+        std::memset(read_mem + (dst_va - READ_POOL_VA), 0xCD, SIZE * SIZE * 4);
+        std::vector<u64> list;
+        Push(list, VC::Op::CopyTextureToBuffer, CopyToBuffer(dst_va, 10, SIZE, SIZE));
+        Run(context, seq, std::move(list));
+        return std::vector<u8>(read_mem + (dst_va - READ_POOL_VA),
+                               read_mem + (dst_va - READ_POOL_VA) + SIZE * SIZE * 4);
+    };
+
+    REQUIRE(read_back(READ_POOL_VA) == initial_texels);
+    for (u64 page = 0; page < 4; ++page) {
+        CHECK(tracked.armed_pages.contains((TEX_POOL_VA >> 12) + page));
+    }
+
+    // Mutate only page 2 directly as the guest CPU would, then issue NotifyCpuWrite without
+    // forcing a full rehash so detection relies on the initial upload having armed page 2.
+    const std::vector<u8> updated_texels = Gradient(SIZE, SIZE, 2);
+    const std::vector<u8> updated_guest = SwizzleLevel0(reference, updated_texels, 4, SIZE, SIZE);
+    constexpr u64 PAGE2_OFFSET = 2 * 4096;
+    constexpr u64 PATCH_SIZE = 256;
+    tracked.CpuWriteBytes(TEX_POOL_VA + PAGE2_OFFSET, updated_guest.data() + PAGE2_OFFSET,
+                          PATCH_SIZE);
+    context.NotifyCpuWrite(TEX_POOL_VA + PAGE2_OFFSET, PATCH_SIZE);
+
+    std::vector<u8> expected_texels(SIZE * SIZE * 4);
+    std::vector<u8> patched_guest = initial_guest;
+    std::memcpy(patched_guest.data() + PAGE2_OFFSET, updated_guest.data() + PAGE2_OFFSET,
+                PATCH_SIZE);
+    u32 tile_h = 0;
+    u32 tile_d = 0;
+    Nvn::TextureLevelTiles(reference.desc, 0, tile_h, tile_d);
+    Tegra::Texture::UnswizzleTexture(expected_texels, patched_guest, 4, SIZE, SIZE, 1, tile_h,
+                                     tile_d, 0, true);
+
+    REQUIRE(read_back(READ_POOL_VA + 16_KiB) == expected_texels);
+    CHECK(context.Stats().cpu_changes >= 1);
+    CHECK(context.Stats().ops_failed == 0);
+}
+
+TEST_CASE("Pool::MirrorRangeAllTrusted tracks trusted bitset across word boundaries",
+          "[nvn][mirror]") {
+    Nvn::Pool pool;
+    constexpr size_t PAGE_COUNT = 200; // crosses multiple 64-page bitset words
+    pool.InitMirrorPages(PAGE_COUNT);
+    CHECK(pool.mirror_trusted_count == 0);
+    CHECK_FALSE(pool.MirrorRangeAllTrusted(0, 0));
+    CHECK_FALSE(pool.MirrorRangeAllTrusted(0, PAGE_COUNT - 1));
+
+    // A page with valid == false must not become bitset-trusted even if trusted is passed.
+    pool.SetMirrorPageTrusted(5, true);
+    CHECK(pool.mirror_trusted_count == 0);
+    CHECK_FALSE(pool.MirrorRangeAllTrusted(5, 5));
+
+    for (size_t i = 0; i < PAGE_COUNT; ++i) {
+        pool.mirror_pages[i].valid = true;
+        pool.SetMirrorPageTrusted(i, true);
+    }
+    CHECK(pool.mirror_trusted_count == PAGE_COUNT);
+    CHECK(pool.MirrorRangeAllTrusted(0, 0));
+    CHECK(pool.MirrorRangeAllTrusted(63, 64));
+    CHECK(pool.MirrorRangeAllTrusted(64, 127));
+    CHECK(pool.MirrorRangeAllTrusted(60, 140));
+    CHECK(pool.MirrorRangeAllTrusted(0, PAGE_COUNT - 1));
+
+    // Clearing one page clears only ranges covering that page.
+    pool.SetMirrorPageTrusted(64, false);
+    CHECK(pool.mirror_trusted_count == PAGE_COUNT - 1);
+    CHECK(pool.MirrorRangeAllTrusted(0, 63));
+    CHECK_FALSE(pool.MirrorRangeAllTrusted(63, 64));
+    CHECK_FALSE(pool.MirrorRangeAllTrusted(64, 127));
+    CHECK(pool.MirrorRangeAllTrusted(65, 199));
+
+    // Out-of-bounds or inverted ranges return false safely.
+    CHECK_FALSE(pool.MirrorRangeAllTrusted(10, 5));
+    CHECK_FALSE(pool.MirrorRangeAllTrusted(0, PAGE_COUNT));
+
+    // ClearAllMirrorTrusted clears every remaining trusted flag and zeroes the count.
+    pool.ClearAllMirrorTrusted();
+    CHECK(pool.mirror_trusted_count == 0);
+    for (const Nvn::Pool::MirrorPage& page : pool.mirror_pages) {
+        CHECK_FALSE(page.trusted);
+    }
+    CHECK_FALSE(pool.MirrorRangeAllTrusted(0, 63));
+}
+
+TEST_CASE("nvn memory: vectorized alias transfer preserves bytes across power-of-two bpp and linear",
+          "[nvn][memory][alias]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    if (!Nvn::AliasTransferGpu::Supported(*vulkan->device)) {
+        SKIP("no alias transfer shader on this device");
+    }
+    struct FormatCase {
+        s32 format;
+        PixelFormat pixel;
+        VkFormat vk;
+        u32 bpp;
+        bool linear;
+    };
+    const FormatCase tc = GENERATE(
+        FormatCase{0x01, PixelFormat::R8_UNORM, VK_FORMAT_R8_UNORM, 1, false},
+        FormatCase{0x08, PixelFormat::R16_UINT, VK_FORMAT_R16_UINT, 2, false},
+        FormatCase{0x25, PixelFormat::A8B8G8R8_UNORM, VK_FORMAT_A8B8G8R8_UNORM_PACK32, 4, false},
+        FormatCase{0x17, PixelFormat::R32G32_UINT, VK_FORMAT_R32G32_UINT, 8, false},
+        FormatCase{0x2F, PixelFormat::R32G32B32A32_UINT, VK_FORMAT_R32G32B32A32_UINT, 16, false},
+        FormatCase{0x25, PixelFormat::A8B8G8R8_UNORM, VK_FORMAT_A8B8G8R8_UNORM_PACK32, 4, true});
+    INFO("bpp=" << tc.bpp << " linear=" << tc.linear);
+
+    constexpr u32 SRC_W = 64;
+    constexpr u32 SRC_H = 64;
+    constexpr u32 DST_W = 128;
+    constexpr u32 DST_H = 32;
+    Rig rig{*vulkan, true};
+
+    VC::TextureDesc src_desc = MakeTexture(10, Rig::TEXTURE_POOL, 0, tc.format, SRC_W, SRC_H);
+    if (tc.linear) {
+        src_desc.flags = Nvn::TexFlag::Linear;
+        src_desc.stride = SRC_W * tc.bpp;
+    }
+    VC::TextureDesc dst_desc = MakeTexture(11, Rig::TEXTURE_POOL, 0, tc.format, DST_W, DST_H);
+
+    // Fill source texels with deterministic unique bytes, and pre-fill destination pool tail
+    // bytes beyond source's size so partial-window preservation is exercised when dst is larger.
+    std::vector<u8> src_linear(static_cast<size_t>(SRC_W) * SRC_H * tc.bpp);
+    for (size_t i = 0; i < src_linear.size(); ++i) {
+        src_linear[i] = static_cast<u8>((i * 37 + 13) & 0xFF);
+    }
+    Nvn::Storage src_storage = MakeStorage(tc.format, SRC_W, SRC_H, 1, tc.pixel, tc.vk);
+    src_storage.desc = {src_desc.target, src_desc.format, src_desc.flags, src_desc.samples,
+                        src_desc.width,  src_desc.height, src_desc.depth, src_desc.levels,
+                        src_desc.stride, src_desc.pkg_block_h};
+    src_storage.layout = Nvn::ComputeTextureLayout(src_storage.desc);
+
+    std::vector<u8> pool_bytes(src_linear.size() * 2 + 0x10000, 0x5A);
+    if (tc.linear) {
+        std::memcpy(pool_bytes.data(), src_linear.data(), src_linear.size());
+    } else {
+        const std::vector<u8> swz = SwizzleLevel0(src_storage, src_linear, tc.bpp, SRC_W, SRC_H);
+        std::memcpy(pool_bytes.data(), swz.data(), swz.size());
+    }
+    std::memcpy(rig.texture_bytes, pool_bytes.data(), (std::min)(pool_bytes.size(), size_t{4_MiB}));
+
+    rig.context.CreateTexture(src_desc);
+    rig.context.CreateTexture(dst_desc);
+
+    // Trigger GPU write on source via a 1-row partial CopyBufferToTexture so ResolveOverlaps runs
+    // TransferOverlapBytes from GPU-owned `src` to `dst`.
+    std::vector<u8> scratch_src(SRC_W * tc.bpp);
+    std::memcpy(scratch_src.data(), src_linear.data(), scratch_src.size());
+    u8* staging = rig.memory.Pointer(Rig::BUFFER_POOL_VA + 0x20000);
+    std::memcpy(staging, scratch_src.data(), scratch_src.size());
+    VC::CopyBufferTexturePayload upload{};
+    upload.buffer = Rig::BUFFER_POOL_VA + 0x20000;
+    upload.texture = {.serial = 10, .level = 0, .layer = 0};
+    upload.region = {0, 0, 0, static_cast<s32>(SRC_W), 1, 1};
+    std::vector<u64> list;
+    Push(list, VC::Op::CopyBufferToTexture, upload);
+    Run(rig.context, rig.seq, std::move(list));
+
+    Nvn::Storage dst_storage = MakeStorage(tc.format, DST_W, DST_H, 1, tc.pixel, tc.vk);
+    u32 dst_th = 0;
+    u32 dst_td = 0;
+    Nvn::TextureLevelTiles(dst_storage.desc, 0, dst_th, dst_td);
+    std::vector<u8> expected(static_cast<size_t>(DST_W) * DST_H * tc.bpp);
+    Tegra::Texture::UnswizzleTexture(expected, pool_bytes, tc.bpp, DST_W, DST_H, 1, dst_th,
+                                     dst_td, 0, true);
+
+    std::vector<u64> read_list;
+    VC::CopyBufferTexturePayload copy{};
+    copy.buffer = Rig::BUFFER_POOL_VA;
+    copy.texture = {.serial = 11, .level = 0, .layer = 0};
+    copy.region = {0, 0, 0, static_cast<s32>(DST_W), static_cast<s32>(DST_H), 1};
+    Push(read_list, VC::Op::CopyTextureToBuffer, copy);
+    Run(rig.context, rig.seq, std::move(read_list));
+
+    REQUIRE(rig.context.Stats().alias_byte_transfers == 1);
+    REQUIRE(rig.context.Stats().alias_unsupported == 0);
+    REQUIRE(std::memcmp(rig.readback, expected.data(), expected.size()) == 0);
+}
+
+TEST_CASE("nvn memory: subresource offset alias, D32F<->R32F, and dead-writer pruning use fast path",
+          "[nvn][memory][alias]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    const auto push_set_rt = [](std::vector<u64>& list, std::span<const VC::RenderTargetRef> colors,
+                                std::optional<VC::RenderTargetRef> depth) {
+        const VC::SetRenderTargetsPayload p{.color_count = static_cast<u32>(colors.size()),
+                                            .has_depth = depth.has_value() ? 1u : 0u};
+        const size_t total_bytes =
+            sizeof(VC::RecordHeader) + sizeof(p) +
+            (colors.size() + (depth.has_value() ? 1u : 0u)) * sizeof(VC::RenderTargetRef);
+        const size_t words = (total_bytes + 7) / 8;
+        const size_t at = list.size();
+        list.resize(at + words, 0);
+        auto* header = reinterpret_cast<VC::RecordHeader*>(&list[at]);
+        header->op = static_cast<u16>(VC::Op::SetRenderTargets);
+        header->size = static_cast<u32>(words * 8);
+        std::memcpy(&list[at + 1], &p, sizeof(p));
+        auto* out = reinterpret_cast<VC::RenderTargetRef*>(
+            reinterpret_cast<u8*>(&list[at + 1]) + sizeof(p));
+        for (size_t i = 0; i < colors.size(); ++i) {
+            out[i] = colors[i];
+        }
+        if (depth.has_value()) {
+            out[colors.size()] = *depth;
+        }
+    };
+
+    SECTION("Array layer and mip level subresource aliases use TransferOverlap") {
+        Rig rig{*vulkan, true};
+        VC::TextureDesc array_desc = MakeTexture(10, Rig::TEXTURE_POOL, 0, NVN_FORMAT_RGBA8, 32, 32);
+        array_desc.target = static_cast<s32>(Nvn::TexTarget::Dim2DArray);
+        array_desc.depth = 2;
+        const Nvn::TextureLayout array_layout = Nvn::ComputeTextureLayout(
+            {array_desc.target, array_desc.format, array_desc.flags, array_desc.samples,
+             array_desc.width, array_desc.height, array_desc.depth, array_desc.levels,
+             array_desc.stride, array_desc.pkg_block_h});
+        rig.context.CreateTexture(array_desc);
+        rig.context.CreateTexture(
+            MakeTexture(11, Rig::TEXTURE_POOL, array_layout.layer_size, NVN_FORMAT_RGBA8, 32, 32));
+
+        VC::ClearTexturePayload clear0 = ClearColor(10, 32, 32, 1, 0, 0, 1);
+        VC::ClearTexturePayload clear1 = ClearColor(10, 32, 32, 0, 1, 0, 1);
+        clear1.texture.layer = 1;
+        std::vector<u64> list;
+        Push(list, VC::Op::ClearTexture, clear0, 0xF);
+        Push(list, VC::Op::ClearTexture, clear1, 0xF);
+        Run(rig.context, rig.seq, std::move(list));
+
+        const std::vector<u8> layer1 = rig.Read(11, 32, 32);
+        CHECK(rig.context.Stats().alias_transfers == 1);
+        CHECK(rig.context.Stats().alias_byte_transfers == 0);
+        CHECK(rig.context.Stats().alias_unsupported == 0);
+        for (u32 px = 0; px < 32u * 32u; ++px) {
+            REQUIRE(layer1[px * 4 + 0] == 0);
+            REQUIRE(layer1[px * 4 + 1] == 255);
+            REQUIRE(layer1[px * 4 + 2] == 0);
+            REQUIRE(layer1[px * 4 + 3] == 255);
+        }
+
+        // Multi-mip level 1 read by a single-mip 32x32 view at TextureLevelOffset(desc, 1).
+        constexpr u64 MIP_BASE = 0x100000;
+        VC::TextureDesc mip_desc = MakeTexture(20, Rig::TEXTURE_POOL, MIP_BASE, NVN_FORMAT_RGBA8, 64, 64);
+        mip_desc.levels = 2;
+        const u64 lvl1_off = Nvn::TextureLevelOffset(
+            {mip_desc.target, mip_desc.format, mip_desc.flags, mip_desc.samples, mip_desc.width,
+             mip_desc.height, mip_desc.depth, mip_desc.levels, mip_desc.stride, mip_desc.pkg_block_h},
+            1);
+        rig.context.CreateTexture(mip_desc);
+        rig.context.CreateTexture(
+            MakeTexture(21, Rig::TEXTURE_POOL, MIP_BASE + lvl1_off, NVN_FORMAT_RGBA8, 32, 32));
+        VC::ClearTexturePayload clear_mip1 = ClearColor(20, 32, 32, 0, 0, 1, 1);
+        clear_mip1.texture.level = 1;
+        std::vector<u64> mip_list;
+        Push(mip_list, VC::Op::ClearTexture, clear_mip1, 0xF);
+        Run(rig.context, rig.seq, std::move(mip_list));
+
+        const std::vector<u8> mip1_seen = rig.Read(21, 32, 32);
+        CHECK(rig.context.Stats().alias_transfers == 2);
+        CHECK(rig.context.Stats().alias_byte_transfers == 0);
+        for (u32 px = 0; px < 32u * 32u; ++px) {
+            REQUIRE(mip1_seen[px * 4 + 0] == 0);
+            REQUIRE(mip1_seen[px * 4 + 1] == 0);
+            REQUIRE(mip1_seen[px * 4 + 2] == 255);
+            REQUIRE(mip1_seen[px * 4 + 3] == 255);
+        }
+    }
+
+    SECTION("D32F to R32F reinterpretation uses buffer copy via TransferOverlap") {
+        Rig rig{*vulkan, true};
+        constexpr s32 NVN_FORMAT_D32F = 0x34;
+        constexpr s32 NVN_FORMAT_R32F = 0x0A;
+        rig.context.CreateTexture(MakeTexture(30, Rig::TEXTURE_POOL, 0, NVN_FORMAT_D32F, 64, 64));
+        rig.context.CreateTexture(MakeTexture(31, Rig::TEXTURE_POOL, 0, NVN_FORMAT_R32F, 64, 64));
+
+        std::vector<u64> list;
+        push_set_rt(list, {}, VC::RenderTargetRef{.texture = {.serial = 30, .level = 0, .layer = 0}});
+        Push(list, VC::Op::ClearDepthStencil,
+             VC::ClearDepthStencilPayload{.depth = 0.5f, .depth_mask = 1, .stencil = 0, .stencil_mask = 0});
+        push_set_rt(list, {}, std::nullopt);
+        Push(list, VC::Op::CopyTextureToBuffer, CopyToBuffer(Rig::BUFFER_POOL_VA, 31, 64, 64));
+        Run(rig.context, rig.seq, std::move(list));
+
+        CHECK(rig.context.Stats().ops_failed == 0);
+        CHECK(rig.context.Stats().alias_transfers == 1);
+        CHECK(rig.context.Stats().alias_byte_transfers == 0);
+        for (u32 px = 0; px < 64u * 64u; ++px) {
+            float v = 0.0f;
+            std::memcpy(&v, rig.readback + px * sizeof(float), sizeof(float));
+            REQUIRE(v == 0.5f);
+        }
+    }
+
+    SECTION("ResolveOverlaps prunes older writer superseded by newer full-coverage writer") {
+        Rig rig{*vulkan, true};
+        rig.context.CreateTexture(MakeTexture(40, Rig::TEXTURE_POOL, 0, NVN_FORMAT_RGBA8, 32, 64));
+        VC::TextureDesc tex41 = MakeTexture(41, Rig::TEXTURE_POOL, 0, NVN_FORMAT_RGBA8, 64, 64);
+        tex41.target = static_cast<s32>(Nvn::TexTarget::Dim2DArray);
+        tex41.depth = 2;
+        rig.context.CreateTexture(tex41);
+        rig.context.CreateTexture(MakeTexture(42, Rig::TEXTURE_POOL, 0, NVN_FORMAT_RGBA8, 64, 64));
+
+        std::vector<u64> list;
+        Push(list, VC::Op::ClearTexture, ClearColor(40, 32, 64, 1, 0, 0, 1), 0xF);
+        VC::ClearTexturePayload clear41 = ClearColor(41, 64, 64, 0, 0, 1, 1);
+        clear41.layer_count = 2;
+        clear41.region.depth = 2;
+        Push(list, VC::Op::ClearTexture, clear41, 0xF);
+        Run(rig.context, rig.seq, std::move(list));
+
+        const std::vector<u8> seen = rig.Read(42, 64, 64);
+        CHECK(rig.context.Stats().alias_transfers == 1);
+        CHECK(rig.context.Stats().alias_byte_transfers == 0);
+        for (u32 px = 0; px < 64u * 64u; ++px) {
+            REQUIRE(seen[px * 4 + 0] == 0);
+            REQUIRE(seen[px * 4 + 1] == 0);
+            REQUIRE(seen[px * 4 + 2] == 255);
+            REQUIRE(seen[px * 4 + 3] == 255);
+        }
+    }
+}
+
+TEST_CASE("nvn memory: deferred LOAD_OP_CLEAR executes clear-only pass and scissor fallback",
+          "[nvn][memory][clear]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    Rig rig{*vulkan, true};
+    rig.context.CreateTexture(MakeTexture(50, Rig::TEXTURE_POOL, 0, NVN_FORMAT_RGBA8, 64, 64));
+
+    const auto push_set_rt0 = [](std::vector<u64>& list, u64 serial) {
+        const VC::RenderTargetRef color{.texture = {.serial = serial, .level = 0, .layer = 0}};
+        const VC::SetRenderTargetsPayload p{.color_count = 1, .has_depth = 0};
+        const size_t total_bytes = sizeof(VC::RecordHeader) + sizeof(p) + sizeof(color);
+        const size_t words = (total_bytes + 7) / 8;
+        const size_t at = list.size();
+        list.resize(at + words, 0);
+        auto* header = reinterpret_cast<VC::RecordHeader*>(&list[at]);
+        header->op = static_cast<u16>(VC::Op::SetRenderTargets);
+        header->size = static_cast<u32>(words * 8);
+        std::memcpy(&list[at + 1], &p, sizeof(p));
+        std::memcpy(reinterpret_cast<u8*>(&list[at + 1]) + sizeof(p), &color, sizeof(color));
+    };
+    const auto push_scissor = [](std::vector<u64>& list, s32 x, s32 y, s32 w, s32 h) {
+        const VC::SetScissorsPayload p{.first = 0, .count = 1};
+        const VC::ScissorRect rect{.x = x, .y = y, .width = w, .height = h};
+        const size_t total_bytes = sizeof(VC::RecordHeader) + sizeof(p) + sizeof(rect);
+        const size_t words = (total_bytes + 7) / 8;
+        const size_t at = list.size();
+        list.resize(at + words, 0);
+        auto* header = reinterpret_cast<VC::RecordHeader*>(&list[at]);
+        header->op = static_cast<u16>(VC::Op::SetScissors);
+        header->size = static_cast<u32>(words * 8);
+        std::memcpy(&list[at + 1], &p, sizeof(p));
+        std::memcpy(reinterpret_cast<u8*>(&list[at + 1]) + sizeof(p), &rect, sizeof(rect));
+    };
+    const auto push_clear_color = [](std::vector<u64>& list, f32 r, f32 g, f32 b, f32 a) {
+        VC::ClearColorPayload clear{};
+        clear.index = 0;
+        clear.mask = 0xF;
+        const f32 c[4]{r, g, b, a};
+        std::memcpy(clear.color, c, sizeof(c));
+        Push(list, VC::Op::ClearColor, clear);
+    };
+
+    std::vector<u64> list;
+    push_set_rt0(list, 50);
+    // Deferred full clear (red), then partial scissor clear (green on left half).
+    push_clear_color(list, 1.0f, 0.0f, 0.0f, 1.0f);
+    push_scissor(list, 0, 0, 32, 64);
+    push_clear_color(list, 0.0f, 1.0f, 0.0f, 1.0f);
+    Push(list, VC::Op::CopyTextureToBuffer, CopyToBuffer(Rig::BUFFER_POOL_VA, 50, 64, 64));
+    Run(rig.context, rig.seq, std::move(list));
+
+    REQUIRE(rig.context.Stats().ops_failed == 0);
+    for (u32 y = 0; y < 64; ++y) {
+        for (u32 x = 0; x < 64; ++x) {
+            const u8* px = rig.readback + (static_cast<size_t>(y) * 64 + x) * 4;
+            if (x < 32) {
+                REQUIRE(px[0] == 0);
+                REQUIRE(px[1] == 255);
+                REQUIRE(px[2] == 0);
+                REQUIRE(px[3] == 255);
+            } else {
+                REQUIRE(px[0] == 255);
+                REQUIRE(px[1] == 0);
+                REQUIRE(px[2] == 0);
+                REQUIRE(px[3] == 255);
+            }
+        }
+    }
+
+    // Clear-only pass flushed purely at End() (submission ends with no draws or target changes).
+    std::vector<u64> end_flush;
+    push_scissor(end_flush, 0, 0, 64, 64);
+    push_set_rt0(end_flush, 50);
+    push_clear_color(end_flush, 0.0f, 0.0f, 1.0f, 1.0f);
+    Run(rig.context, rig.seq, std::move(end_flush));
+    const std::vector<u8> blue = rig.Read(50, 64, 64);
+    for (u32 px = 0; px < 64u * 64u; ++px) {
+        REQUIRE(blue[px * 4 + 0] == 0);
+        REQUIRE(blue[px * 4 + 1] == 0);
+        REQUIRE(blue[px * 4 + 2] == 255);
+        REQUIRE(blue[px * 4 + 3] == 255);
+    }
+}
+
+TEST_CASE("nvn memory: multi-source ResolveOverlaps prunes dead writers and batches "
+          "TransferOverlapBytes",
+          "[nvn][memory][alias]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    constexpr u64 POOL_VA = 0x3000'0000;
+    constexpr u64 TEX_POOL_VA = 0x4000'0000;
+
+    SECTION("identical-layout dead writer is pruned before byte-alias transfer") {
+        FakeMemory memory;
+        u8* data = memory.Add(POOL_VA, 1_MiB);
+        std::memset(data, 0, 1_MiB);
+        memory.Add(TEX_POOL_VA, 1_MiB);
+
+        Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr, {});
+        context.SetGuestMemory(&memory);
+        context.CreatePool(
+            {.serial = 1, .guest_address = POOL_VA, .size = 1_MiB, .flags = POOL_CPU_CACHED});
+        context.CreatePool({.serial = 2,
+                            .guest_address = TEX_POOL_VA,
+                            .size = 1_MiB,
+                            .flags = POOL_CPU_NO_ACCESS});
+        context.CreateTexture(MakeTexture(10, 2, 0, NVN_FORMAT_RGBA8, 64, 64));
+        context.CreateTexture(MakeTexture(11, 2, 0, NVN_FORMAT_RGBA8, 64, 64));
+        VC::TextureDesc dst = MakeTexture(12, 2, 0, NVN_FORMAT_RGBA8, 64, 64);
+        dst.flags = Nvn::TexFlag::Linear;
+        dst.stride = 64 * 4;
+        context.CreateTexture(dst);
+
+        std::vector<u64> list;
+        Push(list, VC::Op::ClearTexture, ClearColor(10, 64, 64, 1.0f, 0.0f, 0.0f, 1.0f), 0xF);
+        Push(list, VC::Op::ClearTexture, ClearColor(11, 64, 64, 0.0f, 1.0f, 0.0f, 1.0f), 0xF);
+        Push(list, VC::Op::CopyTextureToBuffer, CopyToBuffer(POOL_VA, 12, 64, 64));
+        u64 seq = 0;
+        Run(context, seq, std::move(list));
+
+        const Nvn::ContextStats stats = context.Stats();
+        CHECK(stats.ops_failed == 0);
+        CHECK(stats.ops_unsupported == 0);
+        CHECK(stats.alias_byte_transfers == 1);
+        for (u32 px = 0; px < 64u * 64u; ++px) {
+            REQUIRE(data[px * 4 + 0] == 0);
+            REQUIRE(data[px * 4 + 1] == 255);
+            REQUIRE(data[px * 4 + 2] == 0);
+            REQUIRE(data[px * 4 + 3] == 255);
+        }
+    }
+
+    SECTION("multiple disjoint byte-alias sources are batched into one TransferOverlapBytes") {
+        FakeMemory memory;
+        u8* data = memory.Add(POOL_VA, 1_MiB);
+        std::memset(data, 0, 1_MiB);
+        memory.Add(TEX_POOL_VA, 1_MiB);
+
+        const VC::TextureDesc src1 = MakeTexture(10, 2, 0, NVN_FORMAT_RGBA8, 64, 8);
+        const u64 band_bytes =
+            MakeStorage(NVN_FORMAT_RGBA8, 64, 8, 1, PixelFormat::A8B8G8R8_UNORM,
+                        VK_FORMAT_A8B8G8R8_UNORM_PACK32)
+                .layout.size;
+        REQUIRE(band_bytes % 256 == 0);
+        const u32 band_rows = static_cast<u32>(band_bytes / 256);
+        const u32 dst_height = band_rows * 4;
+
+        VC::TextureDesc dst = MakeTexture(12, 2, 0, NVN_FORMAT_RGBA8, 64, dst_height);
+        dst.flags = Nvn::TexFlag::Linear;
+        dst.stride = 64 * 4;
+
+        Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr, {});
+        context.SetGuestMemory(&memory);
+        context.CreatePool(
+            {.serial = 1, .guest_address = POOL_VA, .size = 1_MiB, .flags = POOL_CPU_CACHED});
+        context.CreatePool({.serial = 2,
+                            .guest_address = TEX_POOL_VA,
+                            .size = 1_MiB,
+                            .flags = POOL_CPU_NO_ACCESS});
+        context.CreateTexture(src1);
+        context.CreateTexture(MakeTexture(11, 2, band_bytes * 2, NVN_FORMAT_RGBA8, 64, 8));
+        context.CreateTexture(dst);
+
+        std::vector<u64> list;
+        Push(list, VC::Op::ClearTexture, ClearColor(12, 64, dst_height, 0.0f, 0.0f, 1.0f, 1.0f),
+             0xF);
+        Push(list, VC::Op::ClearTexture, ClearColor(10, 64, 8, 1.0f, 0.0f, 0.0f, 1.0f), 0xF);
+        Push(list, VC::Op::ClearTexture, ClearColor(11, 64, 8, 0.0f, 1.0f, 0.0f, 1.0f), 0xF);
+        Push(list, VC::Op::CopyTextureToBuffer, CopyToBuffer(POOL_VA, 12, 64, dst_height));
+        u64 seq = 0;
+        Run(context, seq, std::move(list));
+
+        const Nvn::ContextStats stats = context.Stats();
+        CHECK(stats.ops_failed == 0);
+        CHECK(stats.ops_unsupported == 0);
+        CHECK(stats.alias_byte_transfers == 1);
+        for (u32 y = 0; y < dst_height; ++y) {
+            u8 er = 0;
+            u8 eg = 0;
+            u8 eb = 255;
+            if (y < 8) {
+                er = 255;
+                eb = 0;
+            } else if (y >= band_rows * 2 && y < band_rows * 2 + 8) {
+                eg = 255;
+                eb = 0;
+            }
+            for (u32 x = 0; x < 64; ++x) {
+                const size_t idx = (static_cast<size_t>(y) * 64 + x) * 4;
+                REQUIRE(data[idx + 0] == er);
+                REQUIRE(data[idx + 1] == eg);
+                REQUIRE(data[idx + 2] == eb);
+                REQUIRE(data[idx + 3] == 255);
+            }
+        }
+    }
+}
+
+TEST_CASE("nvn memory: lazy STORAGE_BIT and format-list upgrade preserves contents",
+          "[nvn][memory][dcc]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    constexpr u64 POOL_VA = 0x3000'0000;
+    constexpr u64 TEX_POOL_VA = 0x4000'0000;
+    FakeMemory memory;
+    u8* data = memory.Add(POOL_VA, 64_KiB);
+    std::memset(data, 0, 64_KiB);
+    memory.Add(TEX_POOL_VA, 1_MiB);
+
+    Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr, {});
+    context.SetGuestMemory(&memory);
+    context.CreatePool(
+        {.serial = 1, .guest_address = POOL_VA, .size = 64_KiB, .flags = POOL_CPU_CACHED});
+    context.CreatePool({.serial = 2,
+                        .guest_address = TEX_POOL_VA,
+                        .size = 1_MiB,
+                        .flags = POOL_CPU_NO_ACCESS});
+    VC::TextureDesc tex = MakeTexture(10, 2, 0, NVN_FORMAT_RGBA8, 8, 8);
+    tex.flags = Nvn::TexFlag::Compressible;
+    context.CreateTexture(tex);
+
+    u64 seq = 0;
+    {
+        std::vector<u64> list;
+        Push(list, VC::Op::ClearTexture, ClearColor(10, 8, 8, 1.0f, 0.0f, 1.0f, 1.0f), 0xF);
+        Run(context, seq, std::move(list));
+    }
+
+    VC::TextureDesc view = tex;
+    view.serial = 11;
+    view.view_of = 10;
+    view.view.set_format = true;
+    view.view.format = NVN_FORMAT_R32UI;
+    context.CreateTexture(view);
+
+    {
+        std::vector<u64> list;
+        VC::ClearTexturePayload partial = ClearColor(10, 4, 8, 0.0f, 1.0f, 0.0f, 1.0f);
+        partial.region = {0, 0, 0, 4, 8, 1};
+        Push(list, VC::Op::ClearTexture, partial, 0xF);
+        Push(list, VC::Op::CopyTextureToBuffer, CopyToBuffer(POOL_VA, 10, 8, 8));
+        Run(context, seq, std::move(list));
+    }
+
+    const Nvn::ContextStats stats = context.Stats();
+    CHECK(stats.ops_failed == 0);
+    CHECK(stats.ops_unsupported == 0);
+    for (u32 y = 0; y < 8; ++y) {
+        for (u32 x = 0; x < 8; ++x) {
+            const size_t idx = (static_cast<size_t>(y) * 8 + x) * 4;
+            REQUIRE(data[idx + 0] == (x < 4 ? 0 : 255));
+            REQUIRE(data[idx + 1] == (x < 4 ? 255 : 0));
+            REQUIRE(data[idx + 2] == (x < 4 ? 0 : 255));
+            REQUIRE(data[idx + 3] == 255);
+        }
+    }
+}
+
+TEST_CASE("nvn memory: Compressible CpuNoAccess pool defers VkBuffer backing until buffer use",
+          "[nvn][memory][pool]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+
+    SECTION("Context::Impl skips eager backing and backs lazily on EnsureBacking") {
+        Nvn::Context::Impl impl(*vulkan->device, vulkan->submit_mutex, nullptr,
+                                {.allow_host_import = false, .background_backing = false});
+        constexpr u64 POOL_BYTES = 1_MiB;
+        impl.CreatePoolNow({.serial = 1,
+                            .guest_address = 0x5000'0000,
+                            .size = POOL_BYTES,
+                            .flags = Nvn::PoolFlag::CpuNoAccess | Nvn::PoolFlag::Compressible});
+        const auto& raw = impl.RawGlobalMemoryTable();
+        (void)raw;
+        const auto pool = impl.pools.at(1);
+        REQUIRE(pool->pending.load());
+        REQUIRE(pool->backing == Nvn::Pool::Backing::None);
+        REQUIRE(impl.pool_bytes.load() == 0);
+
+        impl.EnsureBacking(*pool);
+        REQUIRE_FALSE(pool->pending.load());
+        REQUIRE(pool->backing == Nvn::Pool::Backing::DeviceLocal);
+        REQUIRE(impl.pool_bytes.load() == POOL_BYTES);
+    }
+
+    SECTION("Large (>= 16 MiB) plain CpuNoAccess pool is deferred without host import") {
+        Nvn::Context::Impl impl(*vulkan->device, vulkan->submit_mutex, nullptr,
+                                {.allow_host_import = false, .background_backing = false});
+        constexpr u64 SMALL_BYTES = 1_MiB;
+        constexpr u64 LARGE_BYTES = 16_MiB;
+        impl.CreatePoolNow({.serial = 1,
+                            .guest_address = 0x5000'0000,
+                            .size = SMALL_BYTES,
+                            .flags = Nvn::PoolFlag::CpuNoAccess});
+        impl.CreatePoolNow({.serial = 2,
+                            .guest_address = 0x6000'0000,
+                            .size = LARGE_BYTES,
+                            .flags = Nvn::PoolFlag::CpuNoAccess});
+        const auto& raw = impl.RawGlobalMemoryTable();
+        (void)raw;
+        const auto small_pool = impl.pools.at(1);
+        const auto large_pool = impl.pools.at(2);
+        REQUIRE_FALSE(small_pool->pending.load());
+        REQUIRE(small_pool->backing == Nvn::Pool::Backing::DeviceLocal);
+        REQUIRE(large_pool->pending.load());
+        REQUIRE(large_pool->backing == Nvn::Pool::Backing::None);
+        REQUIRE(impl.pool_bytes.load() == SMALL_BYTES);
+
+        impl.EnsureBacking(*large_pool);
+        REQUIRE_FALSE(large_pool->pending.load());
+        REQUIRE(large_pool->backing == Nvn::Pool::Backing::DeviceLocal);
+        REQUIRE(impl.pool_bytes.load() == SMALL_BYTES + LARGE_BYTES);
+    }
+
+    SECTION("Texture operations do not back Compressible pool while ClearBuffer does") {
+        constexpr u64 BUF_POOL_VA = 0x3000'0000;
+        constexpr u64 TEX_POOL_VA = 0x4000'0000;
+        constexpr u64 BUF_BYTES = 1_MiB;
+        constexpr u64 TEX_BYTES = 2_MiB;
+        FakeMemory memory;
+        u8* readback = memory.Add(BUF_POOL_VA, BUF_BYTES);
+        std::memset(readback, 0, BUF_BYTES);
+        memory.Add(TEX_POOL_VA, TEX_BYTES);
+
+        Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr,
+                             {.allow_host_import = false, .background_backing = true});
+        context.SetGuestMemory(&memory);
+        context.CreatePool(
+            {.serial = 1, .guest_address = BUF_POOL_VA, .size = BUF_BYTES, .flags = POOL_CPU_CACHED});
+        context.CreatePool({.serial = 2,
+                            .guest_address = TEX_POOL_VA,
+                            .size = TEX_BYTES,
+                            .flags = Nvn::PoolFlag::CpuNoAccess | Nvn::PoolFlag::Compressible});
+        VC::TextureDesc tex = MakeTexture(10, 2, 0, NVN_FORMAT_RGBA8, 8, 8);
+        tex.flags = Nvn::TexFlag::Compressible;
+        context.CreateTexture(tex);
+
+        u64 seq = 0;
+        {
+            std::vector<u64> list;
+            Push(list, VC::Op::ClearTexture, ClearColor(10, 8, 8, 1.0f, 0.25f, 0.5f, 1.0f), 0xF);
+            Push(list, VC::Op::CopyTextureToBuffer, CopyToBuffer(BUF_POOL_VA, 10, 8, 8));
+            Run(context, seq, std::move(list));
+        }
+
+        // Only BUF_POOL (1 MiB) should be backed after texture ops + copy-to-buffer.
+        CHECK(context.DescribeState().find("pool_MB=1 ") != std::string::npos);
+        REQUIRE(readback[0] == 255);
+        REQUIRE(readback[3] == 255);
+
+        {
+            std::vector<u64> list;
+            Push(list, VC::Op::ClearBuffer,
+                 VC::ClearBufferPayload{.address = TEX_POOL_VA, .size = 256, .value = 0x11223344u});
+            Run(context, seq, std::move(list));
+        }
+
+        // Now TEX_POOL (2 MiB) is lazily backed as well -> 1 + 2 = 3 MiB.
+        CHECK(context.DescribeState().find("pool_MB=3 ") != std::string::npos);
+        const Nvn::ContextStats stats = context.Stats();
+        CHECK(stats.ops_failed == 0);
+        CHECK(stats.ops_unsupported == 0);
+    }
 }

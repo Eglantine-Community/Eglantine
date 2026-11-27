@@ -275,6 +275,8 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkCmdSetEvent vkCmdSetEvent{};
     PFN_vkCmdSetFrontFaceEXT vkCmdSetFrontFaceEXT{};
     PFN_vkCmdSetPatchControlPointsEXT vkCmdSetPatchControlPointsEXT{};
+    PFN_vkCmdSetPolygonModeEXT vkCmdSetPolygonModeEXT{};
+    PFN_vkCmdSetProvokingVertexModeEXT vkCmdSetProvokingVertexModeEXT{};
     PFN_vkCmdSetLogicOpEXT vkCmdSetLogicOpEXT{};
     PFN_vkCmdSetLineWidth vkCmdSetLineWidth{};
     PFN_vkCmdSetPrimitiveTopologyEXT vkCmdSetPrimitiveTopologyEXT{};
@@ -318,6 +320,7 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkDestroyBufferView vkDestroyBufferView{};
     PFN_vkDestroyCommandPool vkDestroyCommandPool{};
     PFN_vkDestroyDescriptorPool vkDestroyDescriptorPool{};
+    PFN_vkResetDescriptorPool vkResetDescriptorPool{};
     PFN_vkDestroyDescriptorSetLayout vkDestroyDescriptorSetLayout{};
     PFN_vkDestroyDescriptorUpdateTemplate vkDestroyDescriptorUpdateTemplate{};
     PFN_vkDestroyEvent vkDestroyEvent{};
@@ -970,6 +973,8 @@ class DescriptorPool : public Handle<VkDescriptorPool, VkDevice, DeviceDispatch>
 public:
     DescriptorSets Allocate(const VkDescriptorSetAllocateInfo& ai) const;
 
+    void Reset(VkDescriptorPoolResetFlags flags = 0) const;
+
     /// Set object name.
     void SetObjectNameEXT(const char* name) const;
 };
@@ -1249,10 +1254,17 @@ private:
 
 class CommandBuffer {
 public:
+    struct ComputeBinding {
+        VkPipeline pipeline{};
+        u64 requests{};
+        u64 reused{};
+    };
+
     CommandBuffer() noexcept = default;
 
-    explicit CommandBuffer(VkCommandBuffer handle_, const DeviceDispatch& dld_) noexcept
-        : handle{handle_}, dld{&dld_} {}
+    explicit CommandBuffer(VkCommandBuffer handle_, const DeviceDispatch& dld_,
+                           ComputeBinding* compute_binding_ = nullptr) noexcept
+        : handle{handle_}, dld{&dld_}, compute_binding{compute_binding_} {}
 
     const VkCommandBuffer* address() const noexcept {
         return &handle;
@@ -1263,6 +1275,9 @@ public:
     }
     void Begin(const VkCommandBufferBeginInfo& begin_info) const {
         Check(dld->vkBeginCommandBuffer(handle, &begin_info));
+        if (compute_binding) {
+            compute_binding->pipeline = VK_NULL_HANDLE;
+        }
     }
 
     void End() const {
@@ -1309,7 +1324,21 @@ public:
     }
 
     void BindPipeline(VkPipelineBindPoint bind_point, VkPipeline pipeline) const noexcept {
+        if (bind_point == VK_PIPELINE_BIND_POINT_COMPUTE && compute_binding) {
+            ++compute_binding->requests;
+            if (pipeline != VK_NULL_HANDLE && pipeline == compute_binding->pipeline) {
+                ++compute_binding->reused;
+                return;
+            }
+            compute_binding->pipeline = pipeline;
+        }
         dld->vkCmdBindPipeline(handle, bind_point, pipeline);
+    }
+
+    void ForgetComputePipeline() const noexcept {
+        if (compute_binding) {
+            compute_binding->pipeline = VK_NULL_HANDLE;
+        }
     }
 
     void BindIndexBuffer(VkBuffer buffer, VkDeviceSize offset,
@@ -1721,6 +1750,14 @@ public:
         dld->vkCmdSetPatchControlPointsEXT(handle, patch_control_points);
     }
 
+    void SetPolygonModeEXT(VkPolygonMode polygon_mode) const noexcept {
+        dld->vkCmdSetPolygonModeEXT(handle, polygon_mode);
+    }
+
+    void SetProvokingVertexModeEXT(VkProvokingVertexModeEXT mode) const noexcept {
+        dld->vkCmdSetProvokingVertexModeEXT(handle, mode);
+    }
+
     void SetColorWriteMaskEXT(u32 first, Span<VkColorComponentFlags> masks) const noexcept {
         dld->vkCmdSetColorWriteMaskEXT(handle, first, masks.size(), masks.data());
     }
@@ -1806,8 +1843,9 @@ public:
     }
 
 private:
-    VkCommandBuffer handle;
-    const DeviceDispatch* dld;
+    VkCommandBuffer handle{};
+    const DeviceDispatch* dld{};
+    ComputeBinding* compute_binding{};
 };
 
 u32 AvailableVersion(const InstanceDispatch& dld) noexcept;
