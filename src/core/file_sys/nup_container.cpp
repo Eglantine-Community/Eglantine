@@ -1057,6 +1057,34 @@ void NupContainer::BuildDirTree(u32 dir_index, VectorVfsDirectory& out, bool ser
     }
 }
 
+void NupContainer::WalkPackageTree(std::size_t package_index, const TreeVisitor& visit) const {
+    if (package_index >= packages.size()) {
+        return;
+    }
+    std::vector<std::string> path;
+    WalkDir(packages[package_index].root_dir, path, visit);
+}
+
+void NupContainer::WalkDir(u32 dir_index, std::vector<std::string>& path,
+                           const TreeVisitor& visit) const {
+    const DirNode& node = dirs[dir_index];
+    const u64 end = static_cast<u64>(node.first_child) + node.child_count;
+    for (u64 slot = node.first_child; slot < end; ++slot) {
+        const u32 child = children[slot];
+        if (child >= dirs.size()) {
+            const std::size_t index = child - static_cast<u32>(dirs.size());
+            path.push_back(files[index].name);
+            visit(path, index);
+            path.pop_back();
+        } else {
+            path.push_back(dirs[child].name);
+            visit(path, std::nullopt);
+            WalkDir(child, path, visit);
+            path.pop_back();
+        }
+    }
+}
+
 VirtualDir NupContainer::BuildPackageDir(u32 dir_index, bool serve_stand_ins) {
     auto out = std::make_shared<VectorVfsDirectory>(std::vector<VirtualFile>{},
                                                     std::vector<VirtualDir>{}, dirs[dir_index].name);

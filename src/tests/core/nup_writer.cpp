@@ -6,6 +6,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -728,6 +729,33 @@ TEST_CASE("NUP extract removes output it created when it fails", "[nup]") {
                                      &error) == FileSys::Nup::ExtractResult::InvalidSource);
     REQUIRE(fs::exists(preexisting));
     REQUIRE(fs::is_empty(preexisting));
+}
+
+TEST_CASE("NUP extract fails on a member whose contents do not match its SHA-256", "[nup]") {
+    TempDir t;
+    const auto root = t.path / "Game";
+    MakeDump(root);
+    const auto archive = t.path / "Game.nup";
+    REQUIRE(FileSys::Nup::PackDump(root, archive) == FileSys::Nup::PackResult::Success);
+
+    // Zero one stored extent in place: sizes and the TOC stay valid, only the bytes change.
+    auto nup = ReadAll(archive);
+    const auto records = RawFiles(nup);
+    const auto it = std::ranges::find_if(
+        records, [](const RawFile& f) { return f.name == "random.bin" && f.codec == 0; });
+    REQUIRE(it != records.end());
+    std::fill_n(nup.begin() + static_cast<std::ptrdiff_t>(it->extent_offset), it->extent_size,
+                '\0');
+    Put(archive, nup);
+
+    const auto out = t.path / "Extracted";
+    std::string error;
+    REQUIRE(FileSys::Nup::ExtractNup(archive, out, {}, nullptr, &error) ==
+            FileSys::Nup::ExtractResult::InvalidSource);
+    INFO(error);
+    REQUIRE(error.find("base/romfs/random.bin") != std::string::npos);
+    REQUIRE(error.find("SHA-256") != std::string::npos);
+    REQUIRE_FALSE(fs::exists(out));
 }
 
 TEST_CASE("NUP edit propagates display version to the newest update", "[nup]") {
