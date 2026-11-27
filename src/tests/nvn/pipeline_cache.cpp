@@ -16,6 +16,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -619,6 +620,56 @@ TEST_CASE("Disk cache records round trip", "[nvn]") {
     REQUIRE(compute.compute_layout.image_count == 1);
     REQUIRE(compute.compute_layout.total_matches);
     REQUIRE(compute.compute_layout.declared_total == 0x60);
+}
+
+TEST_CASE("Disk cache preserves the emulated mesh artifact in a separate record type",
+          "[nvn][mesh-fallback-cache]") {
+    const Disk::Header header = MakeHeader();
+    FileImage image = MakeImage(header);
+    auto record = image.graphics;
+    record.shaders[0] = {};
+    record.shaders[Vulkan::Nvn::STAGE_MESH] = {1, 2};
+    record.viewport_count = 1;
+    auto& mesh = record.emulated_mesh.emplace();
+    mesh.output_binding = 9;
+    mesh.block_words = 51;
+    mesh.max_primitives = 1;
+    mesh.primitive_vertices = 3;
+    mesh.topology = 4;
+    mesh.vertex_spirv = {0x07230203U, 0x00010000U, 0U, 1U, 0U};
+
+    bool valid = true;
+    SECTION("mesh only") {}
+    SECTION("task and mesh") {
+        record.shaders[Vulkan::Nvn::STAGE_TASK] = {3, 4};
+        mesh.has_task = true;
+        mesh.payload_binding = 10;
+        mesh.offsets_binding = 11;
+        mesh.args_binding = 12;
+        mesh.payload_stride = 32;
+    }
+    SECTION("damaged scratch layout") {
+        mesh.block_words = 2;
+        valid = false;
+    }
+    SECTION("damaged generated vertex shader") {
+        mesh.vertex_spirv[0] = 0U;
+        valid = false;
+    }
+
+    const auto bytes = Disk::EncodeGraphicsPipeline(record);
+    image.bytes.insert(image.bytes.end(), bytes.begin(), bytes.end());
+    Disk::Contents contents;
+    const auto loaded = Disk::Parse(image.bytes, header, contents);
+    REQUIRE(loaded.status == Disk::LoadStatus::Loaded);
+    REQUIRE(loaded.HasBadTail() == !valid);
+    REQUIRE(contents.graphics.size() == (valid ? 2 : 1));
+    CHECK_FALSE(contents.graphics[0].emulated_mesh.has_value());
+    if (valid) {
+        CHECK(contents.graphics[1].shaders == record.shaders);
+        CHECK(contents.graphics[1].targets == record.targets);
+        CHECK(contents.graphics[1].emulated_mesh == record.emulated_mesh);
+    }
 }
 
 TEST_CASE("Disk cache survives truncation at every byte offset", "[nvn]") {
@@ -2628,6 +2679,87 @@ TEST_CASE("Async compile off: nothing is counted as building", "[nvn]") {
     REQUIRE(notify.ShadersBuilding() == 0);
 }
 
+TEST_CASE("Compute prefetch at program creation bounds the number of unused pipelines",
+          "[nvn][pipeline-lookahead]") {
+    const auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    auto options = AsyncOptions(false);
+    options.prefetch_graphics = true;
+    PipelineCache cache{*vulkan->device, options};
+    constexpr u32 MAX_UNUSED = 16;
+    for (u32 i = 0; i < MAX_UNUSED; ++i) {
+        const auto program = MakeAddProgram(5, i);
+        cache.PrefetchCompute(MakeComputeRequest(program, nullptr), 0);
+        cache.Flush();
+    }
+    REQUIRE(cache.Stats().compute_pipelines == MAX_UNUSED);
+
+    const auto next = MakeAddProgram(5, MAX_UNUSED);
+    cache.PrefetchCompute(MakeComputeRequest(next, nullptr), 0);
+    cache.Flush();
+    CHECK(cache.Stats().prefetch_queued == MAX_UNUSED);
+    CHECK(cache.Stats().compute_pipelines == MAX_UNUSED);
+
+    const auto first = MakeAddProgram(5, 0);
+    REQUIRE(cache.GetCompute(MakeComputeRequest(first, nullptr)));
+    cache.PrefetchCompute(MakeComputeRequest(next, nullptr), 0);
+    cache.Flush();
+    CHECK(cache.Stats().prefetch_used == 1);
+    CHECK(cache.Stats().prefetch_queued == MAX_UNUSED + 1);
+    CHECK(cache.Stats().compute_pipelines == MAX_UNUSED + 1);
+}
+
+TEST_CASE("Compute prefetch at program creation persists only when used",
+          "[nvn][pipeline-lookahead]") {
+    const auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    TempDirectory directory;
+    auto options = AsyncOptions(false);
+    options.directory = directory.path;
+    options.driver_cache_file = false;
+    options.prefetch_graphics = true;
+    const auto used = MakeAddProgram(5, 42);
+    const auto unused = MakeAddProgram(5, 43);
+    const auto used_request = MakeComputeRequest(used, nullptr);
+    const auto unused_request = MakeComputeRequest(unused, nullptr);
+    {
+        PipelineCache cold{*vulkan->device, options};
+        cold.Flush();
+        cold.PrefetchCompute(used_request, 0);
+        cold.Flush();
+        cold.PrefetchCompute(unused_request, 0);
+        cold.Flush();
+        REQUIRE(cold.Stats().compiled_at_runtime == 2);
+        CHECK(cold.Stats().disk_entries_written == 0);
+
+        FreezableOracle oracle;
+        cold.PrefetchCompute(MakeComputeRequest(used, &oracle), 0);
+        cold.Flush();
+        CHECK(cold.Stats().disk_entries_written == 0);
+
+        auto lookup = std::async(std::launch::async, [&] { return cold.GetCompute(used_request); });
+        const auto hit = cold.GetCompute(used_request);
+        REQUIRE(hit);
+        CHECK(lookup.get() == hit);
+        cold.Flush();
+        CHECK(cold.Stats().prefetch_used == 1);
+        CHECK(cold.Stats().compiled_at_runtime == 2);
+        CHECK(cold.Stats().disk_entries_written == 2);
+    }
+
+    PipelineCache warm{*vulkan->device, options};
+    warm.Flush();
+    CHECK(warm.Stats().loaded == 1);
+    REQUIRE(warm.GetCompute(used_request));
+    CHECK(warm.Stats().compiled_at_runtime == 0);
+    REQUIRE(warm.GetCompute(unused_request));
+    CHECK(warm.Stats().compiled_at_runtime == 1);
+}
+
 TEST_CASE("Async compile: a rejected program is counted, cached as rejected and never fatal",
           "[nvn]") {
     const auto vulkan = MakeHeadlessVulkan();
@@ -2867,6 +2999,70 @@ TEST_CASE("Preload reports nothing without a sink or with preload off", "[nvn]")
         warm.Flush();
         REQUIRE(progress.events.empty());
     }
+}
+
+TEST_CASE("An emulated mesh pipeline is restored by preload without runtime compilation",
+          "[nvn][mesh-fallback-cache]") {
+    const auto vulkan = [] {
+        auto& setting = Settings::values.mesh_shader_mode;
+        const auto previous = setting.GetValue();
+        SCOPE_EXIT { setting.SetValue(previous); };
+        setting.SetValue(Settings::MeshShaderMode::ComputeFallback);
+        return MakeHeadlessVulkan();
+    }();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    REQUIRE_FALSE(vulkan->device->IsExtMeshShaderSupported());
+
+    constexpr u32 TASK = Vulkan::Nvn::STAGE_TASK;
+    constexpr u32 MESH = Vulkan::Nvn::STAGE_MESH;
+    auto task = MakeTestProgram(TASK, EXIT_INSTRUCTION);
+    PutWord(task.control, 0x58, (128U << 16) | 32U); // payload bytes, threads
+    PutWord(task.control, 0x5c, 0U); // no local payload beyond the bytes passed to the mesh stage
+    PutWord(task.code, 0, 0U);
+    task.hash = HashProgramStage(task.control, task.code);
+    auto mesh = MakeTestProgram(MESH, EXIT_INSTRUCTION);
+    PutWord(mesh.control, 0x58, 32U);
+    PutWord(mesh.control, 0x5c, 3U << 24); // triangle topology
+    PutWord(mesh.control, 0x60, (1U << 16) | 3U); // maximum primitives, vertices
+    PutWord(mesh.code, 0, 0U);
+    mesh.hash = HashProgramStage(mesh.control, mesh.code);
+    const auto fragment = MakeTexturedFragment();
+    FreezableOracle oracle;
+    auto request = MakeGraphicsRequest(mesh, fragment, &oracle);
+    request.state.topology = 0;
+    request.stages[0] = {};
+    request.stages[TASK] = task.View();
+    request.stages[MESH] = mesh.View();
+
+    TempDirectory directory;
+    auto options = AsyncOptions(false);
+    options.directory = directory.path;
+    options.graphics_pipeline_library = true;
+    {
+        PipelineCache cold{*vulkan->device, options};
+        const auto pipeline = cold.GetGraphics(request);
+        REQUIRE(pipeline);
+        REQUIRE(pipeline->mesh_emulation.has_value());
+        cold.Flush();
+        CHECK(cold.Stats().compiled_at_runtime == 1);
+    }
+
+    PipelineCache warm{*vulkan->device, options};
+    warm.Flush();
+    REQUIRE(warm.Stats().loaded == 1);
+    const auto restored = warm.GetGraphics(request);
+    REQUIRE(restored);
+    REQUIRE(restored->mesh_emulation.has_value());
+    CHECK(restored->mesh_emulation->has_task);
+    CHECK(restored->mesh_emulation->task_pipeline);
+    CHECK(restored->mesh_emulation->mesh_pipeline);
+    CHECK(restored->mesh_emulation->vertices_per_group == 3);
+    CHECK(restored->mesh_emulation->payload_stride == 32);
+    CHECK(restored->QueriesMatch(oracle));
+    CHECK(warm.Stats().compiled_at_runtime == 0);
+    CHECK(warm.Stats().gpl_shader_sets_warmed == 0);
 }
 
 TEST_CASE("The load progress sink forwards to the callback set and ignores calls without one",

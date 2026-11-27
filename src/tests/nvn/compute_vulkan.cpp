@@ -37,6 +37,7 @@
 #include "video_core/renderer_vulkan/nvn/nvn_bc_encode.h"
 #include "video_core/renderer_vulkan/nvn/nvn_context.h"
 #include "video_core/renderer_vulkan/nvn/nvn_counters.h"
+#include "video_core/renderer_vulkan/nvn/nvn_pipeline_cache.h"
 #include "video_core/renderer_vulkan/nvn/nvn_sparse_layout.h"
 #include "video_core/renderer_vulkan/nvn/nvn_texture_layout.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -1874,6 +1875,35 @@ std::array<Inst, 12> SampleTextureRedProgram() {
 }
 
 } // namespace
+
+TEST_CASE("NVN compute prefetch before binding keeps only texture-independent pipelines",
+          "[nvn][compute][pipeline-lookahead]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    using namespace Vulkan::Nvn;
+    const bool sampled = GENERATE(false, true);
+    CAPTURE(sampled);
+    const VC::ProgramDesc program =
+        sampled
+            ? MakeProgram(PROGRAM, SampleTextureRedProgram(), {.storage = 1, .textures = 1})
+            : MakeProgram(PROGRAM, FillProgramBase(0x20, 100), {.uniform = 1, .storage = 1});
+    const auto& control = program.control[STAGE_COMPUTE];
+    const auto& code = program.code[STAGE_COMPUTE];
+    ComputeRequest request;
+    request.program = {HashProgramStage(control, code), &control, &code};
+    PipelineCache cache{*vulkan->device, {.prefetch_graphics = true}};
+    cache.PrefetchCompute(request, 0);
+    cache.Flush();
+    CHECK(cache.Stats().prefetch_queued == 1);
+    CHECK(cache.Stats().compute_pipelines == (sampled ? 0 : 1));
+    CHECK(cache.Stats().rejected_shaders == 0);
+
+    REQUIRE(cache.GetCompute(request));
+    CHECK(cache.Stats().prefetch_used == (sampled ? 0 : 1));
+    CHECK(cache.Stats().compiled_at_runtime == 1);
+}
 
 TEST_CASE("NVN compute: an image written as a storage image is sampled in GENERAL, ordered by the "
           "game's barrier",

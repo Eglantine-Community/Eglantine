@@ -455,6 +455,27 @@ std::shared_ptr<BcScratch> Context::Impl::AcquireBcScratchFrom(std::shared_ptr<B
     }
 }
 
+u64 Context::Impl::BcScratchCacheBytes() const {
+    u64 bytes = 0;
+    for (const auto& scratch : bc_scratches) {
+        bytes += scratch->allocated_bytes;
+    }
+    return bytes;
+}
+
+u64 Context::Impl::TrimBcScratchCache(u64 target_bytes) {
+    const u64 before = BcScratchCacheBytes();
+    u64 bytes = before;
+    for (size_t i = bc_scratches.size(); i > 0 && bytes > target_bytes; --i) {
+        const auto& scratch = bc_scratches[i - 1];
+        if (scratch.use_count() == 1) {
+            bytes -= scratch->allocated_bytes;
+            bc_scratches.erase(bc_scratches.begin() + static_cast<std::ptrdiff_t>(i - 1));
+        }
+    }
+    return before - bytes;
+}
+
 std::shared_ptr<BcScratch> Context::Impl::AcquireBcScratch(u32 width, u32 height, u32 layers) {
     const bool bc7 = astc_standin == AstcStandin::Bc7;
     for (size_t i = 0; i < bc_scratches.size(); ++i) {
@@ -466,33 +487,42 @@ std::shared_ptr<BcScratch> Context::Impl::AcquireBcScratch(u32 width, u32 height
             return bc_scratches.front();
         }
     }
+    constexpr u64 MAX_CACHE_BYTES = u64{96} << 20;
+    const u64 cache_budget = (std::min)(MAX_CACHE_BYTES, storage_cache_budget / 16);
     const auto texel_bytes = [](u32 w, u32 h, u32 l) { return u64{w} * h * l * 4; };
+    const auto estimated_bytes = [&](u32 w, u32 h, u32 l) {
+        return texel_bytes(w, h, l) + BcBlocksSize(w, h, l, bc7 ? 24 : 16);
+    };
     u32 w = width;
     u32 h = height;
     u32 l = layers;
-    bool replace_front = false;
     if (!bc_scratches.empty() && bc_scratches.front()) {
         // Grow to cover both shapes while that stays in the budget, else take the new shape.
         const u32 grown_w = (std::max)(bc_scratches.front()->width, width);
         const u32 grown_h = (std::max)(bc_scratches.front()->height, height);
         const u32 grown_l = (std::max)(bc_scratches.front()->layers, layers);
-        if (texel_bytes(grown_w, grown_h, grown_l) <= BC_SCRATCH_BUDGET) {
+        if (texel_bytes(grown_w, grown_h, grown_l) <= BC_SCRATCH_BUDGET &&
+            estimated_bytes(grown_w, grown_h, grown_l) <= cache_budget) {
             w = grown_w;
             h = grown_h;
             l = grown_l;
-            replace_front = true;
         }
+    }
+    const u64 expected = estimated_bytes(w, h, l);
+    if (expected <= cache_budget) {
+        TrimBcScratchCache(cache_budget - expected);
     }
     try {
         auto scratch = MakeBcScratch(device, *allocator, w, h, l, bc7);
-        if (texel_bytes(w, h, l) <= BC_SCRATCH_BUDGET) {
-            if (replace_front) {
-                bc_scratches.front() = scratch;
-            } else {
+        if (texel_bytes(w, h, l) <= BC_SCRATCH_BUDGET &&
+            scratch->allocated_bytes <= cache_budget) {
+            const u64 target_bytes = cache_budget - scratch->allocated_bytes;
+            TrimBcScratchCache(target_bytes);
+            if (bc_scratches.size() >= 4 && bc_scratches.back().use_count() == 1) {
+                bc_scratches.pop_back();
+            }
+            if (bc_scratches.size() < 4 && BcScratchCacheBytes() <= target_bytes) {
                 bc_scratches.insert(bc_scratches.begin(), scratch);
-                if (bc_scratches.size() > 4) {
-                    bc_scratches.pop_back();
-                }
             }
         }
         return scratch;

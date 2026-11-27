@@ -77,6 +77,20 @@ void PipelineCache::Impl::PostComputeRecord(const Disk::ComputePipelineRecord& r
     PostBytes(std::move(bytes));
 }
 
+void PipelineCache::Impl::PostComputePipeline(const StageArtifact& stage, const ComputeKey& key,
+                                              const ComputePipeline& pipeline) {
+    PostShader(stage);
+    PostComputeRecord({
+        .shader = stage.record->id,
+        .push_constant_size = pipeline.push_constant_size,
+        .environment_flags = key.environment_flags,
+        .local_memory_size = key.local_memory_size,
+        .shared_memory_size = key.shared_memory_size,
+        .compute_layout = pipeline.compute_layout,
+    });
+    ++new_since_vk_write;
+}
+
 std::vector<u8> PipelineCache::Impl::ReadVkCacheBlob() const {
     std::ifstream file(vk_cache_path, std::ios::binary | std::ios::ate);
     if (!file.is_open()) {
@@ -188,8 +202,15 @@ void PipelineCache::Impl::NotePreloadStep() {
 void PipelineCache::Impl::PreloadGraphics(
     const Disk::GraphicsPipelineRecord& record,
     const std::unordered_map<Disk::ContentId, StageArtifact, Disk::ContentIdHash>& shaders) {
+    if (!record.shaders[STAGE_MESH].IsZero() &&
+        record.emulated_mesh.has_value() == device.IsExtMeshShaderSupported()) {
+        // Native and compute-emulated mesh modules have different execution models.
+        NotePreloadStep();
+        return;
+    }
     GraphicsKey key;
     std::array<StageArtifact, GRAPHICS_STAGE_COUNT> artifacts;
+    u32 binding_count = 0;
     for (u32 stage = 0; stage < GRAPHICS_STAGE_COUNT; ++stage) {
         if (record.shaders[stage].IsZero()) {
             continue;
@@ -200,8 +221,22 @@ void PipelineCache::Impl::PreloadGraphics(
             NotePreloadStep();
             return;
         }
+        const auto& shader = *it->second.record;
+        if (record.emulated_mesh && (stage == STAGE_TASK || stage == STAGE_MESH) &&
+            (shader.workgroup_size[0] == 0 || shader.workgroup_size[1] != 1 ||
+             shader.workgroup_size[2] != 1)) {
+            NoteRow("disk cache: invalid mesh emulation compute workgroup");
+            NotePreloadStep();
+            return;
+        }
         artifacts[stage] = it->second;
-        key.hashes[stage] = it->second.record->program_hash;
+        key.hashes[stage] = shader.program_hash;
+        binding_count = std::max(binding_count, shader.layout.binding_count);
+    }
+    if (record.emulated_mesh && record.emulated_mesh->output_binding != binding_count) {
+        NoteRow("disk cache: invalid mesh emulation output binding");
+        NotePreloadStep();
+        return;
     }
     key.state = record.state;
     key.targets = record.targets;
@@ -226,7 +261,8 @@ void PipelineCache::Impl::PreloadGraphics(
                     stages[stage] = &artifacts[stage];
                 }
             }
-            pipeline = AssembleGraphics(record.state, record.targets, stages);
+            pipeline = AssembleGraphics(record.state, record.targets, stages, {}, false,
+                                        record.emulated_mesh ? &*record.emulated_mesh : nullptr);
         }
         {
             std::scoped_lock lock{pipeline_mutex};

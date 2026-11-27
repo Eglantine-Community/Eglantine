@@ -17,6 +17,7 @@
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include "common/literals.h"
 #include "video_core/nvn/guest_memory.h"
@@ -494,18 +495,26 @@ TEST_CASE("NVN draw: inline uniform updates of the same bytes keep the last one"
     const std::vector<u8> second = filled(64, 100);
     const std::vector<u8> part = filled(16, 200);
     constexpr u64 AT = BUFFER_POOL_VA + 4096;
+    const bool part_before_second = GENERATE(false, true);
+    CAPTURE(part_before_second);
     std::vector<u64> list;
-    // `first` is rewritten whole by `second`: no copy. `part` overlaps `second` partly: it is
-    // copied behind a barrier.
+    // The second whole write replaces the first. A partial write between them must also lose.
     Push(list, VC::Op::UpdateUniformBuffer, VC::UpdateUniformBufferPayload{AT, 64}, first);
+    if (part_before_second) {
+        Push(list, VC::Op::UpdateUniformBuffer, VC::UpdateUniformBufferPayload{AT + 8, 16}, part);
+    }
     Push(list, VC::Op::UpdateUniformBuffer, VC::UpdateUniformBufferPayload{AT, 64}, second);
-    Push(list, VC::Op::UpdateUniformBuffer, VC::UpdateUniformBufferPayload{AT + 8, 16}, part);
+    if (!part_before_second) {
+        Push(list, VC::Op::UpdateUniformBuffer, VC::UpdateUniformBufferPayload{AT + 8, 16}, part);
+    }
     Push(list, VC::Op::CopyBufferToBuffer,
          VC::CopyBufferToBufferPayload{.src = AT, .dst = BUFFER_POOL_VA + 8192, .size = 64});
     rig.Run(std::move(list), {});
 
     std::vector<u8> expected = second;
-    std::memcpy(expected.data() + 8, part.data(), part.size());
+    if (!part_before_second) {
+        std::memcpy(expected.data() + 8, part.data(), part.size());
+    }
     CHECK(std::memcmp(rig.readback + 8192, expected.data(), expected.size()) == 0);
     CHECK(rig.context.Stats().ops_failed == 0);
     const auto stat = [&](std::string_view reason) {
@@ -514,8 +523,10 @@ TEST_CASE("NVN draw: inline uniform updates of the same bytes keep the last one"
         const auto it = std::ranges::find(rows, reason, &VC::SinkStat::reason);
         return it == rows.end() ? ~u64{0} : it->count;
     };
-    CHECK(stat("inline_uniform_updates: rewritten whole by a later one (no copy)") == 1);
-    CHECK(stat("inline_uniform_updates: transfer barriers between overlapping copies") == 1);
+    CHECK(stat("inline_uniform_updates: rewritten whole by a later one (no copy)") ==
+          (part_before_second ? 2 : 1));
+    CHECK(stat("inline_uniform_updates: transfer barriers between overlapping copies") ==
+          (part_before_second ? 0 : 1));
 }
 
 namespace {

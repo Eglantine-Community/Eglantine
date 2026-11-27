@@ -426,6 +426,14 @@ void DrawResources::OnProgramCreated(const std::shared_ptr<const VC::ProgramDesc
     if (!desc.control[STAGE_COMPUTE].empty()) {
         ParsedComputeControl parsed;
         parsed.control = VC::ParseControl(desc.control[STAGE_COMPUTE], parsed.error);
+        if (cache_instance && hashes[STAGE_COMPUTE] != 0 && parsed.control &&
+            parsed.control->has_compute_counts && parsed.control->compute.texture_count == 0 &&
+            parsed.control->compute.image_count == 0) {
+            ComputeRequest request;
+            request.program = {hashes[STAGE_COMPUTE], &desc.control[STAGE_COMPUTE],
+                               &desc.code[STAGE_COMPUTE]};
+            cache_instance->PrefetchCompute(request, 0);
+        }
         compute_controls[desc.serial] = std::move(parsed);
     }
 }
@@ -600,12 +608,21 @@ VkImageView DrawResources::GetView(const Texture& texture, const ViewKey& key,
     }
     // The texture remembers its texture_views node (stable until TakeViews erases it).
     if (texture.view_slot == nullptr || texture.view_slot_epoch != views_epoch) {
-        auto& fresh = const_cast<Texture&>(texture);
-        fresh.view_slot = &texture_views[texture.serial];
-        fresh.view_slot_epoch = views_epoch;
+        const auto [it, inserted] = texture_views.try_emplace(texture.serial);
+        TextureViews& node = it->second;
+        if (inserted) {
+            node.sole_slot_owner = &texture;
+        } else if (node.sole_slot_owner != &texture) {
+            node.sole_slot_owner = nullptr;
+        }
+        texture.view_slot = &node;
+        texture.view_slot_epoch = views_epoch;
     }
-    TextureViews& views = *static_cast<TextureViews*>(texture.view_slot);
+    TextureViews& views = *texture.view_slot;
     if (!views.storage) {
+        auto& entries = storage_views[texture.storage.get()];
+        views.storage_index = entries.size();
+        entries.push_back(&views);
         views.storage = texture.storage;
     }
     for (auto& [existing, view] : views.views) {
@@ -669,11 +686,13 @@ VkImageView DrawResources::GetView(const Texture& texture, const ViewKey& key,
 
 std::vector<vk::ImageView> DrawResources::TakeStorageViews(const Storage& storage) {
     std::vector<vk::ImageView> taken;
+    const auto entries = storage_views.find(&storage);
+    if (entries == storage_views.end()) {
+        return taken;
+    }
     bool any_framebuffer = false;
-    for (auto& [serial, views] : texture_views) {
-        if (views.storage.get() != &storage) {
-            continue;
-        }
+    for (TextureViews* entry : entries->second) {
+        TextureViews& views = *entry;
         any_framebuffer |= (!views.views.empty() && views.used_in_framebuffer);
         views.used_in_framebuffer = false;
         for (auto& [key, view] : views.views) {
@@ -687,15 +706,29 @@ std::vector<vk::ImageView> DrawResources::TakeStorageViews(const Storage& storag
     return taken;
 }
 
-std::shared_ptr<TextureViews> DrawResources::TakeViews(u64 serial) {
-    const auto it = texture_views.find(serial);
+std::shared_ptr<TextureViews> DrawResources::TakeViews(const Texture& texture) {
+    const auto it = texture_views.find(texture.serial);
     if (it == texture_views.end()) {
         return nullptr;
     }
     const bool was_framebuffer = it->second.used_in_framebuffer;
+    const bool other_slot_owners = it->second.sole_slot_owner != &texture;
     auto result = std::make_shared<TextureViews>(std::move(it->second));
+    if (result->storage) {
+        const auto storage = storage_views.find(result->storage.get());
+        auto& entries = storage->second;
+        entries[result->storage_index] = entries.back();
+        entries.back()->storage_index = result->storage_index;
+        entries.pop_back();
+        if (entries.empty()) {
+            storage_views.erase(storage);
+        }
+    }
+    texture.view_slot = nullptr;
     texture_views.erase(it);
-    ++views_epoch;
+    if (other_slot_owners) {
+        ++views_epoch;
+    }
     if (was_framebuffer) {
         ++framebuffer_views_epoch;
     }

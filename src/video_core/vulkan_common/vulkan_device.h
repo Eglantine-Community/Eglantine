@@ -586,6 +586,13 @@ FN_MAX_LIMIT_LIST
         return properties.subgroup_size_control.requiredSubgroupSizeStages & stage;
     }
 
+    /// Whether a compute pipeline can request a guest-sized subgroup for this local size.
+    bool CanRequireGuestWarpForCompute(const std::array<u32, 3>& workgroup_size) const;
+
+    bool SupportsFullComputeSubgroups() const {
+        return extensions.subgroup_size_control && features.subgroup_size_control.computeFullSubgroups;
+    }
+
     /// Returns true if the device supports the provided subgroup feature.
     bool IsSubgroupFeatureSupported(VkSubgroupFeatureFlagBits feature) const {
         return properties.subgroup_properties.supportedOperations & feature;

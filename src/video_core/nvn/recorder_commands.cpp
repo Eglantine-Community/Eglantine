@@ -442,6 +442,8 @@ void Recorder::CopyTextureToTexture(u64 cmd_va, u64 src_va, u64 src_view_va, u64
     payload->dst = dst.texture;
     payload->dst_region = dst_region;
     payload->flags = flags;
+    payload->src_view_format = src.view.set_format ? src.view.format : 0;
+    payload->dst_view_format = dst.view.set_format ? dst.view.format : 0;
 }
 
 void Recorder::Downsample(u64 cmd_va, u64 src_va, u64 dst_va) {
@@ -463,6 +465,8 @@ void Recorder::Downsample(u64 cmd_va, u64 src_va, u64 dst_va) {
     payload->dst = dst.texture;
     payload->dst_region = region;
     payload->flags = COPY_FLAG_RESOLVE;
+    payload->src_view_format = 0;
+    payload->dst_view_format = 0;
 }
 
 void Recorder::SetCopyRowStride(u64 cmd_va, s64 stride) {

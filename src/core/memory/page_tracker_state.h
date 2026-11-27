@@ -7,6 +7,7 @@
 #include <functional>
 #include <memory>
 #include <span>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -128,6 +129,7 @@ private:
         u64 id{};
         u64 page_begin{};
         u64 page_end{};
+        u64 prefix_max_end{}; ///< highest page_end up to and including this owner
         std::vector<u64> armed;  ///< the owner holds the page's contents (bit per page)
         std::vector<u64> dirty;  ///< written since the owner took the contents
         std::vector<u64> device; ///< the device memory manager caches the page
@@ -159,7 +161,7 @@ private:
     Owner* Find(u64 id);
     const Owner* Find(u64 id) const;
     PageClaim ClaimOf(u64 page, bool& tracked) const;
-    void RecomputeMaxPages();
+    void UpdatePrefixMaxEnds(size_t first);
     /// Fills `spans` with the sorted, merged parts of [page_begin, page_end) some owner covers.
     void TrackedSpans(u64 page_begin, u64 page_end);
 
@@ -168,7 +170,7 @@ private:
 
     PageClaimSink& sink;
     std::vector<std::unique_ptr<Owner>> owners; ///< sorted by page_begin
-    u64 max_pages{};                            ///< longest owner range, bounds overlap lookups
+    std::unordered_map<u64, Owner*> owners_by_id;
     u64 next_id{1};
     std::vector<std::pair<u64, u64>> spans; ///< TrackedSpans' result, reused
     std::atomic<size_t> owner_count{};

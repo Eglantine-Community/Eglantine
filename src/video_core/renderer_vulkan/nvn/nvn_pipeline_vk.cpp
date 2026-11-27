@@ -191,7 +191,8 @@ bool PipelineCache::Impl::CanUsePush(u32 descriptor_count) const {
 }
 
 std::shared_ptr<const SharedPipelineLayout> PipelineCache::Impl::CreateLayoutObjects(
-    const VC::DescriptorLayout& descriptors, bool is_compute, VkShaderStageFlags push_stages) {
+    const VC::DescriptorLayout& descriptors, bool is_compute, VkShaderStageFlags push_stages,
+    const EmulatedMeshArtifact* emulated_mesh) {
     boost::container::small_vector<VkDescriptorSetLayoutBinding, 32> bindings;
     boost::container::small_vector<VkDescriptorUpdateTemplateEntry, 32> template_entries;
     u32 total = 0;
@@ -199,11 +200,17 @@ std::shared_ptr<const SharedPipelineLayout> PipelineCache::Impl::CreateLayoutObj
     bool can_template = !descriptors.bindings.empty();
     for (const VC::DescriptorBinding& binding : descriptors.bindings) {
         const VkDescriptorType type = static_cast<VkDescriptorType>(binding.kind);
+        VkShaderStageFlags stage_flags = StageFlagsOf(binding);
+        constexpr VkShaderStageFlags mesh_stages =
+            VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT;
+        if (emulated_mesh && (stage_flags & mesh_stages) != 0) {
+            stage_flags = (stage_flags & ~mesh_stages) | VK_SHADER_STAGE_COMPUTE_BIT;
+        }
         bindings.push_back({
             .binding = binding.binding,
             .descriptorType = type,
             .descriptorCount = std::max<u32>(binding.count, 1),
-            .stageFlags = StageFlagsOf(binding),
+            .stageFlags = stage_flags,
             .pImmutableSamplers = nullptr,
         });
         total += std::max<u32>(binding.count, 1);
@@ -227,7 +234,21 @@ std::shared_ptr<const SharedPipelineLayout> PipelineCache::Impl::CreateLayoutObj
             slot_offset += binding.count;
         }
     }
-    const bool push_descriptors = !bindings.empty() && CanUsePush(total);
+    if (emulated_mesh) {
+        const u32 count = emulated_mesh->has_task ? 4 : 1;
+        for (u32 i = 0; i < count; ++i) {
+            bindings.push_back({
+                .binding = emulated_mesh->output_binding + i,
+                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .descriptorCount = 1,
+                .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT |
+                              (i == 0 || i == 3 ? VK_SHADER_STAGE_VERTEX_BIT : 0u),
+            });
+        }
+        can_template = false;
+    }
+    // The compute and graphics work bind the same populated set.
+    const bool push_descriptors = !emulated_mesh && !bindings.empty() && CanUsePush(total);
     const bool partially_bound =
         !bindings.empty() && !push_descriptors && device.IsDescriptorBindingPartiallyBoundSupported();
     u32 push_constant_size = 0;
@@ -414,10 +435,105 @@ void PipelineCache::Impl::FillStages(PipelineBase& pipeline,
     }
 }
 
+namespace {
+
+vk::ShaderModule CreateModule(const Device& device, std::span<const u32> spirv) {
+    return device.GetLogical().CreateShaderModule({
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = spirv.size_bytes(),
+        .pCode = spirv.data(),
+    });
+}
+
+vk::Pipeline CreateCompute(const Device& device, VkPipelineLayout layout, VkShaderModule module,
+                           VkPipelineCache cache, const Disk::ShaderRecord* record = nullptr) {
+    const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+        .requiredSubgroupSize = GuestWarpSize,
+    };
+    const bool force_guest_warp = record && record->layout.requires_guest_warp &&
+                                  device.CanRequireGuestWarpForCompute(record->workgroup_size);
+    const bool require_full_subgroups = force_guest_warp &&
+                                        device.SupportsFullComputeSubgroups() &&
+                                        record->workgroup_size[0] % GuestWarpSize == 0;
+    return device.GetLogical().CreateComputePipeline(
+        {
+            .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            .stage =
+                {
+                    .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                    .pNext = force_guest_warp ? &subgroup : nullptr,
+                    .flags =
+                        require_full_subgroups
+                            ? VkPipelineShaderStageCreateFlags{VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT}
+                            : 0U,
+                    .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                    .module = module,
+                    .pName = "main",
+                },
+            .layout = layout,
+            .basePipelineIndex = -1,
+        },
+        cache);
+}
+
+} // namespace
+
+const MeshEmulationHelpers* PipelineCache::Impl::GetMeshEmulationHelpers() {
+    std::scoped_lock lock{mesh_helpers_mutex};
+    if (mesh_helpers || mesh_helpers_failed) {
+        return mesh_helpers.get();
+    }
+    using namespace Shader::Backend::SPIRV;
+    try {
+        auto helpers = std::make_unique<MeshEmulationHelpers>();
+        const auto create = [&](std::span<const u32> spirv, u32 binding_count, u32 push_size,
+                                vk::DescriptorSetLayout& set, vk::PipelineLayout& layout,
+                                vk::Pipeline& pipeline) {
+            std::array<VkDescriptorSetLayoutBinding, 4> bindings{};
+            for (u32 i = 0; i < binding_count; ++i) {
+                bindings[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                               VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+            }
+            set = device.GetLogical().CreateDescriptorSetLayout({
+                .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                .bindingCount = binding_count,
+                .pBindings = bindings.data(),
+            });
+            const VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, push_size};
+            layout = device.GetLogical().CreatePipelineLayout({
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                .setLayoutCount = 1,
+                .pSetLayouts = set.address(),
+                .pushConstantRangeCount = 1,
+                .pPushConstantRanges = &range,
+            });
+            const auto module = CreateModule(device, spirv);
+            pipeline = CreateCompute(device, *layout, *module, VK_NULL_HANDLE);
+        };
+        create(EmitMeshEmulationDistribution(profile, MeshDistribution::DedicatedOutput), 3,
+               sizeof(MeshEmulationDistributionConstants), helpers->distribution_set_layout,
+               helpers->distribution_layout, helpers->distribution_pipeline);
+        create(EmitMeshEmulationDistribution(profile, MeshDistribution::DedicatedOutputIndirect), 4,
+               sizeof(MeshEmulationDistributionConstants), helpers->indirect_dist_set_layout,
+               helpers->indirect_dist_layout, helpers->indirect_dist_pipeline);
+        create(EmitMeshEmulationIndirectClamp(profile), 3,
+               sizeof(MeshEmulationIndirectConstants), helpers->indirect_clamp_set_layout,
+               helpers->indirect_clamp_layout, helpers->indirect_clamp_pipeline);
+        mesh_helpers = std::move(helpers);
+    } catch (const vk::Exception& e) {
+        mesh_helpers_failed = true;
+        NoteIssue(fmt::format("pipeline: mesh emulation helper creation failed: {}",
+                              FirstLine(e.what())));
+    }
+    return mesh_helpers.get();
+}
+
 std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::AssembleGraphics(
     const GraphicsFixedState& state, const RenderPassKey& targets,
     const std::array<const StageArtifact*, GRAPHICS_STAGE_COUNT>& stages,
-    const std::shared_ptr<ShaderSet>& gpl_set, bool warm_parts) {
+    const std::shared_ptr<ShaderSet>& gpl_set, bool warm_parts,
+    const EmulatedMeshArtifact* emulated_mesh) {
     try {
         auto pipeline = std::make_shared<GraphicsPipeline>();
         pipeline->render_pass = GetRenderPass(targets);
@@ -427,19 +543,41 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::AssembleGraphics(
             ordered[i] = stages[PIPELINE_ORDER[i]];
         }
         const bool mesh = stages[STAGE_MESH] != nullptr;
-        if (mesh && !device.IsExtMeshShaderSupported()) {
-            // Never hand the driver task/mesh stages it cannot create (logged once, counted).
-            NoteIssue("pipeline: task/mesh programs need VK_EXT_mesh_shader with task and mesh "
-                      "shaders; their draws are skipped");
+        if (mesh && !emulated_mesh && !device.IsExtMeshShaderSupported()) {
             return nullptr;
         }
-        const VkShaderStageFlags push_stages =
-            mesh ? VkShaderStageFlags{VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT |
-                                      VK_SHADER_STAGE_FRAGMENT_BIT}
-                 : VkShaderStageFlags{VK_SHADER_STAGE_ALL_GRAPHICS};
+        VkShaderStageFlags push_stages = VK_SHADER_STAGE_ALL_GRAPHICS;
+        if (emulated_mesh) {
+            push_stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT |
+                          VK_SHADER_STAGE_COMPUTE_BIT;
+        } else if (mesh) {
+            push_stages = VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT |
+                          VK_SHADER_STAGE_FRAGMENT_BIT;
+        }
         pipeline->descriptors = MergeLayouts(ordered);
         const std::shared_ptr<const SharedPipelineLayout> layout =
-            CreateLayoutObjects(pipeline->descriptors, false, push_stages);
+            CreateLayoutObjects(pipeline->descriptors, false, push_stages, emulated_mesh);
+        std::optional<VkPrimitiveTopology> emulated_topology;
+        if (emulated_mesh) {
+            auto& emulation = pipeline->mesh_emulation.emplace();
+            emulation.has_task = emulated_mesh->has_task;
+            emulation.output_binding = emulated_mesh->output_binding;
+            emulation.payload_stride = emulated_mesh->payload_stride;
+            emulation.block_words = emulated_mesh->block_words;
+            emulation.vertices_per_group =
+                emulated_mesh->max_primitives * emulated_mesh->primitive_vertices;
+            switch (emulated_mesh->topology) {
+            case 0:
+                emulated_topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+                break;
+            case 1:
+                emulated_topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+                break;
+            default:
+                emulated_topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+                break;
+            }
+        }
         if (gpl_set) {
             CreateShaderSetObjects(*gpl_set, pipeline->descriptors, push_stages);
         }
@@ -455,6 +593,17 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::AssembleGraphics(
             }
             const Disk::ShaderRecord& record = *stage->record;
             flags |= record.flags;
+            if (emulated_mesh && record.stage != STAGE_FRAGMENT) {
+                if (record.stage == STAGE_TASK || record.stage == STAGE_MESH) {
+                    auto& emulation = *pipeline->mesh_emulation;
+                    const auto module = CreateModule(device, record.spirv);
+                    auto& mesh_stage = record.stage == STAGE_TASK ? emulation.task_pipeline
+                                                                  : emulation.mesh_pipeline;
+                    mesh_stage =
+                        CreateCompute(device, *layout->layout, *module, *vk_cache, &record);
+                }
+                continue;
+            }
             has_tessellation |=
                 record.stage == STAGE_TESS_CONTROL || record.stage == STAGE_TESS_EVAL;
             VkShaderModule module = VK_NULL_HANDLE;
@@ -462,13 +611,7 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::AssembleGraphics(
                 // The set's modules: their handles are part of the library keys.
                 module = *gpl_set->modules[record.stage];
             } else {
-                modules.push_back(device.GetLogical().CreateShaderModule({
-                    .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-                    .pNext = nullptr,
-                    .flags = 0,
-                    .codeSize = record.spirv.size() * sizeof(u32),
-                    .pCode = record.spirv.data(),
-                }));
+                modules.push_back(CreateModule(device, record.spirv));
                 module = *modules.back();
             }
             stage_infos.push_back({
@@ -481,8 +624,18 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::AssembleGraphics(
                 .pSpecializationInfo = nullptr,
             });
         }
+        if (emulated_mesh) {
+            modules.push_back(CreateModule(device, emulated_mesh->vertex_spirv));
+            stage_infos.push_back({
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                .stage = VK_SHADER_STAGE_VERTEX_BIT,
+                .module = *modules.back(),
+                .pName = "main",
+            });
+        }
         u32 viewport_count = 1;
-        if ((flags & Disk::SHADER_STORES_VIEWPORT_INDEX) != 0 && device.SupportsMultiViewport()) {
+        if (!emulated_mesh && (flags & Disk::SHADER_STORES_VIEWPORT_INDEX) != 0 &&
+            device.SupportsMultiViewport()) {
             viewport_count = std::min<u32>(MAX_VIEWPORTS, device.GetMaxViewports());
         }
         const StageArtifact* const vertex = stages[STAGE_VERTEX];
@@ -542,6 +695,7 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::AssembleGraphics(
                 .color_outputs_written = pipeline->color_outputs_written,
                 .has_tessellation = has_tessellation,
                 .mesh = mesh,
+                .emulated_mesh_topology = emulated_topology,
                 .vertex_input = vertex_input_mode,
                 .dynamic_fixed = pipeline->dynamic_fixed,
                 .dynamic_blend = pipeline->dynamic_blend,

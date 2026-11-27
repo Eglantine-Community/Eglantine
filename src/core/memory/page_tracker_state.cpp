@@ -71,8 +71,8 @@ void PageTrackerState::RunEmitter::Flush() {
 
 template <typename Func>
 void PageTrackerState::ForEachOwner(u64 page_begin, u64 page_end, Func&& func) const {
-    // Owners are sorted by their first page; the longest range bounds how far back one can start
-    // and still reach page_begin.
+    // Owners starting after the range cannot overlap it. Stop walking backwards once this owner
+    // and all earlier owners also end before the range.
     auto it = std::upper_bound(owners.begin(), owners.end(), page_end - 1,
                                [](u64 page, const std::unique_ptr<Owner>& owner) {
                                    return page < owner->page_begin;
@@ -80,7 +80,7 @@ void PageTrackerState::ForEachOwner(u64 page_begin, u64 page_end, Func&& func) c
     while (it != owners.begin()) {
         --it;
         Owner& owner = **it;
-        if (owner.page_begin + max_pages <= page_begin) {
+        if (owner.prefix_max_end <= page_begin) {
             break;
         }
         if (owner.page_end > page_begin) {
@@ -108,12 +108,8 @@ void PageTrackerState::TrackedSpans(u64 page_begin, u64 page_end) {
 }
 
 PageTrackerState::Owner* PageTrackerState::Find(u64 id) {
-    for (const auto& owner : owners) {
-        if (owner->id == id) {
-            return owner.get();
-        }
-    }
-    return nullptr;
+    const auto it = owners_by_id.find(id);
+    return it == owners_by_id.end() ? nullptr : it->second;
 }
 
 const PageTrackerState::Owner* PageTrackerState::Find(u64 id) const {
@@ -133,10 +129,15 @@ PageClaim PageTrackerState::ClaimOf(u64 page, bool& tracked) const {
     return claim;
 }
 
-void PageTrackerState::RecomputeMaxPages() {
-    max_pages = 0;
-    for (const auto& owner : owners) {
-        max_pages = (std::max)(max_pages, owner->page_end - owner->page_begin);
+void PageTrackerState::UpdatePrefixMaxEnds(size_t first) {
+    u64 max_end = first == 0 ? 0 : owners[first - 1]->prefix_max_end;
+    for (size_t i = first; i < owners.size(); ++i) {
+        Owner& owner = *owners[i];
+        max_end = (std::max)(max_end, owner.page_end);
+        if (owner.prefix_max_end == max_end) {
+            break;
+        }
+        owner.prefix_max_end = max_end;
     }
 }
 
@@ -167,8 +168,14 @@ u64 PageTrackerState::Register(u64 page_begin, u64 page_end, bool armed) {
                                            [](u64 page, const std::unique_ptr<Owner>& other) {
                                                return page < other->page_begin;
                                            });
-    owners.insert(position, std::move(owner));
-    max_pages = (std::max)(max_pages, pages);
+    const auto inserted = owners.insert(position, std::move(owner));
+    try {
+        owners_by_id.emplace(id, inserted->get());
+    } catch (...) {
+        owners.erase(inserted);
+        throw;
+    }
+    UpdatePrefixMaxEnds(static_cast<size_t>(inserted - owners.begin()));
     owner_count.fetch_add(1, std::memory_order_release);
     if (armed) {
         RunEmitter emitter{sink};
@@ -186,9 +193,11 @@ void PageTrackerState::Unregister(u64 id) {
     if (it == owners.end()) {
         return;
     }
+    const size_t position = static_cast<size_t>(it - owners.begin());
     const std::unique_ptr<Owner> owner = std::move(*it);
     owners.erase(it);
-    RecomputeMaxPages();
+    owners_by_id.erase(id);
+    UpdatePrefixMaxEnds(position);
     access_pages.fetch_sub(owner->access.Size(), std::memory_order_release);
     owner_count.fetch_sub(1, std::memory_order_release);
     RunEmitter emitter{sink};

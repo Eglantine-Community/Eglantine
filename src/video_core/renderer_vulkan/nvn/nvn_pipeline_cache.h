@@ -403,9 +403,21 @@ struct GraphicsPipeline : PipelineBase {
     /// The pipeline declares VK_DYNAMIC_STATE_VERTEX_INPUT_EXT: the replay must
     /// vkCmdSetVertexInputEXT before drawing with it (`BuildVertexInput`).
     bool dynamic_vertex_input{};
-    /// Task/mesh pipeline (VK_EXT_mesh_shader): no vertex input or input assembly; drawn with
-    /// vkCmdDrawMeshTasks*EXT only.
+    /// Task/mesh pipeline (VK_EXT_mesh_shader or compute mesh emulation): no vertex input or
+    /// input assembly from the guest.
     bool mesh{};
+    /// When the Vulkan device lacks VK_EXT_mesh_shader, task/mesh pipelines run through compute
+    /// shaders writing an output buffer, then draw it with an emulated vertex shader.
+    struct MeshEmulation {
+        bool has_task{};
+        u32 output_binding{};
+        u32 payload_stride{};
+        u32 block_words{};
+        u32 vertices_per_group{};
+        vk::Pipeline task_pipeline;
+        vk::Pipeline mesh_pipeline;
+    };
+    std::optional<MeshEmulation> mesh_emulation;
     /// The pipeline declares the states of DynamicFixedState dynamic (GPL path): the replay sets
     /// `fixed_values` after binding it.
     bool dynamic_fixed{};
@@ -447,6 +459,10 @@ struct ComputeRequest {
 
 struct ComputePipeline : PipelineBase {
     std::atomic<bool> prefetched_unused{};
+    bool prefetched_at_creation{};
+    /// The portable record of a before-binding prefetch, held until its first matching lookup.
+    /// Guarded by the pipeline cache mutex.
+    std::shared_ptr<const Disk::ShaderRecord> deferred_prefetch_shader;
 };
 
 struct PipelineCacheOptions {
@@ -544,6 +560,20 @@ struct PipelineCacheStats {
     u64 lowered_programs{}; ///< lowered stage programs held now
 };
 
+/// Shared compute helper pipelines used by compute mesh emulation (distribution and indirect
+/// argument clamping). Owned lazily by PipelineCache.
+struct MeshEmulationHelpers {
+    vk::DescriptorSetLayout distribution_set_layout;
+    vk::PipelineLayout distribution_layout;
+    vk::Pipeline distribution_pipeline;
+    vk::DescriptorSetLayout indirect_dist_set_layout;
+    vk::PipelineLayout indirect_dist_layout;
+    vk::Pipeline indirect_dist_pipeline;
+    vk::DescriptorSetLayout indirect_clamp_set_layout;
+    vk::PipelineLayout indirect_clamp_layout;
+    vk::Pipeline indirect_clamp_pipeline;
+};
+
 /// Attachment clear bits passed to `PipelineCache::GetRenderPass` to turn `LOAD_OP_LOAD` into
 /// `LOAD_OP_CLEAR` while keeping render-pass compatibility with `clear_mask == 0` pipelines.
 /// Bits 0..7 select color attachment slots 0..7; `RENDER_PASS_CLEAR_DEPTH` and
@@ -608,6 +638,8 @@ public:
 
     /// The Shader::Profile / HostTranslateInfo built from the device (as vk_pipeline_cache.cpp).
     [[nodiscard]] const Shader::Profile& Profile() const noexcept;
+    /// Helper compute pipelines for compute mesh emulation when !VK_EXT_mesh_shader (null on error).
+    [[nodiscard]] const MeshEmulationHelpers* GetMeshEmulationHelpers();
     /// Dynamic when the device supports VK_EXT_vertex_input_dynamic_state (and the options allow
     /// it), regardless of the legacy renderer's `vertex_input_dynamic_state` user setting.
     [[nodiscard]] VertexInputMode VertexInput() const noexcept;

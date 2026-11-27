@@ -24,6 +24,7 @@
 #include "common/host_memory.h"
 #include "common/literals.h"
 #include "video_core/nvn/guest_memory.h"
+#include "video_core/nvn/nvn_types.h"
 #include "video_core/nvn/queue_sync.h"
 #include "video_core/nvn/record.h"
 #include "video_core/nvn/sink.h"
@@ -869,6 +870,130 @@ TEST_CASE("NVN Vulkan: clear a texture and copy it to a buffer", "[nvn]") {
     }
     SECTION("device-local mirror") {
         RunClearAndCopy(*vulkan, false, "forced mirror pool path");
+    }
+}
+
+TEST_CASE("NVN Vulkan: texture copies convert noninteger color with different texel sizes",
+          "[nvn]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    constexpr u32 SIZE = 4;
+    constexpr u64 TEXTURE_POOL = 1;
+    constexpr u64 BUFFER_POOL = 2;
+    constexpr u64 SRC = 3;
+    constexpr u64 DST = 4;
+    constexpr u64 TEXTURE_POOL_VA = 0x1000'0000;
+    constexpr u64 BUFFER_POOL_VA = 0x2000'0000;
+    using Format = VC::NVNformat;
+
+    Format src_format{};
+    Format dst_format{};
+    VkFormat src_host{};
+    VkFormat dst_host{};
+    bool byte_copy = false;
+    std::array<float, 4> color{-1.5f, -0.5f, 0.25f, 1.5f};
+    SECTION("RGBA32F to RG32F") {
+        src_format = Format::RGBA32F;
+        dst_format = Format::RG32F;
+        src_host = VK_FORMAT_R32G32B32A32_SFLOAT;
+        dst_host = VK_FORMAT_R32G32_SFLOAT;
+    }
+    SECTION("RGBA16F to RGBA8SN") {
+        src_format = Format::RGBA16F;
+        dst_format = Format::RGBA8SN;
+        src_host = VK_FORMAT_R16G16B16A16_SFLOAT;
+        dst_host = VK_FORMAT_A8B8G8R8_SNORM_PACK32;
+    }
+    SECTION("equal texel size retains raw bytes") {
+        src_format = Format::RGBA8;
+        dst_format = Format::RGBA8SN;
+        src_host = VK_FORMAT_A8B8G8R8_UNORM_PACK32;
+        dst_host = VK_FORMAT_A8B8G8R8_SNORM_PACK32;
+        color = {1.0f, 0.0f, 0.0f, 1.0f};
+        byte_copy = true;
+    }
+    constexpr VkFormatFeatureFlags TRANSFER =
+        VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+    const VkFormatFeatureFlags src_features =
+        TRANSFER | (byte_copy ? 0 : VK_FORMAT_FEATURE_BLIT_SRC_BIT);
+    const VkFormatFeatureFlags dst_features =
+        TRANSFER | (byte_copy ? 0 : VK_FORMAT_FEATURE_BLIT_DST_BIT);
+    if (!vulkan->device->IsFormatSupported(src_host, src_features, Vulkan::FormatType::Optimal) ||
+        !vulkan->device->IsFormatSupported(dst_host, dst_features, Vulkan::FormatType::Optimal)) {
+        SKIP("device cannot transfer the required texture formats");
+    }
+
+    FakeMemory memory;
+    memory.Add(TEXTURE_POOL_VA, 1_MiB);
+    const u8* readback = memory.Add(BUFFER_POOL_VA, 64_KiB);
+    Vulkan::Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr,
+                                 {.allow_host_import = false});
+    context.SetGuestMemory(&memory);
+    context.CreatePool({.serial = TEXTURE_POOL,
+                        .guest_address = TEXTURE_POOL_VA,
+                        .size = 1_MiB,
+                        .flags = POOL_CPU_NO_ACCESS});
+    context.CreatePool({.serial = BUFFER_POOL,
+                        .guest_address = BUFFER_POOL_VA,
+                        .size = 64_KiB,
+                        .flags = POOL_CPU_CACHED});
+    auto src = MakeRgba8Texture(SRC, TEXTURE_POOL, 0, SIZE, SIZE);
+    auto dst = MakeRgba8Texture(DST, TEXTURE_POOL, 64_KiB, SIZE, SIZE);
+    src.format = static_cast<s32>(src_format);
+    dst.format = static_cast<s32>(dst_format);
+    context.CreateTexture(src);
+    context.CreateTexture(dst);
+
+    std::vector<u64> list;
+    VC::ClearTexturePayload clear{
+        .texture = {.serial = SRC}, .region = {0, 0, 0, SIZE, SIZE, 1}, .layer_count = 1};
+    std::memcpy(clear.color, color.data(), sizeof(clear.color));
+    Push(list, VC::Op::ClearTexture, clear, 0xF);
+    clear.texture.serial = DST;
+    std::memset(clear.color, 0, sizeof(clear.color));
+    Push(list, VC::Op::ClearTexture, clear, 0xF);
+    const VC::CopyTextureToTexturePayload copy{.src = {.serial = SRC},
+                                               .src_region = {1, 0, 0, 2, 2, 1},
+                                               .dst = {.serial = DST},
+                                               .dst_region = {1, 1, 0, 2, 2, 1}};
+    Push(list, VC::Op::CopyTextureToTexture, copy);
+    const VC::CopyBufferTexturePayload download{
+        .buffer = BUFFER_POOL_VA, .texture = {.serial = DST}, .region = {0, 0, 0, SIZE, SIZE, 1}};
+    Push(list, VC::Op::CopyTextureToBuffer, download);
+    PushEnd(list);
+    context.Submit(MakeSubmission(1, 0, std::move(list), {SRC, DST}));
+    REQUIRE(context.Wait(1, 20s));
+    CHECK(context.Stats().ops_failed == 0);
+    CHECK(context.Stats().ops_unsupported == 0);
+
+    for (u32 y = 0; y < SIZE; ++y) {
+        for (u32 x = 0; x < SIZE; ++x) {
+            CAPTURE(x, y);
+            const bool inside = x >= 1 && x < 3 && y >= 1 && y < 3;
+            const u32 pixel = (y * SIZE) + x;
+            if (dst_format == Format::RG32F) {
+                std::array<float, 2> actual{};
+                std::memcpy(actual.data(), readback + pixel * sizeof(actual), sizeof(actual));
+                CHECK(actual[0] == (inside ? color[0] : 0.0f));
+                CHECK(actual[1] == (inside ? color[1] : 0.0f));
+            } else if (byte_copy) {
+                std::array<u8, 4> actual{};
+                std::memcpy(actual.data(), readback + pixel * sizeof(actual), sizeof(actual));
+                const std::array<u8, 4> expected =
+                    inside ? std::array<u8, 4>{255, 0, 0, 255} : std::array<u8, 4>{};
+                CHECK(actual == expected);
+            } else {
+                std::array<s8, 4> actual{};
+                std::memcpy(actual.data(), readback + pixel * sizeof(actual), sizeof(actual));
+                constexpr std::array<s8, 4> expected{-127, -64, 32, 127};
+                for (size_t channel = 0; channel < actual.size(); ++channel) {
+                    CHECK(std::abs(int(actual[channel]) - (inside ? expected[channel] : 0)) <=
+                          (inside ? 1 : 0));
+                }
+            }
+        }
     }
 }
 

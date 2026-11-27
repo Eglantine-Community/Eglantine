@@ -30,6 +30,28 @@ namespace {
 constexpr u64 MAX_UNIFORM_RANGE = 65536;
 constexpr u64 ZERO_SIZE_RANGE_MAX = u64{8} << 20; // longest range of a size-0 storage entry
 
+void CopyInlineUniformBytes(u8* destination, const u8* source, size_t size) {
+    // Most inline uniform writes are a scalar, a vector, or a matrix. Use constant-size
+    // copies here so the replay loop can copy them inline, including unaligned fragments.
+    switch (size) {
+    case 4:
+        std::memcpy(destination, source, 4);
+        break;
+    case 8:
+        std::memcpy(destination, source, 8);
+        break;
+    case 16:
+        std::memcpy(destination, source, 16);
+        break;
+    case 64:
+        std::memcpy(destination, source, 64);
+        break;
+    default:
+        std::memcpy(destination, source, size);
+        break;
+    }
+}
+
 enum class TargetKind { Dim1D, Dim2D, Dim3D, Dim1DArray, Dim2DArray, Cube, CubeArray, Buffer, Rect };
 
 Shader::TextureType TypeOfTarget(s32 target) {
@@ -915,7 +937,8 @@ std::shared_ptr<Texture> DrawContext::ScaledTextureFor(Texture& texture, bool gr
     return use_twin ? impl.ScaledTextureOf(texture) : nullptr;
 }
 
-bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool graphics) {
+bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool graphics,
+                                   size_t mesh_buffers) {
     plan.graphics = graphics;
     if (graphics) {
         compute_groups = {};
@@ -952,8 +975,8 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
     for (const VC::DescriptorBinding& binding : layout.bindings) {
         total += binding.count;
     }
-    scratch_writes.reserve(layout.bindings.size());
-    scratch_buffers.reserve(total);
+    scratch_writes.reserve(layout.bindings.size() + mesh_buffers);
+    scratch_buffers.reserve(total + mesh_buffers);
     scratch_images.reserve(total);
     scratch_views.reserve(total);
 
@@ -1233,8 +1256,8 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                     const u64 begin = (std::max)(update.address, binding.address);
                     const u64 end = (std::min)(update.address + update.size, binding.address + size);
                     if (begin < end) {
-                        std::memcpy(pointer + (begin - binding.address),
-                                    update.data + (begin - update.address), end - begin);
+                        CopyInlineUniformBytes(pointer + (begin - binding.address),
+                                               update.data + (begin - update.address), end - begin);
                     }
                 }
                 return VkDescriptorBufferInfo{copy.buffer, copy.offset, size};
@@ -2463,7 +2486,9 @@ bool DrawContext::PushPlan(PipelineBase& pipe, DrawPlan& plan, VkPipelineBindPoi
     static_assert(Rescale::PUSH_WORDS == 6);
     PassBoundState::PushWords pushed;
     pushed.words = plan.rescale_words.Get();
-    if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS && targets_scaled) {
+    const bool graphics_constants = bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS ||
+                                    (pipe.push_constant_stages & VK_SHADER_STAGE_VERTEX_BIT) != 0;
+    if (graphics_constants && targets_scaled) {
         pushed.down_factor = target_scale.DownFactor();
     }
     if (pipe.descriptors.UsesPushConstants() && pipe.layout &&
@@ -2472,7 +2497,7 @@ bool DrawContext::PushPlan(PipelineBase& pipe, DrawPlan& plan, VkPipelineBindPoi
     } else if (pipe.descriptors.UsesPushConstants() && pipe.layout) {
         using namespace Shader::Backend::SPIRV;
         const VkShaderStageFlags stage_flags = pipe.push_constant_stages;
-        if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+        if (graphics_constants) {
             struct ScalingConstants {
                 std::array<u32, Rescale::PUSH_WORDS> words;
                 f32 down_factor;

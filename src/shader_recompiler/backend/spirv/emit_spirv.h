@@ -92,11 +92,29 @@ constexpr u32 MESH_EMULATION_ARGS_BASE = 8;
 constexpr u32 MESH_EMULATION_ARGS_TASKS = 9;
 constexpr u32 MESH_EMULATION_ARGS_WORDS = 10;
 
-/// Distribution pass (one invocation) between the task and mesh dispatches, set 0: payload
-/// buffer (binding 0), offsets (1: first mesh workgroup of each task), arguments (2) and the
-/// arena counter (3: output words allocated so far, kept counting past the arena's end). The
-/// draw's output is allocated from the arena every draw of the submission shares; mesh
-/// workgroups that do not fit are not dispatched.
-[[nodiscard]] std::vector<u32> EmitMeshEmulationDistribution(const Profile& profile);
+enum class MeshDistribution {
+    SharedArena,
+    DedicatedOutput,
+    DedicatedOutputIndirect,
+};
+
+/// Distribution writes task offsets and mesh dispatch/draw arguments. Binding 3 is the arena
+/// counter in SharedArena mode and the indirect task arguments in DedicatedOutputIndirect mode.
+[[nodiscard]] std::vector<u32> EmitMeshEmulationDistribution(
+    const Profile& profile, MeshDistribution mode = MeshDistribution::SharedArena);
+
+/// Clamps a guest {count, first} record, optionally gated by the GPU's draw count.
+struct MeshEmulationIndirectConstants {
+    u32 max_groups;
+    u32 vertices_per_group;
+    u32 argument_word;
+    u32 count_word;
+    u32 draw_index;
+    u32 counted;
+};
+constexpr u32 MESH_EMULATION_CLAMP_DRAW_OFFSET = 3 * sizeof(u32);
+constexpr u32 MESH_EMULATION_CLAMP_WORDS = 7;
+
+[[nodiscard]] std::vector<u32> EmitMeshEmulationIndirectClamp(const Profile& profile);
 
 } // namespace Shader::Backend::SPIRV

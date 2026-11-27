@@ -126,7 +126,8 @@ void TranslateBlock(Environment& env, IR::Block* block, std::span<const Instruct
         case 0x81a:
             visitor.SGXT(insn);
             break;
-        case 0x816: case 0x896:
+        case 0x216: case 0x416: case 0x616: case 0x816: case 0xa16: case 0xc16: case 0xe16:
+        case 0x296: case 0x496: case 0x896:
             visitor.PRMT(insn);
             break;
         case 0x300: case 0xd00: case 0x2bd:

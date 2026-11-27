@@ -80,6 +80,7 @@ class WriteBackMerge;
 class SparseBacking;
 class SparsePagePool;
 struct DrawResources;
+struct TextureViews;
 class DrawContext;
 class PresentChain;
 
@@ -511,10 +512,9 @@ struct Texture {
     VC::TextureDesc desc{};
     std::shared_ptr<Storage> storage; ///< Null when the image could not be created.
     HostFormat host;                  ///< Format of this texture object (views).
-    /// DrawResources::GetView: this texture's TextureViews (a texture_views node) and the
-    /// DrawResources::views_epoch it was found at. Replay thread only.
-    void* view_slot{};
-    u64 view_slot_epoch{0};
+    /// Its DrawResources view node, cleared before detaching the node. Replay thread only.
+    mutable TextureViews* view_slot{};
+    mutable u64 view_slot_epoch{};
     /// The scaled twin of this texture object (Impl::ScaledTextureOf), for views of the twin
     /// storage; null until a scaled pass or sampled read needs it. It goes with the texture.
     std::shared_ptr<Texture> scaled;
@@ -1676,6 +1676,8 @@ struct Context::Impl {
                                                                    u64 budget, u32 width,
                                                                    u32 height, u32 layers);
     [[nodiscard]] std::shared_ptr<BcScratch> AcquireBcScratch(u32 width, u32 height, u32 layers);
+    [[nodiscard]] u64 BcScratchCacheBytes() const;
+    u64 TrimBcScratchCache(u64 target_bytes);
     [[nodiscard]] std::shared_ptr<BcScratch> AcquireBcScratchSlot(size_t slot, u32 width,
                                                                    u32 height, u32 layers);
     /// Bumped whenever a storage tracked by a bindless table changes image/validity/format/caps.

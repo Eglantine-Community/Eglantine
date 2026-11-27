@@ -356,9 +356,11 @@ struct PipelineCache::Impl {
         const VC::NvnEnvironmentOptions* environment{};
         u64 extra_key{};
     };
+    using EmulatedMeshArtifact = Disk::EmulatedMeshArtifact;
     struct TranslateOutput {
         std::array<StageArtifact, STAGE_COUNT> stages;
         VC::ComputeDriverLayout compute_layout;
+        EmulatedMeshArtifact mesh_emulation;
         /// Shader log only (filled while `ShaderLog::Enabled()`): IR text and constant buffer
         /// use of the stages translated so far, also when a later stage failed.
         std::array<std::string, STAGE_COUNT> ir;
@@ -375,7 +377,8 @@ struct PipelineCache::Impl {
     bool CanUsePush(u32 descriptor_count) const;
     /// `push_stages`: the stages of the push-constant range (PipelineBase::push_constant_stages).
     std::shared_ptr<const SharedPipelineLayout> CreateLayoutObjects(
-        const VC::DescriptorLayout& descriptors, bool is_compute, VkShaderStageFlags push_stages);
+        const VC::DescriptorLayout& descriptors, bool is_compute, VkShaderStageFlags push_stages,
+        const EmulatedMeshArtifact* emulated_mesh = nullptr);
     VC::DescriptorLayout MergeLayouts(std::span<const StageArtifact* const> stages);
     struct ShaderSet;
     /// Without `gpl_set` the pipeline is compiled whole from modules made for the call. With it
@@ -386,7 +389,9 @@ struct PipelineCache::Impl {
     std::shared_ptr<GraphicsPipeline> AssembleGraphics(
         const GraphicsFixedState& state, const RenderPassKey& targets,
         const std::array<const StageArtifact*, GRAPHICS_STAGE_COUNT>& stages,
-        const std::shared_ptr<ShaderSet>& gpl_set = {}, bool warm_parts = false);
+        const std::shared_ptr<ShaderSet>& gpl_set = {}, bool warm_parts = false,
+        const EmulatedMeshArtifact* emulated_mesh = nullptr);
+    const MeshEmulationHelpers* GetMeshEmulationHelpers();
     std::shared_ptr<ComputePipeline> AssembleCompute(const StageArtifact& stage,
                                                      const VC::ComputeDriverLayout& layout);
     void FillStages(PipelineBase& pipeline, std::span<const StageArtifact* const> stages);
@@ -536,7 +541,7 @@ struct PipelineCache::Impl {
     /// Drops one claim on `pending` (and the map entry when it was the last), wakes waiters.
     template <typename Map, typename Key>
     void ReleasePending(Map& map, const Key& key, const std::shared_ptr<PendingKey>& pending);
-    void AsyncQueued();
+    bool AsyncQueued(size_t limit = 0);
     void AsyncDone();
 
     // --- shader log (nvn_pipeline_log.cpp; every entry is a no-op unless ShaderLog::Enabled()) --
@@ -568,6 +573,8 @@ struct PipelineCache::Impl {
     void PostShader(const StageArtifact& artifact);
     void PostGraphicsRecord(const Disk::GraphicsPipelineRecord& record);
     void PostComputeRecord(const Disk::ComputePipelineRecord& record);
+    void PostComputePipeline(const StageArtifact& stage, const ComputeKey& key,
+                             const ComputePipeline& pipeline);
     void PostBytes(std::vector<u8> bytes);
     void MaybeWriteVkCache();
     void WriteVkCache();
@@ -665,6 +672,9 @@ struct PipelineCache::Impl {
 
     std::mutex layout_cache_mutex;
     std::map<std::vector<u32>, std::shared_ptr<const SharedPipelineLayout>> layout_cache;
+    std::mutex mesh_helpers_mutex;
+    std::unique_ptr<MeshEmulationHelpers> mesh_helpers;
+    bool mesh_helpers_failed{};
 
     mutable std::mutex pipeline_mutex;
     std::unordered_map<GraphicsKey, std::vector<std::shared_ptr<GraphicsPipeline>>, GraphicsKeyHash,
@@ -678,6 +688,7 @@ struct PipelineCache::Impl {
     /// Keys whose asynchronous compile produced no pipeline (guarded by pipeline_mutex).
     std::unordered_set<GraphicsKey, GraphicsKeyHash, GraphicsKeyEqual> failed_graphics;
     std::unordered_set<ComputeKey, ComputeKeyHash> failed_compute;
+    u32 unused_compute_prefetches{}; ///< Protected by pipeline_mutex.
 
     std::mutex written_mutex;
     std::unordered_set<Disk::ContentId, Disk::ContentIdHash> written_shaders;

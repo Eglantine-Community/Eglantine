@@ -403,7 +403,7 @@ bool DecodeShader(std::span<const u8> payload, ShaderRecord& out) {
     return r.AtEnd() && !out.id.IsZero();
 }
 
-bool DecodeGraphics(std::span<const u8> payload, GraphicsPipelineRecord& out) {
+bool DecodeGraphics(std::span<const u8> payload, GraphicsPipelineRecord& out, bool emulated_mesh) {
     Reader r{payload};
     out = {};
     for (ContentId& id : out.shaders) {
@@ -417,8 +417,41 @@ bool DecodeGraphics(std::span<const u8> payload, GraphicsPipelineRecord& out) {
     out.push_constant_size = r.U32();
     out.viewport_count = r.U32();
     // A graphics pipeline has a vertex program or (task/mesh pipeline) a mesh program.
-    return r.Ok() && r.AtEnd() && out.viewport_count >= 1 && out.viewport_count <= MAX_VIEWPORTS &&
-           (!out.shaders[0].IsZero() || !out.shaders[STAGE_MESH].IsZero());
+    if (!r.Ok() || out.viewport_count < 1 || out.viewport_count > MAX_VIEWPORTS ||
+        (out.shaders[0].IsZero() && out.shaders[STAGE_MESH].IsZero())) {
+        return false;
+    }
+    if (emulated_mesh) {
+        for (const u32 stage : {0U, 2U, 3U, 4U, STAGE_COMPUTE}) {
+            if (!out.shaders[stage].IsZero()) {
+                return false;
+            }
+        }
+        auto& mesh = out.emulated_mesh.emplace();
+        mesh.has_task = !out.shaders[STAGE_TASK].IsZero();
+        mesh.output_binding = r.U32();
+        mesh.payload_stride = r.U32();
+        mesh.block_words = r.U32();
+        mesh.max_primitives = r.U32();
+        mesh.topology = r.U32();
+        if (!r.Ok() || mesh.output_binding > MAX_BINDINGS ||
+            (mesh.has_task ? mesh.payload_stride < 2 : mesh.payload_stride != 0) ||
+            (mesh.topology != 0 && mesh.topology != 1 && mesh.topology != 4)) {
+            return false;
+        }
+        if (mesh.has_task) {
+            mesh.payload_binding = mesh.output_binding + 1;
+            mesh.offsets_binding = mesh.output_binding + 2;
+            mesh.args_binding = mesh.output_binding + 3;
+        }
+        mesh.primitive_vertices = mesh.topology == 0 ? 1U : mesh.topology == 1 ? 2U : 3U;
+        if (u64{mesh.max_primitives} * mesh.primitive_vertices > mesh.block_words ||
+            !r.Words(mesh.vertex_spirv, MAX_WORDS) || mesh.vertex_spirv.size() < 5 ||
+            mesh.vertex_spirv[0] != SPIRV_MAGIC) {
+            return false;
+        }
+    }
+    return r.AtEnd();
 }
 
 void WriteComputeLayout(Writer& w, const VC::ComputeDriverLayout& c) {
@@ -674,6 +707,16 @@ std::vector<u8> EncodeGraphicsPipeline(const GraphicsPipelineRecord& record) {
     WriteTargets(w, record.targets);
     w.U32(record.push_constant_size);
     w.U32(record.viewport_count);
+    if (record.emulated_mesh) {
+        const auto& mesh = *record.emulated_mesh;
+        w.U32(mesh.output_binding);
+        w.U32(mesh.payload_stride);
+        w.U32(mesh.block_words);
+        w.U32(mesh.max_primitives);
+        w.U32(mesh.topology);
+        w.Words(mesh.vertex_spirv);
+        return Frame(RecordType::EmulatedMeshPipeline, w.data);
+    }
     return Frame(RecordType::GraphicsPipeline, w.data);
 }
 
@@ -781,11 +824,13 @@ LoadResult Parse(std::span<const u8> bytes, const Header& expected, Contents& co
                 }
                 break;
             }
-            case RecordType::GraphicsPipeline: {
+            case RecordType::GraphicsPipeline:
+            case RecordType::EmulatedMeshPipeline: {
                 GraphicsPipelineRecord record;
-                decoded = DecodeGraphics(payload, record);
+                decoded = DecodeGraphics(payload, record,
+                                         type == static_cast<u32>(RecordType::EmulatedMeshPipeline));
                 if (decoded) {
-                    contents.graphics.push_back(record);
+                    contents.graphics.push_back(std::move(record));
                 }
                 break;
             }

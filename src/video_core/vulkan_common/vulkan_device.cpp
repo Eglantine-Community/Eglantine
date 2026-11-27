@@ -1139,6 +1139,17 @@ bool Device::ShouldBoostClocks() const {
     return validated_driver && !is_steam_deck && !is_debugging;
 }
 
+bool Device::CanRequireGuestWarpForCompute(const std::array<u32, 3>& workgroup_size) const {
+    const auto [x, y, z] = workgroup_size;
+    if (!extensions.subgroup_size_control ||
+        !IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT) || x == 0 || y == 0 || z == 0) {
+        return false;
+    }
+    const u64 max_threads =
+        u64{GuestWarpSize} * properties.subgroup_size_control.maxComputeWorkgroupSubgroups;
+    return x <= max_threads / y / z;
+}
+
 bool Device::HasTimelineSemaphore() const {
     if (GetDriverID() == VK_DRIVER_ID_MESA_TURNIP) {
         return false;

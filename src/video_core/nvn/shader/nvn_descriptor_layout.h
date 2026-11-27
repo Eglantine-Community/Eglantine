@@ -137,8 +137,7 @@ struct DescriptorLayout {
     /// Every stage that stores raw global memory writes each store through to the mirror alias
     /// table (RawStoresWrittenThrough). False when no stage stores.
     bool raw_stores_written_through{};
-    /// A compute program that must run 32 threads per subgroup (the compact tensor helper
-    /// shuffles across the warp): its pipeline asks for a required subgroup size of 32.
+    /// A compute stage requires a 32-thread subgroup when the device supports it.
     bool requires_guest_warp{};
     /// A stage samples through the replay's bindless table (set Shader::BINDLESS_SET): the
     /// pipeline layout carries that set and the draw binds it.

@@ -493,6 +493,10 @@ std::shared_ptr<BcScratch> MakeBcScratch(const Device& device, const MemoryAlloc
         .pQueueFamilyIndices = nullptr,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
     });
+    if (scratch->image.IsUnbacked()) {
+        vk::Check(VK_ERROR_OUT_OF_DEVICE_MEMORY);
+    }
+    scratch->allocated_bytes = scratch->image.GetMemoryBlock().size;
     scratch->view = device.GetLogical().CreateImageView({
         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
         .pNext = nullptr,
@@ -526,6 +530,8 @@ std::shared_ptr<BcScratch> MakeBcScratch(const Device& device, const MemoryAlloc
             .pQueueFamilyIndices = nullptr,
         },
         MemoryUsage::DeviceLocal);
+    const auto& logical = device.GetLogical();
+    scratch->allocated_bytes += logical.GetBufferMemoryRequirements(*scratch->blocks).size;
     if (bc7) {
         scratch->modes = allocator.CreateBuffer(
             VkBufferCreateInfo{
@@ -539,6 +545,7 @@ std::shared_ptr<BcScratch> MakeBcScratch(const Device& device, const MemoryAlloc
                 .pQueueFamilyIndices = nullptr,
             },
             MemoryUsage::DeviceLocal);
+        scratch->allocated_bytes += logical.GetBufferMemoryRequirements(*scratch->modes).size;
     }
     return scratch;
 }

@@ -3,7 +3,6 @@
 
 #include <array>
 #include <bit>
-#include <cstdlib>
 
 #include "shader_recompiler/frontend/ampere/control_flow.h"
 #include "shader_recompiler/frontend/ampere/translate/impl/impl.h"
@@ -13,15 +12,7 @@
 namespace Shader::Ampere {
 namespace {
 
-[[nodiscard]] bool StrictFpContraction() noexcept {
-    static const bool enabled = [] {
-        const char* value = std::getenv("EDEN_NX2_STRICT_FP_CONTRACT");
-        return value != nullptr && value[0] == '1';
-    }();
-    return enabled;
-}
-
-[[nodiscard]] IR::FpControl MakeFpControl(u32 rnd_bits, bool ftz, bool allow_contract) {
+[[nodiscard]] IR::FpControl MakeFpControl(u32 rnd_bits, bool ftz) {
     IR::FpRounding rounding = IR::FpRounding::RN;
     switch (rnd_bits & 3U) {
     case 0U:
@@ -37,9 +28,9 @@ namespace {
         rounding = IR::FpRounding::RZ;
         break;
     }
-    const bool no_contract = !allow_contract || (rnd_bits & 3U) != 0U || StrictFpContraction();
     return IR::FpControl{
-        .no_contraction = no_contract,
+        // Each instruction rounds independently. FFMA itself is still fused.
+        .no_contraction = true,
         .rounding = rounding,
         .fmz_mode = ftz ? IR::FmzMode::FTZ : IR::FmzMode::None,
     };
@@ -52,7 +43,7 @@ void TranslatorVisitor::FFMA(const Instruction& insn) {
     const IR::F32 a = AluSourceF32(insn, 0U);
     const IR::F32 b = AluSourceF32(insn, 1U);
     const IR::F32 c = AluSourceF32(insn, 2U);
-    const IR::FpControl control = MakeFpControl(insn.Bits(78, 2), insn.Bits(80, 1) != 0U, true);
+    const IR::FpControl control = MakeFpControl(insn.Bits(78, 2), insn.Bits(80, 1) != 0U);
 
     IR::F32 result = ir.FPFma(a, b, c, control);
     if (insn.Bits(77, 1) != 0U) {
@@ -74,7 +65,7 @@ void TranslatorVisitor::FMUL(const Instruction& insn) {
         a = ir.FPMul(a, ir.Imm32(ScaleFactors[scale]));
     }
 
-    const IR::FpControl control = MakeFpControl(insn.Bits(78, 2), insn.Bits(80, 1) != 0U, true);
+    const IR::FpControl control = MakeFpControl(insn.Bits(78, 2), insn.Bits(80, 1) != 0U);
     IR::F32 result = ir.FPMul(a, b, control);
     if (insn.Bits(77, 1) != 0U) {
         result = ir.FPSaturate(result);
@@ -88,7 +79,7 @@ void TranslatorVisitor::FADD(const Instruction& insn) {
     const u32 b_which = (form == 2U || form == 3U || form == 7U) ? 2U : 1U;
     const IR::F32 a = AluSourceF32(insn, 0U);
     const IR::F32 b = AluSourceF32(insn, b_which);
-    const IR::FpControl control = MakeFpControl(insn.Bits(78, 2), insn.Bits(80, 1) != 0U, true);
+    const IR::FpControl control = MakeFpControl(insn.Bits(78, 2), insn.Bits(80, 1) != 0U);
 
     IR::F32 result = ir.FPAdd(a, b, control);
     if (insn.Bits(77, 1) != 0U) {

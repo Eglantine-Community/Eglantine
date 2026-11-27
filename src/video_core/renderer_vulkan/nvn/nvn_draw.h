@@ -20,6 +20,7 @@
 #include <array>
 #include <bitset>
 #include <chrono>
+#include <list>
 #include <map>
 #include <optional>
 #include <memory>
@@ -298,9 +299,18 @@ struct BufferRef {
     u64 pool_offset{};
 };
 
+struct MeshDraw {
+    u32 groups{};
+    BufferRef arguments;
+    BufferRef count;
+    u32 draw_index{};
+};
+
 /// The result of PrepareDraw. The caller records the draw command.
 struct PreparedDraw {
     GraphicsPipeline* pipeline{};
+    BufferRef mesh_draw_args;
+    u32 mesh_vertex_count{};
     u32 host_topology{}; ///< NVNdrawPrimitive the host draws (after quad/loop conversion)
     bool quad_list{};    ///< QUADS: draw triangles from generated indices
     bool quad_strip{};   ///< QUAD_STRIP
@@ -368,7 +378,7 @@ public:
     /// draw, 0 for indirect and mesh draws (it decides whether the draw may skip a pipeline that is
     /// still compiling, MaySkipUnbuiltDraw).
     bool PrepareDraw(u32 mode, u32 element_count, const IndexRange* index, PreparedDraw& out,
-                     HostIndex& host_index);
+                     HostIndex& host_index, const MeshDraw* mesh_draw = nullptr);
 
     /// Pushes (or allocates and binds) the descriptors of `pipeline` for the bindings of its
     /// stages. Compute dispatches use it too (`bind_point` COMPUTE). Must be called outside a
@@ -509,9 +519,14 @@ private:
     bool GenerateIndices(const PreparedDraw& prepared, const IndexRange* source, u32 first,
                          u32 count, s32 base_vertex, HostIndex& out, u32& out_count);
     void DrawIndexed(const VC::DrawIndexedPayload& p);
-    /// Every nvnCommandBufferDrawMeshTasks* entry (nvn_draw_mesh.cpp): vkCmdDrawMeshTasks*EXT.
+    /// Every nvnCommandBufferDrawMeshTasks* entry (nvn_draw_mesh.cpp).
     void DrawMeshTasks(const VC::DrawMeshTasksPayload& p);
     void DrawMeshTasksIndirect(const VC::DrawMeshTasksPayload& p);
+    void DrawEmulatedMesh(const PreparedDraw& prepared);
+    bool PrepareEmulatedMesh(GraphicsPipeline& graphics, DrawPlan& plan, const MeshDraw& draw,
+                             PreparedDraw& prepared);
+    std::shared_ptr<ShadowChunk> mesh_scratch;
+    const ShadowChunk* mesh_scratch_kept{};
     void SetProgram(const VC::BindProgramPayload& p);
 
     // ---- storage shadows and pool mirrors (nvn_draw_shadow.cpp) ----
@@ -790,7 +805,8 @@ private:
     void ApplyDynamicState(const GraphicsPipeline& pipeline);
 
     // ---- descriptors (nvn_draw_descriptors.cpp) ----
-    bool BuildDescriptors(PipelineBase& pipeline, DrawPlan& plan, bool graphics);
+    bool BuildDescriptors(PipelineBase& pipeline, DrawPlan& plan, bool graphics,
+                          size_t mesh_buffers = 0);
     bool PrepareOutsidePass(DrawPlan& plan);
     // ---- bindless texture table (nvn_bindless.cpp) ----
     /// The replay's table of every texture and sampler the game registered, for shaders that
@@ -1069,11 +1085,12 @@ private:
     };
     struct CachedFramebuffer {
         std::shared_ptr<vk::Framebuffer> fb;
-        u64 last_used_seq{};
         u64 last_retained_seq{~u64{0}};
+        std::list<FramebufferKey>::iterator order;
     };
     static constexpr size_t FRAMEBUFFER_CACHE_MAX = 128;
     u64 framebuffer_cache_epoch{0};
+    std::list<FramebufferKey> framebuffer_cache_order; ///< newest retained sequence first
     std::unordered_map<FramebufferKey, CachedFramebuffer, FramebufferKeyHash> framebuffer_cache;
     mutable bool pass_key_valid{false};
     mutable RenderPassKey cached_pass_key{};

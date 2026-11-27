@@ -190,6 +190,9 @@ struct GraphicsPipelineParams {
     u32 color_outputs_written{};   ///< fragment shader outputs
     bool has_tessellation{};
     bool mesh{}; ///< task/mesh stages: no vertex input or input assembly state
+    /// Compute mesh emulation (device lacks VK_EXT_mesh_shader): draws with empty vertex input
+    /// and this output primitive topology (point/line/triangle list) while task/mesh run as compute.
+    std::optional<VkPrimitiveTopology> emulated_mesh_topology{};
     VertexInputMode vertex_input{VertexInputMode::Static};
     /// Declare the DynamicFixedState states dynamic (VK_DYNAMIC_STATE_CULL_MODE ...
     /// DEPTH_BIAS_ENABLE) and leave their create-info fields at fixed values, so that pipelines

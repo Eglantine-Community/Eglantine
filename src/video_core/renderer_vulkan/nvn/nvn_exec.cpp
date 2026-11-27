@@ -340,6 +340,12 @@ public:
         MarkWritten(ALL_STAGES, ALL_WRITES);
     }
     void HostMarkPassWritten(bool has_color, bool has_depth, bool shader_writes) override {
+        // Without external subpass dependencies this barrier also orders earlier reads,
+        // including read-only attachments and conditional rendering predicates.
+        if (impl.draw_resources->Cache().SyncDiet()) {
+            HostMarkWritten();
+            return;
+        }
         VkPipelineStageFlags stages = 0;
         VkAccessFlags access = 0;
         if (has_color) {
@@ -998,6 +1004,7 @@ private:
     void CopyBufferToTexture(const VC::CopyBufferTexturePayload& p);
     void CopyTextureToBuffer(const VC::CopyBufferTexturePayload& p);
     void CopyTextureToTexture(const VC::CopyTextureToTexturePayload& p);
+    bool TryConvertTextureCopy(const VC::CopyTextureToTexturePayload& p, Storage& src, Storage& dst);
     void FenceSync(const VC::FenceSyncPayload& p);
     void WaitSync(const VC::WaitSyncPayload& p);
     void SignalEvent(const VC::SignalEventPayload& p);
@@ -3765,6 +3772,7 @@ bool Recorder::RecordBcUpload(Storage& s, std::span<const BcChunk> chunks, bool 
     const bool bc_refine = s.smart_standin && impl.smart_bc.refine;
     std::array<std::shared_ptr<BcScratch>, Context::Impl::BC_SMALL_SCRATCH_COUNT> batch_scratches;
     std::array<VkImageMemoryBarrier, Context::Impl::BC_SMALL_SCRATCH_COUNT> batch_barriers;
+    std::shared_ptr<BcScratch> large_scratch;
     const auto chunk_texel_bytes = [](const BcChunk& c) {
         return u64{c.width} * c.height * c.layers * 4;
     };
@@ -3791,17 +3799,21 @@ bool Recorder::RecordBcUpload(Storage& s, std::span<const BcChunk> chunks, bool 
             }
         } else {
             const BcChunk& chunk = chunks[i];
-            std::shared_ptr<BcScratch> scratch =
-                impl.AcquireBcScratch(chunk.width, chunk.height, chunk.layers);
-            if (!scratch) {
-                if (times) {
-                    Cmd().WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *times->pool,
-                                         query + 1);
+            // Keep reusing this allocation even when it is too large for the context cache.
+            // The existing reuse barrier orders the previous batch's reads before new writes.
+            if (!large_scratch ||
+                !large_scratch->Fits(chunk.width, chunk.height, chunk.layers, bc7)) {
+                large_scratch = impl.AcquireBcScratch(chunk.width, chunk.height, chunk.layers);
+                if (!large_scratch) {
+                    if (times) {
+                        Cmd().WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *times->pool,
+                                             query + 1);
+                    }
+                    return false;
                 }
-                return false;
+                flight.keepalive.push_back(large_scratch);
             }
-            flight.keepalive.push_back(scratch);
-            batch_scratches[0] = std::move(scratch);
+            batch_scratches[0] = large_scratch;
             batch_count = 1;
         }
         // The scratches are reused across uploads/batches: whatever read or wrote them last
@@ -5979,6 +5991,65 @@ void Recorder::CopyTextureToBuffer(const VC::CopyBufferTexturePayload& p) {
     MarkWritten(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
 }
 
+bool Recorder::TryConvertTextureCopy(const VC::CopyTextureToTexturePayload& p, Storage& src,
+                                     Storage& dst) {
+    using VideoCore::Surface::IsPixelFormatInteger;
+    const auto& from = p.src_region;
+    const auto& to = p.dst_region;
+    if (p.flags != 0 || p.src_view_format != 0 || p.dst_view_format != 0 || from.width <= 0 ||
+        from.height <= 0 || from.width != to.width || from.height != to.height || from.z != 0 ||
+        to.z != 0 || from.depth != 1 || to.depth != 1) {
+        return false;
+    }
+    if (src.type != VK_IMAGE_TYPE_2D || dst.type != VK_IMAGE_TYPE_2D ||
+        src.samples != VK_SAMPLE_COUNT_1_BIT || dst.samples != VK_SAMPLE_COUNT_1_BIT ||
+        src.aspect != VK_IMAGE_ASPECT_COLOR_BIT || dst.aspect != VK_IMAGE_ASPECT_COLOR_BIT ||
+        src.host.needs_transcode || dst.host.needs_transcode ||
+        IsPixelFormatInteger(src.host.pixel_format) ||
+        IsPixelFormatInteger(dst.host.pixel_format)) {
+        return false;
+    }
+    if ((src.usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) == 0 ||
+        (dst.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) == 0 ||
+        !impl.device.IsFormatSupported(src.host.format, VK_FORMAT_FEATURE_BLIT_SRC_BIT,
+                                       FormatType::Optimal) ||
+        !impl.device.IsFormatSupported(dst.host.format, VK_FORMAT_FEATURE_BLIT_DST_BIT,
+                                       FormatType::Optimal)) {
+        return false;
+    }
+
+    const LevelExtent dst_extent = ExtentOfLevel(dst, p.dst.level);
+    const auto fits = [](const VC::CopyRegion& region, const LevelExtent& extent) {
+        return region.x >= 0 && region.y >= 0 &&
+               static_cast<u64>(region.x) + static_cast<u32>(region.width) <= extent.width &&
+               static_cast<u64>(region.y) + static_cast<u32>(region.height) <= extent.height;
+    };
+    if (!fits(from, ExtentOfLevel(src, p.src.level)) || !fits(to, dst_extent)) {
+        Failed("CopyTextureToTexture", "format conversion region outside the texture");
+        return true;
+    }
+    const bool dst_covered =
+        to.x == 0 && to.y == 0 && static_cast<u32>(to.width) == dst_extent.width &&
+        static_cast<u32>(to.height) == dst_extent.height && dst.levels == 1 && dst.layers == 1;
+    if (!EnsureContentsAs("CopyTextureToTexture", src, false) ||
+        !EnsureContentsAs("CopyTextureToTexture", dst, dst_covered)) {
+        Failed("CopyTextureToTexture", "could not prepare images for format conversion");
+        return true;
+    }
+    PrepareImages({{&src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL},
+                   {&dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL}});
+    const VkImageBlit region{
+        .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, p.src.level, p.src.layer, 1},
+        .srcOffsets = {{from.x, from.y, 0}, {from.x + from.width, from.y + from.height, 1}},
+        .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, p.dst.level, p.dst.layer, 1},
+        .dstOffsets = {{to.x, to.y, 0}, {to.x + to.width, to.y + to.height, 1}},
+    };
+    Cmd().BlitImage(*src.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, *dst.image,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region, VK_FILTER_NEAREST);
+    MarkWritten(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    return true;
+}
+
 void Recorder::CopyTextureToTexture(const VC::CopyTextureToTexturePayload& p) {
     Storage* src{};
     Storage* dst{};
@@ -6021,7 +6092,22 @@ void Recorder::CopyTextureToTexture(const VC::CopyTextureToTexturePayload& p) {
     const BlockInfo dst_block = FormatBlockInfo(dst->desc.format);
     if (src_block.bytes != dst_block.bytes || src_block.width != dst_block.width ||
         src_block.height != dst_block.height) {
-        Unsupported("CopyTextureToTexture", "source and destination formats are not compatible");
+        // A color copy may convert texels when the formats have different byte sizes.
+        // Compatible block copies below retain the existing bitwise behavior.
+        if (src_block.bytes != 0 && dst_block.bytes != 0 && src_block.width == 1 &&
+            src_block.height == 1 && dst_block.width == 1 && dst_block.height == 1 &&
+            TryConvertTextureCopy(p, *src, *dst)) {
+            return;
+        }
+        Unsupported("CopyTextureToTexture",
+                    fmt::format("incompatible formats: NVN {} (view {}, VkFormat {}) to "
+                                "NVN {} (view {}, VkFormat {}), {}x{}x{} to {}x{}x{}, flags {:#x}",
+                                src->desc.format, p.src_view_format,
+                                static_cast<u32>(src->host.format), dst->desc.format,
+                                p.dst_view_format, static_cast<u32>(dst->host.format),
+                                p.src_region.width, p.src_region.height, p.src_region.depth,
+                                p.dst_region.width, p.dst_region.height, p.dst_region.depth,
+                                p.flags));
         return;
     }
     const bool resolve =
