@@ -23,6 +23,9 @@
 
 #include "core/arm/dynarmic/arm_dynarmic_32.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
+#ifdef HAS_SCARLETNX
+#include "core/arm/scarletnx/arm_scarletnx_64.h"
+#endif
 #ifdef HAS_NCE
 #include "core/arm/nce/arm_nce.h"
 #endif
@@ -1336,6 +1339,23 @@ void KProcess::InitializeInterfaces(KernelCore& kernel) {
                 static_cast<Core::DynarmicExclusiveMonitor&>(*m_exclusive_monitor), i);
         }
     }
+
+#ifdef HAS_SCARLETNX
+    if (Core::ScarletNxProcess::ShouldUse(kernel.System(), *this)) {
+        auto scarlet = std::make_shared<Core::ScarletNxProcess>(kernel.System(), *this);
+        if (scarlet->Ready()) {
+            for (size_t i = 0; i < Core::Hardware::NUM_CPU_CORES; ++i) {
+                m_arm_interfaces[i] = std::make_unique<Core::ArmScarletNx64>(
+                    scarlet, std::move(m_arm_interfaces[i]), i);
+            }
+            if (!scarlet->FallbackRequested()) {
+                LOG_INFO(Core_ARM, "ScarletNX: selected AArch64 for the application process");
+            }
+        } else {
+            LOG_WARNING(Core_ARM, "ScarletNX: initialization failed; using Dynarmic");
+        }
+    }
+#endif
 }
 
 bool KProcess::InsertWatchpoint(KernelCore& kernel, KProcessAddress addr, u64 size, DebugWatchpointType type) {

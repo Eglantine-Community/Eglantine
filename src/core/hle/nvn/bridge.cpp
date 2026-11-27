@@ -595,6 +595,14 @@ void Bridge::Activate(const void* owner_, u64 base, u64 title) {
     }
 }
 
+std::optional<u64> Bridge::ThunkCodeBaseFor(const void* owner_) {
+    const Bridge* const bridge = InstancePointer().load(std::memory_order_acquire);
+    if (!bridge || !bridge->IsActive() || bridge->owner != owner_) {
+        return std::nullopt;
+    }
+    return bridge->region_base;
+}
+
 bool Bridge::Handle(Core::System& system, Kernel::KThread* thread, Core::ArmInterface& interface,
                     u32 svc) {
     if (svc < Thunk::SvcBase || svc >= Thunk::SvcBase + Thunk::SlotCount) {

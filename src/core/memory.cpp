@@ -1458,6 +1458,52 @@ bool Memory::InvalidateNCE(Common::ProcessAddress vaddr, size_t size) {
     return mapped && ptr != nullptr;
 }
 
+#ifdef HAS_SCARLETNX
+Memory::ScarletNxFault Memory::ResolveScarletNxFastmemFault(u64 address, bool write) {
+    bool rasterizer = false;
+    if (!impl->GetPointerImpl(address, [] {}, [&] { rasterizer = true; })) {
+        return ScarletNxFault::Unmapped;
+    }
+    if (!rasterizer) {
+        return ScarletNxFault::Retry;
+    }
+    const u64 base = address & ~YUZU_PAGEMASK;
+    bool read_trapped;
+    {
+        std::scoped_lock lock{impl->read_trap_mutex};
+        const u64 page = base >> YUZU_PAGEBITS;
+        read_trapped =
+            impl->armed_read_traps.contains(page) || impl->page_tracker_state.AccessArmed(page);
+    }
+    if (read_trapped) {
+        impl->HandleRasterizerDownload(base, YUZU_PAGESIZE);
+    }
+    if (write) {
+        impl->RasterizerPreWrite(base, YUZU_PAGESIZE);
+        impl->host_buffer->Protect(base, YUZU_PAGESIZE, Common::MemoryPermission::ReadWrite);
+        return ScarletNxFault::CompleteWrite;
+    }
+    // Another core may have consumed the trap after this core faulted.
+    return read_trapped ? ScarletNxFault::Resolved : ScarletNxFault::Retry;
+}
+
+void Memory::CompleteScarletNxFastmemWrite(u64 address) {
+    const u64 base = address & ~YUZU_PAGEMASK;
+    impl->NotifyHostWrite(base, YUZU_PAGESIZE);
+    std::scoped_lock lock{impl->read_trap_mutex};
+    const u64 page = base >> YUZU_PAGEBITS;
+    // Leave freshly armed pages protected and ordinary writable memory alone.
+    if (std::as_const(impl->current_page_table->entries)[page].Type() ==
+        Common::PageType::RasterizerCachedMemory) {
+        const bool read_trapped =
+            impl->armed_read_traps.contains(page) || impl->page_tracker_state.AccessArmed(page);
+        impl->host_buffer->Protect(base, YUZU_PAGESIZE,
+                                  read_trapped ? Common::MemoryPermission{}
+                                               : Common::MemoryPermission::Read);
+    }
+}
+#endif
+
 bool Memory::InvalidateSeparateHeap(void* fault_address) {
 #ifdef __ANDROID__
     return impl->host_buffer->DeferredMapSeparateHeap(static_cast<u8*>(fault_address));

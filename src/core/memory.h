@@ -528,6 +528,12 @@ public:
 
     bool InvalidateNCE(Common::ProcessAddress vaddr, size_t size);
 
+    enum class ScarletNxFault { Unmapped, Retry, Resolved, CompleteWrite };
+    /// Resolve a protected fastmem data access made by generated AArch64 code.
+    ScarletNxFault ResolveScarletNxFastmemFault(u64 address, bool write);
+    /// Publish a direct fastmem store after the host instruction has finished.
+    void CompleteScarletNxFastmemWrite(u64 address);
+
     bool InvalidateSeparateHeap(void* fault_address);
 
     /// Lets PageTracker register ranges of this memory. VTX-HLE turns it on when it hooks the

@@ -149,6 +149,9 @@ public:
     /// After process.LoadModule + reprotect: marks the region live for `owner`.
     void Activate(const void* owner, u64 region_base, u64 title_id);
 
+    /// Address of the generated instructions for this process, excluding the target table.
+    [[nodiscard]] static std::optional<u64> ThunkCodeBaseFor(const void* owner);
+
     /// Dispatch of one thunk SVC. See Handle.
     bool Dispatch(Core::System* system, GuestPort& port, const void* owner, u32 svc);
 
