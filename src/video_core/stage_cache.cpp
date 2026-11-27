@@ -493,6 +493,7 @@ std::vector<u8> StageCache::RuntimeKey(const Shader::RuntimeInfo& info,
     }
     writer.Put(info.color_output_types);
     writer.Put(info.dual_source_blend);
+    writer.Put(info.nan_safe_min_max);
     return std::move(writer.bytes);
 }
 

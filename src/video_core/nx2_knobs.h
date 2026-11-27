@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <cstdlib>
+
 #include "common/common_types.h"
 #include "common/settings.h"
 
@@ -22,11 +24,23 @@ enum : u8 {
     BackWait = 9,      ///< EDEN_NX2_BACK_WAIT=1: at a present wait for the GPU back thread to finish the
                        ///< frame's commands (and the previous fence), not for this frame's fence
     HostImport = 10,   ///< EDEN_NX2_HOST_IMPORT=1: 64 KiB native uniform banks read the guest's pages in place (no copy)
+    NanSafeMinMax = 11, ///< EDEN_NX2_NAN_SAFE_MIN_MAX (on unless 0): see NanSafeMinMaxOn
 };
 
 /// `start_value` is what the environment chose; the knob inverts it.
 [[nodiscard]] inline bool Live(bool start_value, u8 knob) {
     return start_value != Settings::GetDebugKnobAt(knob);
+}
+
+/// Saturate, clamp and FMNMX in emitted SPIR-V ignore a NaN operand, as the guest GPU does
+/// (Shader::RuntimeInfo::nan_safe_min_max). Read when a stage is emitted, so a change reaches the
+/// pipelines built after it: reject and restore a program (reject_shaders) to rebuild its own.
+[[nodiscard]] inline bool NanSafeMinMaxOn() {
+    static const bool start = [] {
+        const char* const value = std::getenv("EDEN_NX2_NAN_SAFE_MIN_MAX");
+        return value == nullptr || value[0] != '0';
+    }();
+    return Live(start, NanSafeMinMax);
 }
 
 } // namespace VideoCommon::Nx2Knob

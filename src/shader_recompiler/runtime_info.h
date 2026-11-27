@@ -125,6 +125,10 @@ struct RuntimeInfo {
     /// Dual source blending
     bool dual_source_blend{};
 
+    /// Saturate, clamp and FMNMX return the operand that isn't NaN, as on the guest GPU
+    /// (SPIR-V NMin/NMax instead of FClamp/FMin/FMax, whose result is undefined for NaN).
+    bool nan_safe_min_max{};
+
     /// Mesh program on a device without VK_EXT_mesh_shader: emit it as a compute shader that
     /// writes its vertices and primitives to the storage buffer at mesh_output_binding (see
     /// EmitMeshEmulationVertex for the layout), for a vertex shader to draw them.

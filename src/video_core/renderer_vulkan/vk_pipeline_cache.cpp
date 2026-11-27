@@ -47,6 +47,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_knobs.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_spikes.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
@@ -239,6 +240,7 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
                                     const Shader::IR::Program* previous_program,
                                     const Vulkan::Device& device) {
     Shader::RuntimeInfo info;
+    info.nan_safe_min_max = VideoCommon::Nx2Knob::NanSafeMinMaxOn();
     if (previous_program) {
         info.previous_stage_stores = previous_program->info.stores;
         info.previous_stage_legacy_stores_mapping = previous_program->info.legacy_stores_mapping;
@@ -4034,7 +4036,10 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(ShaderPools& pool
             key.unique_hash, program.shared_memory_size / 1024, max_shared_memory / 1024);
         program.shared_memory_size = max_shared_memory;
     }
-    const std::vector<u32> code{EmitSPIRV(profile, program)};
+    Shader::RuntimeInfo runtime_info;
+    runtime_info.nan_safe_min_max = VideoCommon::Nx2Knob::NanSafeMinMaxOn();
+    Shader::Backend::Bindings bindings;
+    const std::vector<u32> code{EmitSPIRV(profile, runtime_info, program, bindings)};
     device.SaveShader(code);
     vk::ShaderModule spv_module{BuildShader(device, code)};
 

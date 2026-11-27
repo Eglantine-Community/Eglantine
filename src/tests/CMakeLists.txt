@@ -29,6 +29,7 @@ add_executable(tests
     video_core/ampere_logged_numeric.cpp
     video_core/pipeline_optimization.cpp
     video_core/spirv_screen_linear.cpp
+    video_core/spirv_nan_safe_min_max.cpp
     video_core/spirv_atomic_retry.cpp
     video_core/spirv_storage_alignment.cpp
     video_core/spirv_fragment_shuffle.cpp
