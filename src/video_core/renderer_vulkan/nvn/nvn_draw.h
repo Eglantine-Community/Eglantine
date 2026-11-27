@@ -759,7 +759,7 @@ private:
     /// view `key` also covers (a real feedback loop); false when they are disjoint subresources.
     [[nodiscard]] bool TargetOverlapsView(const Storage& storage, const ViewKey& key) const;
     /// Records the copies of render targets that the draw samples (outside the pass).
-    void RecordFeedbackCopies(DrawPlan& plan);
+    bool RecordFeedbackCopies(DrawPlan& plan);
     /// Drops the feedback copies of the plan whose scratch already holds the source (see the
     /// DESIGN.md paragraph "Feedback copies per target epoch").
     void PruneFreshFeedback(DrawPlan& plan);

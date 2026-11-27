@@ -578,7 +578,7 @@ struct PipelineCache::Impl {
     void PostBytes(std::vector<u8> bytes);
     void MaybeWriteVkCache();
     void WriteVkCache();
-    std::vector<u8> ReadVkCacheBlob() const;
+    std::vector<u8> ReadVkCacheBlob();
     void RunLoader(std::stop_token stop);
     /// Counts one handled cached record and reports Build done / total (rate limited, always on
     /// the last one).
@@ -695,6 +695,7 @@ struct PipelineCache::Impl {
     std::unordered_set<Disk::ContentId, Disk::ContentIdHash> written_pipelines;
     Disk::Appender appender; ///< touched by the writer thread only (and the loader before Ready)
     std::atomic<u64> new_since_vk_write{};
+    std::optional<std::pair<u64, u32>> saved_driver_cache;
     std::atomic<s64> last_vk_write_ticks{};
 
     std::atomic<bool> stopping{};

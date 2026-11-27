@@ -582,6 +582,7 @@ PipelineCache::Impl::Impl(const Device& device_, PipelineCacheOptions options_)
     try {
         vk_cache = create_cache(blob);
     } catch (const vk::Exception&) {
+        saved_driver_cache.reset();
         vk_cache = create_cache({});
     }
     last_vk_write_ticks = std::chrono::steady_clock::now().time_since_epoch().count();

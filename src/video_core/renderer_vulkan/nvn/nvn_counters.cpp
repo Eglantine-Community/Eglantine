@@ -86,10 +86,9 @@ CounterEngine::CounterEngine(
     timestamp_period = properties.limits.timestampPeriod > 0.0f ? properties.limits.timestampPeriod
                                                                  : 1.0;
     const auto families = device.GetPhysical().GetQueueFamilyProperties();
-    u32 valid_bits = 64;
-    if (device.GetGraphicsFamily() < families.size()) {
-        valid_bits = families[device.GetGraphicsFamily()].timestampValidBits;
-    }
+    const u32 graphics_family = device.GetGraphicsFamily();
+    const u32 valid_bits =
+        graphics_family < families.size() ? families[graphics_family].timestampValidBits : 0;
     timestamp_mask = valid_bits >= 64 ? ~u64{0} : (u64{1} << valid_bits) - 1;
 
     VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
@@ -618,6 +617,15 @@ u64 CounterEngine::TicksToNanoseconds(u64 ticks) {
 void CounterEngine::Complete(CounterFlight& flight, VideoCommon::Nvn::GuestMemory* memory) {
     const bool legacy =
         VideoCommon::Nvn::CurrentTimestampMode() == VideoCommon::Nvn::TimestampMode::Legacy;
+    struct TimestampResult {
+        u64 ticks;
+        u64 available;
+    };
+    static_assert(sizeof(TimestampResult) == 2 * sizeof(u64));
+    std::array<TimestampResult, BLOCK_QUERIES> results;
+    u32 read_block = ~u32{0};
+    bool batch_valid = false;
+    const vk::Device& logical = device.GetLogical();
     for (TimestampReport& report : flight.timestamps) {
         u64 field = 0; // legacy: the guest GPU clock (LegacyReportField); real: GPU time on the guest clock
         if (legacy) {
@@ -626,13 +634,36 @@ void CounterEngine::Complete(CounterFlight& flight, VideoCommon::Nvn::GuestMemor
             field = VideoCommon::Nvn::LegacyReportField();
         } else {
             u64 ticks = 0;
-            const VkResult result = device.GetLogical().GetQueryResults(
-                *flight.blocks[report.query.block].timestamp, report.query.slot, 1, sizeof(ticks),
-                &ticks, sizeof(ticks), VK_QUERY_RESULT_64_BIT);
+            bool available = false;
+            if (timestamp_mask != 0) {
+                const QueryBlock& block = flight.blocks[report.query.block];
+                if (read_block != report.query.block) {
+                    read_block = report.query.block;
+                    batch_valid = false;
+                    // WriteTimestamp fills each block in slot order. Read the used slots at once
+                    // and still map and publish every report in the order it was recorded.
+                    if (block.timestamp_used > 1) {
+                        const VkResult result = logical.GetQueryResults(
+                            *block.timestamp, 0, block.timestamp_used,
+                            block.timestamp_used * sizeof(TimestampResult), results.data(),
+                            sizeof(TimestampResult),
+                            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+                        batch_valid = result == VK_SUCCESS || result == VK_NOT_READY;
+                    }
+                }
+                if (batch_valid && results[report.query.slot].available != 0) {
+                    ticks = results[report.query.slot].ticks;
+                    available = true;
+                } else {
+                    // Preserve the individual nonblocking read on error or an unavailable slot.
+                    available = logical.GetQueryResults(*block.timestamp, report.query.slot, 1,
+                                                        sizeof(ticks), &ticks, sizeof(ticks),
+                                                        VK_QUERY_RESULT_64_BIT) == VK_SUCCESS;
+                }
+            }
             // A submission that never ran (failed, aborted) has no ticks: stamp it with now.
             field = VideoCommon::Nvn::GuestNanosecondsToReportField(
-                result == VK_SUCCESS ? TicksToNanoseconds(ticks)
-                                     : VideoCommon::Nvn::GuestClockNanoseconds());
+                available ? TicksToNanoseconds(ticks) : VideoCommon::Nvn::GuestClockNanoseconds());
         }
         if (report.host) {
             std::memcpy(report.host + sizeof(u64), &field, sizeof(field));

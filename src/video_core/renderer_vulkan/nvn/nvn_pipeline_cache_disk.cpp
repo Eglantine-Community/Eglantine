@@ -5,11 +5,16 @@
 // Disk cache of the NVN pipeline cache: record posting, the driver VkPipelineCache blob and the
 // background loader that rebuilds the cached pipelines.
 
+#include <algorithm>
+#include <cstring>
 #include <fstream>
+#include <limits>
+#include <new>
 
 #include <fmt/format.h>
 
 #include "common/logging.h"
+#include "common/swap.h"
 #include "video_core/load_progress.h"
 #include "video_core/renderer_vulkan/nvn/nvn_pipeline_impl.h"
 
@@ -48,6 +53,18 @@ void PipelineCache::Impl::PostShader(const StageArtifact& artifact) {
 }
 
 namespace {
+constexpr size_t VK_CACHE_HEADER_SIZE =
+    VK_CACHE_MAGIC.size() + sizeof(u32) + sizeof(u64) + sizeof(u32);
+
+struct VulkanCacheHeader {
+    u32_le size;
+    u32_le version;
+    u32_le vendor;
+    u32_le device;
+    std::array<u8, VK_UUID_SIZE> uuid;
+};
+static_assert(sizeof(VulkanCacheHeader) == 32);
+
 Disk::ContentId SignatureOf(const std::vector<u8>& encoded) {
     const u128 hash =
         Common::CityHash128(reinterpret_cast<const char*>(encoded.data()), encoded.size());
@@ -91,14 +108,13 @@ void PipelineCache::Impl::PostComputePipeline(const StageArtifact& stage, const 
     ++new_since_vk_write;
 }
 
-std::vector<u8> PipelineCache::Impl::ReadVkCacheBlob() const {
+std::vector<u8> PipelineCache::Impl::ReadVkCacheBlob() {
     std::ifstream file(vk_cache_path, std::ios::binary | std::ios::ate);
     if (!file.is_open()) {
         return {};
     }
     const auto end = file.tellg();
-    constexpr size_t HEADER = VK_CACHE_MAGIC.size() + sizeof(u32) + sizeof(u64) + sizeof(u32);
-    if (end < 0 || static_cast<size_t>(end) < HEADER) {
+    if (end < 0 || static_cast<size_t>(end) < VK_CACHE_HEADER_SIZE) {
         return {};
     }
     file.seekg(0);
@@ -111,18 +127,42 @@ std::vector<u8> PipelineCache::Impl::ReadVkCacheBlob() const {
     file.read(reinterpret_cast<char*>(&size), sizeof(size));
     file.read(reinterpret_cast<char*>(&crc), sizeof(crc));
     if (!file || magic != VK_CACHE_MAGIC || version != VK_CACHE_VERSION ||
-        size != static_cast<u64>(end) - HEADER) {
+        size != static_cast<u64>(end) - VK_CACHE_HEADER_SIZE) {
         LOG_WARNING(Render_Vulkan, "[nvn] driver pipeline cache {} discarded (header)",
                     vk_cache_path.string());
         return {};
     }
-    std::vector<u8> data(static_cast<size_t>(size));
+    std::vector<u8> data;
+    if (size > data.max_size() ||
+        size > static_cast<u64>((std::numeric_limits<std::streamsize>::max)())) {
+        return {};
+    }
+    try {
+        data.resize(static_cast<size_t>(size));
+    } catch (const std::bad_alloc&) {
+        LOG_WARNING(Render_Vulkan, "[nvn] driver pipeline cache not loaded: no host memory");
+        return {};
+    }
     file.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size()));
     if (!file || Disk::Crc32(data) != crc) {
         LOG_WARNING(Render_Vulkan, "[nvn] driver pipeline cache {} discarded (checksum)",
                     vk_cache_path.string());
         return {};
     }
+    VulkanCacheHeader header{};
+    if (data.size() >= sizeof(header)) {
+        std::memcpy(&header, data.data(), sizeof(header));
+    }
+    const auto properties = device.GetPhysical().GetProperties();
+    if (header.size != sizeof(header) ||
+        header.version != VK_PIPELINE_CACHE_HEADER_VERSION_ONE ||
+        header.vendor != properties.vendorID || header.device != properties.deviceID ||
+        !std::ranges::equal(header.uuid, properties.pipelineCacheUUID)) {
+        LOG_WARNING(Render_Vulkan, "[nvn] driver pipeline cache {} discarded (device header)",
+                    vk_cache_path.string());
+        return {};
+    }
+    saved_driver_cache = std::pair{size, crc};
     return data;
 }
 
@@ -132,33 +172,57 @@ void PipelineCache::Impl::WriteVkCache() {
     }
     // Pipelines created from here on may be missing from the blob: they stay counted.
     const u64 claimed = new_since_vk_write.load();
-    size_t size = 0;
-    if (vk_cache.Read(&size, nullptr) != VK_SUCCESS || size == 0) {
+    if (claimed == 0) {
         return;
     }
-    std::vector<u8> data(size);
-    const VkResult result = vk_cache.Read(&size, data.data());
-    if (result != VK_SUCCESS && result != VK_INCOMPLETE) {
-        return;
-    }
-    data.resize(size);
+    // Read straight into the file buffer, leaving room for the NVN header.
     std::vector<u8> file;
-    file.reserve(VK_CACHE_MAGIC.size() + 16 + data.size());
-    const auto put = [&file](const void* bytes, size_t count) {
-        const auto* const first = static_cast<const u8*>(bytes);
-        file.insert(file.end(), first, first + count);
+    size_t size{};
+    VkResult result = VK_INCOMPLETE;
+    try {
+        // A pipeline can grow the cache between the two queries. Keep the previous file if a
+        // fresh size query still cannot capture the whole cache.
+        for (u32 attempt = 0; attempt < 2 && result == VK_INCOMPLETE; ++attempt) {
+            size = 0;
+            if (vk_cache.Read(&size, nullptr) != VK_SUCCESS || size == 0 ||
+                size > file.max_size() - VK_CACHE_HEADER_SIZE) {
+                return;
+            }
+            file.resize(VK_CACHE_HEADER_SIZE + size);
+            result = vk_cache.Read(&size, file.data() + VK_CACHE_HEADER_SIZE);
+            if (result == VK_INCOMPLETE) {
+                file = std::vector<u8>{};
+            }
+        }
+    } catch (const std::bad_alloc&) {
+        LOG_WARNING(Render_Vulkan, "[nvn] driver pipeline cache not saved: no host memory");
+        return;
+    }
+    if (result != VK_SUCCESS || size == 0 || size > file.size() - VK_CACHE_HEADER_SIZE) {
+        return;
+    }
+    file.resize(VK_CACHE_HEADER_SIZE + size);
+    const u64 payload_size = size;
+    const u32 crc = Disk::Crc32(std::span<const u8>{file}.subspan(VK_CACHE_HEADER_SIZE));
+    const auto signature = std::pair{payload_size, crc};
+    if (saved_driver_cache == signature) {
+        new_since_vk_write.fetch_sub(claimed);
+        return;
+    }
+    u8* header = file.data();
+    const auto put = [&header](const void* bytes, size_t count) {
+        std::memcpy(header, bytes, count);
+        header += count;
     };
     const u32 version = VK_CACHE_VERSION;
-    const u64 payload_size = data.size();
-    const u32 crc = Disk::Crc32(data);
     put(VK_CACHE_MAGIC.data(), VK_CACHE_MAGIC.size());
     put(&version, sizeof(version));
     put(&payload_size, sizeof(payload_size));
     put(&crc, sizeof(crc));
-    put(data.data(), data.size());
     if (Disk::WriteFileAtomic(vk_cache_path, file)) {
+        saved_driver_cache = signature;
         new_since_vk_write.fetch_sub(claimed);
-        LOG_INFO(Render_Vulkan, "[nvn] driver pipeline cache written: {} bytes", data.size());
+        LOG_INFO(Render_Vulkan, "[nvn] driver pipeline cache written: {} bytes", size);
     } else {
         LOG_ERROR(Render_Vulkan, "[nvn] driver pipeline cache {} could not be written",
                   vk_cache_path.string());
@@ -170,12 +234,13 @@ void PipelineCache::Impl::MaybeWriteVkCache() {
         return;
     }
     const auto now = std::chrono::steady_clock::now();
+    s64 last_ticks = last_vk_write_ticks.load();
     const std::chrono::steady_clock::time_point last{
-        std::chrono::steady_clock::duration{last_vk_write_ticks.load()}};
-    if (now - last < VK_CACHE_WRITE_INTERVAL) {
+        std::chrono::steady_clock::duration{last_ticks}};
+    if (now - last < VK_CACHE_WRITE_INTERVAL ||
+        !last_vk_write_ticks.compare_exchange_strong(last_ticks, now.time_since_epoch().count())) {
         return;
     }
-    last_vk_write_ticks = now.time_since_epoch().count();
     writer.Post([this] { WriteVkCache(); });
 }
 
@@ -284,6 +349,9 @@ void PipelineCache::Impl::PreloadGraphics(
         pk->cv.notify_all();
         if (pipeline) {
             ++stat_loaded;
+            if (!vk_cache_path.empty()) {
+                ++new_since_vk_write;
+            }
         }
         NotePreloadStep();
     });
@@ -338,6 +406,9 @@ void PipelineCache::Impl::PreloadCompute(
         pk->cv.notify_all();
         if (pipeline) {
             ++stat_loaded;
+            if (!vk_cache_path.empty()) {
+                ++new_since_vk_write;
+            }
         }
         NotePreloadStep();
     });

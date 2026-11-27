@@ -29,11 +29,13 @@
 #include "common/diag_request.h"
 #include "common/game_presets.h"
 #include "common/literals.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "video_core/nvn/guest_memory.h"
 #include "video_core/nvn/record.h"
 #include "video_core/nvn/shader/nvn_program_map.h"
 #include "video_core/nvn/sink.h"
+#include "video_core/nvn/state_layouts.h"
 #include "video_core/renderer_vulkan/nvn/nvn_bc_encode.h"
 #include "video_core/renderer_vulkan/nvn/nvn_context.h"
 #include "video_core/renderer_vulkan/nvn/nvn_counters.h"
@@ -3280,6 +3282,134 @@ TEST_CASE("NVN draw: without render targets a draw rasterizes over NVN's no-targ
     CHECK(StatRow(context, "render_pass_begins") == 1);
     CHECK(WordAt(data, REPORTS) == 1);
     CHECK(WordAt(data, REPORTS + 4) == 0);
+}
+
+TEST_CASE("NVN draw: depth feedback reads the latest native contents before scaling",
+          "[nvn][compute][pass_state]") {
+    const auto resolution =
+        GENERATE(Settings::ResolutionSetup::Res1X, Settings::ResolutionSetup::Res3_4X);
+    const auto saved_resolution = Settings::values.resolution_info;
+    SCOPE_EXIT { Settings::values.resolution_info = saved_resolution; };
+    Settings::TranslateResolutionInfo(resolution, Settings::values.resolution_info);
+    const bool scaled = Settings::values.resolution_info.active;
+    const u32 size = scaled ? 384 : 64;
+    const u64 texture_pool_size = scaled ? 6_MiB : 1_MiB;
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan || vulkan->device->ApiVersion() < VK_API_VERSION_1_3) {
+        SKIP("requires Vulkan 1.3");
+    }
+    FakeMemory memory;
+    u8* data = memory.Add(POOL_VA, 64_KiB);
+    std::memset(data, 0xCD, 64_KiB);
+    memory.Add(TEXTURE_POOL_VA, texture_pool_size);
+    Vulkan::Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr, {});
+    context.SetGuestMemory(&memory);
+    context.SetDeviceModes(0, 1); // zero-to-one clip depth
+    context.CreatePool({.serial = 1, .guest_address = POOL_VA, .size = 64_KiB,
+                        .flags = POOL_CPU_CACHED});
+    context.CreatePool({.serial = 2, .guest_address = TEXTURE_POOL_VA, .size = texture_pool_size,
+                        .flags = 1 /* CPU_NO_ACCESS */});
+    context.CreateTexture({.target = 1, .format = 0x34, .width = size, .height = size, .depth = 1,
+                           .levels = 1, .serial = 10, .pool_serial = 2});
+    if (scaled) {
+        context.CreateTexture({.target = 1, .format = 0x25, .width = size, .height = size,
+                               .depth = 1, .levels = 1, .serial = 11, .pool_serial = 2,
+                               .pool_offset = 2_MiB});
+        context.CreateTexture({.target = 1, .format = 0x25, .width = size, .height = size,
+                               .depth = 1, .levels = 2, .serial = 12, .pool_serial = 2,
+                               .pool_offset = 4_MiB});
+    }
+    context.CreateSampler({.wrap_s = 7, .wrap_t = 7, .wrap_r = 7, .serial = 20});
+
+    // Set position.z to the depth sampled from combined handle 0. The point only passes the
+    // EQUAL depth test if that sample saw the value last cleared into the attachment.
+    constexpr Inst TexDepth{{0x04027b60, 0x30800803, 0x049e01ff, 0x000f4800}};
+    constexpr Inst AstPosition{{0xff007322, 0x00007000, 0x00000cff, 0x000fe200}};
+    constexpr u32 ONE_64TH = 0x3c800000;
+    constexpr u32 HALF = 0x3f000000;
+    constexpr u32 ONE = 0x3f800000;
+    const std::array<Inst, 8> point{{
+        AddImm(0, 255, ONE_64TH), AddImm(1, 255, ONE_64TH), AddImm(3, 255, HALF),
+        AddImm(4, 255, HALF), TexDepth, AddImm(3, 255, ONE), AstPosition, Exit,
+    }};
+    context.CreateProgram(MakeVertexProgram(VERTEX_PROGRAM, point));
+
+    std::vector<u64> list;
+    const auto set_targets = [&](u64 color) {
+        const std::array<VC::RenderTargetRef, 2> targets{{
+            {.texture = {.serial = color}}, {.texture = {.serial = 10}},
+        }};
+        const auto attachments = std::span{targets}.subspan(scaled ? 0 : 1);
+        Push(list, VC::Op::SetRenderTargets, VC::SetRenderTargetsPayload{scaled ? 1u : 0u, 1},
+             {reinterpret_cast<const u8*>(attachments.data()), attachments.size_bytes()});
+    };
+    set_targets(11);
+    const VC::ViewportRect viewport{0, 0, static_cast<f32>(size), static_cast<f32>(size)};
+    Push(list, VC::Op::SetViewports, VC::SetViewportsPayload{.first = 0, .count = 1},
+         {reinterpret_cast<const u8*>(&viewport), sizeof(viewport)});
+    Push(list, VC::Op::SetPointSize, VC::F32Payload{.value = 1.0f});
+    using DS = VC::DepthStencilState;
+    const auto bind_depth = [&](bool write) {
+        const u64 state =
+            DS::WithDepthWriteEnable(DS::WithDepthFunc(DS::WithDepthTestEnable(0, 1), 3), write);
+        Push(list, VC::Op::BindState,
+             VC::BindStatePayload{static_cast<u32>(VC::StateKind::DepthStencil), sizeof(state)},
+             {reinterpret_cast<const u8*>(&state), sizeof(state)});
+    };
+    bind_depth(false);
+    Push(list, VC::Op::BindProgram,
+         VC::BindProgramPayload{.program_serial = VERTEX_PROGRAM, .stages = 1u << 0});
+    const u64 handle = 1u | (1u << 20);
+    Push(list, VC::Op::BindTextures, VC::BindHandlesPayload{.stage = 0, .first = 0, .count = 1},
+         {reinterpret_cast<const u8*>(&handle), sizeof(handle)});
+    if (scaled) {
+        // Allocate the twins and fill the depth image before testing direct sampling.
+        Push(list, VC::Op::ClearDepthStencil,
+             VC::ClearDepthStencilPayload{.depth = 0.125f, .depth_mask = 1});
+        Push(list, VC::Op::Barrier, VC::BarrierPayload{.bits = 0x11});
+    }
+    Push(list, VC::Op::ResetCounter, VC::ResetCounterPayload{.counter_type = SAMPLES_PASSED});
+    for (const float value : {0.25f, 0.75f}) {
+        Push(list, VC::Op::ClearDepthStencil,
+             VC::ClearDepthStencilPayload{.depth = value, .depth_mask = 1});
+        Push(list, VC::Op::Barrier, VC::BarrierPayload{.bits = 0x11});
+        Push(list, VC::Op::Draw, VC::DrawPayload{.mode = 0, .count = 1, .instance_count = 1});
+    }
+    // The same shader still samples the cleared depth, but now the draw can write depth too.
+    bind_depth(true);
+    Push(list, VC::Op::Draw, VC::DrawPayload{.mode = 0, .count = 1, .instance_count = 1});
+    if (scaled) {
+        // The mipmapped color target keeps this clear at the native size. The next draw samples
+        // the new depth and depth-tests against it in the scaled pass.
+        set_targets(12);
+        Push(list, VC::Op::ClearDepthStencil,
+             VC::ClearDepthStencilPayload{.depth = 0.5f, .depth_mask = 1});
+        Push(list, VC::Op::Barrier, VC::BarrierPayload{.bits = 0x11});
+        set_targets(11);
+        Push(list, VC::Op::Draw, VC::DrawPayload{.mode = 0, .count = 1, .instance_count = 1});
+    }
+    Push(list, VC::Op::ReportCounter,
+         VC::ReportCounterPayload{.address = POOL_VA, .counter_type = SAMPLES_PASSED});
+    PushEnd(list);
+    std::vector<u64> retained{VERTEX_PROGRAM, 10, 20, 1, 2};
+    if (scaled) {
+        retained.push_back(11);
+        retained.push_back(12);
+    }
+    auto submission = MakeSubmission(1, std::move(list), std::move(retained));
+    submission.texture_pool_snapshot =
+        VC::IdSnapshot{std::make_shared<const std::vector<u64>>(std::vector<u64>{0, 10})};
+    submission.sampler_pool_snapshot =
+        VC::IdSnapshot{std::make_shared<const std::vector<u64>>(std::vector<u64>{0, 20})};
+    context.Submit(std::move(submission));
+    REQUIRE(context.Wait(1, 60s));
+
+    CHECK(context.Stats().ops_failed == 0);
+    CHECK(context.Stats().ops_unsupported == 0);
+    CHECK(WordAt(data, 0) == (scaled ? 4 : 3));
+    if (scaled) {
+        CHECK(StatRow(context, "resolution scale: passes drawn at the scaled size") > 0);
+    }
 }
 
 TEST_CASE("NVN draw: unchanged dynamic state survives a masked clear",

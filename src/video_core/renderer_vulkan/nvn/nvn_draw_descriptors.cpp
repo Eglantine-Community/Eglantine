@@ -1983,7 +1983,7 @@ bool DrawContext::TargetOverlapsView(const Storage& storage, const ViewKey& key)
     return overlaps(depth_target);
 }
 
-void DrawContext::RecordFeedbackCopies(DrawPlan& plan) {
+bool DrawContext::RecordFeedbackCopies(DrawPlan& plan) {
     GpuProf::Flight* const prof = plan.feedback.empty() ? nullptr : ProfFlight();
     const GpuProf::Scope prof_scope{
         prof, prof ? host->HostCmd() : vk::CommandBuffer{},
@@ -1999,7 +1999,13 @@ void DrawContext::RecordFeedbackCopies(DrawPlan& plan) {
         Storage& scratch = *copy.scratch;
         host->HostNoteTouched(copy.source);
         host->HostNoteTouched(copy.scratch);
-        if (host->HostNeedsCommands(source, false)) {
+        if (Storage* const native = source.scale_owner) {
+            // The snapshot precedes BeginPass, which normally refreshes scaled attachments.
+            if (!host->HostPrepareScaledTarget(*native)) {
+                host->HostFailed("Draw", "could not prepare the scaled feedback source");
+                return false;
+            }
+        } else if (host->HostNeedsCommands(source, false)) {
             host->HostEnsureContents(source, false);
         }
         if (!source.image || !scratch.image) {
@@ -2088,6 +2094,7 @@ void DrawContext::RecordFeedbackCopies(DrawPlan& plan) {
         }
         source.feedback_epoch = render_target_epoch.value;
     }
+    return true;
 }
 
 void DrawContext::PruneFreshFeedback(DrawPlan& plan) {
@@ -2101,7 +2108,9 @@ void DrawContext::PruneFreshFeedback(DrawPlan& plan) {
                                    {copy.level, copy.levels, copy.layer, copy.layers})) {
             return false;
         }
-        if (host->HostNeedsCommands(*copy.source, false)) {
+        if ((copy.source->scale_owner &&
+             !Rescale::TwinIsCurrent(copy.source->scale_owner->scale_state)) ||
+            host->HostNeedsCommands(*copy.source, false)) {
             return false; // the guest changed the bytes: the scratch is stale
         }
         ++counters.feedback_skipped;
@@ -2295,7 +2304,9 @@ bool DrawContext::PrepareOutsidePass(DrawPlan& plan) {
         if (plan.flush_inline && !inline_updates.empty()) {
             FlushInlineUpdates();
         }
-        RecordFeedbackCopies(plan);
+        if (!RecordFeedbackCopies(plan)) {
+            return false;
+        }
         transition_scratch.clear();
         for (DrawPlan::ImageUse& use : plan.images) {
             if (use.skip) {
