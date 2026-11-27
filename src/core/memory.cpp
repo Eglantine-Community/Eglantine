@@ -1602,6 +1602,11 @@ std::shared_ptr<const std::atomic<u64>> PageTracker::WriteEpoch(u64 id) {
     return impl.page_tracker_state.WriteEpoch(id);
 }
 
+bool PageTracker::TrackWriteNotification(u64 id, std::shared_ptr<std::atomic<u64>> word, u64 mask) {
+    std::scoped_lock lk{impl.read_trap_mutex};
+    return impl.page_tracker_state.TrackWriteNotification(id, std::move(word), mask);
+}
+
 void PageTracker::SetAccessCallback(u64 id, AccessCallback callback) {
     std::scoped_lock lk{impl.read_trap_mutex};
     impl.page_tracker_state.SetAccessCallback(id, std::move(callback));

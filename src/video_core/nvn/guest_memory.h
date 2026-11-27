@@ -93,6 +93,15 @@ public:
         return nullptr;
     }
 
+    /// Optionally publish mask to word when a tracked page turns dirty, after updating the epoch.
+    /// A null word or zero mask detaches. The caller seeds and clears the word.
+    virtual bool TrackWriteNotification(u64 id, std::shared_ptr<std::atomic<u64>> word, u64 mask) {
+        static_cast<void>(id);
+        static_cast<void>(word);
+        static_cast<void>(mask);
+        return false;
+    }
+
     /// Whether SetAccessCallback/ArmAccessTrap/DisarmAccessTrap do anything (the guarded write-back
     /// merge needs them).
     [[nodiscard]] virtual bool SupportsAccessTraps() const {

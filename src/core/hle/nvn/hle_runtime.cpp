@@ -128,6 +128,9 @@ public:
     std::shared_ptr<const std::atomic<u64>> WriteEpoch(u64 id) override {
         return memory.PageTracker().WriteEpoch(id);
     }
+    bool TrackWriteNotification(u64 id, std::shared_ptr<std::atomic<u64>> word, u64 mask) override {
+        return memory.PageTracker().TrackWriteNotification(id, std::move(word), mask);
+    }
     bool SupportsAccessTraps() const override {
         return true;
     }

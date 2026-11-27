@@ -61,6 +61,8 @@ public:
     [[nodiscard]] bool AnyDirty(u64 id, u64 va, u64 size);
     /// PageTrackerState::WriteEpoch: a lock-free counter of the pages that turned dirty.
     [[nodiscard]] std::shared_ptr<const std::atomic<u64>> WriteEpoch(u64 id);
+    /// PageTrackerState::TrackWriteNotification: attach or detach the owner's dirty marker.
+    bool TrackWriteNotification(u64 id, std::shared_ptr<std::atomic<u64>> word, u64 mask);
 
     /// Called on the guest thread whose read or write hits an access-armed page, before that
     /// access lands, with the armed page run of this owner it touched. No tracker lock is held:

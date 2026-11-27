@@ -217,6 +217,52 @@ TEST_CASE("PageTracker: the write epoch grows with each page that turns dirty, n
     CHECK(state.AnyDirty(id, 0, 4));
 }
 
+TEST_CASE("PageTracker: dirty notifications publish owner masks and detach",
+          "[core][page_tracker]") {
+    FakeSink sink;
+    PageTrackerState state{sink};
+    const u64 first = state.Register(0, 4, true);
+    const u64 second = state.Register(2, 6, true);
+    const auto word = std::make_shared<std::atomic<u64>>(0);
+    constexpr u64 first_mask = 1 << 3;
+    constexpr u64 second_mask = 1 << 9;
+    CHECK_FALSE(state.TrackWriteNotification(0, word, first_mask));
+    REQUIRE(state.TrackWriteNotification(first, word, first_mask));
+    REQUIRE(state.TrackWriteNotification(second, word, second_mask));
+    CHECK(word->load() == 0);
+
+    state.OnWrite(1, 4);
+    CHECK(word->exchange(0, std::memory_order_acquire) == (first_mask | second_mask));
+    CHECK(state.WriteEpoch(first)->load(std::memory_order_relaxed) == 3);
+    CHECK(state.WriteEpoch(second)->load(std::memory_order_relaxed) == 2);
+    state.OnWrite(1, 4);
+    CHECK(word->load() == 0);
+
+    state.Arm(first, 0, 4);
+    state.Arm(second, 2, 6);
+    state.OnRemap(2, 5, false);
+    CHECK(word->exchange(0, std::memory_order_acquire) == (first_mask | second_mask));
+    CHECK(state.WriteEpoch(first)->load(std::memory_order_relaxed) == 5);
+    CHECK(state.WriteEpoch(second)->load(std::memory_order_relaxed) == 5);
+
+    // Newly dirty pages signal again even if the previous exchange is still being handled.
+    state.OnWrite(0, 1);
+    state.OnWrite(5, 6);
+    REQUIRE(state.TrackWriteNotification(first, nullptr, 0));
+    CHECK(word->exchange(0, std::memory_order_acquire) == (first_mask | second_mask));
+    state.Arm(first, 0, 4);
+    state.Arm(second, 2, 6);
+    state.OnRemap(2, 3, true);
+    CHECK(word->exchange(0, std::memory_order_acquire) == second_mask);
+    CHECK(state.WriteEpoch(first)->load(std::memory_order_relaxed) == 7);
+    CHECK(state.WriteEpoch(second)->load(std::memory_order_relaxed) == 7);
+
+    REQUIRE(state.TrackWriteNotification(second, word, 0));
+    state.Arm(second, 2, 6);
+    state.OnWrite(2, 3);
+    CHECK(word->load() == 0);
+}
+
 TEST_CASE("PageTracker: unarmed pages neither trap nor count until armed",
           "[core][page_tracker]") {
     FakeSink sink;

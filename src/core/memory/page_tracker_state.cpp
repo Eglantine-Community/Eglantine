@@ -5,6 +5,7 @@
 #include <bit>
 #include <type_traits>
 
+#include "common/scope_exit.h"
 #include "core/memory/page_tracker_state.h"
 
 namespace Core::Memory {
@@ -35,6 +36,26 @@ u64 WordMask(u64 word, u64 first, u64 last) {
 } // Anonymous namespace
 
 PageTrackerState::~PageTrackerState() = default;
+
+PageTrackerState::WriteNotifications::~WriteNotifications() {
+    while (first != nullptr) {
+        Owner* const owner = first;
+        first = std::exchange(owner->next_notification, nullptr);
+        owner->notification_word->fetch_or(owner->notification_mask, std::memory_order_release);
+    }
+}
+
+void PageTrackerState::WriteNotifications::Add(Owner& owner) {
+    if (!owner.notification_word || owner.next_notification != nullptr || &owner == last) {
+        return;
+    }
+    if (last != nullptr) {
+        last->next_notification = &owner;
+    } else {
+        first = &owner;
+    }
+    last = &owner;
+}
 
 void PageTrackerState::RunEmitter::Add(u64 page, PageClaim page_claim) {
     if (end != begin && page == end && page_claim == claim) {
@@ -169,11 +190,12 @@ u64 PageTrackerState::Register(u64 page_begin, u64 page_end, bool armed) {
                                                return page < other->page_begin;
                                            });
     const auto inserted = owners.insert(position, std::move(owner));
-    try {
+    {
+        auto rollback = SCOPE_GUARD {
+            owners.erase(inserted);
+        };
         owners_by_id.emplace(id, inserted->get());
-    } catch (...) {
-        owners.erase(inserted);
-        throw;
+        rollback.Cancel();
     }
     UpdatePrefixMaxEnds(static_cast<size_t>(inserted - owners.begin()));
     owner_count.fetch_add(1, std::memory_order_release);
@@ -341,6 +363,20 @@ std::shared_ptr<const std::atomic<u64>> PageTrackerState::WriteEpoch(u64 id) con
     return owner != nullptr ? owner->epoch : nullptr;
 }
 
+bool PageTrackerState::TrackWriteNotification(u64 id, std::shared_ptr<std::atomic<u64>> word,
+                                              u64 mask) {
+    Owner* const owner = Find(id);
+    if (owner == nullptr) {
+        return false;
+    }
+    if (mask == 0) {
+        word.reset();
+    }
+    owner->notification_mask = word ? mask : 0;
+    owner->notification_word = std::move(word);
+    return true;
+}
+
 void PageTrackerState::SetAccessCallback(u64 id, AccessCallback callback) {
     Owner* const owner = Find(id);
     if (owner == nullptr) {
@@ -442,6 +478,7 @@ bool PageTrackerState::AccessArmed(u64 page) const {
 
 bool PageTrackerState::OnWrite(u64 page_begin, u64 page_end) {
     bool device_path = false;
+    WriteNotifications notifications;
     RunEmitter emitter{sink};
     for (u64 page = page_begin; page != page_end; ++page) {
         bool tracked = false;
@@ -453,6 +490,7 @@ bool PageTrackerState::OnWrite(u64 page_begin, u64 page_end) {
                 SetBit(owner.dirty, index);
                 ++owner.dirty_count;
                 owner.epoch->fetch_add(1, std::memory_order_release);
+                notifications.Add(owner);
                 changed = true;
             }
         });
@@ -504,6 +542,7 @@ void PageTrackerState::SetDeviceCached(u64 page_begin, u64 page_end, bool cached
 }
 
 void PageTrackerState::OnRemap(u64 page_begin, u64 page_end, bool mapped) {
+    WriteNotifications notifications;
     RunEmitter emitter{sink};
     TrackedSpans(page_begin, page_end);
     for (const auto& [span_begin, span_end] : spans) {
@@ -515,6 +554,7 @@ void PageTrackerState::OnRemap(u64 page_begin, u64 page_end, bool mapped) {
                     SetBit(owner.dirty, index);
                     ++owner.dirty_count;
                     owner.epoch->fetch_add(1, std::memory_order_release);
+                    notifications.Add(owner);
                 }
             });
             if (mapped) {

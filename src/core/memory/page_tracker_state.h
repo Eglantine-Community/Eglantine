@@ -100,6 +100,9 @@ public:
     /// value read before a full CollectDirty of the owner, no page of the owner is dirty. Null for
     /// an unknown id.
     [[nodiscard]] std::shared_ptr<const std::atomic<u64>> WriteEpoch(u64 id) const;
+    /// Publish the owner's mask after new dirty pages advance its epoch. A null word or zero mask
+    /// detaches. Returns false for an unknown owner and leaves existing bits in the word alone.
+    bool TrackWriteNotification(u64 id, std::shared_ptr<std::atomic<u64>> word, u64 mask);
 
     void SetAccessCallback(u64 id, AccessCallback callback);
     void ArmAccess(u64 id, u64 page_begin, u64 page_end);
@@ -136,8 +139,22 @@ private:
         size_t dirty_count{};
         /// Counts every page that turned dirty (WriteEpoch).
         std::shared_ptr<std::atomic<u64>> epoch{std::make_shared<std::atomic<u64>>(0)};
+        std::shared_ptr<std::atomic<u64>> notification_word;
+        u64 notification_mask{};
+        Owner* next_notification{};
         ReadTraps access;
         std::shared_ptr<const AccessCallback> callback;
+    };
+
+    /// Publishes once per changed owner, after all epoch increments for this update.
+    class WriteNotifications {
+    public:
+        ~WriteNotifications();
+        void Add(Owner& owner);
+
+    private:
+        Owner* first{};
+        Owner* last{};
     };
 
     /// Emits page runs of equal claims to the sink.
