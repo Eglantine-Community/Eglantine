@@ -221,7 +221,7 @@ public:
     /// the manifest is complete. Works without EDEN_NX2_FRAME_DUMP.
     /// Sampled textures over `sampled_max_bytes` (0: no limit) are listed without readback.
     void Arm(std::filesystem::path directory, bool sampled, bool buffers, u64 id,
-             size_t sampled_max_bytes = 0);
+             size_t sampled_max_bytes = 0, std::vector<u32> sampled_tics = {});
 
 private:
     enum class DepthEncoding { None, Unorm16, Unorm24, Float32 };
@@ -239,6 +239,9 @@ private:
         bool rescaled;
         bool msaa;
         DepthEncoding depth_encoding;
+        std::optional<VideoCore::Surface::PixelFormat> host_blocks{};
+        VkImage view_image{};
+        s32 view_mip_count{1};
     };
 
     /// An image readback, or a buffer one (`raw`) of `bytes` bytes.
@@ -269,6 +272,7 @@ private:
     /// The native program key of a shader hash as 16 hex digits, or "" when unknown.
     std::string KeyOf(u64 shader_hash) const;
     static u32 TexelBytes(const Target& target);
+    static size_t ImageBytes(const Target& target);
     static int Decode(const Target& target, const u8* pixel, std::array<float, 4>& out);
     bool Record(const Target& target, std::string name, std::string tags);
     bool RecordSampled(const Sampled& texture, u32 index, std::string name, std::string tags);
@@ -295,6 +299,7 @@ private:
     size_t pending_bytes{};
     size_t recorded_bytes{};
     size_t sampled_max_bytes{};
+    std::vector<u32> sampled_tics;
     size_t written_bytes{};
     u32 sequence{};
     u32 images{};

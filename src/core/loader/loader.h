@@ -51,6 +51,7 @@ enum class FileType {
     NAX,
     KIP,
     NUP,
+    NX,
     DeconstructedRomDirectory,
 };
 
@@ -297,6 +298,20 @@ public:
      * @return ResultStatus result of function
      */
     virtual ResultStatus ReadRomFS(FileSys::VirtualFile& out_file) {
+        return ResultStatus::ErrorNotImplemented;
+    }
+
+    /**
+     * Get the RomFS of another program of the same application (multi-program titles), with
+     * that program's updates applied. Containers holding several programs implement this so
+     * OpenDataStorageWithProgramIndex finds programs that are not in the content provider.
+     *
+     * @param program_id The program to open, one of ReadProgramIds
+     * @param[out] out_file The RomFS
+     *
+     * @return ResultStatus result of function
+     */
+    virtual ResultStatus ReadProgramRomFS(u64 program_id, FileSys::VirtualFile& out_file) {
         return ResultStatus::ErrorNotImplemented;
     }
 
