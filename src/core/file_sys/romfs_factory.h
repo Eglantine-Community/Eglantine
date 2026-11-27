@@ -62,6 +62,8 @@ public:
 private:
     VirtualFile file;
     VirtualFile packed_update_raw;
+    /// RomFS of the container's other programs (multi-program titles), by program ID.
+    std::vector<std::pair<u64, VirtualFile>> program_romfs;
 
     VirtualFile base;
 

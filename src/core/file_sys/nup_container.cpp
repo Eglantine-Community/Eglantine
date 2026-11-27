@@ -7,6 +7,7 @@
 #include "core/file_sys/nup_container.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <list>
@@ -19,6 +20,17 @@
 #include <fmt/format.h>
 #include <openssl/evp.h>
 #include <zstd.h>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <cerrno>
+#include <csignal>
+#include <unistd.h>
+#endif
 
 #include "common/fs/path_util.h"
 #include "common/logging.h"
@@ -51,6 +63,69 @@ std::vector<std::pair<u64, VirtualFile>> NupContainer::GetAddonRomFS(u64 program
 
 namespace {
 
+u64 CurrentProcessId() {
+#ifdef _WIN32
+    return GetCurrentProcessId();
+#else
+    return static_cast<u64>(getpid());
+#endif
+}
+
+bool ProcessAlive(u64 pid) {
+#ifdef _WIN32
+    const HANDLE process =
+        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid));
+    if (process == nullptr) {
+        return GetLastError() == ERROR_ACCESS_DENIED;
+    }
+    DWORD code = 0;
+    const bool alive = GetExitCodeProcess(process, &code) && code == STILL_ACTIVE;
+    CloseHandle(process);
+    return alive;
+#else
+    return kill(static_cast<pid_t>(pid), 0) == 0 || errno == EPERM;
+#endif
+}
+
+// Removes spill files of processes that ended without deleting them (a crash or a forced
+// stop on Windows, where an open file cannot be unlinked), and files of older builds that
+// named them without the owner's process ID once they are an hour old.
+void RemoveSpillsOfEndedRuns(const std::filesystem::path& dir) {
+    std::error_code ec;
+    u64 removed = 0;
+    u64 bytes = 0;
+    const auto now = std::filesystem::file_time_type::clock::now();
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        const auto name = entry.path().filename().string();
+        if (!name.ends_with(".tmp") || !entry.is_regular_file(ec)) {
+            continue;
+        }
+        const auto dash = name.find('-');
+        const auto owner = name.substr(0, dash);
+        bool leftover;
+        if (dash != std::string::npos && dash <= 10 && !owner.empty() &&
+            std::ranges::all_of(owner, [](char c) { return c >= '0' && c <= '9'; })) {
+            const u64 pid = std::stoull(owner);
+            leftover = pid != CurrentProcessId() && !ProcessAlive(pid);
+        } else {
+            const auto written = entry.last_write_time(ec);
+            leftover = !ec && now - written > std::chrono::hours{1};
+        }
+        if (!leftover) {
+            continue;
+        }
+        const auto size = entry.file_size(ec);
+        if (std::filesystem::remove(entry.path(), ec)) {
+            ++removed;
+            bytes += ec ? 0 : size;
+        }
+    }
+    if (removed != 0) {
+        LOG_INFO(Loader, "Removed {} NUP temporary files ({} MiB) left by earlier runs", removed,
+                 bytes >> 20);
+    }
+}
+
 constexpr u32 NoDir = 0xFFFFFFFF;
 constexpr std::size_t SuperblockSize = 0x80;
 constexpr std::size_t PackageRecordSize = 0x40;
@@ -63,6 +138,8 @@ constexpr u8 CodecRaw = 0;
 constexpr std::array<u8, 4> ZstdMagic{0x28, 0xB5, 0x2F, 0xFD};
 constexpr u8 CodecZstd = 1;
 constexpr u8 PackageFlagStandaloneUpdate = 0x01;
+// Bit 1 is reserved for .listing retention (SPEC §6.3).
+constexpr u8 PackageFlagLaunchProgram = 0x04;
 constexpr u32 MaxDirDepth = 128;
 
 #pragma pack(push, 1)
@@ -292,12 +369,20 @@ private:
         std::random_device random;
         std::error_code ec;
         std::filesystem::create_directories(cache->spill_dir, ec);
-        spill.path =
-            cache->spill_dir / fmt::format("{:08x}{:08x}-{}.tmp", random(), random(), cache_index);
-        Common::FS::IOFile out{spill.path, Common::FS::FileAccessMode::Write};
+        // The owner's process ID lets a later run remove files a crashed run left behind.
+        spill.path = cache->spill_dir / fmt::format("{}-{:08x}{:08x}-{}.tmp", CurrentProcessId(),
+                                                    random(), random(), cache_index);
+        Common::FS::IOFile{spill.path, Common::FS::FileAccessMode::Write}.Close();
+        auto& out = spill.file;
+        out.Open(spill.path, Common::FS::FileAccessMode::ReadWrite);
         if (!out.IsOpen()) {
             return fail("cannot create the temporary file");
         }
+#ifndef _WIN32
+        // Unlinked while open: the system frees it when the process ends, even on a crash.
+        std::filesystem::remove(spill.path, ec);
+        spill.path.clear();
+#endif
 
         std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)> dctx{ZSTD_createDCtx(),
                                                                   &ZSTD_freeDCtx};
@@ -333,10 +418,8 @@ private:
         if (!frame_done || written != uncompressed_size) {
             return fail("size mismatch");
         }
-        out.Close();
-        spill.file.Open(spill.path, Common::FS::FileAccessMode::Read);
-        if (!spill.file.IsOpen()) {
-            fail("cannot reopen the temporary file");
+        if (!out.Flush()) {
+            fail("cannot flush the temporary file");
         }
     }
 
@@ -397,6 +480,14 @@ NupSpillFile::~NupSpillFile() {
     }
 }
 
+void NupContainer::RemoveLeftoverSpills(const std::filesystem::path& dir) {
+    RemoveSpillsOfEndedRuns(dir);
+}
+
+u64 NupContainer::CurrentProcessIdForSpills() {
+    return CurrentProcessId();
+}
+
 bool NupContainer::IsNupFile(const VirtualFile& file) {
     if (file == nullptr || file->GetSize() < SuperblockSize) {
         return false;
@@ -413,6 +504,8 @@ NupContainer::NupContainer(VirtualFile file_, std::size_t memory_cache_cap,
     cache->spill_dir = spill_dir_.empty()
                            ? Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) / "nup"
                            : std::move(spill_dir_);
+    static std::once_flag sweep;
+    std::call_once(sweep, [dir = cache->spill_dir] { RemoveSpillsOfEndedRuns(dir); });
     if (file == nullptr) {
         return;
     }
@@ -500,7 +593,7 @@ bool NupContainer::Parse() {
         std::memcpy(&record, base + pos, sizeof(record));
         pos += PackageRecordSize;
         if (record.kind > static_cast<u8>(PackageKind::Addon) ||
-            (record.flags & ~PackageFlagStandaloneUpdate) != 0 ||
+            (record.flags & ~(PackageFlagStandaloneUpdate | PackageFlagLaunchProgram)) != 0 ||
             record.root_dir >= header.dir_count ||
             (record.exefs_dir != NoDir && record.exefs_dir >= header.dir_count) ||
             (record.romfs_dir != NoDir && record.romfs_dir >= header.dir_count)) {
@@ -512,6 +605,7 @@ bool NupContainer::Parse() {
         package.version = record.version;
         package.kind = static_cast<PackageKind>(record.kind);
         package.standalone_update = (record.flags & PackageFlagStandaloneUpdate) != 0;
+        package.launch_program = (record.flags & PackageFlagLaunchProgram) != 0;
         package.root_dir = record.root_dir;
         package.exefs_dir = record.exefs_dir;
         package.romfs_dir = record.romfs_dir;
@@ -738,14 +832,72 @@ std::optional<std::size_t> NupContainer::FindPackage(PackageKind kind,
     return std::nullopt;
 }
 
-std::optional<std::size_t> NupContainer::FindBasePackage() const {
-    return FindPackage(PackageKind::Base);
+std::vector<u64> NupContainer::GetProgramIds() const {
+    std::vector<u64> ids;
+    const auto add = [&ids](u64 id) {
+        if (std::ranges::find(ids, id) == ids.end()) {
+            ids.push_back(id);
+        }
+    };
+    for (const auto& package : packages) {
+        if (package.kind == PackageKind::Base) {
+            add(package.title_id);
+        }
+    }
+    // A program without a base boots from its standalone update (update-only dumps).
+    for (const auto& package : packages) {
+        if (package.kind == PackageKind::Update && package.standalone_update &&
+            !FindPackage(PackageKind::Base, package.title_id)) {
+            add(package.title_id);
+        }
+    }
+    std::ranges::sort(ids);
+    return ids;
 }
 
-std::optional<std::size_t> NupContainer::FindBestUpdatePackage() const {
+std::optional<u64> NupContainer::FindLaunchProgram(std::size_t program_index) const {
+    const auto ids = GetProgramIds();
+    if (ids.empty()) {
+        return std::nullopt;
+    }
+    if (program_index != 0) {
+        const u64 target = GetBaseTitleIDWithProgramIndex(ids.front(), program_index);
+        if (std::ranges::find(ids, target) != ids.end()) {
+            return target;
+        }
+    }
+    for (const auto& package : packages) {
+        if (package.launch_program && package.kind != PackageKind::Addon &&
+            std::ranges::find(ids, package.title_id) != ids.end()) {
+            return package.title_id;
+        }
+    }
+    return ids.front();
+}
+
+std::optional<std::size_t> NupContainer::FindBasePackage(std::optional<u64> program_id) const {
+    if (!program_id) {
+        program_id = FindLaunchProgram();
+    }
+    // A single-program container keeps v1's rule: its one base, whatever its title ID.
+    if (GetProgramIds().size() <= 1) {
+        return FindPackage(PackageKind::Base);
+    }
+    return program_id ? FindPackage(PackageKind::Base, *program_id) : std::nullopt;
+}
+
+std::optional<std::size_t> NupContainer::FindBestUpdatePackage(
+    std::optional<u64> program_id) const {
+    if (!program_id) {
+        program_id = FindLaunchProgram();
+    }
+    const bool single_program = GetProgramIds().size() <= 1;
     std::optional<std::size_t> best;
     for (std::size_t i = 0; i < packages.size(); ++i) {
         if (packages[i].kind != PackageKind::Update) {
+            continue;
+        }
+        if (!single_program && packages[i].title_id != program_id) {
             continue;
         }
         if (!best || packages[i].version > packages[*best].version) {
@@ -753,6 +905,13 @@ std::optional<std::size_t> NupContainer::FindBestUpdatePackage() const {
         }
     }
     return best;
+}
+
+VirtualDir NupContainer::GetProgramRomFSDir(u64 program_id) {
+    const auto base = FindBasePackage(program_id);
+    const auto update = FindBestUpdatePackage(program_id);
+    return MergeShadowDirs(base ? GetRomFSDir(*base) : VirtualDir{},
+                           update ? GetRomFSDir(*update) : VirtualDir{});
 }
 
 VirtualFile NupContainer::OpenFile(std::size_t file_index) {

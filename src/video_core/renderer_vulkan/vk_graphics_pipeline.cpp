@@ -904,7 +904,8 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
     }
 
-    if (regs.transform_feedback_enabled != 0) {
+    if (regs.transform_feedback_enabled != 0 ||
+        (writes_storage && scheduler.HasDeferredWaitForIdle())) {
         scheduler.RequestOutsideRenderPassOperationContext();
     }
 

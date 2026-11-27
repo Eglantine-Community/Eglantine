@@ -25,7 +25,7 @@ namespace Loader {
 /// over the base; add-on content RomFS trees are registered with the DLC service.
 class AppLoader_NUP final : public AppLoader {
 public:
-    explicit AppLoader_NUP(FileSys::VirtualFile file_);
+    explicit AppLoader_NUP(FileSys::VirtualFile file_, std::size_t requested_program_index = 0);
     ~AppLoader_NUP() override;
 
     /**
@@ -46,6 +46,7 @@ public:
     ResultStatus VerifyIntegrity(std::function<bool(size_t, size_t)> progress_callback) override;
 
     ResultStatus ReadRomFS(FileSys::VirtualFile& out_file) override;
+    ResultStatus ReadProgramRomFS(u64 program_id, FileSys::VirtualFile& out_file) override;
     bool IsRomFSUpdatable() const override;
     ResultStatus ReadProgramId(u64& out_program_id) override;
     ResultStatus ReadProgramIds(std::vector<u64>& out_program_ids) override;

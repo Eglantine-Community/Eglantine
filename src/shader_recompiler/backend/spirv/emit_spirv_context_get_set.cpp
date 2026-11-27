@@ -321,6 +321,13 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, Id vertex) {
         const Id pointer{
             AttrPointer(ctx, generic.pointer_type, vertex, generic.id, ctx.Const(element))};
         const Id value{ctx.OpLoad(generic.component_type, pointer)};
+        if (ctx.stage == Stage::Fragment && ctx.runtime_info.screen_linear_generics.test(index) &&
+            generic.load_op == InputGenericLoadOp::None) {
+            // Written times w by the last vertex stage: interpolated perspective-correct, this
+            // gives the screen-linear value even where the host clipped the primitive.
+            const Id frag_coord{ctx.OpLoad(ctx.F32[4], ctx.input_position)};
+            return ctx.OpFMul(ctx.F32[1], value, ctx.OpCompositeExtract(ctx.F32[1], frag_coord, 3u));
+        }
         return [&ctx, generic, value]() {
             switch (generic.load_op) {
             case InputGenericLoadOp::Bitcast:
@@ -629,16 +636,21 @@ Id EmitRenderArea(EmitContext& ctx) {
     }
 }
 
+namespace {
+Id LocalMemoryPointer(EmitContext& ctx, Id word_offset) {
+    // The offset can come from guest data: an access past the array is undefined in SPIR-V and
+    // hangs the GPU on RADV, where the array lives in scratch memory.
+    const Id index{ctx.OpUMin(ctx.U32[1], word_offset, ctx.local_memory_spare)};
+    return ctx.OpAccessChain(ctx.private_u32, ctx.local_memory, index, ctx.Const(0U));
+}
+} // Anonymous namespace
+
 Id EmitLoadLocal(EmitContext& ctx, Id word_offset) {
-    const Id pointer{
-        ctx.OpAccessChain(ctx.private_u32, ctx.local_memory, word_offset, ctx.Const(0U))};
-    return ctx.OpLoad(ctx.U32[1], pointer);
+    return ctx.OpLoad(ctx.U32[1], LocalMemoryPointer(ctx, word_offset));
 }
 
 void EmitWriteLocal(EmitContext& ctx, Id word_offset, Id value) {
-    const Id pointer{
-        ctx.OpAccessChain(ctx.private_u32, ctx.local_memory, word_offset, ctx.Const(0U))};
-    ctx.OpStore(pointer, value);
+    ctx.OpStore(LocalMemoryPointer(ctx, word_offset), value);
 }
 
 } // namespace Shader::Backend::SPIRV

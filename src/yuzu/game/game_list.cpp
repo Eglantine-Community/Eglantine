@@ -43,9 +43,13 @@
 #include "common/game_presets.h"
 #include "core/core.h"
 #include "core/file_sys/nup_writer.h"
+#ifdef EGLANTINE_NX_TOOLS
+#include "yuzu/nx_tools.h"
+#endif
 #include "core/file_sys/patch_manager.h"
 #include "core/file_sys/registered_cache.h"
 #include "core/loader/loader.h"
+#include "core/loader/nx.h"
 #include "qt_common/config/uisettings.h"
 #include "qt_common/game_list/game_list_p.h"
 #include "qt_common/game_list/model.h"
@@ -362,6 +366,10 @@ void GameList::SetNupConversionRunning(bool running) {
     nup_conversion_running = running;
 }
 
+void GameList::SetNxToolRunning(bool running) {
+    nx_tool_running = running;
+}
+
 GameList::~GameList() {
     UnloadController();
 }
@@ -422,6 +430,9 @@ void GameList::PopulateAsync(QVector<UISettings::GameDir>& game_dirs) {
 
 void GameList::SetScanEnabled(bool enabled) {
     item_model->SetScanEnabled(enabled);
+    if (!enabled && details_pool) {
+        details_pool->waitForDone();
+    }
 }
 
 void GameList::SaveInterfaceLayout() {
@@ -854,10 +865,12 @@ void GameList::RefreshAddOnsRow(u64 program_id, const QString& path) {
         if (!loader) {
             return;
         }
+        const auto content = Loader::AppLoader_NX::ContentForGame(
+            system_.GetContentProviderUnion(), loader.get());
         const FileSys::PatchManager patch_manager{program_id, system_.GetFileSystemController(),
-                                                  system_.GetContentProvider()};
+                                                  content};
         GameListPatchInfo info = ReadGameListPatchInfo(*loader, patch_manager);
-        QMetaObject::invokeMethod(qApp, [guard, program_id, info = std::move(info)] {
+        QMetaObject::invokeMethod(qApp, [guard, program_id, path, info = std::move(info)] {
             if (!guard) {
                 return;
             }
@@ -878,8 +891,8 @@ void GameList::RefreshAddOnsRow(u64 program_id, const QString& path) {
                         continue;
                     }
                     if (child->type() == static_cast<int>(GameListItemType::Game) &&
-                        child->data(GameListItemPath::ProgramIdRole).toULongLong() ==
-                            program_id) {
+                        child->data(GameListItemPath::ProgramIdRole).toULongLong() == program_id &&
+                        child->data(GameListItemPath::FullPathRole).toString() == path) {
                         child->setData(info.version, GameListItemPath::VersionRole);
                         const QString tooltip = child->data(Qt::ToolTipRole).toString();
                         child->setData(QStringLiteral("%1\n%2").arg(
@@ -1038,14 +1051,16 @@ void GameList::LoadGameDetailsExtras(u64 program_id, const QString& path) {
 
         FileSys::VirtualFile update_raw;
         std::vector<std::pair<u64, u32>> packed_add_ons;
-        if (const auto file = Core::GetGameFileFromPath(vfs_, path.toStdString())) {
-            if (const auto loader = Loader::GetLoader(system_, file)) {
-                loader->ReadUpdateRaw(update_raw);
-                loader->ReadAddOnContent(packed_add_ons);
-            }
+        const auto file = Core::GetGameFileFromPath(vfs_, path.toStdString());
+        const auto loader = file ? Loader::GetLoader(system_, file) : nullptr;
+        if (loader) {
+            loader->ReadUpdateRaw(update_raw);
+            loader->ReadAddOnContent(packed_add_ons);
         }
+        const auto content = Loader::AppLoader_NX::ContentForGame(
+            system_.GetContentProviderUnion(), loader.get());
         const FileSys::PatchManager patch_manager{program_id, system_.GetFileSystemController(),
-                                                  system_.GetContentProvider()};
+                                                  content};
         // Same rules as the per-game Add-Ons tab: one update at most is enabled.
         bool has_enabled_update = false;
         for (const auto& patch : patch_manager.GetPatches(update_raw, packed_add_ons)) {
@@ -1487,6 +1502,27 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
         convert_nup = context_menu.addAction(tr("Convert to NUP..."));
         convert_nup->setEnabled(!nup_conversion_running);
     }
+    QAction* convert_nx = nullptr;
+    QAction* extract_nx = nullptr;
+    QAction* add_to_nx = nullptr;
+    QAction* remove_from_nx = nullptr;
+    QAction* edit_nx_metadata = nullptr;
+#ifdef EGLANTINE_NX_TOOLS
+    if (NxTools::CanConvert(path)) {
+        convert_nx = context_menu.addAction(tr("Convert to NX..."));
+        convert_nx->setEnabled(!nx_tool_running);
+    }
+    if (NxTools::IsNxArchive(path)) {
+        extract_nx = context_menu.addAction(tr("Dump NX..."));
+        extract_nx->setEnabled(!nx_tool_running);
+        QMenu* nx_menu = context_menu.addMenu(tr("Manage NX Archive"));
+        add_to_nx = nx_menu->addAction(tr("Add Update or DLC..."));
+        remove_from_nx = nx_menu->addAction(tr("Remove Update or DLC..."));
+        nx_menu->addSeparator();
+        edit_nx_metadata = nx_menu->addAction(tr("Edit Title and Icon..."));
+        nx_menu->setEnabled(!nx_tool_running);
+    }
+#endif
 #if !defined(__APPLE__)
     QMenu* shortcut_menu = context_menu.addMenu(tr("Create Shortcut"));
     QAction* create_desktop_shortcut = shortcut_menu->addAction(tr("Add to Desktop"));
@@ -1591,6 +1627,20 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
     if (convert_nup) {
         connect(convert_nup, &QAction::triggered, this,
                 [this, path]() { emit ConvertToNupRequested(path); });
+    }
+    if (convert_nx) {
+        connect(convert_nx, &QAction::triggered, this,
+                [this, path]() { emit ConvertToNxRequested(path); });
+    }
+    if (add_to_nx) {
+        connect(extract_nx, &QAction::triggered, this,
+                [this, path]() { emit ExtractNxRequested(path); });
+        connect(add_to_nx, &QAction::triggered, this,
+                [this, path]() { emit AddToNxRequested(path); });
+        connect(remove_from_nx, &QAction::triggered, this,
+                [this, path]() { emit RemoveFromNxRequested(path); });
+        connect(edit_nx_metadata, &QAction::triggered, this,
+                [this, path]() { emit EditNxMetadataRequested(path); });
     }
     if (extract_nup) {
         connect(extract_nup, &QAction::triggered, this,

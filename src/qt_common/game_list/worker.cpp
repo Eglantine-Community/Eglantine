@@ -20,6 +20,7 @@
 #include <QFileInfo>
 #include <QSettings>
 
+#include "common/fs/file.h"
 #include "common/fs/fs.h"
 #include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
@@ -34,6 +35,7 @@
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/submission_package.h"
 #include "core/loader/loader.h"
+#include "core/loader/nx.h"
 
 #include "qt_common/config/uisettings.h"
 #include "qt_common/qt_common.h"
@@ -279,7 +281,10 @@ GameListPatchInfo ReadPatchInfo(Loader::AppLoader& loader, const FileSys::PatchM
             return FormatPatchNameVersions(patch, loader, loader.IsRomFSUpdatable());
         });
 
-    if (loader.GetFileType() == Loader::FileType::NUP && nacp) {
+    const auto file_type = loader.GetFileType();
+    // An NX tree snapshot, like a NUP, is already the updated game: no patch manager update.
+    if ((file_type == Loader::FileType::NUP ||
+         (file_type == Loader::FileType::NX && !loader.IsRomFSUpdatable())) && nacp) {
         const std::string version_string = nacp->GetVersionString();
         if (!version_string.empty()) {
             if (!patch_versions.isEmpty()) {
@@ -425,7 +430,8 @@ void GameListWorker::AddTitlesToGameList(GameListDir* parent_dir, GameListItemTy
     }
 
     for (const auto& [slot, game] : installed_games) {
-        if (slot == ContentProviderUnionSlot::FrontendManual) {
+        if (slot == ContentProviderUnionSlot::FrontendManual ||
+            slot == ContentProviderUnionSlot::GameArchive) {
             continue;
         }
 
@@ -464,6 +470,15 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::vector<std::fi
                                     GameListDir* parent_dir) {
     const auto process_candidate = [this, target,
                                     parent_dir](const std::filesystem::path& path) {
+        // The VFS opens lazily. Check access before handing a locked copy to the format probes.
+        Common::FS::IOFile readable;
+        readable.Open(path, Common::FS::FileAccessMode::Read, Common::FS::FileType::BinaryFile,
+                      Common::FS::FileShareFlag::ShareReadOnly, false);
+        if (!readable.IsOpen()) {
+            LOG_DEBUG(Frontend, "Skipping unavailable game file: {}",
+                      Common::FS::PathToUTF8String(path));
+            return;
+        }
         const auto physical_name = Common::FS::PathToUTF8String(path);
         const auto file = vfs->OpenFile(physical_name, FileSys::OpenMode::Read);
         if (!file) {
@@ -483,7 +498,7 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::vector<std::fi
         if (target == ScanTarget::PopulateGameList &&
             (file_type == Loader::FileType::XCI || file_type == Loader::FileType::XCZ ||
              file_type == Loader::FileType::NSP || file_type == Loader::FileType::NSZ ||
-             file_type == Loader::FileType::NUP) &&
+             file_type == Loader::FileType::NUP || file_type == Loader::FileType::NX) &&
             !Loader::IsBootableGameContainer(file, file_type)) {
             return;
         }
@@ -497,10 +512,8 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::vector<std::fi
                                    FileSys::GetCRTypeFromNCAType(FileSys::NCA{file}.GetType()),
                                    program_id, file);
             } else if (Settings::values.ext_content_from_game_dirs.GetValue() &&
-                       (file_type == Loader::FileType::XCI ||
-                        file_type == Loader::FileType::XCZ ||
-                        file_type == Loader::FileType::NSP ||
-                        file_type == Loader::FileType::NSZ)) {
+                       (file_type == Loader::FileType::XCI || file_type == Loader::FileType::XCZ ||
+                        file_type == Loader::FileType::NSP || file_type == Loader::FileType::NSZ)) {
                 void(provider->AddEntriesFromContainer(file));
             }
         } else {
@@ -521,9 +534,19 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::vector<std::fi
                         name = loose.toStdString();
                     }
                 }
+                if ((res3 != Loader::ResultStatus::Success || name.empty() || name == " ") &&
+                    (app_loader->GetFileType() == Loader::FileType::NX ||
+                     app_loader->GetFileType() == Loader::FileType::NUP)) {
+                    // A dump without control data has no title: show the file name.
+                    name = QFileInfo(QString::fromStdString(physical_name))
+                               .completeBaseName()
+                               .toStdString();
+                }
 
-                const FileSys::PatchManager patch{id, system.GetFileSystemController(),
-                                                  system.GetContentProvider()};
+                const auto content =
+                    Loader::AppLoader_NX::ContentForGame(system.GetContentProviderUnion(),
+                                                         app_loader.get());
+                const FileSys::PatchManager patch{id, system.GetFileSystemController(), content};
 
                 const bool loose_dump = IsExtractedNCAMain(physical_name);
                 const u64 size = loose_dump ? 0 : Common::FS::GetSize(physical_name);

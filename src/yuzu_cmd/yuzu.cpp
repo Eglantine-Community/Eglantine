@@ -8,6 +8,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <iterator>
 #include <fstream>
@@ -353,6 +354,61 @@ static std::optional<RestartHandoff> ReadRestartHandoff() {
     return handoff;
 }
 
+// The Qt frontend copies data folders out of an older emulator's folder, but only updates its own
+// config (UserDataMigrator::ReconcileLegacyPaths). Follow it here: a path still inside such a
+// folder moves to the same place under the Eglantine folder once that holds the data, or when the
+// old folder is empty. Otherwise it is kept, so nothing is lost.
+static void FollowMovedLegacyPaths(SdlConfig& config) {
+    namespace fs = std::filesystem;
+    using Common::FS::EdenPath;
+    using Common::FS::EmuPath;
+
+    static constexpr std::array legacy_roots{EmuPath::CitronDir, EmuPath::SudachiDir,
+                                             EmuPath::SuyuDir, EmuPath::YuzuDir,
+                                             EmuPath::LegacyEdenDir};
+    static constexpr std::array paths{EdenPath::NANDDir,  EdenPath::SDMCDir, EdenPath::SaveDir,
+                                      EdenPath::LoadDir,  EdenPath::DumpDir, EdenPath::TASDir,
+                                      EdenPath::ScreenshotsDir};
+    const auto has_files = [](const fs::path& dir) {
+        std::error_code ec;
+        return fs::is_directory(dir, ec) && !fs::is_empty(dir, ec) && !ec;
+    };
+
+    const fs::path eden_dir = Common::FS::GetEdenPath(EdenPath::EdenDir);
+    bool changed = false;
+    for (const EmuPath root : legacy_roots) {
+        const fs::path legacy_dir = Common::FS::GetLegacyPath(root).lexically_normal();
+        std::error_code ec;
+        // Linked migrations share the folder on purpose.
+        if (!fs::is_directory(legacy_dir, ec) || fs::equivalent(legacy_dir, eden_dir, ec)) {
+            continue;
+        }
+        for (const EdenPath path : paths) {
+            const fs::path current = Common::FS::GetEdenPath(path).lexically_normal();
+            const fs::path relative = current.lexically_relative(legacy_dir);
+            if (relative.empty() || relative == "." || *relative.begin() == "..") {
+                continue;
+            }
+            const fs::path target = (eden_dir / relative).lexically_normal();
+            if (!has_files(target) && has_files(current)) {
+                LOG_WARNING(Frontend,
+                            "{} is inside another emulator's folder and {} holds no copy of it; "
+                            "keeping it. Open Eglantine once to copy it over.",
+                            Common::FS::PathToUTF8String(current),
+                            Common::FS::PathToUTF8String(target));
+                continue;
+            }
+            LOG_INFO(Frontend, "Using {} instead of {}", Common::FS::PathToUTF8String(target),
+                     Common::FS::PathToUTF8String(current));
+            Common::FS::SetEdenPath(path, target);
+            changed = true;
+        }
+    }
+    if (changed) {
+        config.SaveAllValues();
+    }
+}
+
 static std::atomic_bool pack_nup_cancel{false};
 static std::atomic_bool unpack_nup_cancel{false};
 static std::atomic_bool edit_nup_cancel{false};
@@ -611,6 +667,7 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     LocalFree(argv_w);
 #endif
     SdlConfig config{lp.config_path};
+    FollowMovedLegacyPaths(config);
     // Before anything loads a GPU driver.
     Common::ConfigureDriverShaderCache(Settings::values.private_driver_shader_cache.GetValue(),
                                        Settings::values.driver_shader_cache_size.GetValue());

@@ -114,14 +114,16 @@ std::string DecodeVersion(u32 version) {
 
 } // namespace
 
-AppLoader_NUP::AppLoader_NUP(FileSys::VirtualFile file_)
+AppLoader_NUP::AppLoader_NUP(FileSys::VirtualFile file_, std::size_t requested_program_index)
     : AppLoader(std::move(file_)), nup(std::make_unique<NupContainer>(file)) {
     if (nup->GetStatus() != ResultStatus::Success) {
         return;
     }
 
-    const auto base_index = nup->FindBasePackage();
-    const auto update_index = nup->FindBestUpdatePackage();
+    // Multi-program containers (SPEC §3.1.2) hold one base per program.
+    const auto launch = nup->FindLaunchProgram(requested_program_index);
+    const auto base_index = nup->FindBasePackage(launch);
+    const auto update_index = nup->FindBestUpdatePackage(launch);
 
     // The program comes from the base package; a standalone update container
     // (SPEC §4.1.2) carries a complete patched tree and boots on its own.
@@ -153,7 +155,8 @@ AppLoader_NUP::AppLoader_NUP(FileSys::VirtualFile file_)
         LOG_ERROR(Loader, "NUP package has no usable ExeFS");
         return;
     }
-    secondary_loader = std::make_unique<AppLoader_DeconstructedRomDirectory>(exefs, true);
+    secondary_loader = std::make_unique<AppLoader_DeconstructedRomDirectory>(
+            exefs, AppLoader_DeconstructedRomDirectory::ExeFSPatching::UpdatesAndMods);
 
     if (update_index) {
         const auto& update = nup->GetPackages()[*update_index];
@@ -226,14 +229,24 @@ ResultStatus AppLoader_NUP::VerifyIntegrity(
 }
 
 ResultStatus AppLoader_NUP::ReadRomFS(FileSys::VirtualFile& out_file) {
-    const auto base_index = nup->FindBasePackage();
-    const auto base_romfs = base_index ? nup->GetRomFSDir(*base_index) : FileSys::VirtualDir{};
-    const auto update_index = nup->FindBestUpdatePackage();
-    const auto update_romfs =
-        update_index ? nup->GetRomFSDir(*update_index) : FileSys::VirtualDir{};
+    if (!has_program) {
+        return ResultStatus::ErrorNotInitialized;
+    }
+    return ReadProgramRomFS(base_title_id, out_file);
+}
+
+ResultStatus AppLoader_NUP::ReadProgramRomFS(u64 program_id, FileSys::VirtualFile& out_file) {
+    if (nup->GetStatus() != ResultStatus::Success) {
+        return nup->GetStatus();
+    }
+    const auto program_ids = nup->GetProgramIds();
+    if (program_id != base_title_id && std::ranges::find(program_ids, program_id) ==
+                                           program_ids.end()) {
+        return ResultStatus::ErrorNoRomFS;
+    }
     // A standalone update carries the complete merged tree; a base+update pair
     // overlays the update onto the base (SPEC §4.1.4).
-    const auto merged = FileSys::NupContainer::MergeShadowDirs(base_romfs, update_romfs);
+    const auto merged = nup->GetProgramRomFSDir(program_id);
     if (merged == nullptr) {
         return ResultStatus::ErrorNoRomFS;
     }
@@ -262,6 +275,11 @@ ResultStatus AppLoader_NUP::ReadProgramIds(std::vector<u64>& out_program_ids) {
         return ResultStatus::ErrorNotInitialized;
     }
     out_program_ids.push_back(base_title_id);
+    for (const u64 id : nup->GetProgramIds()) {
+        if (id != base_title_id) {
+            out_program_ids.push_back(id);
+        }
+    }
     return ResultStatus::Success;
 }
 

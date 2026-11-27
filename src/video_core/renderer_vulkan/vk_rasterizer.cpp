@@ -2652,9 +2652,28 @@ void RasterizerVulkan::TickFrame() {
     draw_counter = 0;
     // Debug server requests (docs/nx2/debug-mcp.md), taken between frames on the owning thread.
     if (VideoCore::Nx2Debug::HasRequests()) {
+        if (auto request = VideoCore::Nx2Debug::TakeAstcFusion()) {
+            const bool supported = texture_cache_runtime.SupportsAstcFusion();
+            size_t marked = 0;
+            try {
+                if (supported && request->enable &&
+                    *request->enable != texture_cache_runtime.AstcFusionEnabled()) {
+                    std::scoped_lock lock{texture_cache.mutex};
+                    texture_cache_runtime.SetAstcFusion(*request->enable);
+                    marked = texture_cache.InvalidateAstcTranscodes();
+                    LOG_INFO(Render_Vulkan, "ASTC fusion {}: {} cached images marked for refresh",
+                             *request->enable ? "enabled" : "disabled", marked);
+                }
+                request->result.set_value({supported,
+                                           supported && texture_cache_runtime.AstcFusionEnabled(),
+                                           marked});
+            } catch (...) {
+                request->result.set_exception(std::current_exception());
+            }
+        }
         if (auto capture = VideoCore::Nx2Debug::TakeCapture()) {
             frame_dump.Arm(std::move(capture->directory), capture->sampled, capture->buffers,
-                           capture->id, capture->sampled_max_bytes);
+                           capture->id, capture->sampled_max_bytes, std::move(capture->sampled_tics));
         }
         if (const auto change = VideoCore::Nx2Debug::TakeRejectChange()) {
             pipeline_cache.RefreshDebugRejections(change->unrejected);
@@ -3160,8 +3179,12 @@ void RasterizerVulkan::LoadDiskResources(u64 title_id, std::stop_token stop_load
     pipeline_cache.LoadDiskResources(title_id, stop_loading, callback);
 }
 
+namespace {
+// Cap on guest bytes recorded per buffer, so one oversized binding cannot blow up the dump.
+constexpr u32 BUFFER_CAP = 4U << 20;
+} // namespace
+
 bool RasterizerVulkan::FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes) {
-    static constexpr u32 BUFFER_CAP = 4U << 20;
     std::vector<FrameDump::BoundBuffer> buffers;
     buffer_cache.ForEachBoundBuffer(compute, [&](u32 stage, bool storage, u32 index, bool written,
                                                  const auto& binding, u32 bound_size,
@@ -3191,7 +3214,6 @@ bool RasterizerVulkan::FrameDumpBuffers(bool compute, std::span<const u64> shade
 }
 
 bool RasterizerVulkan::FrameDumpDrawInputs(bool is_indexed, std::span<const u64> shader_hashes) {
-    static constexpr u32 BUFFER_CAP = 4U << 20;
     static constexpr u32 INDIRECT_WORDS = 64;
     const auto& regs = maxwell3d->regs;
     const auto& state = maxwell3d->draw_manager.draw_state;
@@ -3260,6 +3282,7 @@ bool RasterizerVulkan::FrameDumpDrawInputs(bool is_indexed, std::span<const u64>
             if (slot < 0 && !is_indexed) {
                 return;
             }
+            constexpr u32 BUFFER_CAP = 4U << 20;
             const u32 size = (std::min)(binding.size, BUFFER_CAP);
             FrameDump::VertexInput& input = inputs.emplace_back(FrameDump::VertexInput{
                 .slot = slot,

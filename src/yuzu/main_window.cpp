@@ -61,6 +61,10 @@
 #include "mcp/server.h"
 #include "yuzu/mcp_host_qt.h"
 #endif
+#ifdef EGLANTINE_NX_TOOLS
+#include "core/file_sys/registered_cache.h"
+#include "yuzu/nx_tools.h"
+#endif
 
 #include "applets/qt_amiibo_settings.h"
 #include "applets/qt_controller.h"
@@ -190,6 +194,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "core/file_sys/nup_writer.h"
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/savedata_factory.h"
+#include "core/loader/nx.h"
 
 #include "core/tools/renderdoc.h"
 
@@ -1922,6 +1927,24 @@ void MainWindow::ConnectWidgetEvents() {
     connect(game_list, &GameList::ExtractMusicRequested, this, &MainWindow::OnGameListExtractMusic);
     connect(game_list, &GameList::EditNupMetadataRequested, this,
             &MainWindow::OnGameListEditNupMetadata);
+#ifdef EGLANTINE_NX_TOOLS
+    nx_tools = new NxTools(QtCommon::vfs, this, [this] { return PrepareNxWrite(); });
+    connect(nx_tools, &NxTools::RunningChanged, game_list, &GameList::SetNxToolRunning);
+    connect(nx_tools, &NxTools::ArchivesChanged, this, &MainWindow::OnGameListRefresh);
+    connect(nx_tools, &NxTools::ArchiveWriteFinished, this, [this] {
+        nx_write_in_progress = false;
+        if (!close_pending) {
+            QtCommon::Game::ResetMetadata(false);
+            game_list->SetScanEnabled(true);
+            game_list->PopulateAsync(UISettings::values.game_dirs);
+        }
+    });
+    connect(game_list, &GameList::ConvertToNxRequested, nx_tools, &NxTools::ConvertToNx);
+    connect(game_list, &GameList::ExtractNxRequested, nx_tools, &NxTools::ExtractNx);
+    connect(game_list, &GameList::AddToNxRequested, nx_tools, &NxTools::AddToNx);
+    connect(game_list, &GameList::RemoveFromNxRequested, nx_tools, &NxTools::RemoveFromNx);
+    connect(game_list, &GameList::EditNxMetadataRequested, nx_tools, &NxTools::EditNxMetadata);
+#endif
     connect(game_list, &GameList::CopyTIDRequested, this, &MainWindow::OnGameListCopyTID);
     connect(game_list, &GameList::CreateShortcut, this, &MainWindow::OnGameListCreateShortcut);
     connect(game_list, &GameList::AddDirectory, this, &MainWindow::OnGameListAddDirectory);
@@ -2440,6 +2463,14 @@ bool MainWindow::SelectAndSetCurrentUser(
 
 void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletParameters params,
                           StartGameType type, bool allow_recommended_settings_prompt) {
+#ifdef EGLANTINE_NX_TOOLS
+    if (nx_write_in_progress) {
+        QMessageBox::information(
+            this, tr("NX Archive"),
+            tr("Wait for the NX file operation to finish before starting a game."));
+        return;
+    }
+#endif
     if (nup_running && filename.toStdString() == nup_source_path) {
         QMessageBox::information(this, tr("Conversion in Progress"),
                                  tr("This game cannot be started while its dump is being "
@@ -3247,33 +3278,49 @@ void MainWindow::OnGameListDumpRomFS(u64 program_id, const std::string& game_pat
         return;
     }
 
-    FileSys::VirtualFile packed_update_raw{};
-    loader->ReadUpdateRaw(packed_update_raw);
-
     const auto& installed = QtCommon::system->GetContentProvider();
 
     u64 title_id{};
-    u8 raw_type{};
-    if (!SelectRomFSDumpTarget(installed, program_id, &title_id, &raw_type)) {
-        failed();
-        return;
+    FileSys::VirtualFile romfs;
+    if (loader->GetFileType() == Loader::FileType::NX) {
+        // An NX archive is never installed: it gives its own RomFS, update applied.
+        Loader::AppLoader_NX nx_loader{*QtCommon::system,
+                                       QtCommon::vfs->OpenFile(game_path, FileSys::OpenMode::Read),
+                                       program_id};
+        title_id = program_id;
+        if (nx_loader.ReadPatchedRomFS(romfs) != Loader::ResultStatus::Success) {
+            failed();
+            return;
+        }
+    } else {
+        FileSys::VirtualFile packed_update_raw{};
+        loader->ReadUpdateRaw(packed_update_raw);
+
+        u8 raw_type{};
+        if (!SelectRomFSDumpTarget(installed, program_id, &title_id, &raw_type)) {
+            failed();
+            return;
+        }
+
+        const auto type = static_cast<FileSys::ContentRecordType>(raw_type);
+        const auto base_nca = installed.GetEntry(title_id, type);
+        if (!base_nca) {
+            failed();
+            return;
+        }
+
+        const FileSys::NCA update_nca{packed_update_raw, nullptr};
+        if (type != FileSys::ContentRecordType::Program ||
+            update_nca.GetStatus() != Loader::ResultStatus::ErrorMissingBKTRBaseRomFS ||
+            update_nca.GetTitleId() != FileSys::GetUpdateTitleID(title_id)) {
+            packed_update_raw = {};
+        }
+
+        const FileSys::PatchManager pm{title_id, QtCommon::system->GetFileSystemController(),
+                                       installed};
+        romfs = pm.PatchRomFS(base_nca.get(), base_nca->GetRomFS(), type, packed_update_raw, false);
     }
 
-    const auto type = static_cast<FileSys::ContentRecordType>(raw_type);
-    const auto base_nca = installed.GetEntry(title_id, type);
-    if (!base_nca) {
-        failed();
-        return;
-    }
-
-    const FileSys::NCA update_nca{packed_update_raw, nullptr};
-    if (type != FileSys::ContentRecordType::Program ||
-        update_nca.GetStatus() != Loader::ResultStatus::ErrorMissingBKTRBaseRomFS ||
-        update_nca.GetTitleId() != FileSys::GetUpdateTitleID(title_id)) {
-        packed_update_raw = {};
-    }
-
-    const auto base_romfs = base_nca->GetRomFS();
     const auto dump_dir =
         target == DumpRomFSTarget::Normal
             ? Common::FS::GetEdenPath(Common::FS::EdenPath::DumpDir)
@@ -3281,10 +3328,6 @@ void MainWindow::OnGameListDumpRomFS(u64 program_id, const std::string& game_pat
     const auto romfs_dir = fmt::format("{:016X}/romfs", title_id);
 
     const auto path = Common::FS::PathToUTF8String(dump_dir / romfs_dir);
-
-    const FileSys::PatchManager pm{title_id, QtCommon::system->GetFileSystemController(),
-                                   installed};
-    auto romfs = pm.PatchRomFS(base_nca.get(), base_romfs, type, packed_update_raw, false);
 
     const auto out = VfsFilesystemCreateDirectoryWrapper(path, FileSys::OpenMode::ReadWrite);
 
@@ -4726,6 +4769,23 @@ void MainWindow::OnGameListRefresh() {
     game_list->RefreshExternalContent();
     SetFirmwareVersion();
 }
+
+#ifdef EGLANTINE_NX_TOOLS
+bool MainWindow::PrepareNxWrite() {
+    if (boot_in_progress || close_pending || nx_write_in_progress) {
+        return false;
+    }
+    if (emulation_running || QtCommon::system->IsPoweredOn()) {
+        QMessageBox::information(
+            this, tr("NX Archive"), tr("Stop emulation before changing the archive or its sources."));
+        return false;
+    }
+    nx_write_in_progress = true;
+    game_list->SetScanEnabled(false);
+    QtCommon::provider->ClearAllEntries();
+    return true;
+}
+#endif
 
 void MainWindow::OnGameListConvertToNup(const std::string& game_path) {
     if (nup_running)

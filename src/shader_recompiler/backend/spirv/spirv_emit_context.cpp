@@ -816,9 +816,11 @@ void EmitContext::DefineLocalMemory(const IR::Program& program) {
     }
     const u32 num_elements{Common::DivCeil(program.local_memory_size, 4U)};
     const Id element_type{TypeStruct(U32[1])};
-    const Id type{TypeArray(element_type, Const(num_elements))};
+    // One spare element takes the accesses whose runtime offset is out of bounds.
+    const Id type{TypeArray(element_type, Const(num_elements + 1))};
     const Id pointer{TypePointer(spv::StorageClass::Private, type)};
     local_memory = AddGlobalVariable(pointer, spv::StorageClass::Private);
+    local_memory_spare = Const(num_elements);
     if (profile.supported_spirv >= 0x00010400) {
         interfaces.push_back(local_memory);
     }
@@ -2556,7 +2558,8 @@ void EmitContext::DefineInputs(const IR::Program& program) {
         layer = DefineInput(*this, U32[1], false, spv::BuiltIn::Layer);
         Decorate(layer, spv::Decoration::Flat);
     }
-    if (loads.AnyComponent(IR::Attribute::PositionX)) {
+    if (loads.AnyComponent(IR::Attribute::PositionX) ||
+        (stage == Stage::Fragment && runtime_info.screen_linear_generics.any())) {
         const bool is_fragment{stage == Stage::Fragment};
         if (!is_fragment && profile.has_broken_spirv_position_input) {
             need_input_position_indirect = true;
@@ -2665,7 +2668,9 @@ void EmitContext::DefineInputs(const IR::Program& program) {
             case Interpolation::Smooth:
                 break;
             case Interpolation::NoPerspective:
-                Decorate(id, spv::Decoration::NoPerspective);
+                if (!runtime_info.screen_linear_generics.test(index)) {
+                    Decorate(id, spv::Decoration::NoPerspective);
+                }
                 break;
             case Interpolation::Flat:
                 Decorate(id, spv::Decoration::Flat);
