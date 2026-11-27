@@ -173,23 +173,14 @@ TEST_CASE("MKW adaptive present only shortens the two-vblank gameplay interval",
     REQUIRE(AdaptivePresentInterval(3, true, false) == 3);
 }
 
-TEST_CASE("MKW early submit keeps bounded overlap through long passes and shadows", "[nvn][mkw]") {
+TEST_CASE("NVN early submission respects recording intervals, open passes and live shadows",
+          "[nvn][early-submit]") {
     using Vulkan::Nvn::CoalescedEarlySubmitDue;
-    using Vulkan::Nvn::MkwEarlySubmitDue;
-    CHECK_FALSE(MkwEarlySubmitDue(0, 299, 300, 4000, false, false));
-    CHECK(MkwEarlySubmitDue(0, 300, 300, 4000, false, false));
-    CHECK_FALSE(MkwEarlySubmitDue(1, 1499, 1500, 4000, false, false));
-    CHECK(MkwEarlySubmitDue(1, 1500, 1500, 4000, false, false));
-    CHECK_FALSE(MkwEarlySubmitDue(0, 3999, 300, 4000, true, false));
-    CHECK(MkwEarlySubmitDue(0, 4000, 300, 4000, true, false));
-    CHECK_FALSE(MkwEarlySubmitDue(0, 3999, 300, 4000, false, true));
-    CHECK(MkwEarlySubmitDue(0, 4000, 300, 4000, false, true));
-    CHECK_FALSE(MkwEarlySubmitDue(0, 5000, 300, 0, true, true));
-    CHECK_FALSE(MkwEarlySubmitDue(2, 100000, 300, 4000, false, false));
-    CHECK_FALSE(MkwEarlySubmitDue(2, 100000, 300, 4000, true, true));
-
-    // Non-MKW titles uncap piece count at natural boundaries while still coalescing open passes and
-    // live storage shadows up to early_pass_us.
+    CHECK_FALSE(CoalescedEarlySubmitDue(299, 300, 4000, false, false));
+    CHECK(CoalescedEarlySubmitDue(300, 300, 4000, false, false));
+    CHECK_FALSE(CoalescedEarlySubmitDue(3999, 7000, 4000, true, true));
+    CHECK_FALSE(CoalescedEarlySubmitDue(6999, 7000, 4000, true, true));
+    CHECK(CoalescedEarlySubmitDue(7000, 7000, 4000, true, true));
     CHECK_FALSE(CoalescedEarlySubmitDue(1499, 1500, 4000, false, false));
     CHECK(CoalescedEarlySubmitDue(1500, 1500, 4000, false, false));
     CHECK_FALSE(CoalescedEarlySubmitDue(3999, 1500, 4000, true, false));

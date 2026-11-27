@@ -250,6 +250,33 @@ TEST_CASE("nvn hle cmdbuf: draw argument decoding", "[nvn]") {
     CHECK(both->instance_count == 17);
 }
 
+TEST_CASE("nvn hle cmdbuf: nonpositive direct draw counts produce empty draws", "[nvn]") {
+    Fx f;
+    constexpr u64 NEGATIVE = 0xDEADBEEF'FFFFFFFF;
+    const auto list = f.Run([&] {
+        f.Call("nvnCommandBufferDrawArrays", {Rig::I(CMD), Rig::I(4), Rig::I(0), Rig::I(NEGATIVE)});
+        f.Call("nvnCommandBufferDrawElements",
+               {Rig::I(CMD), Rig::I(4), Rig::I(2), Rig::I(NEGATIVE), Rig::I(Rig::STORAGE)});
+        f.Call("nvnCommandBufferDrawElementsBaseVertex",
+               {Rig::I(CMD), Rig::I(4), Rig::I(2), Rig::I(NEGATIVE), Rig::I(Rig::STORAGE),
+                Rig::I(0)});
+        for (u64 instances : {u64{0}, NEGATIVE}) {
+            f.Call("nvnCommandBufferDrawArraysInstanced",
+                   {Rig::I(CMD), Rig::I(4), Rig::I(0), Rig::I(3), Rig::I(0), Rig::I(instances)});
+            f.Call("nvnCommandBufferDrawElementsInstanced",
+                   {Rig::I(CMD), Rig::I(4), Rig::I(2), Rig::I(3), Rig::I(Rig::STORAGE),
+                    Rig::I(0), Rig::I(0), Rig::I(instances)});
+        }
+    });
+    CHECK(Ops(list).size() == 7);
+    for (size_t draw = 0; draw < 3; ++draw) {
+        CHECK(Payload<DrawPayload>(list, Op::Draw, draw)->count == 0);
+    }
+    for (size_t draw = 0; draw < 4; ++draw) {
+        CHECK(Payload<DrawIndexedPayload>(list, Op::DrawIndexed, draw)->count == 0);
+    }
+}
+
 TEST_CASE("nvn hle cmdbuf: indirect draws, dispatch, draw texture and transform feedback",
           "[nvn]") {
     Fx f;

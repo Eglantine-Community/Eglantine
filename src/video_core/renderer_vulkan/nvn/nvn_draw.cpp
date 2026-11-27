@@ -6,6 +6,7 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 #include <fmt/format.h>
 
@@ -19,6 +20,7 @@
 #include "video_core/nvn/timestamp_mode.h"
 #include "video_core/nvn_draw_probe.h"
 #include "video_core/shader_log.h"
+#include "video_core/renderer_vulkan/index_restart.h"
 #include "video_core/renderer_vulkan/nvn/nvn_barrier.h"
 #include "video_core/renderer_vulkan/nvn/nvn_draw.h"
 #include "video_core/renderer_vulkan/nvn/nvn_draw_plan.h"
@@ -145,7 +147,7 @@ void DrawContext::BeginSubmission(DrawHost& host_, const VC::Submission& submiss
     vertex_input_set = false;
     inline_updates.clear();
     pending_clears.Reset();
-    shadows.clear();
+    ClearShadows();
     staged_vertex.clear();
     stage_covered_end = nullptr;
     extra_uses.clear();
@@ -171,7 +173,7 @@ void DrawContext::EndSubmission() {
     pass_open = false;
     inline_updates.clear();
     pending_clears.Reset();
-    shadows.clear();
+    ClearShadows();
     staged_vertex.clear();
     stage_covered_end = nullptr;
     extra_uses.clear();
@@ -196,7 +198,7 @@ void DrawContext::OnSegmentBegin(bool keep_shadows) {
     vertex_dirty = true;
     dynamic_dirty = ~0u;
     if (!keep_shadows) {
-        shadows.clear();
+        ClearShadows();
     }
     staged_vertex.clear();
     stage_covered_end = nullptr;
@@ -806,27 +808,140 @@ void DrawContext::UpdateUniformBuffer(const VC::RecordHeader* header) {
 // Render targets and passes
 // ---------------------------------------------------------------------------------------------
 
-void DrawContext::SetRenderTargets(const VC::RecordHeader* header) {
+namespace {
+
+bool SameRenderTarget(const VC::RenderTargetRef& a, const VC::RenderTargetRef& b) {
+    if (a.texture.serial != b.texture.serial) {
+        return false;
+    }
+    if (a.texture.serial == 0) {
+        return true;
+    }
+    // Level and layer are already resolved in TextureRef. Attachment views use one level,
+    // identity swizzle and the image's aspects; only the format and layer count can differ.
+    return a.texture.level == b.texture.level && a.texture.layer == b.texture.layer &&
+           a.view.set_format == b.view.set_format &&
+           (!a.view.set_format || a.view.format == b.view.format) &&
+           a.view.set_layers == b.view.set_layers &&
+           (!a.view.set_layers || a.view.nlayers == b.view.nlayers);
+}
+
+bool CanLookPastForTargetRebind(VC::Op op) {
+    using VC::Op;
+    switch (op) {
+    case Op::SetViewports:
+    case Op::SetScissors:
+    case Op::SetDepthRanges:
+    case Op::BindProgram:
+    case Op::BindState:
+    case Op::BindVertexAttribs:
+    case Op::BindVertexStreams:
+    case Op::BindVertexBuffers:
+    case Op::BindUniformBuffers:
+    case Op::BindStorageBuffers:
+    case Op::BindTextures:
+    case Op::BindSeparateTextures:
+    case Op::BindSeparateSamplers:
+    case Op::BindImages:
+    case Op::SetStencil:
+    case Op::SetPolygonOffset:
+    case Op::SetBlendColor:
+    case Op::SetDepthClamp:
+    case Op::SetAlphaRef:
+    case Op::SetPrimitiveRestart:
+    case Op::SetRasterizerDiscard:
+    case Op::SetSampleMask:
+    case Op::SetPointSize:
+    case Op::SetLineWidth:
+    case Op::SetProvokingVertex:
+        return true;
+    default:
+        return false;
+    }
+}
+
+std::optional<std::span<const VC::RenderTargetRef>> ReadRenderTargets(
+    const VC::RecordHeader* header) {
+    if (header->size < sizeof(*header) + sizeof(VC::SetRenderTargetsPayload)) {
+        return std::nullopt;
+    }
     const auto* p = VC::RecordPayload<VC::SetRenderTargetsPayload>(header);
-    const u32 total = p->color_count + p->has_depth;
-    const auto refs = Array<VC::SetRenderTargetsPayload, VC::RenderTargetRef>(header, p, total);
-    if (p->color_count > MAX_COLOR_TARGETS || refs.size() < total) {
-        host->HostFailed("SetRenderTargets", fmt::format("{} color targets", p->color_count));
+    if (p->color_count > MAX_COLOR_TARGETS || p->has_depth > 1) {
+        return std::nullopt;
+    }
+    const u32 count = p->color_count + p->has_depth;
+    const auto refs = Array<VC::SetRenderTargetsPayload, VC::RenderTargetRef>(header, p, count);
+    return refs.size() == count ? std::optional{refs} : std::nullopt;
+}
+
+bool RenderTargetsOverwritten(DrawHost& host) {
+    auto records = host.HostRecordsAhead();
+    std::span<const std::vector<u64>> following;
+    bool first_list = true;
+    constexpr u32 MAX_REBIND_LOOKAHEAD = 12;
+    for (u32 i = 0; i < MAX_REBIND_LOOKAHEAD && !records.empty(); ++i) {
+        const auto* header = reinterpret_cast<const VC::RecordHeader*>(records.data());
+        const size_t words = header->size / sizeof(u64);
+        if (header->size < sizeof(*header) || header->size % sizeof(u64) != 0 ||
+            words > records.size()) {
+            return false;
+        }
+        const VC::Op op = VC::RecordOp(header);
+        if (op == VC::Op::SetRenderTargets) {
+            return ReadRenderTargets(header).has_value();
+        }
+        if (op == VC::Op::End) {
+            if (first_list) {
+                following = host.HostFollowingLists();
+                first_list = false;
+            }
+            if (following.empty()) {
+                return false;
+            }
+            records = following.front();
+            following = following.subspan(1);
+        } else if (CanLookPastForTargetRebind(op)) {
+            records = records.subspan(words);
+        } else {
+            return false;
+        }
+    }
+    return false;
+}
+
+} // namespace
+
+void DrawContext::SetRenderTargets(const VC::RecordHeader* header) {
+    const auto refs = ReadRenderTargets(header);
+    if (!refs) {
+        host->HostFailed("SetRenderTargets", "invalid target bindings");
         return;
     }
+    const auto* p = VC::RecordPayload<VC::SetRenderTargetsPayload>(header);
     ++counters.render_targets_ops;
-    {
-        // The game re-binds what is bound (it does so around state changes): keep the pass.
-        bool same = p->color_count == color_target_count &&
-                    (p->has_depth != 0) == (depth_target.ref.texture.serial != 0);
-        for (u32 i = 0; same && i < total; ++i) {
-            const TargetBinding& bound = i < p->color_count ? color_targets[i] : depth_target;
-            same = std::memcmp(&bound.game_ref, &refs[i], sizeof(VC::RenderTargetRef)) == 0;
+    const auto same = [&](const VC::SetRenderTargetsPayload& bindings,
+                          std::span<const VC::RenderTargetRef> targets) {
+        if (bindings.color_count != color_target_count) {
+            return false;
         }
-        if (same) {
-            ++counters.render_targets_same;
-            return;
+        for (u32 i = 0; i < color_target_count; ++i) {
+            if (!SameRenderTarget(color_targets[i].game_ref, targets[i])) {
+                return false;
+            }
         }
+        const VC::RenderTargetRef empty{};
+        const auto& depth = bindings.has_depth ? targets[color_target_count] : empty;
+        return SameRenderTarget(depth_target.game_ref, depth);
+    };
+    if (same(*p, *refs)) {
+        ++counters.render_targets_same;
+        return;
+    }
+
+    // Defer the pass break until a target binding that a later command can use.
+    if (pass_open && !pending_clears.Any() && RenderTargetsOverwritten(*host)) {
+        ++counters.render_targets_overwritten;
+        return;
     }
     render_target_epoch.OnTargetChange();
     EndPass(BreakCause::SetRenderTargets);
@@ -849,9 +964,9 @@ void DrawContext::SetRenderTargets(const VC::RecordHeader* header) {
     };
     color_target_count = p->color_count;
     for (u32 i = 0; i < MAX_COLOR_TARGETS; ++i) {
-        color_targets[i] = i < p->color_count ? resolve(refs[i]) : TargetBinding{};
+        color_targets[i] = i < p->color_count ? resolve((*refs)[i]) : TargetBinding{};
     }
-    depth_target = p->has_depth ? resolve(refs[p->color_count]) : TargetBinding{};
+    depth_target = p->has_depth ? resolve((*refs)[p->color_count]) : TargetBinding{};
     if (depth_target.texture && NetworkReplacementWanted()) {
         // The scene's depth for a later replacement of the game's upscaling network: the depth of
         // the last pass drawn into each colour texture (the guest's textures, before any twin).
@@ -1176,6 +1291,7 @@ bool DrawContext::BeginPass(bool read_only_depth) {
         Storage* storage;
         AttachmentShape shape;
         VkImageView view;
+        bool clear_all_aspects;
     };
     std::array<Attachment, MAX_COLOR_TARGETS + 1> attachments{};
     u32 attachment_count = 0;
@@ -1209,6 +1325,12 @@ bool DrawContext::BeginPass(bool read_only_depth) {
         layers = (std::min)(layers, shape.layer_count);
         samples = static_cast<u32>(storage.samples);
         (is_depth ? key.depth : key.color[slot]) = static_cast<s32>(shape.format);
+        const bool clear_all_aspects = is_depth
+            ? (!(storage.aspect & VK_IMAGE_ASPECT_DEPTH_BIT) ||
+               ((shape.key.aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && clears.clear_depth)) &&
+                  (!(storage.aspect & VK_IMAGE_ASPECT_STENCIL_BIT) ||
+                   ((shape.key.aspect & VK_IMAGE_ASPECT_STENCIL_BIT) && clears.clear_stencil))
+            : (clears.color_mask & (1u << slot)) != 0;
         if (is_depth) {
             if (clears.clear_depth && storage.host.depth) {
                 clear_mask |= RENDER_PASS_CLEAR_DEPTH;
@@ -1221,7 +1343,8 @@ bool DrawContext::BeginPass(bool read_only_depth) {
             clear_mask |= static_cast<u16>(1u << slot);
             clear_values[attachment_count].color = clears.color[slot];
         }
-        attachments[attachment_count++] = {&texture, &storage, shape, VK_NULL_HANDLE};
+        attachments[attachment_count++] = {&texture, &storage, shape, VK_NULL_HANDLE,
+                                           clear_all_aspects};
         return true;
     };
     for (u32 slot = 0; slot < color_target_count; ++slot) {
@@ -1247,23 +1370,11 @@ bool DrawContext::BeginPass(bool read_only_depth) {
 
     // Images, first-use contents and layout transitions happen outside the pass (none is open).
     transition_scratch.clear();
+    std::array<u32, MAX_COLOR_TARGETS + 1> attachment_levels{};
     for (u32 i = 0; i < attachment_count; ++i) {
         Attachment& attachment = attachments[i];
         const bool is_depth = attachment.storage->host.depth || attachment.storage->host.stencil;
         host->HostNoteTouched(attachment.texture->storage);
-        if (Storage* const owner = attachment.storage->scale_owner) {
-            // Drawing at the scaled size: the twin holds what the guest-sized image holds that it
-            // does not (loaded by the pass).
-            if (!host->HostPrepareScaledTarget(*owner)) {
-                host->HostFailed("SetRenderTargets",
-                                 fmt::format("no scaled image for render target {:#x}",
-                                             attachment.texture->serial));
-                return false;
-            }
-        } else if (attachment.storage->scaled) {
-            // Drawing at the guest size into an image whose twin may be the newer one.
-            host->HostMakeNativeCurrent(*attachment.storage);
-        }
         if (attachment.storage->pending_unrestricted_formats ||
             !attachment.storage->FormatListAllows(attachment.shape.key.format)) {
             if (!host->HostUpgradeImageCaps(*attachment.storage, false, true)) {
@@ -1272,7 +1383,17 @@ bool DrawContext::BeginPass(bool read_only_depth) {
                 return false;
             }
         }
-        if (!host->HostEnsureAttachmentContents(*attachment.storage)) {
+        const Storage& storage = *attachment.storage;
+        const auto& view = attachment.shape.key;
+        const u32 storage_layers = storage.type == VK_IMAGE_TYPE_3D ? storage.extent.depth
+                                                                    : storage.layers;
+        // The entire storage is the coherence unit for now. A clear at the start of a pass
+        // only replaces it if the view and actual framebuffer cover every texel and aspect.
+        const bool whole_clear = attachment.clear_all_aspects && view.base_level == 0 &&
+                                 storage.levels == 1 && view.base_layer == 0 &&
+                                 layers == storage_layers && extent.width == storage.extent.width &&
+                                 extent.height == storage.extent.height;
+        if (!host->HostEnsureAttachmentContents(*attachment.storage, whole_clear)) {
             host->HostFailed("SetRenderTargets", fmt::format("no image for render target {:#x}",
                                                              attachment.texture->serial));
             return false;
@@ -1283,6 +1404,7 @@ bool DrawContext::BeginPass(bool read_only_depth) {
         transition_scratch.emplace_back(attachment.storage,
                                         is_depth ? depth_layout
                                                  : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        attachment_levels[i] = attachment.shape.key.base_level;
     }
     // Storages that flip between attachment and sampled use go to their sampled layout now, in
     // the same barrier: a later draw of this pass that samples one finds it in place.
@@ -1316,7 +1438,8 @@ bool DrawContext::BeginPass(bool read_only_depth) {
     // Pool mirrors made for uniform bindings: their stale pages are copied in before the pass (the
     // barrier flush below orders the copies before the draws).
     PrefetchMirrors();
-    host->HostTransitionMany(transition_scratch);
+    host->HostTransitionMany(transition_scratch, true,
+                             std::span{attachment_levels}.first(attachment_count));
     host->HostFlushBarrier();
     // Device-local copies of the vertex ranges this pass reads (nvn_vertex_stage.h), recorded after
     // the barrier that orders the work before the pass.
@@ -2185,8 +2308,8 @@ void DrawContext::ClearColor(const VC::ClearColorPayload& p) {
         .layerCount = framebuffer_layers,
     };
     host->HostCmd().ClearAttachments(std::span{&clear, 1}, std::span{&clear_rect, 1});
-    if (rect.offset.x == 0 && rect.offset.y == 0 && rect.extent.width == host_extent.width &&
-        rect.extent.height == host_extent.height) {
+    if (!host->HostConditional() && rect.offset.x == 0 && rect.offset.y == 0 &&
+        rect.extent.width == host_extent.width && rect.extent.height == host_extent.height) {
         if (Storage* const st = CanonicalTargetStorage(color_targets[p.index].texture,
                                                        color_targets[p.index].native)) {
             st->last_full_clear_frame = impl.stats.presents.load(std::memory_order_relaxed) + 1;
@@ -2206,11 +2329,15 @@ void DrawContext::ClearDepthStencil(const VC::ClearDepthStencilPayload& p) {
     }
     const Storage* st = depth_target.texture->storage.get();
     const u32 stencil_bits = static_cast<u32>(p.stencil_mask) & 0xFF;
+    const auto clears_all_aspects = [&](const Storage& storage) {
+        return (!storage.host.depth || p.depth_mask) &&
+               (!storage.host.stencil || stencil_bits == 0xFF);
+    };
     if (!pass_open && !host->HostConditional() && st != nullptr && !st->image_failed &&
         TargetsUsable() && !(stencil_bits != 0 && stencil_bits != 0xFF && st->host.stencil)) {
         VkExtent2D native_extent{};
         if (TargetNativeExtent(native_extent) && ScissorCoversFullTarget(native_extent)) {
-            if ((p.depth_mask && st->host.depth) || (stencil_bits == 0xFF && st->host.stencil)) {
+            if (clears_all_aspects(*st)) {
                 if (Storage* const canon =
                         CanonicalTargetStorage(depth_target.texture, depth_target.native)) {
                     canon->last_full_clear_frame =
@@ -2261,7 +2388,8 @@ void DrawContext::ClearDepthStencil(const VC::ClearDepthStencilPayload& p) {
             .layerCount = framebuffer_layers,
         };
         host->HostCmd().ClearAttachments(std::span{&clear, 1}, std::span{&clear_rect, 1});
-        if (rect.offset.x == 0 && rect.offset.y == 0 && rect.extent.width == host_extent.width &&
+        if (!host->HostConditional() && clears_all_aspects(storage) && rect.offset.x == 0 &&
+            rect.offset.y == 0 && rect.extent.width == host_extent.width &&
             rect.extent.height == host_extent.height) {
             if (Storage* const canon =
                     CanonicalTargetStorage(depth_target.texture, depth_target.native)) {
@@ -2330,21 +2458,14 @@ RenderPassKey DrawContext::MakePassKey() const {
 }
 
 std::optional<RenderPassKey> DrawContext::LookaheadPassKey(const VC::RecordHeader* header) const {
-    if (header->size < sizeof(*header) + sizeof(VC::SetRenderTargetsPayload)) {
+    const auto refs = ReadRenderTargets(header);
+    if (!refs) {
         return std::nullopt;
     }
     const auto* p = VC::RecordPayload<VC::SetRenderTargetsPayload>(header);
-    if (p->color_count > MAX_COLOR_TARGETS || p->has_depth > 1) {
-        return std::nullopt;
-    }
-    const u32 total = p->color_count + p->has_depth;
-    const auto refs = Array<VC::SetRenderTargetsPayload, VC::RenderTargetRef>(header, p, total);
-    if (refs.size() != total) {
-        return std::nullopt;
-    }
     RenderPassKey key{};
-    for (u32 slot = 0; slot < total; ++slot) {
-        const auto& ref = refs[slot];
+    for (u32 slot = 0; slot < refs->size(); ++slot) {
+        const auto& ref = (*refs)[slot];
         if (ref.texture.serial == 0) {
             continue;
         }
@@ -2391,8 +2512,16 @@ bool DrawContext::QueriesValidFor(const GraphicsPipeline& candidate,
     return true;
 }
 
-std::shared_ptr<GraphicsPipeline> DrawContext::ResolvePipeline(u32 mode, u32 element_count,
-    bool& awaiting_async, const PipelineLookahead* lookahead) {
+std::shared_ptr<GraphicsPipeline> DrawContext::ResolvePipeline(u32 mode,
+                                                            const PipelineLookahead* lookahead) {
+    if (!impl.device.SupportsLogicOp() && fixed.rasterizer_discard == 0 &&
+        VC::ColorState::LogicOp(fixed.color) != VC::STATE_LOGIC_OP_COPY &&
+        UsesColorLogicOp(fixed, lookahead ? lookahead->targets : MakePassKey())) {
+        if (!lookahead) {
+            host->HostUnsupported("Draw", "color logic operation requires Vulkan logicOp");
+        }
+        return nullptr;
+    }
     const u64 generation = resources.Cache().ShaderGeneration();
     if (!lookahead && shader_generation != generation) {
         pipeline.reset();
@@ -2444,6 +2573,11 @@ std::shared_ptr<GraphicsPipeline> DrawContext::ResolvePipeline(u32 mode, u32 ele
     // programs, state and pass formats before canonicalizing and hashing the key.
     GraphicsFixedState input = fixed;
     input.topology = mesh ? 0 : mode;
+    if (mode == 7 || mode == 8) {
+        // Quad conversion consumes restart markers before submitting a triangle list.
+        input.primitive_restart = 0;
+        input.restart_index = 0;
+    }
     if (mesh) {
         // No vertex input, input assembly or tessellation: the vertex layout, topology and
         // restart state of the last vertex draw must not split mesh pipelines.
@@ -2540,37 +2674,10 @@ std::shared_ptr<GraphicsPipeline> DrawContext::ResolvePipeline(u32 mode, u32 ele
         resources.Cache().PrefetchGraphics(request, lookahead->skip_key);
         return nullptr;
     }
-    bool targets_per_frame = false;
-    {
-        bool has_target = false;
-        const u64 rt_frame = impl.stats.presents.load(std::memory_order_relaxed) + 1;
-        const auto check_target = [&](const TargetBinding& target) {
-            Storage* const st = CanonicalTargetStorage(target.texture, target.native);
-            if (!st) {
-                return true;
-            }
-            has_target = true;
-            if (st->last_rt_frame == 0 || rt_frame < st->last_rt_frame ||
-                (rt_frame - st->last_rt_frame) > 4) {
-                return false;
-            }
-            const bool cleared_this_frame = st->last_full_clear_frame == rt_frame;
-            const u32 min_consecutive = cleared_this_frame ? 4u : 8u;
-            return st->consecutive_rt_frames >= min_consecutive;
-        };
-        bool all_ok = check_target(depth_target);
-        for (u32 i = 0; i < color_target_count && all_ok; ++i) {
-            all_ok = check_target(color_targets[i]);
-        }
-        targets_per_frame = all_ok && has_target;
-    }
-    // Only a draw that may be skipped asks without waiting for a compile on a worker.
-    const bool may_skip = !impl.mario_kart_world && targets_per_frame &&
-                          MaySkipUnbuiltDraw(StoresGlobalMemory(request),
-                                             depth_target.texture != nullptr, element_count);
     std::shared_ptr<GraphicsPipeline> result =
-        resources.Cache().GetGraphics(request, may_skip ? &awaiting_async : nullptr,
-                                      [this, mode](u64 key) { PrefetchUpcomingGraphics(mode, key); });
+        resources.Cache().GetGraphics(request, nullptr,
+                                      [this, mode](u64 key) { PrefetchUpcomingGraphics(mode, key); },
+                                      [this] { host->HostSubmitBeforePipelineWait(); });
     if (!result) {
         return nullptr;
     }
@@ -2604,6 +2711,7 @@ void DrawContext::PrefetchUpcomingGraphics(u32 current_mode, u64 current_key,
     const auto saved_stages = stages;
     const auto saved_handles = handle_gen;
     const u64 saved_clock = bank_clock;
+    const u64 saved_compute_uniform = compute_uniform_gen;
     const bool saved_pipeline_dirty = pipeline_dirty;
     const bool saved_layout_dirty = vertex_layout_dirty;
     SCOPE_EXIT {
@@ -2611,6 +2719,7 @@ void DrawContext::PrefetchUpcomingGraphics(u32 current_mode, u64 current_key,
         stages = saved_stages;
         handle_gen = saved_handles;
         bank_clock = saved_clock;
+        compute_uniform_gen = saved_compute_uniform;
         pipeline_dirty = saved_pipeline_dirty;
         vertex_layout_dirty = saved_layout_dirty;
     };
@@ -2682,6 +2791,8 @@ void DrawContext::PrefetchUpcomingGraphics(u32 current_mode, u64 current_key,
         case Op::ClearColor:
         case Op::ClearDepthStencil:
         case Op::Barrier:
+        case Op::FenceSync:
+        case Op::SignalEvent:
         case Op::SetRenderCondition:
             continue;
         case Op::Draw:
@@ -2714,8 +2825,7 @@ void DrawContext::PrefetchUpcomingGraphics(u32 current_mode, u64 current_key,
         }
         ++draws;
         if ((changed || mode != previous_mode) && mode != 14) {
-            bool unused = false;
-            (void)ResolvePipeline(mode, 0, unused, &lookahead);
+            (void)ResolvePipeline(mode, &lookahead);
             changed = false;
             previous_mode = mode;
         }
@@ -2784,6 +2894,12 @@ void DrawContext::ApplyDynamicState(const GraphicsPipeline& active) {
             }
         }
         cmd.SetScissor(0, std::span{rects.data(), count});
+    }
+    if (fixed.rasterizer_discard != 0) {
+        // Binding a discard pipeline can invalidate these values. Restore them on the next draw
+        // that rasterizes, even if the guest's state has not changed.
+        dynamic_dirty = DIRTY_BLEND | DIRTY_STENCIL | DIRTY_BIAS | DIRTY_LINE;
+        return;
     }
     if (dynamic_dirty & DIRTY_BLEND) {
         cmd.SetBlendConstants(blend_color);
@@ -2872,13 +2988,14 @@ BufferRef DrawContext::TryCopyMirrorRangeToArena(Pool& pool, u64 pool_offset, u6
 }
 
 bool DrawContext::ResolveBuffer(u64 address, u64 size, bool write, BufferRef& out,
-                                ShadowPolicy policy) {
+                                ShadowPolicy policy, bool bounded_storage) {
     static_cast<void>(write);
     out = {};
     Pool* pool = nullptr;
     u64 offset = 0;
     if (address == 0 ||
-        !host->HostResolvePoolRange(address, (std::max<u64>)(size, 1), pool, offset, "buffer")) {
+        !host->HostResolvePoolRange(address, (std::max<u64>)(size, 1), pool, offset, "buffer",
+                                    bounded_storage)) {
         return false;
     }
     out.buffer = pool->Handle();
@@ -2920,7 +3037,7 @@ std::optional<u32> DrawContext::ReadUniformWord(u32 stage, u32 slot, u32 byte_of
     if (cached.ref.pool != nullptr && cached.address == binding.address &&
         cached.binding_size == binding.size && byte_offset + sizeof(u32) <= cached.ref.range &&
         cached.pool_gen == impl.pool_generation.load(std::memory_order_acquire) &&
-        cached.mapping_gen == impl.mkw_mapping_generation) {
+        cached.mapping_gen == impl.pool_mapping_generation) {
         const Pool* const pool = cached.ref.pool;
         if (!pool->pending.load(std::memory_order_acquire) && pool->host != nullptr &&
             cached.ref.pool_offset + byte_offset + sizeof(u32) <= pool->size) {
@@ -2960,17 +3077,30 @@ u32 IndexSize(u32 type) {
     return type == 0 ? 1 : type == 1 ? 2 : 4;
 }
 
+VkIndexType HostIndexType(u32 type) {
+    return type == 0 ? VK_INDEX_TYPE_UINT8_EXT :
+           type == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
+}
+
+u32 FixedRestartMarker(u32 type) {
+    return type == 0 ? 0xffU : type == 1 ? 0xffffU : std::numeric_limits<u32>::max();
+}
+
 } // namespace
 
 bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* index,
                               PreparedDraw& out, HostIndex& host_index,
                               const MeshDraw* mesh_draw) {
+    const auto* gpu_quad = index ? index->gpu_quad : nullptr;
     movie_network_input.reset();
     movie_network_skip = 0;
     ++counters.draws;
     CostSplitWork cost_split{costsplit ? CostSplitBeginDraw() : nullptr, false};
     if (!TargetsUsable()) {
         ++counters.draws_skipped;
+        if (mode == MESH_DRAW_MODE) {
+            ++counters.mesh_draws_skipped;
+        }
         host->HostUnsupported("Draw", "no usable render target");
         static Common::BootCounter logged;
         if (logged.Next() < 16) {
@@ -2992,14 +3122,11 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
             hold = ~size_t{0};
         }
     } diag_hold_release{diag_hold};
-    bool awaiting_async = false;
-    std::shared_ptr<GraphicsPipeline> active = ResolvePipeline(mode, element_count, awaiting_async);
+    std::shared_ptr<GraphicsPipeline> active = ResolvePipeline(mode);
     if (!active) {
-        if (awaiting_async) {
-            // The pipeline is compiling on a worker: skip the draw, ask again with the next one.
-            ++counters.draws_skipped_async;
-        } else {
-            ++counters.draws_skipped;
+        ++counters.draws_skipped;
+        if (mode == MESH_DRAW_MODE) {
+            ++counters.mesh_draws_skipped;
         }
         return false;
     }
@@ -3046,6 +3173,9 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
     }
     if (!descriptors_built) {
         ++counters.draws_skipped;
+        if (mode == MESH_DRAW_MODE) {
+            ++counters.mesh_draws_skipped;
+        }
         return false;
     }
     const u32 bindless_mask = active->descriptors.bindless_types_mask != 0
@@ -3053,6 +3183,9 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
                                   : ~u32{0};
     if (active->descriptors.uses_bindless_table && !BindlessPrepare(plan, bindless_mask)) {
         ++counters.draws_skipped;
+        if (mode == MESH_DRAW_MODE) {
+            ++counters.mesh_draws_skipped;
+        }
         host->HostUnsupported("Draw", "the bindless texture table cannot be created");
         return false;
     }
@@ -3108,6 +3241,23 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
             CostSplitToRing(CostSplit::Data::Vertex, vertex[s], range.address, range.size);
         }
     }
+    const bool restart_enabled = index && !gpu_quad && fixed.primitive_restart != 0 &&
+                                 impl.device.SupportsPrimitiveRestart(ToVkTopology(mode));
+    const auto restart_marker = restart_enabled ? std::optional<u32>{fixed.restart_index}
+                                                : std::nullopt;
+    const VkIndexType source_index_type = index ? HostIndexType(index->type) : VK_INDEX_TYPE_UINT32;
+    const auto restart = index ? PlanIndexRestart(
+                                     source_index_type, restart_marker,
+                                     impl.device.IsExtIndexTypeUint8Supported(),
+                                     impl.device.SupportsCustomRestartIndex())
+                               : IndexRestartPlan{};
+    const bool widen_indices = index && !gpu_quad && restart.host_type != source_index_type;
+    if (restart_marker && !widen_indices && !restart.native_marker &&
+        *restart_marker != FixedRestartMarker(index->type)) {
+        ++counters.draws_skipped;
+        host->HostUnsupported("Draw", "custom primitive restart is unavailable for this index type");
+        return false;
+    }
     BufferRef index_ref;
     bool inpass_arena_index = false;
     if (index) {
@@ -3119,7 +3269,7 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
         }
         bool index_arena = false;
         if (!index->uploaded) {
-            if (try_inpass_mirror_arena(index_ref, index->address, index->bytes)) {
+            if (!gpu_quad && !widen_indices && try_inpass_mirror_arena(index_ref, index->address, index->bytes)) {
                 inpass_arena_index = true;
                 index_arena = true;
             } else {
@@ -3134,13 +3284,41 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
         }
     }
 
+    const bool rasterizes = fixed.rasterizer_discard == 0;
     {
         // A conditional-rendering region cannot straddle a render pass begin or end.
         const bool suspended = host->HostSuspendCondition();
+        host->HostPrepareOcclusion(rasterizes);
         if (pass_open && pass_read_only_depth != plan.read_only_depth) {
             EndPass(BreakCause::LayoutChange);
         }
+        if (widen_indices || gpu_quad) {
+            plan.flush_inline |= InlineUpdatePending(index->address, index->bytes);
+            // The conversion reads the current GPU backing, including storage-shadow writes.
+            EndPass(BreakCause::Dispatch);
+            ResolveIndirectSource(index_ref, index->bytes);
+            plan.ranges.insert(plan.ranges.end(), extra_uses.begin(), extra_uses.end());
+            extra_uses.clear();
+        }
         bool ready = PrepareOutsidePass(plan);
+        if (ready && widen_indices) {
+            index_ref = WidenIndices(index_ref, source_index_type, index->bytes, restart_marker);
+            ready = index_ref.buffer != VK_NULL_HANDLE;
+            if (!ready) {
+                host->HostUnsupported(
+                    "Draw", "index widening exceeds the host range or is unavailable");
+            }
+        }
+        if (ready && gpu_quad) {
+            BufferRef converted;
+            const u32 instances = CostSplitInstances(gpu_quad->instance_count ? gpu_quad->instance_count : 1);
+            ready = AssembleGpuQuads(index_ref, *gpu_quad, instances, converted, out.quad_draw_args);
+            if (ready) {
+                index_ref = converted;
+            } else {
+                host->HostUnsupported("Draw", "GPU quad index assembly is unavailable for this range");
+            }
+        }
         bool before_pass = suspended;
         if (ready && active->mesh_emulation) {
             if (suspended) {
@@ -3155,10 +3333,13 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
         }
         if (!ready) {
             ++counters.draws_skipped;
+            if (active->mesh_emulation) {
+                ++counters.mesh_draws_skipped;
+            }
             return false;
         }
     }
-    host->HostBeforeDraw();
+    host->HostBeforeDraw(rasterizes);
     // Streams (and the index buffer) of imported pools whose range the pass staged read the
     // device-local copy. Once a draw of the pass wrote through shaders, the pool may hold newer
     // bytes than the copy. EDEN_NX2_NVN_VTXCOV_DIAG counts every bind by where it is read from;
@@ -3213,7 +3394,7 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
                 impl.NoteVtxCov(false, reason, size);
             }
         }
-        if (index) {
+        if (index && !widen_indices && !gpu_quad) {
             if (index_ref.pool == nullptr) {
                 if (impl.vtxcov_diag && inpass_arena_index) {
                     impl.NoteVtxCov(true, VtxCov::Device, index->bytes);
@@ -3249,9 +3430,12 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
         cs_draw_index = cs_pass_draws++;
     }
     vk::CommandBuffer cmd = host->HostCmd();
-    // A GPL pipeline binds its whole compile once the background has published it.
-    const VkPipeline handle = active->Handle();
+    auto binding = active->AcquireBinding();
+    const VkPipeline handle = binding.handle;
     if (bound_pipeline != handle) {
+        if (binding.fast_link_owner) {
+            host->HostFlight().keepalive.push_back(std::move(binding.fast_link_owner));
+        }
         cmd.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, handle);
         if (bound_pipeline == VK_NULL_HANDLE) {
             // A masked clear or another untracked graphics pipeline may have replaced dynamic
@@ -3281,7 +3465,12 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
         vertex_dirty = true;
         bound_state.OnPipelineBind(active->layout, active->descriptors.UsesPushConstants());
     }
-    if (active->dynamic_fixed) {
+    if (!rasterizes) {
+        // With static rasterizer discard, the pipeline can omit fragment and output state.
+        fixed_state_set = false;
+        alpha_to_coverage_set = false;
+        blend_state_set = false;
+    } else if (active->dynamic_fixed) {
         const DynamicFixedState v = MakeDynamicFixedState(fixed);
         if (!fixed_state_set || fixed_state != v) {
             const bool all = !fixed_state_set;
@@ -3345,7 +3534,7 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
             patch_control_points_set = true;
         }
     }
-    if (active->dynamic_alpha_to_coverage) {
+    if (rasterizes && active->dynamic_alpha_to_coverage) {
         const bool a2c = (active->color_outputs_written & 1u) != 0 &&
                          VC::MultisampleState::AlphaToCoverage(fixed.multisample.data());
         if (!alpha_to_coverage_set || bound_alpha_to_coverage != a2c) {
@@ -3354,7 +3543,7 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
             alpha_to_coverage_set = true;
         }
     }
-    if (active->dynamic_blend && active->color_attachment_count > 0) {
+    if (rasterizes && active->dynamic_blend && active->color_attachment_count > 0) {
         DynamicBlendState live_blend = MakeDynamicBlendState(fixed, MakePassKey());
         if (live_blend.attachment_count > 0 && (!blend_state_set || blend_state != live_blend)) {
             const bool all =
@@ -3453,17 +3642,18 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
     if (index) {
         host_index.buffer = index_ref.buffer;
         host_index.offset = index_ref.offset;
-        host_index.type = index->type == 0   ? VK_INDEX_TYPE_UINT8_EXT
-                          : index->type == 1 ? VK_INDEX_TYPE_UINT16
-                                             : VK_INDEX_TYPE_UINT32;
+        host_index.type = gpu_quad ? VK_INDEX_TYPE_UINT32 : restart.host_type;
         if (cs_mode == CostSplit::Mode::NoBind && cs_draw_index > 0 && cs_index_bound)
             [[unlikely]] {
             // The pass's first class draw bound an index buffer: kept.
         } else if (elide && bound_state.TakeIndexBuffer(host_index.buffer, host_index.offset,
-                                                        host_index.type)) {
+                                                        host_index.type, restart.native_marker)) {
             ++counters.elided_index_binds;
         } else {
             cmd.BindIndexBuffer(host_index.buffer, host_index.offset, host_index.type);
+            if (restart.native_marker) {
+                cmd.SetPrimitiveRestartIndexEXT(*restart.native_marker);
+            }
         }
         if (cs_mode == CostSplit::Mode::NoBind) [[unlikely]] {
             cs_index_bound = true;
@@ -3482,102 +3672,154 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
     return true;
 }
 
-bool DrawContext::GenerateIndices(const PreparedDraw& prepared, const IndexRange* source, u32 first,
-                                  u32 count, s32 base_vertex, HostIndex& out, u32& out_count) {
-    // Source vertex numbers: either first..first+count-1 or the game's indices.
-    const u8* indices = nullptr;
-    u32 index_type = 2;
-    if (source) {
-        indices = impl.GuestPointer(source->address, source->bytes);
-        index_type = source->type;
-        if (!indices) {
-            host->HostUnsupported("Draw", "index conversion needs CPU-readable index memory");
+const u8* DrawContext::CurrentIndexData(const IndexRange& source) {
+    Pool* pool{};
+    u64 offset{};
+    if (source.bytes > std::numeric_limits<u64>::max() - source.address ||
+        !host->HostResolvePoolRange(source.address, source.bytes, pool, offset, "Draw") ||
+        !pool || pool->backing == Pool::Backing::DeviceLocal ||
+        HasOverlappingShadow(*pool, offset, offset + source.bytes) ||
+        impl.NeedsGpuFlushForUniform(source.address, source.address + source.bytes,
+                                     host->HostFlight().seq) ||
+        InlineUpdatePending(source.address, source.bytes) ||
+        (pool->backing == Pool::Backing::Mirror &&
+         host->HostMirrorHasPendingGpuWrites(*pool, offset, source.bytes))) {
+        return nullptr;
+    }
+    return pool->host ? pool->host + offset : impl.GuestPointer(source.address, source.bytes);
+}
+
+bool DrawContext::GenerateIndices(const PreparedDraw& prepared, const u8* indices, u32 index_type,
+                                  u32 first, u32 count, HostIndex& out, u32& out_count) {
+    const bool quads = prepared.quad_list || prepared.quad_strip;
+    const auto expanded_count = [&](u32 length) -> u64 {
+        if (prepared.quad_list) {
+            return u64{length / 4} * 6;
+        }
+        return length < 4 ? 0 : u64{length / 2 - 1} * 6;
+    };
+    const u32 marker = fixed.restart_index;
+    // Compare the zero-extended guest index before Vulkan applies baseVertex.
+    const bool split = indices && fixed.primitive_restart != 0 &&
+                       marker <= FixedRestartMarker(index_type);
+    const auto convert = [&](auto fetch) {
+        const auto visit_segments = [&](auto&& visit) {
+            u32 begin = 0;
+            for (u32 i = 0; i < count; ++i) {
+                if (fetch(i) == marker) {
+                    if (!visit(begin, i)) {
+                        return false;
+                    }
+                    begin = i + 1;
+                }
+            }
+            return visit(begin, count);
+        };
+        u64 total = 0;
+        bool has_marker = false;
+        if (quads) {
+            if (split) {
+                visit_segments([&](u32 begin, u32 end) {
+                    has_marker |= end != count;
+                    total += expanded_count(end - begin);
+                    return true;
+                });
+            } else {
+                total = expanded_count(count);
+            }
+        } else if (prepared.line_loop) {
+            total = u64{count} + 1;
+        }
+        if (total == 0) {
+            out_count = 0;
+            return true;
+        }
+        if (total > (std::numeric_limits<u32>::max)() ||
+            total * sizeof(u32) > (std::numeric_limits<size_t>::max)() - 16) {
+            host->HostUnsupported("Draw", "converted index count exceeds the host limits");
             return false;
         }
-    }
-    const auto fetch = [&](u32 i) -> u32 {
-        if (!indices) {
-            return first + i;
+        if (!quads && split) {
+            for (u32 i = 0; i < count; ++i) {
+                if (fetch(i) == marker) {
+                    host->HostUnsupported("Draw", "topology conversion with primitive restart");
+                    return false;
+                }
+            }
         }
-        switch (index_type) {
-        case 0:
-            return indices[i];
-        case 1: {
-            u16 value;
-            std::memcpy(&value, indices + i * 2, 2);
-            return value;
+        u8* pointer = nullptr;
+        const BufferRef ref = AllocArena(total * sizeof(u32), 4, &pointer);
+        if (!ref.buffer) {
+            host->HostFailed("Draw", "no arena space for generated indices");
+            return false;
         }
-        default: {
-            u32 value;
-            std::memcpy(&value, indices + i * 4, 4);
-            return value;
+        u32* out_indices = reinterpret_cast<u32*>(pointer);
+        u32 n = 0;
+        if (quads) {
+            const auto emit = [&]<u32 Step>() {
+                const auto segment = [&](u32 begin, u32 end) {
+                    for (u32 q = begin; end - q >= 4; q += Step) {
+                        const u32 a = fetch(q), b = fetch(q + 1);
+                        const u32 c = fetch(q + (Step == 2 ? 3 : 2));
+                        const u32 d = fetch(q + (Step == 2 ? 2 : 3));
+                        out_indices[n++] = a;
+                        out_indices[n++] = b;
+                        out_indices[n++] = c;
+                        out_indices[n++] = a;
+                        out_indices[n++] = c;
+                        out_indices[n++] = d;
+                    }
+                };
+                if (!has_marker) {
+                    segment(0, count);
+                    return true;
+                }
+                return visit_segments([&](u32 begin, u32 end) {
+                    if (expanded_count(end - begin) > total - n) {
+                        return false;
+                    }
+                    segment(begin, end);
+                    return true;
+                });
+            };
+            const bool written = prepared.quad_list ? emit.template operator()<4>()
+                                                    : emit.template operator()<2>();
+            if (!written || n != total) {
+                host->HostUnsupported("Draw", "indices changed during topology conversion");
+                return false;
+            }
+        } else if (prepared.line_loop) {
+            for (u32 i = 0; i < count; ++i) {
+                out_indices[n++] = fetch(i);
+            }
+            out_indices[n++] = fetch(0);
         }
-        }
-    };
-    static_cast<void>(base_vertex);
-    u32 total = 0;
-    if (prepared.quad_list) {
-        total = count / 4 * 6;
-    } else if (prepared.quad_strip) {
-        total = count >= 4 ? (count / 2 - 1) * 6 : 0;
-    } else if (prepared.line_loop) {
-        total = count + 1;
-    } else if (source) {
-        total = count; // u8 widening
-    }
-    if (total == 0) {
-        out_count = 0;
+        out.buffer = ref.buffer;
+        out.offset = ref.offset;
+        out.type = VK_INDEX_TYPE_UINT32;
+        out_count = n;
+        host->HostCmd().BindIndexBuffer(out.buffer, out.offset, out.type);
+        bound_state.ForgetIndexBuffer();
         return true;
+    };
+    const auto read = [indices]<typename Index>(u32 i) -> u32 {
+        Index value;
+        std::memcpy(&value, indices + u64{i} * sizeof(Index), sizeof(Index));
+        return value;
+    };
+    if (!indices) {
+        return convert([first](u32 i) { return first + i; });
     }
-    u8* pointer = nullptr;
-    const BufferRef ref = AllocArena(static_cast<u64>(total) * 4, 4, &pointer);
-    if (!ref.buffer) {
-        host->HostFailed("Draw", "no arena space for generated indices");
-        return false;
+    switch (index_type) {
+    case 0:
+        return convert([indices](u32 i) -> u32 { return indices[i]; });
+    case 1:
+        return convert([&](u32 i) { return read.template operator()<u16>(i); });
+    default:
+        return convert([&](u32 i) { return read.template operator()<u32>(i); });
     }
-    u32* out_indices = reinterpret_cast<u32*>(pointer);
-    u32 n = 0;
-    if (prepared.quad_list) {
-        for (u32 q = 0; q + 3 < count; q += 4) {
-            const u32 a = fetch(q), b = fetch(q + 1), c = fetch(q + 2), d = fetch(q + 3);
-            out_indices[n++] = a;
-            out_indices[n++] = b;
-            out_indices[n++] = c;
-            out_indices[n++] = a;
-            out_indices[n++] = c;
-            out_indices[n++] = d;
-        }
-    } else if (prepared.quad_strip) {
-        for (u32 q = 0; q + 3 < count; q += 2) {
-            const u32 a = fetch(q), b = fetch(q + 1), c = fetch(q + 2), d = fetch(q + 3);
-            out_indices[n++] = a;
-            out_indices[n++] = b;
-            out_indices[n++] = d;
-            out_indices[n++] = a;
-            out_indices[n++] = d;
-            out_indices[n++] = c;
-        }
-    } else if (prepared.line_loop) {
-        for (u32 i = 0; i < count; ++i) {
-            out_indices[n++] = fetch(i);
-        }
-        out_indices[n++] = fetch(0);
-    } else {
-        // u8 widening keeps the restart marker the UINT8_EXT path would honour.
-        const bool restart_u8 = indices && index_type == 0 && fixed.primitive_restart != 0;
-        for (u32 i = 0; i < count; ++i) {
-            const u32 value = fetch(i);
-            out_indices[n++] = restart_u8 && value == 0xFFu ? 0xFFFFFFFFu : value;
-        }
-    }
-    out.buffer = ref.buffer;
-    out.offset = ref.offset;
-    out.type = VK_INDEX_TYPE_UINT32;
-    out_count = n;
-    host->HostCmd().BindIndexBuffer(out.buffer, out.offset, out.type);
-    bound_state.ForgetIndexBuffer();
-    return true;
 }
+
 
 void DrawContext::Draw(const VC::DrawPayload& p) {
     if (p.indirect != 0 || p.count_address != 0) {
@@ -3601,7 +3843,7 @@ void DrawContext::Draw(const VC::DrawPayload& p) {
         vk::CommandBuffer cmd = host->HostCmd();
         if (prepared.quad_list || prepared.quad_strip || prepared.line_loop) {
             u32 count = 0;
-            if (GenerateIndices(prepared, nullptr, static_cast<u32>(p.first), p.count, 0,
+            if (GenerateIndices(prepared, nullptr, 2, static_cast<u32>(p.first), p.count,
                                 host_index, count) &&
                 count != 0) {
                 cmd.DrawIndexed(CostSplitCount(count), instances, 0, 0, p.base_instance);
@@ -3618,16 +3860,16 @@ void DrawContext::DrawIndexed(const VC::DrawIndexedPayload& p) {
     if (p.indirect != 0 || p.count_address != 0) {
         return DrawIndexedIndirect(p);
     }
-    if (p.count == 0) {
+    const bool quads = p.mode == 7 || p.mode == 8;
+    if (p.count == 0 || (quads && p.count < 4)) {
         return;
     }
     if (!host->HostBeginRenderCondition()) {
         return;
     }
     const u32 size = IndexSize(p.index_type);
-    const IndexRange range{p.index_address, static_cast<u64>(p.count) * size, p.index_type};
-    const bool convert = p.mode == 7 || p.mode == 8 || p.mode == 2 ||
-                         (p.index_type == 0 && !impl.device.IsExtIndexTypeUint8Supported());
+    IndexRange range{p.index_address, static_cast<u64>(p.count) * size, p.index_type};
+    const bool convert = quads || p.mode == 2;
     PreparedDraw prepared;
     HostIndex host_index;
     dbg_call = {p.count, p.instance_count != 0 ? p.instance_count : 1, p.base_vertex, true,
@@ -3635,18 +3877,27 @@ void DrawContext::DrawIndexed(const VC::DrawIndexedPayload& p) {
     if (impl.gpu_profiler) {
         prof_units = u64{p.count} * (p.instance_count != 0 ? p.instance_count : 1);
     }
-    if (PrepareDraw(p.mode, p.count, convert ? nullptr : &range, prepared, host_index)) {
-        const u32 instances = CostSplitInstances(p.instance_count != 0 ? p.instance_count : 1);
+    const u8* cpu_indices = convert ? CurrentIndexData(range) : nullptr;
+    range.gpu_quad = quads && !cpu_indices ? &p : nullptr;
+    if (range.gpu_quad && p.base_instance != 0 && !impl.device.SupportsDrawIndirectFirstInstance()) {
+        host->HostUnsupported("Draw", "GPU quad conversion with base instance requires drawIndirectFirstInstance");
+    } else if (convert && !range.gpu_quad && !cpu_indices) {
+        host->HostUnsupported("Draw", "line loop conversion needs current CPU-readable indices");
+    } else if (PrepareDraw(p.mode, p.count, cpu_indices ? nullptr : &range, prepared, host_index)) {
         vk::CommandBuffer cmd = host->HostCmd();
-        if (convert) {
-            u32 count = 0;
-            if (GenerateIndices(prepared, &range, 0, p.count, p.base_vertex, host_index, count) &&
-                count != 0) {
-                cmd.DrawIndexed(CostSplitCount(count), instances, 0, p.base_vertex,
-                                p.base_instance);
-            }
+        if (range.gpu_quad) {
+            cmd.DrawIndexedIndirect(prepared.quad_draw_args.buffer, prepared.quad_draw_args.offset,
+                                    1, sizeof(VkDrawIndexedIndirectCommand));
         } else {
-            cmd.DrawIndexed(CostSplitCount(p.count), instances, 0, p.base_vertex, p.base_instance);
+            u32 count = p.count;
+            if (!convert || GenerateIndices(prepared, cpu_indices, p.index_type, 0, p.count,
+                                            host_index, count)) {
+                if (count != 0) {
+                    cmd.DrawIndexed(CostSplitCount(count),
+                                    CostSplitInstances(p.instance_count ? p.instance_count : 1),
+                                    0, p.base_vertex, p.base_instance);
+                }
+            }
         }
     }
     host->HostEndRenderCondition();

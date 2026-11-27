@@ -8,18 +8,23 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstring>
-#include <bit>
+#include <limits>
 #include <numeric>
 #include <ranges>
+
+#include <vulkan/utility/vk_format_utils.h>
 #include "common/cityhash.h"
 #include "common/common_types.h"
 #include "common/settings.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
+#include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/vertex_repack.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
+#include "video_core/vulkan_common/vulkan_device.h"
 
 namespace Vulkan {
 namespace {
@@ -104,7 +109,86 @@ void RefreshXfbState(VideoCommon::TransformFeedbackState& state, const Maxwell& 
                            });
     state.varyings = regs.stream_out_layout;
 }
+
+u32 VertexBindingAttributeMask(const Maxwell& regs, const Device& device, u32 binding) {
+    const u32 max_attributes =
+        (std::min)(static_cast<u32>(Maxwell::NumVertexAttributes),
+                   device.GetMaxVertexInputAttributes());
+    u32 mask = 0;
+    for (u32 location = 0; location < max_attributes; ++location) {
+        const auto& attr = regs.vertex_attrib_format[location];
+        if (!attr.constant && attr.buffer == binding) {
+            mask |= 1U << location;
+        }
+    }
+    return mask;
+}
+
+VertexRepackDecision BuildVertexRepackLayoutForMask(const Maxwell& regs, const Device& device,
+                                                  u32 binding, bool dynamic_input, u32 mask) {
+    const auto& stream = regs.vertex_streams[binding];
+    if (mask == 0) {
+        return {};
+    }
+    std::array<VertexRepackAttribute, Maxwell::NumVertexAttributes> attributes;
+    size_t count = 0;
+    for (; mask != 0; mask &= mask - 1) {
+        const u32 location = std::countr_zero(mask);
+        const auto& attr = regs.vertex_attrib_format[location];
+        const VkFormat format = MaxwellToVK::VertexFormat(device, attr.type, attr.size, false);
+        if (format == VK_FORMAT_UNDEFINED) {
+            continue;
+        }
+        const u32 width = vkuFormatTexelBlockSize(format);
+        const u32 alignment =
+            vkuFormatIsPacked(format) ? width : width / vkuFormatComponentCount(format);
+        if (!device.IsFormatSupported(format, VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT,
+                                      FormatType::Buffer)) {
+            return {.supported = false};
+        }
+        const bool bit_compatible =
+            attr.SizeInBytes() == width &&
+            (attr.size != Maxwell::VertexAttribute::Size::Size_B10_G11_R11 ||
+             format == VK_FORMAT_B10G11R11_UFLOAT_PACK32);
+        attributes[count++] = {location, attr.offset, width, alignment, bit_compatible};
+    }
+    const u32 max_offset = device.GetMaxVertexInputAttributeOffset();
+    const u32 max_stride = device.GetMaxVertexInputBindingStride();
+    if (!stream.IsEnabled()) {
+        VertexRepackDecision decision;
+        for (const auto& attr : std::span(attributes.data(), count)) {
+            if (attr.offset > max_offset ||
+                (!device.SupportsVertexAttributeAccessBeyondStride() &&
+                 attr.offset + attr.byte_count > max_stride)) {
+                return {.supported = false};
+            }
+            decision.extent = (std::max)(decision.extent, attr.offset + attr.byte_count);
+        }
+        return decision;
+    }
+    const VertexRepackLimits limits{
+        .stride_alignment = dynamic_input ? 1 : device.GetMinVertexInputBindingStrideAlignment(),
+        .max_stride = dynamic_input ? max_stride :
+            (std::min)(max_stride, u32{std::numeric_limits<u16>::max()}),
+        .max_attribute_offset = dynamic_input ? max_offset : (std::min)(max_offset, 0x3fffU),
+        .access_beyond_stride = device.SupportsVertexAttributeAccessBeyondStride(),
+        .allow_zero_stride = dynamic_input || !device.HasPortabilitySubset() ||
+                             device.IsExtExtendedDynamicStateSupported(),
+        .native_unaligned = dynamic_input && device.HasNativeUnalignedVertexFetch(),
+    };
+    return MakeVertexRepackLayout(stream.Address(), stream.stride,
+                                  std::span(attributes.data(), count), limits);
+}
 } // Anonymous namespace
+
+VertexRepackDecision BuildVertexRepackLayout(const Maxwell& regs, const Device& device,
+                                             u32 binding, bool dynamic_input) {
+    if (binding >= regs.vertex_streams.size() || binding >= device.GetMaxVertexInputBindings()) {
+        return {};
+    }
+    return BuildVertexRepackLayoutForMask(regs, device, binding, dynamic_input,
+                                         VertexBindingAttributeMask(regs, device, binding));
+}
 
 void FixedPipelineState::SetupDirtyRegisters(Tegra::Engines::Maxwell3D& maxwell3d,
                                             const DynamicFeatures& features) {
@@ -155,22 +239,9 @@ void FixedPipelineState::SetupDirtyRegisters(Tegra::Engines::Maxwell3D& maxwell3
                    offsetof(Maxwell::ViewportTransform, swizzle)) / sizeof(u32),
               1);
     }
-    if (!features.has_dynamic_vertex_input || !features.has_extended_dynamic_state ||
-        features.has_static_vertex_repack) {
-        for (size_t index = 0; index < Maxwell::NumVertexArrays; ++index) {
-            track(MAXWELL3D_REG_INDEX(vertex_streams) +
-                      index * sizeof(Maxwell::VertexStream) / sizeof(u32),
-                  1);
-        }
-    }
     if (!features.has_dynamic_vertex_input) {
+        TRACK(vertex_streams);
         TRACK(vertex_stream_instances);
-        for (size_t index = 0; index < Maxwell::NumVertexArrays; ++index) {
-            track(MAXWELL3D_REG_INDEX(vertex_streams) +
-                      (index * sizeof(Maxwell::VertexStream) +
-                       offsetof(Maxwell::VertexStream, frequency)) / sizeof(u32),
-                  1);
-        }
     }
     if (!features.has_extended_dynamic_state) {
         TRACK(stencil_front_op);
@@ -214,7 +285,8 @@ void FixedPipelineState::SetupDirtyRegisters(Tegra::Engines::Maxwell3D& maxwell3
     maxwell3d.dirty.pipeline_state_dirty = true;
 }
 
-void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFeatures& features) {
+bool FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d,
+                                 const DynamicFeatures& features, const Device& device) {
     const Maxwell& regs = maxwell3d.regs;
     const auto topology_ = maxwell3d.draw_manager.draw_state.topology;
 
@@ -362,9 +434,6 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
     dynamic_state.raw2 = 0;
     if (!extended_dynamic_state) {
         dynamic_state.Refresh(regs);
-        std::ranges::transform(regs.vertex_streams, vertex_strides.begin(), [](const auto& array) {
-            return static_cast<u16>(array.stride.Value());
-        });
     }
     if (!extended_dynamic_state_2_logic_op) {
         dynamic_state.Refresh2(regs, topology_, extended_dynamic_state_2);
@@ -390,18 +459,90 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
     if (xfb_enabled) {
         RefreshXfbState(xfb_state, regs);
     }
-    if (!dynamic_vertex_input && features.has_static_vertex_repack) {
-        const u32 repack_mask = VertexRepackMask(regs);
-        // Refresh from guest values even when only the stride changed: offsets must not accumulate.
-        for (size_t index = 0; index < attributes.size(); ++index) {
-            const auto& input = regs.vertex_attrib_format[index];
-            attributes[index].offset.Assign(RepackedVertexOffset(repack_mask, input.buffer, input.offset));
-        }
-        for (u32 binding = 0; binding < vertex_strides.size(); ++binding) {
-            vertex_strides[binding] = static_cast<u16>(RepackedVertexStride(
-                repack_mask, binding, regs.vertex_streams[binding].stride));
+    if (dynamic_vertex_input) {
+        return true;
+    }
+
+    vertex_repack_layout_v2.Assign(1);
+    std::array<u32, Maxwell::NumVertexArrays> binding_attributes{};
+    const u32 max_attributes =
+        (std::min)(static_cast<u32>(Maxwell::NumVertexAttributes),
+                   device.GetMaxVertexInputAttributes());
+    const u32 max_bindings =
+        (std::min)(static_cast<u32>(Maxwell::NumVertexArrays), device.GetMaxVertexInputBindings());
+    for (u32 location = 0; location < max_attributes; ++location) {
+        const auto& input = regs.vertex_attrib_format[location];
+        attributes[location].offset.Assign(input.offset);
+        if (!input.constant && input.buffer < max_bindings) {
+            binding_attributes[input.buffer] |= 1U << location;
         }
     }
+    const bool portability_subset = device.HasPortabilitySubset();
+    const u32 min_stride = portability_subset ? device.GetMinVertexInputBindingStrideAlignment() : 0;
+    bool needs_dynamic_zero = false;
+    bool has_positive_overlap = false;
+    vertex_strides.fill(static_cast<u16>(min_stride));
+    if (!regs.IsMeshEnabled()) {
+        for (u32 binding = 0; binding < max_bindings; ++binding) {
+            const auto& stream = regs.vertex_streams[binding];
+            const u32 mask = binding_attributes[binding];
+            if (mask == 0) {
+                continue;
+            }
+            const auto decision = BuildVertexRepackLayoutForMask(regs, device, binding, false, mask);
+            if (!decision.supported) {
+                return false;
+            }
+            if (decision.extent == 0) {
+                continue;
+            }
+            if (!stream.IsEnabled()) {
+                // The null/dummy buffer still needs a legal descriptor for every attribute.
+                const u32 alignment = (std::max)(min_stride, 1U);
+                const u32 extent = device.SupportsVertexAttributeAccessBeyondStride()
+                                       ? min_stride
+                                       : (std::max)(min_stride, decision.extent);
+                const u32 required = (extent + alignment - 1) / alignment * alignment;
+                const u32 max_stride = device.GetMaxVertexInputBindingStride();
+                if (required > max_stride) {
+                    return false;
+                }
+                const u32 raw_stride = stream.stride;
+                const u32 stride =
+                    raw_stride >= required && raw_stride <= max_stride && raw_stride % alignment == 0
+                        ? raw_stride
+                        : required;
+                vertex_strides[binding] = static_cast<u16>(stride);
+                const u32 commanded_stride = raw_stride <= max_stride ? raw_stride : 0;
+                has_positive_overlap |= commanded_stride != 0 && decision.extent > commanded_stride;
+                continue;
+            }
+            needs_dynamic_zero |= portability_subset && stream.stride == 0 && decision.extent != 0;
+            if (decision.layout) {
+                for (u32 bits = mask; bits != 0; bits &= bits - 1) {
+                    const u32 location = std::countr_zero(bits);
+                    attributes[location].offset.Assign(decision.layout->attribute_offsets[location]);
+                }
+                vertex_strides[binding] = static_cast<u16>(decision.layout->BindingStride());
+            } else {
+                const u32 stride = stream.stride;
+                vertex_strides[binding] = static_cast<u16>(stride);
+                // A legal native overlap cannot be expressed with vkCmdBindVertexBuffers2 pStrides.
+                has_positive_overlap |= stride != 0 && decision.extent > stride;
+            }
+        }
+    }
+    const auto stride_policy = ChooseVertexStridePolicy(
+        extended_dynamic_state, portability_subset, needs_dynamic_zero, has_positive_overlap);
+    if (stride_policy == VertexStridePolicy::Unsupported) {
+        return false;
+    }
+    static_vertex_stride.Assign(stride_policy == VertexStridePolicy::Fixed);
+    if (stride_policy == VertexStridePolicy::Dynamic) {
+        // Values set by the binding command do not participate in the key.
+        vertex_strides.fill(0);
+    }
+    return true;
 }
 
 void FixedPipelineState::BlendingAttachment::Refresh(const Maxwell& regs, size_t index) {
@@ -497,7 +638,8 @@ void FixedPipelineState::DynamicState::Refresh2(const Maxwell& regs,
     const u32 topology_index = static_cast<u32>(topology_);
 
     rasterize_enable.Assign(regs.rasterize_enable != 0 ? 1 : 0);
-    primitive_restart_enable.Assign(regs.primitive_restart.enabled != 0 ? 1 : 0);
+    primitive_restart_enable.Assign(regs.primitive_restart.enabled != 0 &&
+                                    !MaxwellToVK::UsesConvertedQuadIndices(topology_));
     depth_bias_enable.Assign(enabled_lut[POLYGON_OFFSET_ENABLE_LUT[topology_index]] != 0 ? 1 : 0);
 }
 

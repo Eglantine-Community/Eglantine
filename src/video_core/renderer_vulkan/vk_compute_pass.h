@@ -16,6 +16,7 @@
 
 #include "common/common_types.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/renderer_vulkan/vk_indexed_quad.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/texture_cache/types.h"
@@ -37,6 +38,7 @@ class StagingBufferPool;
 class Scheduler;
 class Image;
 struct StagingBufferRef;
+struct VertexRepackLayout;
 
 class ComputePass {
 public:
@@ -60,19 +62,27 @@ private:
     vk::ShaderModule module;
 };
 
+struct RepackedVertexBuffer {
+    VkBuffer buffer;
+    VkDeviceSize offset;
+    VkDeviceSize size;
+};
+
 class VertexRepackPass final : public ComputePass {
 public:
     VertexRepackPass(const Device& device, Scheduler& scheduler, DescriptorPool& descriptor_pool,
                      StagingBufferPool& staging_pool, ComputePassDescriptorQueue& descriptor_queue);
-    /// Returns nothing when the range exceeds the device limits or the source buffer; the binding
-    /// is then left as is.
-    std::optional<std::pair<VkBuffer, VkDeviceSize>> Assemble(VkBuffer source, u32 offset, u32 size,
-                                                              u64 buffer_size);
+    /// Read only the logical binding range, retaining the accessible bytes of any partial vertex.
+    /// Return nothing if the plan cannot fit the host limits.
+    std::optional<RepackedVertexBuffer> Assemble(VkBuffer source, VkDeviceSize offset,
+                                                VkDeviceSize size, VkDeviceSize buffer_size,
+                                                const VertexRepackLayout& vertex_layout);
 
 private:
     Scheduler& scheduler;
     StagingBufferPool& staging_pool;
     ComputePassDescriptorQueue& descriptor_queue;
+    VkDeviceSize max_allocation_size;
 };
 
 class PlainUnswizzlePass final : public ComputePass {
@@ -86,22 +96,43 @@ private:
     ComputePassDescriptorQueue& descriptor_queue;
 };
 
-class Uint8Pass final : public ComputePass {
+class DepthStencilStagingPass final : public ComputePass {
 public:
-    explicit Uint8Pass(const Device& device_, Scheduler& scheduler_,
-                       DescriptorPool& descriptor_pool_, StagingBufferPool& staging_buffer_pool_,
-                       ComputePassDescriptorQueue& compute_pass_descriptor_queue_);
-    ~Uint8Pass();
+    static constexpr u32 LOCAL_SIZE = 128;
 
-    /// Assemble uint8 indices into an uint16 index buffer
-    /// Returns a pair with the staging buffer, and the offset where the assembled data is
-    std::pair<VkBuffer, VkDeviceSize> Assemble(u32 num_vertices, VkBuffer src_buffer,
-                                               u32 src_offset);
+    DepthStencilStagingPass(const Device& device, Scheduler& scheduler,
+                                DescriptorPool& descriptor_pool,
+                                ComputePassDescriptorQueue& descriptor_queue);
+    void CopyTile(VkBuffer staging, VkBuffer scratch, VkDeviceSize plane_offset, VkImage image,
+                  std::span<const VkBufferCopy> upload_regions,
+                  const std::array<VkBufferImageCopy, 2>& planes, u32 count, u32 guest_layout,
+                  bool host_float, bool download);
+
+private:
+    Scheduler& scheduler;
+    ComputePassDescriptorQueue& descriptor_queue;
+};
+
+class IndexWidenPass final : public ComputePass {
+public:
+    explicit IndexWidenPass(const Device& device_, Scheduler& scheduler_,
+                            DescriptorPool& descriptor_pool_, StagingBufferPool& staging_buffer_pool_,
+                            ComputePassDescriptorQueue& compute_pass_descriptor_queue_,
+                            VkIndexType source);
+    ~IndexWidenPass();
+
+    /// Widen UINT8 or UINT16 indices, translating the guest restart marker before vertex offset.
+    /// Returns the staging buffer and the offset of the assembled data.
+    std::optional<std::pair<VkBuffer, VkDeviceSize>> Assemble(
+        u32 num_indices, VkBuffer src_buffer, VkDeviceSize src_offset,
+        VkDeviceSize logical_size, VkDeviceSize buffer_size, u32 restart_index);
 
 private:
     Scheduler& scheduler;
     StagingBufferPool& staging_buffer_pool;
     ComputePassDescriptorQueue& compute_pass_descriptor_queue;
+    VkDeviceSize max_allocation_size;
+    VkIndexType source_type;
 };
 
 class QuadIndexedPass final : public ComputePass {
@@ -112,14 +143,41 @@ public:
                              ComputePassDescriptorQueue& compute_pass_descriptor_queue_);
     ~QuadIndexedPass();
 
-    std::pair<VkBuffer, VkDeviceSize> Assemble(
+    std::optional<std::pair<VkBuffer, VkDeviceSize>> Assemble(
         Tegra::Engines::Maxwell3D::Regs::IndexFormat index_format, u32 num_vertices,
-        u32 base_vertex, VkBuffer src_buffer, u32 src_offset, bool is_strip);
+        u32 base_vertex, VkBuffer src_buffer, VkDeviceSize src_offset,
+        VkDeviceSize logical_size, VkDeviceSize buffer_size, bool is_strip);
 
 private:
     Scheduler& scheduler;
     StagingBufferPool& staging_buffer_pool;
     ComputePassDescriptorQueue& compute_pass_descriptor_queue;
+    VkDeviceSize max_allocation_size;
+};
+
+class QuadRestartPass {
+public:
+    struct DirectDraw {
+        u32 instances;
+        s32 vertex_offset;
+        u32 first_instance;
+    };
+
+    QuadRestartPass(const Device& device, Scheduler& scheduler, DescriptorPool& descriptor_pool,
+                    StagingBufferPool& staging_pool);
+
+    // Return two deferred staging allocations. The caller releases them after recording the draw.
+    bool Assemble(VkBuffer source, VkDeviceSize offset, VkDeviceSize size, VkDeviceSize buffer_size,
+                  u32 count, u32 width, u32 restart_index, bool strip, const DirectDraw& draw,
+                  StagingBufferRef& indices, StagingBufferRef& command);
+
+private:
+    const Device& device;
+    Scheduler& scheduler;
+    StagingBufferPool& staging_pool;
+    VkDeviceSize max_allocation_size;
+    IndexedQuadGpu pipeline;
+    DescriptorAllocator descriptor_allocator;
 };
 
 class ConditionalRenderingResolvePass final : public ComputePass {

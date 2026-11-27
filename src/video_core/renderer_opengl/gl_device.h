@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <string>
 
@@ -65,6 +66,12 @@ public:
 
     bool HasWarpIntrinsics() const {
         return has_warp_intrinsics;
+    }
+
+    bool CanRunNativeTensorCompute(const std::array<u32, 3>& workgroup_size) const {
+        const auto [x, y, z] = workgroup_size;
+        return HasWarpIntrinsics() && !IsWarpSizePotentiallyLargerThanGuest() &&
+               x != 0 && y != 0 && z != 0 && x % 32 == 0;
     }
 
     bool HasShaderBallot() const {

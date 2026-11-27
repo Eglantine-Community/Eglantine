@@ -138,6 +138,10 @@ public:
     ~GraphicsPipeline();
 
     bool HasDynamicVertexInput() const noexcept { return key.state.dynamic_vertex_input; }
+    bool HasOutOfRangeVertexInput(const Tegra::Engines::Maxwell3D::Regs& regs) const;
+    bool UsesDynamicVertexBindingStride() const noexcept {
+        return key.state.UsesDynamicVertexBindingStride();
+    }
     const std::array<u64, 6>& ShaderHashes() const noexcept {
         return key.unique_hashes;
     }

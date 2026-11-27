@@ -114,12 +114,12 @@ void HLE_DrawArraysIndirect::Fallback(Core::System& system, Engines::Maxwell3D& 
     maxwell3d.RefreshParameters();
     const u32 instance_count = (maxwell3d.GetRegisterValue(0xD1B) & parameters[2]);
     auto topology = Maxwell3D::Regs::PrimitiveTopology(parameters[0]);
-    const u32 vertex_first = parameters[3];
-    const u32 vertex_count = parameters[1];
-    if (!IsTopologySafe(topology) && size_t(maxwell3d.GetMaxCurrentVertices()) < size_t(vertex_first) + size_t(vertex_count)) {
-        ASSERT(false && "Faulty draw!");
+    if (topology > Maxwell3D::Regs::PrimitiveTopology::Patches) {
+        LOG_DEBUG(HW_GPU, "Unsupported draw arrays topology {:#x}", parameters[0]);
         return;
     }
+    const u32 vertex_first = parameters[3];
+    const u32 vertex_count = parameters[1];
     const u32 base_instance = parameters[4];
     if (extended) {
         maxwell3d.regs.global_base_instance_index = base_instance;
@@ -141,7 +141,7 @@ void HLE_DrawIndexedIndirect::Execute(Core::System& system, Engines::Maxwell3D& 
         return;
     }
 
-    const u32 estimate = u32(maxwell3d.EstimateIndexBufferSize());
+    const u32 estimate = maxwell3d.EstimateIndexBufferSize();
     const u32 element_base = parameters[4];
     const u32 base_instance = parameters[5];
     maxwell3d.regs.vertex_id_base = element_base;
@@ -221,7 +221,7 @@ void HLE_MultiDrawIndexedIndirectCount::Execute(Core::System& system, Engines::M
         const u32 indirect_words = 5 + padding;
         const u32 stride = indirect_words * sizeof(u32);
         const std::size_t draw_count = end_indirect - start_indirect;
-        const u32 estimate = u32(maxwell3d.EstimateIndexBufferSize());
+        const u32 estimate = maxwell3d.EstimateIndexBufferSize();
         maxwell3d.dirty.flags[VideoCommon::Dirty::IndexBuffer] = true;
         auto& params = maxwell3d.draw_manager.indirect_state;
         params.is_byte_count = false;

@@ -3,7 +3,7 @@
 
 #version 460 core
 
-layout (local_size_x = 1024) in;
+layout (local_size_x = 128) in;
 
 layout (std430, set = 0, binding = 0) readonly buffer InputBuffer {
     uint input_indexes[];
@@ -19,24 +19,30 @@ layout (push_constant) uniform PushConstants {
     int is_strip; // 0: quads 1: quadstrip
 };
 
-void main() {
-    int primitive = int(gl_GlobalInvocationID.x);
-    if (primitive * 6 >= output_indexes.length()) {
-        return;
-    }
-
+void AssembleQuad(uint primitive) {
     int index_size = 8 << index_shift;
-    int flipped_shift = 2 - index_shift;
-    int mask = (1 << flipped_shift) - 1;
+    uint flipped_shift = uint(2 - index_shift);
+    uint mask = (1u << flipped_shift) - 1u;
 
-    const int quads_swizzle[6] = int[](0, 1, 2, 0, 2, 3);
-    const int quad_strip_swizzle[6] = int[](0, 3, 1, 0, 2, 3);
+    const uint quads_swizzle[6] = uint[](0, 1, 2, 0, 2, 3);
+    const uint quad_strip_swizzle[6] = uint[](0, 1, 3, 0, 3, 2);
     for (uint vertex = 0; vertex < 6; ++vertex) {
-        int offset = (is_strip == 0 ? primitive * 4 + quads_swizzle[vertex] : primitive * 2 + quad_strip_swizzle[vertex]);
-        int int_offset = offset >> flipped_shift;
-        int bit_offset = (offset & mask) * index_size;
+        uint offset = is_strip == 0 ? primitive * 4u + quads_swizzle[vertex]
+                                    : primitive * 2u + quad_strip_swizzle[vertex];
+        uint int_offset = offset >> flipped_shift;
+        int bit_offset = int(offset & mask) * index_size;
         uint packed_input = input_indexes[int_offset];
         uint index = bitfieldExtract(packed_input, bit_offset, index_size);
-        output_indexes[primitive * 6 + vertex] = index + base_vertex;
+        output_indexes[primitive * 6u + vertex] = index + base_vertex;
+    }
+}
+
+void main() {
+    uint count = uint(output_indexes.length()) / 6u;
+    uint step = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    // The host caps group count at the device limit. Cover any remaining quads in this grid.
+    for (uint primitive = gl_GlobalInvocationID.x; primitive < count; primitive += step) {
+        AssembleQuad(primitive);
+        if (step >= count - primitive) break;
     }
 }

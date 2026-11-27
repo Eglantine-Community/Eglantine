@@ -118,6 +118,10 @@ struct SparseLayout {
 /// `tile_height` texels in the host's texel size, rows packed.
 [[nodiscard]] u64 SparseTileStagingBytes(const Storage& s, const SparseLayout& layout);
 
+/// ASTC input is a whole guest tile. An edge rectangle retains the full tile's row pitch.
+[[nodiscard]] AstcGpuDecoder::Level SparseAstcTileLevel(const SparseLayout& layout,
+                                                       const SparseRect& rect);
+
 /// Turns the 64 KiB guest bytes of a tile into texels (decoded to the stand-in format when the
 /// host cannot hold the compressed one) in `out` (`SparseTileStagingBytes`). The tile is an
 /// independent block-linear picture of `tile_cols` x `tile_rows` blocks.

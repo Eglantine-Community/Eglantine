@@ -123,6 +123,28 @@ TEST_CASE("Ampere I2F keeps unsigned 16-bit sources unsigned", "[video_core][amp
     CHECK(HasOpcode(program, Shader::IR::Opcode::ConvertF32U32));
 }
 
+TEST_CASE("Ampere I2FP uses native conversion when every input is exactly representable",
+          "[video_core][ampere]") {
+    for (const u32 mask : {0x00ffffffU, 0xffffff00U, 0x01ffffffU}) {
+        INFO(mask);
+        const std::array<Instruction, 6> code{{
+            PTR0,
+            TID_R1,
+            // LOP3.LUT R2, R1, mask, RZ, 0xc0 (A & B)
+            {{0x01027812U, mask, 0x078ec0ffU, Sched}},
+            // I2FP.F32.U32 R3, R2
+            {{0x00037245U, 2U, 0x00201000U, Sched}},
+            StoreAt(3),
+            EXIT,
+        }};
+        IrPools pools;
+        const auto program = TranslateDirect(pools, code);
+        const bool exact = mask != 0x01ffffffU;
+        CHECK(HasOpcode(program, Shader::IR::Opcode::ConvertF32U32) == exact);
+        CHECK(HasOpcode(program, Shader::IR::Opcode::FindUMsb32) != exact);
+    }
+}
+
 TEST_CASE("Ampere I2F converts 16-bit uniform sources", "[video_core][ampere]") {
     // Star Fox's graphics shader: I2F.F32.U16 R2, UR4.
     std::array<Instruction, 7> code{{

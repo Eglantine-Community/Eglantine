@@ -1425,15 +1425,14 @@ void QueryCacheRuntime::EndHostConditionalRendering() {
     impl->hcr_offset = 0;
 }
 
-void QueryCacheRuntime::PauseHostConditionalRendering() {
-    if (!impl->hcr_is_set) {
-        return;
+bool QueryCacheRuntime::PauseHostConditionalRendering() {
+    if (!impl->hcr_is_set || !impl->is_hcr_running) {
+        return false;
     }
-    if (impl->is_hcr_running) {
-        impl->scheduler.Record(
-            [](vk::CommandBuffer cmdbuf) { cmdbuf.EndConditionalRenderingEXT(); });
-    }
+    impl->scheduler.Record(
+        [](vk::CommandBuffer cmdbuf) { cmdbuf.EndConditionalRenderingEXT(); });
     impl->is_hcr_running = false;
+    return true;
 }
 
 void QueryCacheRuntime::ResumeHostConditionalRendering() {

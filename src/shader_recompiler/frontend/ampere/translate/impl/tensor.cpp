@@ -1,27 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <array>
-#include <cstdlib>
-#include <optional>
-#include <string_view>
 
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/ampere/translate/impl/impl.h"
 
 namespace Shader::Ampere {
 namespace {
-
-[[nodiscard]] std::optional<std::string_view> ResolveTensorMode(
-    const LoweringOptions& options) noexcept {
-    if (const char* const forced_mode = std::getenv("EDEN_NX2_TENSOR"); forced_mode != nullptr) {
-        return std::string_view{forced_mode};
-    }
-    if (!options.tensor) {
-        return std::nullopt;
-    }
-    return options.compact_tensor ? std::string_view{"compact"} : std::string_view{"1"};
-}
 
 /// Rounds an F32 accumulator to IEEE-754 binary16 and converts back to F32 using explicit bit
 /// operations matching `emit_spirv_tensor.cpp`, preventing GPU compilers from eliminating an
@@ -46,9 +33,41 @@ namespace {
     return ir.BitCast<IR::F32>(ir.BitwiseOr(mag_res, ir.BitwiseAnd(bits, ir.Imm32(0x80000000U))));
 }
 
+bool IsSingleComputeInvocation(const Environment& env) {
+    return env.ShaderStage() == Stage::Compute &&
+           env.WorkgroupSize() == std::array<u32, 3>{1, 1, 1};
+}
+
+// Inspect emitted predicate definitions in the same block. This includes every predicate
+// writer, even when an opcode writes a predicate as a secondary result. The backend separately
+// requires a straight-line workgroup, so a warp vote here has the full guest warp as participants.
+bool HasWarpUniformPredicate(const IR::Block& block, IR::Pred pred) {
+    const auto writer = std::find_if(block.rbegin(), block.rend(), [pred](const IR::Inst& inst) {
+        return inst.GetOpcode() == IR::Opcode::SetPred && inst.Arg(0).Pred() == pred;
+    });
+    if (writer == block.rend()) {
+        return false;
+    }
+    const auto value = writer->Arg(1);
+    if (value.IsImmediate()) {
+        return true;
+    }
+    switch (value.Inst()->GetOpcode()) {
+    case IR::Opcode::VoteAll:
+    case IR::Opcode::VoteAny:
+    case IR::Opcode::VoteEqual:
+        return true;
+    default:
+        return false;
+    }
+}
+
 } // Anonymous namespace
 
 void TranslatorVisitor::MOVM(const Instruction& insn) {
+    if (IsSingleComputeInvocation(env)) {
+        throw NotImplementedException("MOVM requires other guest warp lanes");
+    }
     const u32 dest = insn.Bits(16, 8);
     const IR::U32 src = R(insn.Bits(24, 8));
     const IR::U32 lane = ir.LaneId();
@@ -68,6 +87,9 @@ void TranslatorVisitor::MOVM(const Instruction& insn) {
 }
 
 void TranslatorVisitor::LDSM(const Instruction& insn) {
+    if (IsSingleComputeInvocation(env)) {
+        throw NotImplementedException("LDSM requires other guest warp lanes");
+    }
     const u32 dest = insn.Bits(16, 8);
     const u32 count = 1U << insn.Bits(72, 2);
     const bool transpose = insn.Bits(78, 1) != 0U;
@@ -120,9 +142,12 @@ void TranslatorVisitor::LDSM(const Instruction& insn) {
 }
 
 void TranslatorVisitor::HMMA(const Instruction& insn) {
-    const std::optional<std::string_view> mode = ResolveTensorMode(options);
-    if (!mode) {
+    const TensorMode mode = ResolveTensorMode(options);
+    if (mode == TensorMode::Disabled) {
         throw NotImplementedException("HMMA encountered without EDEN_NX2_TENSOR enabled");
+    }
+    if (mode != TensorMode::Stub && IsSingleComputeInvocation(env)) {
+        throw NotImplementedException("HMMA requires a complete guest warp");
     }
     const u32 dest = insn.Bits(16, 8);
     const u32 a = insn.Bits(24, 8);
@@ -140,7 +165,12 @@ void TranslatorVisitor::HMMA(const Instruction& insn) {
     const IR::U32 c0 = c == 255U ? ir.Imm32(0U) : R(c);
     const IR::U32 c1 = c == 255U ? ir.Imm32(0U) : R(c + 1U);
 
-    if (*mode == "compact" && insn.Bits(12, 4) == 7U) {
+    if (mode == TensorMode::Workgroup && insn.Bits(12, 4) != 7U &&
+        (!active_guard || !HasWarpUniformPredicate(*ir.block, ThreadPred(insn.Bits(12, 4))))) {
+        throw NotImplementedException("Workgroup HMMA cannot prove a warp-uniform predicate");
+    }
+    if (mode == TensorMode::Workgroup ||
+        (mode == TensorMode::Compact && insn.Bits(12, 4) == 7U)) {
         const IR::Value result =
             ir.TensorMulAdd(ir.CompositeConstruct(a0, a1, a2, a3), ir.CompositeConstruct(b0, b1),
                             ir.CompositeConstruct(c0, c1), depth);
@@ -149,7 +179,7 @@ void TranslatorVisitor::HMMA(const Instruction& insn) {
         return;
     }
 
-    if (*mode == "stub") {
+    if (mode == TensorMode::Stub) {
         R(dest, c0);
         R(dest + 1U, c1);
         return;

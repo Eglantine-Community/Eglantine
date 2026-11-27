@@ -148,6 +148,7 @@ void TranslatorVisitor::PRMT(const Instruction& insn) {
     IR::U32 control = !is_uniform ? AluSourceU32(insn, 1)
                       : form == 4 ? ir.Imm32(insn.words[1])
                                   : UR(insn.Bits(control_field, 8));
+    const auto write_dst = [&](const IR::U32& val) { is_uniform ? UR(dest, val) : R(dest, val); };
     if (mode != 0U) {
         // PTX prmt selector table, packed in destination-byte order (low nibble first).
         constexpr std::array<std::array<u32, 4>, 6> modes{{
@@ -161,6 +162,14 @@ void TranslatorVisitor::PRMT(const Instruction& insn) {
         const auto& selections = modes[mode - 1];
         if (control.IsImmediate()) {
             control = ir.Imm32(selections[control.U32() & 3U]);
+        } else if (mode == 3U || mode == 6U) {
+            // RC8 and RC16 repeat one byte or halfword from the first source.
+            const bool byte = mode == 3U;
+            const IR::U32 index = ir.BitwiseAnd(control, ir.Imm32(byte ? 3U : 1U));
+            const IR::U32 offset = ir.ShiftLeftLogical(index, ir.Imm32(byte ? 3U : 4U));
+            const IR::U32 part = ir.BitFieldExtract(a, offset, ir.Imm32(byte ? 8U : 16U), false);
+            write_dst(ir.IMul(part, ir.Imm32(byte ? 0x01010101U : 0x00010001U)));
+            return;
         } else {
             const IR::U32 selector = ir.BitwiseAnd(control, ir.Imm32(3U));
             const IR::U32 low{ir.Select(ir.IEqual(selector, ir.Imm32(0U)), ir.Imm32(selections[0]),
@@ -170,7 +179,6 @@ void TranslatorVisitor::PRMT(const Instruction& insn) {
             control = IR::U32{ir.Select(ir.ILessThan(selector, ir.Imm32(2U), false), low, high)};
         }
     }
-    const auto write_dst = [&](const IR::U32& val) { is_uniform ? UR(dest, val) : R(dest, val); };
 
     if (!control.IsImmediate()) {
         IR::U32 result = ir.Imm32(0U);

@@ -51,7 +51,7 @@ public:
 
     void EndHostConditionalRendering();
 
-    void PauseHostConditionalRendering();
+    bool PauseHostConditionalRendering();
 
     void ResumeHostConditionalRendering();
 

@@ -1,0 +1,42 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#version 450 core
+
+layout(local_size_x = 128) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer InputBuffer {
+    uint input_words[];
+};
+
+layout(std430, set = 0, binding = 1) writeonly buffer OutputBuffer {
+    uvec2 output_indices[];
+};
+
+// The scalar view writes only the unpaired final index. Full pairs use the vector view.
+layout(std430, set = 0, binding = 1) writeonly buffer OutputTail {
+    uint output_words[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint index_count;
+    uint restart_index;
+};
+
+uint WidenIndex(uint value) {
+    return value == restart_index ? 0xffffffffu : value;
+}
+
+void main() {
+    uint count = index_count / 2 + index_count % 2;
+    uint step = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    for (uint pair = gl_GlobalInvocationID.x; pair < count; pair += step) {
+        uint packed = input_words[pair];
+        uint low = WidenIndex(packed & 0xffff);
+        if (pair < index_count / 2) {
+            output_indices[pair] = uvec2(low, WidenIndex(packed >> 16));
+        } else {
+            output_words[pair * 2] = low;
+        }
+        if (step >= count - pair) break;
+    }
+}

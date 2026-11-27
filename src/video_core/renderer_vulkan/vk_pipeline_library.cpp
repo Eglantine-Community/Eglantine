@@ -272,33 +272,27 @@ bool DescribeColorBlend(KeyWriter& key, const VkPipelineColorBlendStateCreateInf
     return ci->pNext == nullptr;
 }
 
-void DescribeDynamicState(KeyWriter& key, const VkPipelineDynamicStateCreateInfo* ci) {
+bool DescribeDynamicState(KeyWriter& key, const VkPipelineDynamicStateCreateInfo* ci) {
     key.Add(ci != nullptr);
-    if (ci != nullptr) {
-        key.Add(ci->flags);
-        key.AddArray(ci->pDynamicStates, ci->dynamicStateCount);
+    if (ci == nullptr) {
+        return true;
     }
+    key.Add(ci->flags);
+    key.AddArray(ci->pDynamicStates, ci->dynamicStateCount);
+    return ci->pNext == nullptr;
 }
 
-// Writes everything the driver reads from the create info of one part. The pipeline layout is
-// written as the identity of the pipeline's whole shader module set, `shaders`:
-// - the shader parts are linked without VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT, so
-//   their layouts must be identically defined (VUID-VkGraphicsPipelineCreateInfo-pLibraries-06613);
-// - both renderers' layouts have one descriptor set with the bindings of all stages, built from
-//   the translation of all of them, and those travel with the module set.
-// So the vertex part of one pipeline can only be linked with the fragment part of a pipeline
-// with the same module set, never with another fragment program.
+// The shader parts link without independent descriptor sets. Keep the layout in the key so
+// their descriptor sets and push constant ranges match those of the linked pipeline.
 bool DescribePart(KeyWriter& key, const VkGraphicsPipelineCreateInfo& part,
-                  VkGraphicsPipelineLibraryFlagsEXT subset, const void* shaders) {
+                  VkGraphicsPipelineLibraryFlagsEXT subset) {
     key.Add(subset);
-    if (part.layout != VK_NULL_HANDLE) {
-        key.AddHandle(shaders);
-    }
+    key.AddHandle(part.layout);
     key.Add(part.flags);
     key.AddHandle(part.renderPass);
     key.Add(part.subpass);
-    DescribeDynamicState(key, part.pDynamicState);
-    return DescribeStages(key, {part.pStages, part.stageCount}) &&
+    return DescribeDynamicState(key, part.pDynamicState) &&
+           DescribeStages(key, {part.pStages, part.stageCount}) &&
            DescribeVertexInput(key, part.pVertexInputState) &&
            DescribeInputAssembly(key, part.pInputAssemblyState) &&
            DescribeTessellation(key, part.pTessellationState) &&
@@ -317,12 +311,81 @@ bool HasDynamicState(const VkGraphicsPipelineCreateInfo& ci, VkDynamicState stat
     return std::ranges::find(states, state) != states.end();
 }
 
+// As in ScarletNX's vk_pipe_dynamic, keep state local to the library subset that consumes it.
+// Keep states with cross-subset requirements, including multisample and feedback state, in
+// every part. Unknown extensions get the same conservative treatment.
+VkGraphicsPipelineLibraryFlagsEXT DynamicStateSubsets(VkDynamicState state) {
+    switch (state) {
+    case VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY:
+    case VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE:
+    case VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE:
+    case VK_DYNAMIC_STATE_VERTEX_INPUT_EXT:
+        return VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT;
+    case VK_DYNAMIC_STATE_VIEWPORT:
+    case VK_DYNAMIC_STATE_SCISSOR:
+    case VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT:
+    case VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT:
+    case VK_DYNAMIC_STATE_LINE_WIDTH:
+    case VK_DYNAMIC_STATE_DEPTH_BIAS:
+    case VK_DYNAMIC_STATE_CULL_MODE:
+    case VK_DYNAMIC_STATE_FRONT_FACE:
+    case VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE:
+    case VK_DYNAMIC_STATE_POLYGON_MODE_EXT:
+    case VK_DYNAMIC_STATE_DEPTH_CLAMP_ENABLE_EXT:
+    case VK_DYNAMIC_STATE_PROVOKING_VERTEX_MODE_EXT:
+    case VK_DYNAMIC_STATE_PATCH_CONTROL_POINTS_EXT:
+        return VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT;
+    case VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE:
+    case VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE:
+    case VK_DYNAMIC_STATE_DEPTH_COMPARE_OP:
+    case VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE:
+    case VK_DYNAMIC_STATE_DEPTH_BOUNDS:
+    case VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE:
+    case VK_DYNAMIC_STATE_STENCIL_OP:
+    case VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK:
+    case VK_DYNAMIC_STATE_STENCIL_WRITE_MASK:
+    case VK_DYNAMIC_STATE_STENCIL_REFERENCE:
+        return VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT;
+    case VK_DYNAMIC_STATE_BLEND_CONSTANTS:
+    case VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT:
+    case VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT:
+    case VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT:
+    case VK_DYNAMIC_STATE_LOGIC_OP_ENABLE_EXT:
+    case VK_DYNAMIC_STATE_LOGIC_OP_EXT:
+        return VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT;
+    default:
+        return ~VkGraphicsPipelineLibraryFlagsEXT{0};
+    }
+}
+
+const VkPipelineDynamicStateCreateInfo* FilterDynamicState(
+    const VkPipelineDynamicStateCreateInfo* source, VkGraphicsPipelineLibraryFlagsEXT subset,
+    LibraryPartDynamicState& dynamic) {
+    if (source == nullptr || source->pNext != nullptr ||
+        source->dynamicStateCount > dynamic.states.size()) {
+        return source;
+    }
+    auto* end = std::ranges::copy_if(
+                    std::span{source->pDynamicStates, source->dynamicStateCount},
+                    dynamic.states.data(),
+                    [subset](VkDynamicState state) { return (DynamicStateSubsets(state) & subset) != 0; })
+                    .out;
+    const auto count = static_cast<u32>(end - dynamic.states.data());
+    if (count == 0 && source->flags == 0) {
+        return nullptr;
+    }
+    dynamic.info = *source;
+    dynamic.info.dynamicStateCount = count;
+    dynamic.info.pDynamicStates = dynamic.states.data();
+    return &dynamic.info;
+}
+
 } // Anonymous namespace
 
 VkGraphicsPipelineCreateInfo MakeLibraryPartCreateInfo(
     const VkGraphicsPipelineCreateInfo& ci,
     const VkGraphicsPipelineLibraryCreateInfoEXT& library_info,
-    std::span<const VkPipelineShaderStageCreateInfo> stages) {
+    std::span<const VkPipelineShaderStageCreateInfo> stages, LibraryPartDynamicState& dynamic) {
     // A part has no stages to tell it the pipeline is a mesh one, so the vertex input interface
     // part always needs valid vertex input and input assembly state
     // (VUID-VkGraphicsPipelineCreateInfo-pStages-02097, -dynamicPrimitiveTopologyUnrestricted-09031).
@@ -378,9 +441,7 @@ VkGraphicsPipelineCreateInfo MakeLibraryPartCreateInfo(
         .pMultisampleState = vertex_input ? nullptr : ci.pMultisampleState,
         .pDepthStencilState = fragment_shader ? ci.pDepthStencilState : nullptr,
         .pColorBlendState = fragment_output ? ci.pColorBlendState : nullptr,
-        // Every part gets the whole list: a part ignores the dynamic states of state it does not
-        // hold, and the linked pipeline has those of all its parts.
-        .pDynamicState = ci.pDynamicState,
+        .pDynamicState = FilterDynamicState(ci.pDynamicState, subset, dynamic),
         // Only the shader parts take a layout (VUID-VkGraphicsPipelineCreateInfo-flags-06642).
         .layout = pre_rasterization || fragment_shader ? ci.layout : VK_NULL_HANDLE,
         // Eden draws inside render passes, not with dynamic rendering: all parts but the vertex
@@ -401,9 +462,7 @@ struct GraphicsPipelineLibraryCache::Library {
     /// Set after `pipeline`, for FindLibrary, which must not wait for a compile in progress.
     std::atomic_bool ready{false};
     vk::Pipeline pipeline;
-    /// Keeps the shader modules named by the key alive, so neither their handles nor the
-    /// address of the set can be reused while the key exists (DescribePart).
-    std::shared_ptr<const void> shaders;
+    ShaderObjects shader_objects;
 };
 
 size_t GraphicsPipelineLibraryCache::KeyHash::operator()(const Key& key) const noexcept {
@@ -411,14 +470,15 @@ size_t GraphicsPipelineLibraryCache::KeyHash::operator()(const Key& key) const n
                                                   key.words.size() * sizeof(u32)));
 }
 
-GraphicsPipelineLibraryCache::GraphicsPipelineLibraryCache(const Device& device_)
-    : device{device_} {}
+GraphicsPipelineLibraryCache::GraphicsPipelineLibraryCache(const Device& device_,
+                                                            ShaderPartFactory shader_part_)
+    : device{device_}, shader_part{std::move(shader_part_)} {}
 
 GraphicsPipelineLibraryCache::~GraphicsPipelineLibraryCache() = default;
 
 vk::Pipeline GraphicsPipelineLibraryCache::Link(const VkGraphicsPipelineCreateInfo& ci,
                                                 VkPipelineCache pipeline_cache,
-                                                const std::shared_ptr<const void>& shaders,
+                                                const ShaderObjects& shader_objects,
                                                 bool cached_parts_only,
                                                 Common::ThreadWorker* part_workers) {
     // Descriptor buffers are the only creation flag the parts can share: every part of a
@@ -453,6 +513,7 @@ vk::Pipeline GraphicsPipelineLibraryCache::Link(const VkGraphicsPipelineCreateIn
         std::span<const VkPipelineShaderStageCreateInfo> stages;
         VkGraphicsPipelineCreateInfo ci;
         Key key;
+        LibraryPartDynamicState dynamic;
     };
     const auto library_info = [](VkGraphicsPipelineLibraryFlagsEXT subset) {
         return VkGraphicsPipelineLibraryCreateInfoEXT{
@@ -462,18 +523,18 @@ vk::Pipeline GraphicsPipelineLibraryCache::Link(const VkGraphicsPipelineCreateIn
         };
     };
     std::array<Part, 4> parts{{
-        {library_info(VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT), {}, {}, {}},
+        {library_info(VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT), {}, {}, {}, {}},
         {library_info(VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT),
-         {pre_rasterization_stages.data(), pre_rasterization_stages.size()}, {}, {}},
+         {pre_rasterization_stages.data(), pre_rasterization_stages.size()}, {}, {}, {}},
         {library_info(VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT),
-         {fragment_stage, 1}, {}, {}},
-        {library_info(VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT), {}, {}, {}},
+         {fragment_stage, 1}, {}, {}, {}},
+        {library_info(VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT), {}, {}, {}, {}},
     }};
     // Every part is described before any is compiled, so a refused pipeline costs no compile.
     for (Part& part : parts) {
-        part.ci = MakeLibraryPartCreateInfo(ci, part.library_info, part.stages);
+        part.ci = MakeLibraryPartCreateInfo(ci, part.library_info, part.stages, part.dynamic);
         KeyWriter writer{part.key.words};
-        if (!DescribePart(writer, part.ci, part.library_info.flags, shaders.get())) {
+        if (!DescribePart(writer, part.ci, part.library_info.flags)) {
             return {};
         }
     }
@@ -497,9 +558,9 @@ vk::Pipeline GraphicsPipelineLibraryCache::Link(const VkGraphicsPipelineCreateIn
             join.left = missing.size() - 1;
             for (size_t i = 1; i < missing.size(); ++i) {
                 const Part& part = parts[missing[i]];
-                part_workers->QueueWork([this, &part, &join, pipeline_cache, &shaders] {
+                part_workers->QueueWork([this, &part, &join, pipeline_cache, &shader_objects] {
                     try {
-                        (void)GetLibrary(part.key, part.ci, pipeline_cache, shaders);
+                        (void)GetLibrary(part.key, part.ci, pipeline_cache, shader_objects);
                     } catch (...) {
                         // Left uncompiled: the calling thread compiles it again and reports.
                     }
@@ -515,7 +576,8 @@ vk::Pipeline GraphicsPipelineLibraryCache::Link(const VkGraphicsPipelineCreateIn
             for (size_t i = missing.size(); i-- > 0;) {
                 const size_t index = missing[i == missing.size() - 1 ? 0 : i + 1];
                 try {
-                    (void)GetLibrary(parts[index].key, parts[index].ci, pipeline_cache, shaders);
+                    (void)GetLibrary(parts[index].key, parts[index].ci, pipeline_cache,
+                                     shader_objects);
                 } catch (...) {
                     // As above: compiled again (and thrown) by the loop below.
                 }
@@ -532,7 +594,8 @@ vk::Pipeline GraphicsPipelineLibraryCache::Link(const VkGraphicsPipelineCreateIn
             }
         } else {
             handles[index] =
-                GetLibrary(std::move(parts[index].key), parts[index].ci, pipeline_cache, shaders);
+                GetLibrary(std::move(parts[index].key), parts[index].ci, pipeline_cache,
+                           shader_objects);
         }
     }
 
@@ -575,7 +638,7 @@ vk::Pipeline GraphicsPipelineLibraryCache::Link(const VkGraphicsPipelineCreateIn
 
 VkPipeline GraphicsPipelineLibraryCache::GetLibrary(
     Key key, const VkGraphicsPipelineCreateInfo& part_ci, VkPipelineCache pipeline_cache,
-    const std::shared_ptr<const void>& shaders) {
+    const ShaderObjects& shader_objects) {
     std::shared_ptr<Library> library;
     {
         std::scoped_lock lock{mutex};
@@ -588,9 +651,14 @@ VkPipeline GraphicsPipelineLibraryCache::GetLibrary(
     // Compiled without the lock: other parts compile meanwhile, and threads needing this very
     // part wait in call_once until it is done.
     std::call_once(library->compiled, [&] {
-        library->pipeline = device.GetLogical().CreateGraphicsPipeline(part_ci, pipeline_cache);
+        if (shader_part && part_ci.stageCount != 0) {
+            library->pipeline = shader_part(part_ci);
+        }
+        if (!library->pipeline) {
+            library->pipeline = device.GetLogical().CreateGraphicsPipeline(part_ci, pipeline_cache);
+        }
         if (part_ci.layout != VK_NULL_HANDLE) {
-            library->shaders = shaders;
+            library->shader_objects = shader_objects;
         }
         library->ready.store(true, std::memory_order_release);
     });

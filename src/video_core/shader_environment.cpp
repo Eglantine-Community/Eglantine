@@ -575,11 +575,14 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
         }
         if (status == Shader::Ampere::ProgramCaptureState::Result::Complete) break;
     }
+    // Keep ordinary compute programs compatible with the existing packed identity.
+    const bool has_tensor =
+        native_tensor_mode != Shader::Ampere::TensorMode::Default &&
+        Shader::Ampere::HasHmma(native);
     const Shader::Ampere::LoweringOptions opts{
         .geometry = geometry,
-        .tensor = native_tensor,
-        .compact_tensor = native_compact_tensor,
         .native_code_address = program_base + native_header_size,
+        .tensor_mode = has_tensor ? native_tensor_mode : Shader::Ampere::TensorMode::Default,
     };
     auto analysis = Shader::Ampere::AnalyzeProgram(native, opts);
     // EDEN_NX2_REJECT=<hex address>,...: treat these programs as rejected (to find which newly
@@ -981,6 +984,7 @@ GraphicsEnvironment::TexturePoolCheck GraphicsEnvironment::CheckTextureReads(
 ComputeEnvironment::ComputeEnvironment(Tegra::Engines::KeplerCompute& kepler_compute_,
                                        Tegra::MemoryManager& gpu_memory_, GPUVAddr program_base_,
                                        u32 start_address_,
+                                       Shader::Ampere::TensorMode tensor_mode,
                                        std::shared_ptr<const LoweredNativeCode> lowered_native_)
     : GenericEnvironment{gpu_memory_, program_base_, start_address_}, kepler_compute{
                                                                           &kepler_compute_} {
@@ -994,8 +998,7 @@ ComputeEnvironment::ComputeEnvironment(Tegra::Engines::KeplerCompute& kepler_com
     if (kepler_compute->IsNativeMode()) {
         initial_offset = sizeof(sph);
         is_proprietary_driver = true;
-        native_tensor = kepler_compute->EmulatesNativeTensorPrograms();
-        native_compact_tensor = kepler_compute->UsesCompactTensorPrograms();
+        native_tensor_mode = tensor_mode;
         InitializeNativeCode(std::move(lowered_native_), 0);
         start_address = sizeof(sph);
     }

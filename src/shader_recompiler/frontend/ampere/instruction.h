@@ -8,6 +8,7 @@
 #include <cstring>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <vector>
 
 #include "common/common_types.h"
@@ -27,12 +28,48 @@ struct Instruction {
 };
 static_assert(sizeof(Instruction) == 16);
 
+enum class TensorMode : u8 { Default, Disabled, Full, Compact, Stub, Workgroup };
+
+inline bool HasHmma(std::span<const Instruction> code) noexcept {
+    for (const auto& instruction : code) {
+        if (instruction.Bits(0, 12) == 0x23c) {
+            return true;
+        }
+    }
+    return false;
+}
+
 struct LoweringOptions {
     bool geometry{};
     bool tensor{};
     bool compact_tensor{};
     u64 native_code_address{};
+    TensorMode tensor_mode{};
 };
+
+/// Explicit and legacy modes share the same spelling in analysis and translation.
+inline TensorMode ParseTensorMode(std::string_view value) noexcept {
+    if (value == "compact") {
+        return TensorMode::Compact;
+    }
+    if (value == "stub") {
+        return TensorMode::Stub;
+    }
+    return TensorMode::Full;
+}
+
+inline TensorMode ResolveTensorMode(const LoweringOptions& options) noexcept {
+    if (options.tensor_mode != TensorMode::Default) {
+        return options.tensor_mode;
+    }
+    if (const char* forced = std::getenv("EDEN_NX2_TENSOR")) {
+        return ParseTensorMode(forced);
+    }
+    if (!options.tensor) {
+        return TensorMode::Disabled;
+    }
+    return options.compact_tensor ? TensorMode::Compact : TensorMode::Full;
+}
 
 /// Non-owning view of a native Ampere program ready for direct translation.
 struct NativeAmpereView {
@@ -90,7 +127,8 @@ constexpr u64 NativeAmpereCodeMagic = 0x455245504d41584eULL; // "NXAMPERE"
         std::memcpy(packed.data() + base, native.data(), native.size_bytes());
     }
     const u64 flags = (u64{options.geometry} << 0) | (u64{options.tensor} << 1) |
-                      (u64{options.compact_tensor} << 2) | (u64{uses_async_copy} << 3);
+                      (u64{options.compact_tensor} << 2) | (u64{uses_async_copy} << 3) |
+                      (static_cast<u64>(options.tensor_mode) << 4);
     packed.push_back(flags);
     packed.push_back(options.native_code_address);
     packed.push_back(static_cast<u64>(native.size()));
@@ -114,11 +152,16 @@ struct UnpackedNativeAmpere {
         return std::nullopt;
     }
     const u64 flags = code[code.size() - 4];
+    const auto tensor_mode = static_cast<TensorMode>((flags >> 4) & 7);
+    if (tensor_mode > TensorMode::Workgroup) {
+        return std::nullopt;
+    }
     UnpackedNativeAmpere out;
     out.options.geometry = (flags & (u64{1} << 0)) != 0;
     out.options.tensor = (flags & (u64{1} << 1)) != 0;
     out.options.compact_tensor = (flags & (u64{1} << 2)) != 0;
     out.options.native_code_address = code[code.size() - 3];
+    out.options.tensor_mode = tensor_mode;
     out.uses_async_copy = (flags & (u64{1} << 3)) != 0;
     out.instructions.resize(static_cast<size_t>(count));
     std::memcpy(out.instructions.data(), code.data() + header_words,

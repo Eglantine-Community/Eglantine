@@ -51,34 +51,14 @@ void PopulateRecords(std::vector<Record>& records, QWindow* window) try {
     records.reserve(physical_devices.size());
     for (const VkPhysicalDevice device : physical_devices) {
         const auto physical_device = vk::PhysicalDevice(device, dld);
-        std::string name = physical_device.GetProperties().deviceName;
+        const auto properties = physical_device.GetProperties();
+        std::string name = properties.deviceName;
 
         const std::vector<VkPresentModeKHR> present_modes =
             physical_device.GetSurfacePresentModesKHR(*surface);
 
-        VkPhysicalDeviceDriverProperties driver_properties{};
-        driver_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
-        driver_properties.pNext = nullptr;
-        VkPhysicalDeviceProperties2 properties{};
-        properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2_KHR;
-        properties.pNext = &driver_properties;
-        dld.vkGetPhysicalDeviceProperties2(physical_device, &properties);
-
-        const auto driverID = driver_properties.driverID;
-
-        bool has_broken_compute{
-            Vulkan::Device::CheckBrokenCompute(driverID, properties.properties.driverVersion)};
-
-        std::string driver_string = Vulkan::vk::GetDriverName(driver_properties);
-
-        if (driver_string.empty())
-            driver_string = "Unknown";
-
-        name = fmt::format("{} ({})", name, driver_string);
-
         Capabilities capabilities;
-        capabilities.vendor_id = properties.properties.vendorID;
-        capabilities.driver_id = static_cast<u32>(driverID);
+        capabilities.vendor_id = properties.vendorID;
         try {
             for (const VkExtensionProperties& extension :
                  physical_device.EnumerateDeviceExtensionProperties()) {
@@ -88,6 +68,27 @@ void PopulateRecords(std::vector<Record>& records, QWindow* window) try {
             LOG_WARNING(Frontend, "Could not list the extensions of {}: {}", name,
                         exception.what());
         }
+
+        VkPhysicalDeviceDriverProperties driver_properties{};
+        if (properties.apiVersion >= VK_API_VERSION_1_2 ||
+            capabilities.HasExtension(VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME)) {
+            driver_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
+            VkPhysicalDeviceProperties2 properties2{
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+                .pNext = &driver_properties,
+            };
+            physical_device.GetProperties2(properties2);
+        }
+        const auto driverID = driver_properties.driverID;
+        capabilities.driver_id = static_cast<u32>(driverID);
+        const bool has_broken_compute = Device::CheckBrokenCompute(driverID, properties.driverVersion);
+
+        std::string driver_string = Vulkan::vk::GetDriverName(driver_properties);
+
+        if (driver_string.empty())
+            driver_string = "Unknown";
+
+        name = fmt::format("{} ({})", name, driver_string);
 
         records.push_back(
             VkDeviceInfo::Record(name, present_modes, has_broken_compute, std::move(capabilities)));

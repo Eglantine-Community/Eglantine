@@ -34,14 +34,18 @@
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/frontend/emu_window.h"
+#include "tests/nvn/ampere_exec.h"
 #include "tests/temp_path.h"
 #include "video_core/nvn/state_layouts.h"
 #include "video_core/load_progress.h"
 #include "video_core/native_tensor_programs.h"
 #include "video_core/pipeline_cache_files.h"
 #include "video_core/shader_notify.h"
+#include "video_core/renderer_vulkan/index_restart.h"
+#include "video_core/renderer_vulkan/nvn/nvn_debug.h"
 #include "video_core/renderer_vulkan/nvn/nvn_pipeline_cache.h"
 #include "video_core/renderer_vulkan/nvn/nvn_pipeline_disk.h"
+#include "video_core/renderer_vulkan/nvn/nvn_pipeline_impl.h"
 #include "video_core/renderer_vulkan/nvn/nvn_pipeline_state.h"
 #include "video_core/renderer_vulkan/vk_pipeline_library.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -476,18 +480,14 @@ TEST_CASE("Vulkan cache removal includes NVN caches and preserves other files",
     }
 }
 
-TEST_CASE("MaySkipUnbuiltDraw follows the emulated path's async skip rule", "[nvn]") {
-    // vk_pipeline_cache.cpp BuiltPipeline / CanSkipDraw: stores wait, depth may skip, else only
-    // more than 6 elements may skip (indirect and mesh draws pass 0).
+TEST_CASE("MaySkipUnbuiltDraw protects one-time passes and memory stores", "[nvn]") {
     using Vulkan::Nvn::MaySkipUnbuiltDraw;
-    static_assert(!MaySkipUnbuiltDraw(true, true, 1000));
-    static_assert(!MaySkipUnbuiltDraw(true, false, 1000));
-    static_assert(MaySkipUnbuiltDraw(false, true, 0));
-    static_assert(MaySkipUnbuiltDraw(false, true, 3));
-    static_assert(!MaySkipUnbuiltDraw(false, false, 0));
-    static_assert(!MaySkipUnbuiltDraw(false, false, 1));
-    static_assert(!MaySkipUnbuiltDraw(false, false, 6));
-    static_assert(MaySkipUnbuiltDraw(false, false, 7));
+    static_assert(!MaySkipUnbuiltDraw(true, 1000));
+    static_assert(!MaySkipUnbuiltDraw(false, 0));
+    static_assert(!MaySkipUnbuiltDraw(false, 1));
+    static_assert(!MaySkipUnbuiltDraw(false, 3));
+    static_assert(!MaySkipUnbuiltDraw(false, 6));
+    static_assert(MaySkipUnbuiltDraw(false, 7));
     SUCCEED();
 }
 
@@ -1621,6 +1621,15 @@ TEST_CASE("PipelineBase::QueriesMatch revalidates texture types", "[nvn]") {
         oracle.answer.is_integer = true;
         REQUIRE_FALSE(pipeline.QueriesMatch(oracle));
     }
+    SECTION("a stencil sample selects a different shader-cache signature") {
+        oracle.answer.format = Shader::TexturePixelFormat::R8_UINT;
+        oracle.answer.is_integer = true;
+        REQUIRE_FALSE(pipeline.QueriesMatch(oracle));
+        TextureQuery stencil_query = query;
+        stencil_query.info = oracle.answer;
+        REQUIRE(Disk::HashQueries(std::span{&stencil_query, 1}) !=
+                Disk::HashQueries(pipeline.queries));
+    }
     SECTION("a different handle record is answered with the default") {
         oracle.last_offset = 0x170;
         REQUIRE_FALSE(pipeline.QueriesMatch(oracle)); // default is Color2D, the query wants an array
@@ -1819,6 +1828,7 @@ TEST_CASE("Translation switches: the hash covers what the recompiler reads and n
     }));
     REQUIRE(changes([](TranslationSwitches& s) { s.tensor_lowering = 1; }));
     REQUIRE(changes([](TranslationSwitches& s) { s.tensor_lowering = 2; }));
+    REQUIRE(changes([](TranslationSwitches& s) { s.tensor_full_fallback = true; }));
     REQUIRE(changes([](TranslationSwitches& s) { s.raw_coverage = true; }));
     REQUIRE(changes([](TranslationSwitches& s) { s.raw_global_fast = true; }));
     REQUIRE(changes([](TranslationSwitches& s) { s.lean_global_memory = !s.lean_global_memory; }));
@@ -1827,21 +1837,19 @@ TEST_CASE("Translation switches: the hash covers what the recompiler reads and n
     REQUIRE_FALSE(changes([](TranslationSwitches&) {}));
 }
 
-TEST_CASE("Tensor programs are lowered for the titles the emulated GPU lowers them for",
-          "[nvn]") {
+TEST_CASE("NVN uses compact HMMA for compute shaders with full guest warps", "[nvn]") {
     using VideoCommon::NativeTensorLowering;
     using VideoCommon::NativeTensorLoweringFor;
-    // Ocarina of Time: compact where compute shaders can be 32 threads wide, else the expansion.
-    CHECK(NativeTensorLoweringFor(VideoCommon::OcarinaOfTimeProgramId, true) ==
-          NativeTensorLowering::Compact);
-    CHECK(NativeTensorLoweringFor(VideoCommon::OcarinaOfTimeProgramId, false) ==
-          NativeTensorLowering::Full);
-    // Donkey Kong Bananza: the expansion.
-    CHECK(NativeTensorLoweringFor(VideoCommon::DonkeyKongBananzaProgramId, true) ==
-          NativeTensorLowering::Full);
-    // Everyone else: rejected, as before.
-    CHECK(NativeTensorLoweringFor(0x0100000000010000ULL, true) == NativeTensorLowering::None);
-    CHECK(NativeTensorLoweringFor(0, false) == NativeTensorLowering::None);
+    CHECK(NativeTensorLoweringFor({32, 1, 1}, 32, true, false) == NativeTensorLowering::Compact);
+    CHECK(NativeTensorLoweringFor({16, 2, 1}, 32, true, false) == NativeTensorLowering::Full);
+    CHECK(NativeTensorLoweringFor({32, 1, 1}, 64, true, false) == NativeTensorLowering::Full);
+    CHECK(NativeTensorLoweringFor({64, 1, 1}, 64, true, false) == NativeTensorLowering::Compact);
+    CHECK(NativeTensorLoweringFor({48, 1, 1}, 32, true, false) == NativeTensorLowering::Full);
+    CHECK(NativeTensorLoweringFor({32, 1, 1}, 32, false, true) == NativeTensorLowering::Full);
+    CHECK(NativeTensorLoweringFor({32, 1, 1}, 32, false, false) == NativeTensorLowering::None);
+    CHECK(NativeTensorLoweringFor({32, 1, 1}, 16, true, true) == NativeTensorLowering::None);
+    CHECK(NativeTensorLoweringFor({8, 1, 1}, 32, true, true) == NativeTensorLowering::None);
+    CHECK(NativeTensorLoweringFor({32, 0, 1}, 32, true, true) == NativeTensorLowering::None);
 }
 
 TEST_CASE("Translation switches follow the settings the recompiler reads", "[nvn]") {
@@ -2259,6 +2267,8 @@ GraphicsRequest MakeGraphicsRequest(const TestProgram& vertex, const TestProgram
     request.stages[0] = vertex.View();
     request.stages[1] = fragment.View();
     request.state.topology = 4; // triangles
+    request.state.color = VC::ColorState::Defaults();
+    request.state.polygon = VC::PolygonState::Defaults();
     request.state.depth_mode = 1;
     request.state.window_origin = 1;
     request.state.sample_mask = 0xFFFFFFFFu;
@@ -2358,6 +2368,78 @@ TEST_CASE("Compute shader cache separates identical code with different bank lay
     CHECK(cache.GetCompute(MakeComputeRequest(plain, nullptr)) == first);
 }
 
+TEST_CASE("NVN caches guest warp requirements for compute collectives, not local lane IDs",
+          "[nvn][guest-warp]") {
+    const auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    const u64 previous_program_id = Settings::GetCurrentProgramID();
+    Settings::SetCurrentProgramID(0);
+    SCOPE_EXIT {
+        Settings::SetCurrentProgramID(previous_program_id);
+    };
+    const auto& device = *vulkan->device;
+    constexpr std::array<u32, 3> workgroup_size{32, 1, 1};
+    CHECK(device.CanRequireGuestWarpForCompute(workgroup_size) ==
+          (device.IsExtSubgroupSizeControlSupported() &&
+           device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT)));
+    CHECK_FALSE(device.CanRequireGuestWarpForCompute({32, 0, 1}));
+    CHECK_FALSE(device.CanRequireGuestWarpForCompute({~0u, ~0u, ~0u}));
+
+    const auto make_program = [](u32 value_register, const auto&... body) {
+        using namespace AmpereExec;
+        const std::array instructions{
+            body..., MovC0(2, 0x20), MovC0(3, 0x24), Stg(2, 0, value_register), Exit};
+        const auto words = std::bit_cast<std::array<u32, sizeof(instructions) / sizeof(u32)>>(
+            instructions);
+        auto program = MakeTestProgram(5, words);
+        PutWord(program.control, 0x58, 32);
+        program.control[0xb1] = 1;
+        program.control[0xb2] = 1;
+        program.control[0xba] = 0x30;
+        program.hash = HashProgramStage(program.control, program.code);
+        return program;
+    };
+    using namespace AmpereExec;
+    const auto plain = make_program(4, S2R(4, 33)); // SR_TID_X
+    const auto lane = make_program(4, S2R(4, 0));   // SR_LANEID
+    // SHFL.IDX PT, R11, R4, 7, 31. Keep the exchange live by storing its result.
+    const auto shuffle = make_program(
+        11, S2R(4, 33), Inst{{0x040b7f89U, 0x00e01f00U, 0xe0000U, Sched}});
+    const bool native_exchange =
+        device.GetComputeWarpLayout(workgroup_size).has_value() &&
+        (device.IsSubgroupFeatureSupported(VK_SUBGROUP_FEATURE_BALLOT_BIT) ||
+         (device.IsSubgroupFeatureSupported(VK_SUBGROUP_FEATURE_SHUFFLE_BIT) &&
+          !device.HasBrokenSpirvSubgroupShuffle()));
+
+    Tests::TempDir directory{"nvn_compute_guest_warp"};
+    PipelineCacheOptions options;
+    options.directory = directory.Path();
+    const auto check = [&](PipelineCache& cache) {
+        const auto plain_pipeline = cache.GetCompute(MakeComputeRequest(plain, nullptr));
+        const auto lane_pipeline = cache.GetCompute(MakeComputeRequest(lane, nullptr));
+        const auto shuffle_pipeline = cache.GetCompute(MakeComputeRequest(shuffle, nullptr));
+        REQUIRE(plain_pipeline);
+        REQUIRE(lane_pipeline);
+        REQUIRE(shuffle_pipeline);
+        CHECK_FALSE(plain_pipeline->descriptors.requires_guest_warp);
+        // LocalInvocationIndex determines the guest lane for this non-collective shader.
+        CHECK_FALSE(lane_pipeline->descriptors.requires_guest_warp);
+        CHECK(shuffle_pipeline->descriptors.requires_guest_warp == native_exchange);
+        CHECK(lane_pipeline->stages[Vulkan::Nvn::STAGE_COMPUTE].workgroup_size == workgroup_size);
+        CHECK(shuffle_pipeline->stages[Vulkan::Nvn::STAGE_COMPUTE].workgroup_size == workgroup_size);
+    };
+    {
+        PipelineCache cold{device, options};
+        check(cold);
+        cold.Flush();
+    }
+    PipelineCache warm{device, options};
+    check(warm);
+    CHECK(warm.Stats().loaded == 3);
+}
+
 TEST_CASE("Shader refresh drops pipelines while retaining existing owners and render passes",
           "[nvn][shader-refresh]") {
     const auto vulkan = MakeHeadlessVulkan();
@@ -2383,7 +2465,7 @@ TEST_CASE("Shader refresh drops pipelines while retaining existing owners and re
     const auto compute = cache.GetCompute(compute_request);
     REQUIRE(graphics != nullptr);
     REQUIRE(compute != nullptr);
-    const VkPipeline graphics_handle = graphics->Handle();
+    const VkPipeline graphics_handle = graphics->AcquireBinding().handle;
     const VkPipeline compute_handle = *compute->pipeline;
     const VkRenderPass pass = cache.GetRenderPass(graphics_request.targets);
     for (u64 generation = 1; generation <= 3; ++generation) {
@@ -2398,7 +2480,7 @@ TEST_CASE("Shader refresh drops pipelines while retaining existing owners and re
         CHECK(cache.Stats().compute_pipelines == 0);
         CHECK(cache.Stats().lowered_programs == 0);
         CHECK(notify.NumBuildingNoReport() == 0);
-        CHECK(graphics->Handle() == graphics_handle);
+        CHECK(graphics->AcquireBinding().handle == graphics_handle);
         CHECK(*compute->pipeline == compute_handle);
         CHECK(cache.GetRenderPass(graphics_request.targets) == pass);
         const auto fresh_graphics = cache.GetGraphics(graphics_request);
@@ -2407,9 +2489,42 @@ TEST_CASE("Shader refresh drops pipelines while retaining existing owners and re
         REQUIRE(fresh_compute != nullptr);
         CHECK(fresh_graphics != graphics);
         CHECK(fresh_compute != compute);
-        CHECK(fresh_graphics->Handle() != graphics_handle);
+        CHECK(fresh_graphics->AcquireBinding().handle != graphics_handle);
         CHECK(*fresh_compute->pipeline != compute_handle);
     }
+}
+
+TEST_CASE("NVN color logic operations require the Vulkan feature when rasterizing",
+          "[nvn][logic-op]") {
+    const auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    PipelineCacheOptions options;
+    options.dedup_dynamic_state = false;
+    PipelineCache cache{*vulkan->device, options};
+    const auto vertex = MakeAddProgram(0, 23);
+    const auto fragment = MakeTexturedFragment();
+    FreezableOracle oracle;
+    const auto copy = MakeGraphicsRequest(vertex, fragment, &oracle);
+    const auto copy_pipeline = cache.GetGraphics(copy);
+    REQUIRE(copy_pipeline);
+
+    auto logic = copy;
+    logic.state.color = VC::ColorState::WithLogicOp(logic.state.color, VK_LOGIC_OP_XOR);
+    CHECK(Vulkan::Nvn::UsesColorLogicOp(logic.state, logic.targets));
+    auto discard = logic;
+    discard.state.rasterizer_discard = 1;
+    CHECK_FALSE(Vulkan::Nvn::UsesColorLogicOp(discard.state, discard.targets));
+    discard = logic;
+    discard.targets.color.fill(VK_FORMAT_UNDEFINED);
+    CHECK_FALSE(Vulkan::Nvn::UsesColorLogicOp(discard.state, discard.targets));
+
+    bool not_ready = true;
+    const auto logic_pipeline = cache.GetGraphics(logic, &not_ready);
+    CHECK_FALSE(not_ready);
+    CHECK(static_cast<bool>(logic_pipeline) == vulkan->device->SupportsLogicOp());
+    CHECK(cache.GetGraphics(copy) == copy_pipeline);
 }
 
 TEST_CASE("TextureOracle cannot be frozen unless it says so", "[nvn]") {
@@ -2491,6 +2606,91 @@ TEST_CASE("Async compile: many programs compile concurrently and each is deliver
     REQUIRE(stats.async_queued == COUNT); // three rounds of requests, one compile per key
     REQUIRE(stats.compiled_at_runtime == COUNT);
     REQUIRE(stats.async_failed == 0);
+}
+
+TEST_CASE("Async graphics defers new jobs while the compile queue is full", "[nvn]") {
+    const auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    PipelineCache cache{*vulkan->device, AsyncOptions(true)};
+    const auto fragment = MakeTexturedFragment();
+    FreezableOracle oracle;
+    std::vector<TestProgram> vertices;
+    for (u32 i = 0; i < 256; ++i) {
+        vertices.push_back(MakeAddProgram(0, i));
+    }
+    oracle.SetGate(false);
+    for (const auto& vertex : vertices) {
+        bool waiting = false;
+        CHECK_FALSE(cache.GetGraphics(MakeGraphicsRequest(vertex, fragment, &oracle), &waiting));
+        CHECK(waiting);
+    }
+    const auto queued = cache.Stats().async_queued;
+    const auto frozen = oracle.freeze_masks.size();
+    oracle.SetGate(true);
+    cache.Flush();
+    REQUIRE(queued > 0);
+    REQUIRE(queued < vertices.size());
+    CHECK(frozen == queued);
+    // A required draw that was deferred can still compile on replay.
+    CHECK(cache.GetGraphics(MakeGraphicsRequest(vertices.back(), fragment, &oracle)));
+    CHECK(cache.Stats().compiled_at_runtime == queued + 1);
+}
+
+TEST_CASE("A required NVN draw can compile its queued pipeline before unrelated jobs finish",
+          "[nvn][pipeline-priority]") {
+    const auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    const auto fragment = MakeTexturedFragment();
+    std::vector<TestProgram> vertices;
+    for (u32 i = 0; i < 256; ++i) {
+        vertices.push_back(MakeAddProgram(0, i));
+    }
+    std::vector<FreezableOracle> oracles(vertices.size());
+    PipelineCache cache{*vulkan->device, AsyncOptions(true)};
+    SCOPE_EXIT {
+        for (auto& oracle : oracles) {
+            oracle.SetGate(true);
+        }
+    };
+
+    size_t queued = 0;
+    for (size_t i = 0; i < vertices.size(); ++i) {
+        auto& oracle = oracles[i];
+        oracle.answer.type = Shader::TextureType::Color2D;
+        oracle.SetGate(false);
+        bool not_ready = false;
+        REQUIRE_FALSE(cache.GetGraphics(MakeGraphicsRequest(vertices[i], fragment, &oracle),
+                                        &not_ready));
+        REQUIRE(not_ready);
+        if (oracle.freeze_masks.empty()) {
+            break;
+        }
+        ++queued;
+    }
+    REQUIRE(queued >= 2);
+    REQUIRE(queued < vertices.size());
+    REQUIRE(cache.Stats().async_queued == queued);
+
+    // At capacity the last queued job has at least one full batch ahead of it.
+    auto& required_oracle = oracles[queued - 1];
+    required_oracle.SetGate(true);
+    const auto request = MakeGraphicsRequest(vertices[queued - 1], fragment, &required_oracle);
+    auto required = std::async(std::launch::async, [&] { return cache.GetGraphics(request); });
+    const auto status = required.wait_for(std::chrono::seconds(5));
+    for (auto& oracle : oracles) {
+        oracle.SetGate(true);
+    }
+    const auto pipeline = required.get();
+    CHECK(status == std::future_status::ready);
+    REQUIRE(pipeline);
+    CHECK(required_oracle.gate->frozen_queries > 0);
+    cache.Flush();
+    CHECK(cache.GetGraphics(request) == pipeline);
+    CHECK(cache.Stats().compiled_at_runtime == queued);
 }
 
 TEST_CASE("Async compile: graphics answers at request time and keeps variants", "[nvn]") {
@@ -2638,29 +2838,45 @@ TEST_CASE("Graphics lookahead builds the next pipeline without skipping a draw",
     if (!vulkan) {
         SKIP("no Vulkan device");
     }
-    auto options = AsyncOptions(false);
-    options.prefetch_graphics = true;
-    PipelineCache cache{*vulkan->device, options};
-    const auto vertex = MakeAddProgram(0, 12);
-    const auto fragment = MakeTexturedFragment();
-    FreezableOracle oracle;
-    const auto first = MakeGraphicsRequest(vertex, fragment, &oracle);
-    auto next = first;
-    next.targets.color[0] = VK_FORMAT_R32_UINT;
-    REQUIRE(cache.GetGraphics(first, nullptr, [&](u64 current_key) {
-        cache.PrefetchGraphics(first, current_key);
-        cache.PrefetchGraphics(next, current_key);
-        cache.PrefetchGraphics(next, current_key);
-    }));
-    bool waiting = true;
-    REQUIRE(cache.GetGraphics(next, &waiting));
-    CHECK_FALSE(waiting);
-    cache.Flush();
-    const auto stats = cache.Stats();
-    CHECK(stats.compiled_at_runtime == 2);
-    CHECK(stats.prefetch_queued == 1);
-    CHECK(stats.prefetch_used == 1);
-    CHECK(stats.async_not_ready == 0);
+    for (const bool async : {false, true}) {
+        CAPTURE(async);
+        auto options = AsyncOptions(async);
+        options.prefetch_graphics = true;
+        PipelineCache cache{*vulkan->device, options};
+        const auto vertex = MakeAddProgram(0, 12);
+        const auto fragment = MakeTexturedFragment();
+        FreezableOracle oracle;
+        const auto first = MakeGraphicsRequest(vertex, fragment, &oracle);
+        auto next = first;
+        next.targets.color[0] = VK_FORMAT_R32_UINT;
+        bool scanned_ahead = false;
+        bool waiting = false;
+        u32 blocking_misses = 0;
+        const auto before_wait = [&] { ++blocking_misses; };
+        const auto current = cache.GetGraphics(
+            first, async ? &waiting : nullptr,
+            [&](u64 key) {
+                scanned_ahead = true;
+                cache.PrefetchGraphics(first, key);
+                cache.PrefetchGraphics(next, key);
+                cache.PrefetchGraphics(next, key);
+            },
+            before_wait);
+        REQUIRE(scanned_ahead);
+        CHECK(blocking_misses == (async ? 0 : 1));
+        CHECK(waiting == async);
+        CHECK(static_cast<bool>(current) == !async);
+        CHECK(cache.GetGraphics(next));
+        CHECK(cache.GetGraphics(first));
+        cache.Flush();
+        CHECK(cache.GetGraphics(first, nullptr, {}, before_wait));
+        CHECK(blocking_misses == (async ? 0 : 1));
+        const auto stats = cache.Stats();
+        CHECK(stats.compiled_at_runtime == 2);
+        CHECK(stats.prefetch_queued == 1);
+        CHECK(stats.prefetch_used == 1);
+        CHECK(stats.async_not_ready == (async ? 1 : 0));
+    }
 }
 
 TEST_CASE("Async compile off: nothing is counted as building", "[nvn]") {
@@ -2913,7 +3129,114 @@ struct ProgressRecorder {
     }
 };
 
+struct PreloadBuildGate {
+    PFN_vkCreateGraphicsPipelines create;
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool open{};
+    std::atomic<u32> required_builds{};
+
+    static inline PreloadBuildGate* active{};
+    static inline thread_local bool from_required_lookup{};
+
+    static VKAPI_ATTR VkResult VKAPI_CALL Create(VkDevice device, VkPipelineCache cache, u32 count,
+                                                 const VkGraphicsPipelineCreateInfo* infos,
+                                                 const VkAllocationCallbacks* allocator,
+                                                 VkPipeline* pipelines) {
+        auto& gate = *active;
+        if (from_required_lookup) {
+            gate.required_builds += count;
+        } else {
+            std::unique_lock lock{gate.mutex};
+            gate.cv.wait(lock, [&] { return gate.open; });
+        }
+        return gate.create(device, cache, count, infos, allocator, pipelines);
+    }
+
+    void Open() {
+        {
+            std::scoped_lock lock{mutex};
+            open = true;
+        }
+        cv.notify_all();
+    }
+};
+
 } // Anonymous namespace
+
+TEST_CASE("A required NVN lookup can bypass unrelated disk pipelines and texture variants",
+          "[nvn][pipeline-priority]") {
+    const auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    TempDirectory directory;
+    auto options = AsyncOptions(false);
+    options.directory = directory.path;
+    constexpr u32 BLOCKERS = 6; // the preload starts at most four workers
+    const TestProgram fragment = MakeTexturedFragment();
+    const TestProgram vertex = MakeAddProgram(0, 42);
+    const TestProgram compute = MakeAddProgram(5, 43);
+    FreezableOracle oracle;
+    const auto graphics_request = MakeGraphicsRequest(vertex, fragment, &oracle);
+    const auto compute_request = MakeComputeRequest(compute, &oracle);
+    {
+        PipelineCache cold{*vulkan->device, options};
+        cold.Flush();
+        oracle.answer.type = Shader::TextureType::Color2D;
+        for (u32 i = 0; i < BLOCKERS; ++i) {
+            const TestProgram blocker = MakeAddProgram(0, i);
+            REQUIRE(cold.GetGraphics(MakeGraphicsRequest(blocker, fragment, &oracle)));
+        }
+        REQUIRE(cold.GetGraphics(graphics_request));
+        oracle.answer.type = Shader::TextureType::ColorArray2D;
+        const auto array = cold.GetGraphics(graphics_request);
+        REQUIRE(array);
+        REQUIRE_FALSE(array->queries.empty());
+        REQUIRE(cold.GetCompute(compute_request));
+        cold.Flush();
+    }
+
+    u64 runtime_builds = 0;
+    SECTION("takes a compatible variant from the preload queue") {}
+    SECTION("builds a new variant when the queued variants are incompatible") {
+        oracle.answer.format = Shader::TexturePixelFormat::A8B8G8R8_SNORM;
+        runtime_builds = 1;
+    }
+    auto& dispatch = const_cast<Vulkan::vk::DeviceDispatch&>(vulkan->device->GetDispatchLoader());
+    PreloadBuildGate gate{dispatch.vkCreateGraphicsPipelines};
+    PreloadBuildGate::active = &gate;
+    dispatch.vkCreateGraphicsPipelines = &PreloadBuildGate::Create;
+    SCOPE_EXIT {
+        dispatch.vkCreateGraphicsPipelines = gate.create;
+        PreloadBuildGate::active = nullptr;
+    };
+    PipelineCache warm{*vulkan->device, options};
+    SCOPE_EXIT {
+        gate.Open();
+    };
+
+    auto required = std::async(std::launch::async, [&] {
+        PreloadBuildGate::from_required_lookup = true;
+        auto graphics = warm.GetGraphics(graphics_request);
+        auto compute_pipeline = warm.GetCompute(compute_request);
+        return std::make_pair(std::move(graphics), std::move(compute_pipeline));
+    });
+    const auto status = required.wait_for(std::chrono::seconds(5));
+    const auto before_release = warm.Stats();
+    gate.Open();
+    const auto [graphics, compute_pipeline] = required.get();
+    CHECK(status == std::future_status::ready);
+    REQUIRE(graphics);
+    REQUIRE(compute_pipeline);
+    CHECK(graphics->QueriesMatch(oracle));
+    CHECK(before_release.loaded == 2 - runtime_builds);
+    CHECK(before_release.compiled_at_runtime == runtime_builds);
+    CHECK(gate.required_builds == 1);
+    warm.Flush();
+    CHECK(warm.Stats().loaded == BLOCKERS + 3);
+    CHECK(warm.Stats().compiled_at_runtime == runtime_builds);
+}
 
 TEST_CASE("Preload reports Prepare, Build done/total and Complete to the loading screen",
           "[nvn]") {
@@ -3088,6 +3411,72 @@ TEST_CASE("The load progress sink forwards to the callback set and ignores calls
 
 // The use_disk_shader_cache and use_vulkan_driver_pipeline_cache settings (DrawResources::OpenCache
 // gives the cache no directory when the first is off, `driver_cache_file = false` for the second).
+namespace {
+struct CacheSnapshotRead {
+    static inline PFN_vkGetPipelineCacheData original{};
+    static inline std::atomic<u32> payload_reads{};
+    static inline u32 incomplete_reads{};
+
+    static VKAPI_ATTR VkResult VKAPI_CALL Get(VkDevice device, VkPipelineCache cache,
+                                              size_t* size, void* data) {
+        if (data && ++payload_reads <= incomplete_reads) {
+            *size = 0;
+            return VK_INCOMPLETE;
+        }
+        return original(device, cache, size, data);
+    }
+};
+} // Anonymous namespace
+
+TEST_CASE("Driver pipeline cache retries an incomplete snapshot before replacing its file",
+          "[nvn]") {
+    const auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    TempDirectory directory;
+    PipelineCacheOptions options = AsyncOptions(false);
+    options.directory = directory.path;
+    const auto file = directory.path / "nvn_pipelines.vkcache";
+    const std::vector<u8> previous(8, 0x5A);
+    WriteBytes(file, previous);
+
+    u32 incomplete_reads = 1;
+    SECTION("the second snapshot is complete") {}
+    SECTION("both snapshots are incomplete") {
+        incomplete_reads = 2;
+    }
+    {
+        auto& dispatch = const_cast<Vulkan::vk::DeviceDispatch&>(vulkan->device->GetDispatchLoader());
+        CacheSnapshotRead::original = dispatch.vkGetPipelineCacheData;
+        CacheSnapshotRead::payload_reads = 0;
+        CacheSnapshotRead::incomplete_reads = incomplete_reads;
+        dispatch.vkGetPipelineCacheData = &CacheSnapshotRead::Get;
+        SCOPE_EXIT {
+            dispatch.vkGetPipelineCacheData = CacheSnapshotRead::original;
+        };
+
+        PipelineCache cache{*vulkan->device, options};
+        cache.Flush();
+        const TestProgram program = MakeAddProgram(5, 103);
+        REQUIRE(cache.GetCompute(MakeComputeRequest(program, nullptr)) != nullptr);
+    }
+
+    CHECK(CacheSnapshotRead::payload_reads == 2);
+    if (incomplete_reads == 1) {
+        CHECK(std::filesystem::file_size(file) > 24);
+        PipelineCache warm{*vulkan->device, options};
+        warm.Flush();
+        CHECK(warm.Stats().loaded == 1);
+    } else {
+        REQUIRE(std::filesystem::file_size(file) == previous.size());
+        std::vector<u8> stored(previous.size());
+        std::ifstream input(file, std::ios::binary);
+        REQUIRE(static_cast<bool>(input.read(reinterpret_cast<char*>(stored.data()), stored.size())));
+        CHECK(stored == previous);
+    }
+}
+
 TEST_CASE("Driver pipeline cache is regenerated by portable preload alone", "[nvn]") {
     namespace fs = std::filesystem;
     const auto vulkan = MakeHeadlessVulkan();
@@ -3104,30 +3493,39 @@ TEST_CASE("Driver pipeline cache is regenerated by portable preload alone", "[nv
         REQUIRE(static_cast<bool>(input.read(reinterpret_cast<char*>(bytes.data()), bytes.size())));
         return bytes;
     };
-    std::optional<size_t> incompatible_byte;
+    bool invalid_v1_size = false;
+    bool foreign_driver = false;
     SECTION("the driver blob is missing") {}
-    SECTION("the driver blob belongs to another device") {
-        incompatible_byte = VENDOR_OFFSET;
+    SECTION("the version-one header extends past its 32 bytes") {
+        invalid_v1_size = true;
     }
-    SECTION("the driver blob has an invalid Vulkan header size") {
-        incompatible_byte = WRAPPER_SIZE;
+    SECTION("the driver blob belongs to another device") {
+        foreign_driver = true;
     }
 
     PipelineCacheOptions options = AsyncOptions(false);
     options.directory = directory.path;
-    options.driver_cache_file = incompatible_byte.has_value();
+    options.driver_cache_file = foreign_driver || invalid_v1_size;
     {
         PipelineCache cold{*vulkan->device, options};
         cold.Flush();
         const TestProgram program = MakeAddProgram(5, 119);
         REQUIRE(cold.GetCompute(MakeComputeRequest(program, nullptr)));
     }
-    u8 original_byte{};
-    if (incompatible_byte) {
+    u8 vendor_byte{};
+    if (foreign_driver || invalid_v1_size) {
         auto foreign = read_blob();
         REQUIRE(foreign.size() >= WRAPPER_SIZE + sizeof(VkPipelineCacheHeaderVersionOne));
-        original_byte = foreign[*incompatible_byte];
-        foreign[*incompatible_byte] ^= 0xFF;
+        vendor_byte = foreign[VENDOR_OFFSET];
+        if (invalid_v1_size) {
+            // Keep the wrapper size and checksum valid, including for a header-only driver blob.
+            foreign.push_back(0);
+            const u64 size = foreign.size() - WRAPPER_SIZE;
+            std::memcpy(foreign.data() + 8 + sizeof(u32), &size, sizeof(size));
+            foreign[WRAPPER_SIZE] = 33;
+        } else {
+            foreign[VENDOR_OFFSET] ^= 0xFF;
+        }
         const u32 crc = Disk::Crc32(std::span{foreign}.subspan(WRAPPER_SIZE));
         std::memcpy(foreign.data() + WRAPPER_SIZE - sizeof(crc), &crc, sizeof(crc));
         WriteBytes(file, foreign);
@@ -3145,8 +3543,11 @@ TEST_CASE("Driver pipeline cache is regenerated by portable preload alone", "[nv
     REQUIRE(fs::exists(file));
     const auto restored = read_blob();
     REQUIRE(restored.size() >= WRAPPER_SIZE + sizeof(VkPipelineCacheHeaderVersionOne));
-    if (incompatible_byte) {
-        CHECK(restored[*incompatible_byte] == original_byte);
+    if (foreign_driver) {
+        CHECK(restored[VENDOR_OFFSET] == vendor_byte);
+    }
+    if (invalid_v1_size) {
+        CHECK(restored[WRAPPER_SIZE] == 32);
     }
 }
 
@@ -3295,6 +3696,69 @@ PipelineCacheOptions GplOptions() {
     return options;
 }
 
+struct GraphicsBinaryProbe {
+    PFN_vkCreateGraphicsPipelines create;
+    std::atomic<u32> captures{};
+    std::atomic<u32> restores{};
+    std::atomic<u32> links{};
+    std::atomic<u32> unexpected{};
+
+    static inline GraphicsBinaryProbe* active{};
+
+    static VKAPI_ATTR VkResult VKAPI_CALL Create(
+        VkDevice device, VkPipelineCache cache, u32 count, const VkGraphicsPipelineCreateInfo* infos,
+        const VkAllocationCallbacks* allocator, VkPipeline* pipelines) {
+        auto& probe = *active;
+        for (u32 i = 0; i < count; ++i) {
+            VkPipelineCreateFlags2KHR flags = infos[i].flags;
+            const VkGraphicsPipelineLibraryCreateInfoEXT* part{};
+            const VkPipelineBinaryInfoKHR* binary{};
+            const VkPipelineLibraryCreateInfoKHR* libraries{};
+            for (auto* ext = static_cast<const VkBaseInStructure*>(infos[i].pNext); ext;
+                 ext = ext->pNext) {
+                switch (ext->sType) {
+                case VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR:
+                    flags = reinterpret_cast<const VkPipelineCreateFlags2CreateInfoKHR*>(ext)->flags;
+                    break;
+                case VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT:
+                    part = reinterpret_cast<const VkGraphicsPipelineLibraryCreateInfoEXT*>(ext);
+                    break;
+                case VK_STRUCTURE_TYPE_PIPELINE_BINARY_INFO_KHR:
+                    binary = reinterpret_cast<const VkPipelineBinaryInfoKHR*>(ext);
+                    break;
+                case VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR:
+                    libraries = reinterpret_cast<const VkPipelineLibraryCreateInfoKHR*>(ext);
+                    break;
+                default:
+                    break;
+                }
+            }
+            const bool capture = (flags & VK_PIPELINE_CREATE_2_CAPTURE_DATA_BIT_KHR) != 0;
+            if (capture || binary) {
+                const bool shader_part =
+                    part &&
+                    (part->flags == VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT ||
+                     part->flags == VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT);
+                if (!shader_part || infos[i].stageCount == 0 || libraries ||
+                    (flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR) == 0 ||
+                    cache != VK_NULL_HANDLE || (binary && (capture || binary->binaryCount == 0))) {
+                    ++probe.unexpected;
+                }
+                if (capture) {
+                    ++probe.captures;
+                }
+                if (binary) {
+                    ++probe.restores;
+                }
+            }
+            if (libraries && libraries->libraryCount == 4 && infos[i].stageCount == 0) {
+                ++probe.links;
+            }
+        }
+        return probe.create(device, cache, count, infos, allocator, pipelines);
+    }
+};
+
 /// The translation state of a draw state, as the cache keys it (Dynamic vertex input).
 std::string TranslationBytes(GraphicsFixedState state, const RenderPassKey& targets) {
     Vulkan::Nvn::MakeKeyState(state, VertexInputMode::Dynamic, false);
@@ -3322,6 +3786,206 @@ GraphicsFixedState TrianglesState() {
 
 } // Anonymous namespace
 
+TEST_CASE("NVN GPL layout capacity only rounds supported fragment sampler suffixes",
+          "[nvn][layout-capacity]") {
+    using Vulkan::Nvn::Detail::FragmentSamplerPadding;
+    using Vulkan::Nvn::Detail::GraphicsLayoutCapacity;
+    GraphicsLayoutCapacity caps{
+        .limits{
+            .maxPerStageDescriptorSamplers = 16,
+            .maxPerStageDescriptorSampledImages = 16,
+            .maxPerStageResources = 32,
+            .maxDescriptorSetSamplers = 16,
+            .maxDescriptorSetSampledImages = 16,
+            .maxColorAttachments = 8,
+        },
+        .max_set_descriptors = 32,
+        .max_push_descriptors = 32,
+    };
+    std::array<VkDescriptorSetLayoutBinding, 12> bindings{};
+    for (u32 i = 0; i < bindings.size(); ++i) {
+        bindings[i] = {
+            .binding = 14 + i,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        };
+    }
+    const auto shorter = std::span{bindings}.first(11);
+    REQUIRE(FragmentSamplerPadding(shorter, caps) == 1u);
+    REQUIRE(FragmentSamplerPadding(bindings, caps) == 0u);
+
+    SECTION("another stage or array at the end excludes the suffix") {
+        bindings.back().stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+        REQUIRE_FALSE(FragmentSamplerPadding(bindings, caps).has_value());
+        bindings.back().stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        bindings.back().descriptorCount = 2;
+        REQUIRE_FALSE(FragmentSamplerPadding(bindings, caps).has_value());
+    }
+    SECTION("a hole in the sampler numbers excludes the class") {
+        ++bindings.back().binding;
+        REQUIRE_FALSE(FragmentSamplerPadding(bindings, caps).has_value());
+    }
+    SECTION("the extra slot cannot change the push descriptor regime") {
+        caps.max_push_descriptors = 11;
+        REQUIRE_FALSE(FragmentSamplerPadding(shorter, caps).has_value());
+        caps.max_push_descriptors = 10; // both shapes use allocated sets
+        REQUIRE(FragmentSamplerPadding(shorter, caps) == 1u);
+    }
+    SECTION("a combined sampler consumes both sampler and sampled image capacity") {
+        caps.limits.maxPerStageDescriptorSampledImages = 11;
+        REQUIRE_FALSE(FragmentSamplerPadding(shorter, caps).has_value());
+        caps.limits.maxPerStageDescriptorSampledImages = 16;
+        caps.limits.maxDescriptorSetSamplers = 11;
+        REQUIRE_FALSE(FragmentSamplerPadding(shorter, caps).has_value());
+    }
+    SECTION("padded descriptors count towards set and fragment resource limits") {
+        caps.max_set_descriptors = 11;
+        REQUIRE_FALSE(FragmentSamplerPadding(shorter, caps).has_value());
+        caps.max_set_descriptors = 32;
+        caps.limits.maxPerStageResources = 19;
+        REQUIRE_FALSE(FragmentSamplerPadding(shorter, caps).has_value());
+    }
+}
+
+TEST_CASE("NVN GPL layout capacity shares Vulkan handles with exact descriptor templates",
+          "[nvn][layout-capacity]") {
+    const auto vulkan = MakeHeadlessVulkanWithGpl();
+    if (!vulkan || !vulkan->device->IsExtGraphicsPipelineLibrarySupported()) {
+        SKIP("no Vulkan device with fast graphics pipeline libraries");
+    }
+    auto& enabled = Vulkan::Nvn::Debug::g_config.gpl_layout_capacity;
+    const bool old_enabled = enabled;
+    enabled = true;
+    SCOPE_EXIT {
+        enabled = old_enabled;
+    };
+    PipelineCacheOptions options;
+    options.graphics_pipeline_library = true;
+    PipelineCache::Impl cache{*vulkan->device, options};
+    REQUIRE(cache.graphics_layout_capacity.has_value());
+
+    const auto request = [](u32 sampler_count) {
+        VC::DescriptorLayout layout;
+        layout.bindings.push_back({
+            .binding = 0,
+            .kind = VC::DescriptorKind::UniformBuffer,
+            .stage = VC::ShaderStage::Vertex,
+        });
+        for (u32 i = 0; i < sampler_count; ++i) {
+            layout.bindings.push_back({
+                .binding = i + 1,
+                .kind = VC::DescriptorKind::CombinedImageSampler,
+                .stage = VC::ShaderStage::Fragment,
+            });
+        }
+        layout.binding_count = sampler_count + 1;
+        return layout;
+    };
+    constexpr auto stages = VK_SHADER_STAGE_ALL_GRAPHICS;
+    auto smaller = request(11);
+    auto larger = request(12);
+    const auto exact = cache.CreateLayoutObjects(smaller, false, stages, nullptr, false);
+    const auto first = cache.CreateLayoutObjects(smaller, false, stages);
+    const auto second = cache.CreateLayoutObjects(larger, false, stages);
+    REQUIRE(first->padded_bindings);
+    REQUIRE_FALSE(second->padded_bindings);
+    REQUIRE_FALSE(exact->padded_bindings);
+    REQUIRE(*first->handles->set_layout == *second->handles->set_layout);
+    REQUIRE(*first->handles->layout == *second->handles->layout);
+    REQUIRE(*first->handles->layout != *exact->handles->layout);
+    REQUIRE(first->push_descriptors == exact->push_descriptors);
+    REQUIRE(first->update_template);
+    REQUIRE(second->update_template);
+    REQUIRE(*first->update_template != *second->update_template);
+    REQUIRE(first->template_entry_count == 12);
+    REQUIRE(second->template_entry_count == 13);
+    REQUIRE(cache.CreateLayoutObjects(smaller, false, stages) == first);
+    REQUIRE(cache.CreateLayoutObjects(larger, false, stages) == second);
+
+    larger.bindings.back().stage = VC::ShaderStage::Vertex;
+    const auto other_stage = cache.CreateLayoutObjects(larger, false, stages);
+    REQUIRE_FALSE(other_stage->padded_bindings);
+    REQUIRE(*other_stage->handles->layout != *second->handles->layout);
+}
+
+TEST_CASE("GPL shader libraries restore persisted binaries and recapture damaged records",
+          "[nvn][graphics-binary]") {
+    const char* const enabled = std::getenv("EDEN_NX2_NVN_GRAPHICS_BINARIES");
+    if (!enabled || enabled[0] != '1') {
+        SKIP("set EDEN_NX2_NVN_GRAPHICS_BINARIES=1");
+    }
+    const auto vulkan = MakeHeadlessVulkanWithGpl();
+    if (!vulkan || !vulkan->device->IsExtGraphicsPipelineLibrarySupported() ||
+        !vulkan->device->IsKhrPipelineBinarySupported()) {
+        SKIP("no Vulkan device with fast graphics pipeline libraries and pipeline binaries");
+    }
+    Tests::TempDir directory{"nvn_graphics_library_binaries"};
+    PipelineCacheOptions options = GplOptions();
+    options.directory = directory.Path();
+    options.driver_cache_file = false;
+    options.preload = false;
+    options.async_compile = false;
+    options.gpl_optimize_after_presents = 240;
+
+    const auto vertex = MakeAddProgram(0, 31);
+    const auto fragment = MakeTexturedFragment();
+    FreezableOracle oracle;
+    GraphicsRequest request = MakeGraphicsRequest(vertex, fragment, &oracle);
+    request.state = TrianglesState();
+    request.targets.depth = VK_FORMAT_D32_SFLOAT;
+
+    auto& dispatch = const_cast<Vulkan::vk::DeviceDispatch&>(vulkan->device->GetDispatchLoader());
+    GraphicsBinaryProbe probe{dispatch.vkCreateGraphicsPipelines};
+    GraphicsBinaryProbe::active = &probe;
+    dispatch.vkCreateGraphicsPipelines = &GraphicsBinaryProbe::Create;
+    SCOPE_EXIT {
+        dispatch.vkCreateGraphicsPipelines = probe.create;
+        GraphicsBinaryProbe::active = nullptr;
+    };
+
+    const auto build = [&] {
+        PipelineCache cache{*vulkan->device, options};
+        const auto pipeline = cache.GetGraphics(request);
+        REQUIRE(pipeline != nullptr);
+        REQUIRE(pipeline->fast_linked);
+        REQUIRE(pipeline->AcquireBinding().handle != VK_NULL_HANDLE);
+        cache.Flush();
+        CHECK(cache.Stats().loaded == 0);
+        CHECK(cache.Stats().gpl_optimized == 0);
+        CHECK(probe.links.exchange(0) == 1);
+        CHECK(probe.unexpected.exchange(0) == 0);
+        return std::array{probe.captures.exchange(0), probe.restores.exchange(0)};
+    };
+
+    const auto [cold_captures, cold_restores] = build();
+    CHECK(cold_captures == 2);
+    CHECK(cold_restores == 0);
+    const auto binary_directory = directory.Path() / "graphics-library-binaries-v1";
+    REQUIRE(std::filesystem::is_directory(binary_directory));
+    std::vector<std::filesystem::path> binaries;
+    for (const auto& file : std::filesystem::directory_iterator{binary_directory}) {
+        if (file.is_regular_file() && file.path().extension() == ".bin") {
+            binaries.push_back(file.path());
+        }
+    }
+    REQUIRE_FALSE(binaries.empty());
+    REQUIRE(binaries.size() <= 2);
+
+    const auto [warm_captures, warm_restores] = build();
+    CHECK(warm_restores == binaries.size());
+    CHECK(warm_captures + warm_restores == 2);
+
+    constexpr std::array<u8, 4> truncated{};
+    WriteBytes(binaries.front(), truncated);
+    REQUIRE(std::filesystem::file_size(binaries.front()) == truncated.size());
+    const auto [repair_captures, repair_restores] = build();
+    CHECK(repair_captures == warm_captures + 1);
+    CHECK(repair_restores + 1 == warm_restores);
+    REQUIRE(std::filesystem::file_size(binaries.front()) > truncated.size());
+    REQUIRE(build() == (std::array{warm_captures, warm_restores}));
+}
+
 TEST_CASE("Shader refresh rebuilds GPL shader parts and drains optimization workers",
           "[nvn][shader-refresh]") {
     const auto vulkan = MakeHeadlessVulkanWithGpl();
@@ -3345,7 +4009,7 @@ TEST_CASE("Shader refresh rebuilds GPL shader parts and drains optimization work
     REQUIRE(second != nullptr);
     REQUIRE(second->fast_linked);
     CHECK(second != first);
-    CHECK(first->Handle() != VK_NULL_HANDLE);
+    CHECK(first->AcquireBinding().handle != VK_NULL_HANDLE);
     CHECK(cache.Stats().gpl_translations_reused == before.gpl_translations_reused);
     CHECK(cache.Stats().gpl_cached_links == before.gpl_cached_links);
     cache.Flush();
@@ -3442,6 +4106,82 @@ TEST_CASE("TranslationState holds the state the translation reads and nothing el
         RenderPassKey second_integer = targets;
         second_integer.color[3] = VK_FORMAT_R16G16_SINT;
         REQUIRE(TranslationBytes(base, second_integer) != reference);
+    }
+}
+
+TEST_CASE("Index restart preserves the marker across native and widened types", "[primitive-restart]") {
+    using Vulkan::PlanIndexRestart;
+    for (const bool native : {false, true}) {
+        for (const bool programmable : {false, true}) {
+            for (const std::optional<u32> marker : std::array{
+                     std::optional<u32>{}, std::optional{0U}, std::optional{7U},
+                     std::optional{255U}, std::optional{0x107U}, std::optional{~0U}}) {
+                CAPTURE(native, programmable, marker.value_or(~0U));
+                const auto result = PlanIndexRestart(VK_INDEX_TYPE_UINT8_EXT, marker, native,
+                                                     programmable);
+                const bool custom = marker && *marker != 255;
+                const bool set_marker = native && programmable && custom && *marker < 255;
+                CHECK(result.host_type == ((!native || (custom && !set_marker))
+                                               ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT8_EXT));
+                CHECK(result.native_marker == (set_marker ? marker : std::nullopt));
+            }
+        }
+    }
+    for (const bool programmable : {false, true}) {
+        for (const std::optional<u32> marker : std::array{
+                 std::optional<u32>{}, std::optional{0U}, std::optional{7U},
+                 std::optional{0xffffU}, std::optional{0x10007U}, std::optional{~0U}}) {
+            CAPTURE(programmable, marker.value_or(~0U));
+            const auto result = PlanIndexRestart(VK_INDEX_TYPE_UINT16, marker, false, programmable);
+            const bool custom = marker && *marker != 0xffffU;
+            const bool set_marker = programmable && custom && *marker < 0xffffU;
+            CHECK(result.host_type == (custom && !set_marker ? VK_INDEX_TYPE_UINT32
+                                                              : VK_INDEX_TYPE_UINT16));
+            CHECK(result.native_marker == (set_marker ? marker : std::nullopt));
+        }
+    }
+    CHECK_FALSE(PlanIndexRestart(VK_INDEX_TYPE_UINT16, 0x10000U, false, true).native_marker);
+    CHECK(PlanIndexRestart(VK_INDEX_TYPE_UINT32, 0x10000U, false, true).native_marker == 0x10000U);
+}
+
+TEST_CASE("NVN primitive restart follows the topology and the device features", "[nvn][primitive-restart]") {
+    const auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    const auto& device = *vulkan->device;
+    VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT restart{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIMITIVE_TOPOLOGY_LIST_RESTART_FEATURES_EXT,
+    };
+    if (device.GetAvailableExtensions().contains(VK_EXT_PRIMITIVE_TOPOLOGY_LIST_RESTART_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 features{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                                           .pNext = &restart};
+        device.GetPhysical().GetFeatures2(features);
+    }
+    const RenderPassKey targets{};
+    for (const u32 topology : {4U, 5U, 7U, 8U, 14U}) {
+        for (const bool requested : {false, true}) {
+            auto state = TrianglesState();
+            state.topology = topology;
+            state.primitive_restart = requested;
+            state.restart_index = 254;
+            const bool patch = topology == 14;
+            const bool converted = topology == 7 || topology == 8;
+            const bool supported = patch ? restart.primitiveTopologyPatchListRestart
+                                         : topology == 5 || (!converted && restart.primitiveTopologyListRestart);
+            Vulkan::Nvn::GraphicsPipelineDescription out;
+            std::vector<std::string> issues;
+            Vulkan::Nvn::DescribeGraphicsPipeline(device, {.state = &state, .targets = &targets,
+                                                          .has_tessellation = patch}, out, issues);
+            CAPTURE(topology, requested);
+            CHECK(out.input_assembly.primitiveRestartEnable == (requested && supported));
+            if (converted) {
+                CHECK(out.input_assembly.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+                Disk::CanonicalizeState(state, Vulkan::Nvn::VertexInputMode::Static);
+                CHECK(state.primitive_restart == 0);
+                CHECK(state.restart_index == 0);
+            }
+        }
     }
 }
 
@@ -3656,8 +4396,9 @@ TEST_CASE("GPL: the vertex input part of a mesh pipeline has valid vertex input 
     };
     const auto vertex_input_library =
         library(VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT);
+    Vulkan::LibraryPartDynamicState dynamic{};
     const VkGraphicsPipelineCreateInfo part =
-        Vulkan::MakeLibraryPartCreateInfo(mesh_ci, vertex_input_library, {});
+        Vulkan::MakeLibraryPartCreateInfo(mesh_ci, vertex_input_library, {}, dynamic);
     REQUIRE(part.pVertexInputState != nullptr);
     REQUIRE(part.pInputAssemblyState != nullptr);
     CHECK(part.pVertexInputState->vertexBindingDescriptionCount == 0);
@@ -3674,7 +4415,7 @@ TEST_CASE("GPL: the vertex input part of a mesh pipeline has valid vertex input 
           VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT}) {
         const auto other_library = library(flags);
         const VkGraphicsPipelineCreateInfo other =
-            Vulkan::MakeLibraryPartCreateInfo(mesh_ci, other_library, {});
+            Vulkan::MakeLibraryPartCreateInfo(mesh_ci, other_library, {}, dynamic);
         CHECK(other.pVertexInputState == nullptr);
         CHECK(other.pInputAssemblyState == nullptr);
     }
@@ -3689,7 +4430,7 @@ TEST_CASE("GPL: the vertex input part of a mesh pipeline has valid vertex input 
     vertex_ci.pVertexInputState = &vertex_input;
     vertex_ci.pInputAssemblyState = &input_assembly;
     const VkGraphicsPipelineCreateInfo own =
-        Vulkan::MakeLibraryPartCreateInfo(vertex_ci, vertex_input_library, {});
+        Vulkan::MakeLibraryPartCreateInfo(vertex_ci, vertex_input_library, {}, dynamic);
     CHECK(own.pVertexInputState == &vertex_input);
     CHECK(own.pInputAssemblyState == &input_assembly);
 
@@ -3703,6 +4444,54 @@ TEST_CASE("GPL: the vertex input part of a mesh pipeline has valid vertex input 
     CHECK(*created != VK_NULL_HANDLE);
 }
 
+TEST_CASE("GPL: dynamic state unrelated to a part does not change its create info", "[nvn]") {
+    constexpr std::array SHARED_STATES{VK_DYNAMIC_STATE_ALPHA_TO_COVERAGE_ENABLE_EXT,
+                                       VK_DYNAMIC_STATE_ATTACHMENT_FEEDBACK_LOOP_ENABLE_EXT};
+    constexpr std::array STATES{VK_DYNAMIC_STATE_VERTEX_INPUT_EXT,
+                                VK_DYNAMIC_STATE_CULL_MODE,
+                                VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,
+                                VK_DYNAMIC_STATE_BLEND_CONSTANTS,
+                                SHARED_STATES[0],
+                                SHARED_STATES[1],
+                                VK_DYNAMIC_STATE_LOGIC_OP_ENABLE_EXT,
+                                VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT};
+    VkPipelineDynamicStateCreateInfo dynamic{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+        .dynamicStateCount = static_cast<u32>(STATES.size()),
+        .pDynamicStates = STATES.data(),
+    };
+    const VkGraphicsPipelineCreateInfo source{
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        .pDynamicState = &dynamic,
+    };
+    const auto read = [&](VkGraphicsPipelineLibraryFlagsEXT flags) {
+        const VkGraphicsPipelineLibraryCreateInfoEXT library{
+            .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT,
+            .flags = flags,
+        };
+        Vulkan::LibraryPartDynamicState state{};
+        const auto part = Vulkan::MakeLibraryPartCreateInfo(source, library, {}, state);
+        if (part.pDynamicState == nullptr) {
+            return std::vector<VkDynamicState>{};
+        }
+        const auto* first = part.pDynamicState->pDynamicStates;
+        return std::vector<VkDynamicState>{first, first + part.pDynamicState->dynamicStateCount};
+    };
+    constexpr auto VI = VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT;
+    constexpr auto PR = VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT;
+    constexpr auto FS = VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT;
+    constexpr auto FO = VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT;
+    CHECK(read(VI) == std::vector{STATES[0], SHARED_STATES[0], SHARED_STATES[1]});
+    CHECK(read(PR) == std::vector{STATES[1], SHARED_STATES[0], SHARED_STATES[1]});
+    CHECK(read(FS) == std::vector{STATES[2], SHARED_STATES[0], SHARED_STATES[1]});
+    CHECK(read(FO) == std::vector{STATES[3], SHARED_STATES[0], SHARED_STATES[1], STATES[6], STATES[7]});
+
+    dynamic.dynamicStateCount = static_cast<u32>(STATES.size() - 2);
+    CHECK(read(PR) == std::vector{STATES[1], SHARED_STATES[0], SHARED_STATES[1]});
+    CHECK(read(FS) == std::vector{STATES[2], SHARED_STATES[0], SHARED_STATES[1]});
+    CHECK(read(FO) == std::vector{STATES[3], SHARED_STATES[0], SHARED_STATES[1]});
+}
+
 TEST_CASE("GPL: a miss is fast-linked on the calling thread and the whole compile is swapped in",
           "[nvn]") {
     const auto vulkan = MakeHeadlessVulkanWithGpl();
@@ -3714,7 +4503,9 @@ TEST_CASE("GPL: a miss is fast-linked on the calling thread and the whole compil
     }
     // A lookup that may not skip the draw (no `not_ready`) builds the pipeline itself: the
     // asynchronous workers are for draws that can wait.
-    PipelineCache cache{*vulkan->device, GplOptions()};
+    PipelineCacheOptions options = GplOptions();
+    options.gpl_optimize_after_presents = 2;
+    PipelineCache cache{*vulkan->device, options};
     REQUIRE(cache.UsesGraphicsPipelineLibrary());
     const TestProgram vertex = MakeAddProgram(0, 11);
     const TestProgram fragment = MakeTexturedFragment();
@@ -3726,12 +4517,47 @@ TEST_CASE("GPL: a miss is fast-linked on the calling thread and the whole compil
     REQUIRE(pipeline->fast_linked);
     REQUIRE(oracle.freeze_masks.empty()); // nothing went to the asynchronous workers
 
+    auto original = pipeline->AcquireBinding();
+    REQUIRE(original.fast_link_owner);
+    REQUIRE(original.handle != VK_NULL_HANDLE);
+    const std::weak_ptr<Vulkan::vk::Pipeline> fast_link = original.fast_link_owner;
+    const auto& device = *vulkan->device;
+    const auto& logical = device.GetLogical();
+    auto pool = logical.CreateCommandPool({
+        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .queueFamilyIndex = device.GetGraphicsFamily(),
+    });
+    auto buffers = pool.Allocate(1);
+    const VkCommandBuffer raw = buffers[0];
+    const Vulkan::vk::CommandBuffer cmd{raw, device.GetDispatchLoader()};
+    cmd.Begin({
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    });
+    cmd.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, original.handle);
+    cmd.End();
+
+    cache.OnPresent();
+    REQUIRE(cache.GetGraphics(request) == pipeline);
     cache.Flush(); // the optimize job finished
     const VkPipeline optimized = pipeline->optimized_handle.load();
     REQUIRE(optimized != VK_NULL_HANDLE);
     REQUIRE(optimized == *pipeline->optimized);
-    REQUIRE(optimized != *pipeline->pipeline); // the fast-linked one stays alive beside it
-    REQUIRE(pipeline->Handle() == optimized);
+    REQUIRE(optimized != original.handle);
+    REQUIRE(pipeline->AcquireBinding().handle == optimized);
+    REQUIRE_FALSE(fast_link.expired());
+    auto fence = logical.CreateFence({
+        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+    });
+    const VkSubmitInfo submit{
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &raw,
+    };
+    REQUIRE(device.GetGraphicsQueue().Submit(submit, *fence) == VK_SUCCESS);
+    REQUIRE(fence.Wait() == VK_SUCCESS);
+    original.fast_link_owner.reset();
+    CHECK(fast_link.expired());
     // The same key finds the same pipeline object (its handle switched in place).
     REQUIRE(cache.GetGraphics(request) == pipeline);
 
@@ -3743,6 +4569,32 @@ TEST_CASE("GPL: a miss is fast-linked on the calling thread and the whole compil
     REQUIRE(stats.gpl_whole == 0);
     REQUIRE(stats.async_queued == 0);
     REQUIRE(stats.async_not_ready == 0);
+}
+
+TEST_CASE("GPL reuses shader parts across different NVN programs with identical SPIR-V", "[nvn]") {
+    const auto vulkan = MakeHeadlessVulkanWithGpl();
+    if (!vulkan || !vulkan->device->IsExtGraphicsPipelineLibrarySupported()) {
+        SKIP("no Vulkan device with VK_EXT_graphics_pipeline_library");
+    }
+    PipelineCache cache{*vulkan->device, GplOptions()};
+    const TestProgram vertex = MakeAddProgram(0, 11);
+    // The added value is dead, so both vertex programs emit the same SPIR-V.
+    const TestProgram other_vertex = MakeAddProgram(0, 12);
+    const TestProgram fragment = MakeTexturedFragment();
+    FreezableOracle oracle;
+    REQUIRE(vertex.hash != other_vertex.hash);
+
+    const auto first = cache.GetGraphics(MakeGraphicsRequest(vertex, fragment, &oracle));
+    const auto second = cache.GetGraphics(MakeGraphicsRequest(other_vertex, fragment, &oracle));
+    REQUIRE(first != nullptr);
+    REQUIRE(second != nullptr);
+    CHECK(first != second);
+    CHECK(first->layout == second->layout);
+    const auto stats = cache.Stats();
+    CHECK(stats.compiled_at_runtime == 2);
+    CHECK(stats.gpl_translations_reused == 0);
+    CHECK(stats.gpl_fast_links == 2);
+    CHECK(stats.gpl_cached_links == 1);
 }
 
 TEST_CASE("GPL with asynchronous shaders: a draw that may be skipped waits for the workers",
@@ -3783,7 +4635,7 @@ TEST_CASE("GPL with asynchronous shaders: a draw that may be skipped waits for t
     REQUIRE_FALSE(not_ready);
     REQUIRE(pipeline->fast_linked);
     REQUIRE(pipeline->optimized_handle.load() != VK_NULL_HANDLE);
-    REQUIRE(pipeline->Handle() == *pipeline->optimized);
+    REQUIRE(pipeline->AcquireBinding().handle == *pipeline->optimized);
 
     const auto stats = cache.Stats();
     REQUIRE(stats.async_queued == 1);
@@ -3942,7 +4794,7 @@ TEST_CASE("GPL: state variants reuse the translation and the shader parts", "[nv
     REQUIRE(stats.gpl_fast_links == 5);
     REQUIRE(stats.gpl_optimized == 5);
     for (const auto& pipeline : {first, second, third, array_variant, integer_pipeline}) {
-        REQUIRE(pipeline->Handle() == *pipeline->optimized);
+        REQUIRE(pipeline->AcquireBinding().handle == *pipeline->optimized);
     }
 }
 
@@ -4113,7 +4965,7 @@ TEST_CASE("GPL: programs are lowered when created; nothing happens with the swit
         REQUIRE(pipeline != nullptr);
         REQUIRE_FALSE(pipeline->fast_linked);
         REQUIRE_FALSE(pipeline->dynamic_fixed);
-        REQUIRE(pipeline->Handle() == *pipeline->pipeline);
+        REQUIRE(pipeline->AcquireBinding().handle == *pipeline->pipeline);
         REQUIRE(cache.Stats().gpl_fast_links == 0);
     }
 }
@@ -4177,7 +5029,55 @@ TEST_CASE("GPL: background optimization waits for gpl_optimize_after_presents", 
     cache.Flush();
     REQUIRE(cache.Stats().gpl_optimized == 1);
     REQUIRE(pipeline->optimized_handle.load() != VK_NULL_HANDLE);
-    REQUIRE(pipeline->Handle() == *pipeline->optimized);
+    REQUIRE(pipeline->AcquireBinding().handle == *pipeline->optimized);
+}
+
+TEST_CASE("GPL: background optimization yields to a required cache miss", "[nvn]") {
+    const auto vulkan = MakeHeadlessVulkanWithGpl();
+    if (!vulkan || !vulkan->device->IsExtGraphicsPipelineLibrarySupported()) {
+        SKIP("no Vulkan device with VK_EXT_graphics_pipeline_library");
+    }
+    PipelineCacheOptions options = GplOptions();
+    options.async_compile = false;
+    options.gpl_optimize_after_presents = 2;
+    PipelineCache cache{*vulkan->device, options};
+    const TestProgram vertex = MakeAddProgram(0, 13);
+    const TestProgram other_vertex = MakeAddProgram(0, 14);
+    const TestProgram fragment = MakeTexturedFragment();
+    const GraphicsRequest request = MakeGraphicsRequest(vertex, fragment, nullptr);
+    const GraphicsRequest miss = MakeGraphicsRequest(other_vertex, fragment, nullptr);
+    const auto pipeline = cache.GetGraphics(request);
+    REQUIRE(pipeline != nullptr);
+    REQUIRE(pipeline->fast_linked);
+    REQUIRE(cache.Stats().gpl_optimized == 0);
+    cache.OnPresent();
+
+    std::promise<void> entered;
+    std::promise<void> release;
+    auto required = std::async(std::launch::async, [&] {
+        return cache.GetGraphics(miss, nullptr, {}, [&] {
+            entered.set_value();
+            release.get_future().wait();
+        });
+    });
+    auto unblock = SCOPE_GUARD { release.set_value(); };
+    constexpr auto timeout = std::chrono::seconds(2);
+    REQUIRE(entered.get_future().wait_for(timeout) == std::future_status::ready);
+    REQUIRE(cache.GetGraphics(request) == pipeline);
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (cache.Stats().gpl_optimize_waits == 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    CHECK(cache.Stats().gpl_optimize_waits == 1);
+    CHECK(pipeline->optimized_handle.load() == VK_NULL_HANDLE);
+
+    release.set_value();
+    unblock.Cancel();
+    REQUIRE(required.get() != nullptr);
+    cache.Flush();
+    CHECK(cache.Stats().gpl_optimized == 1);
+    CHECK(pipeline->optimized_handle.load() != VK_NULL_HANDLE);
 }
 
 TEST_CASE("dedup_dynamic_state: dynamic states and unread vertex inputs share one pipeline",

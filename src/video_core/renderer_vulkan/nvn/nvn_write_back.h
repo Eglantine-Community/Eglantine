@@ -18,7 +18,7 @@
 #include <span>
 
 #include "common/common_types.h"
-#include "video_core/vulkan_common/vulkan_wrapper.h"
+#include "video_core/renderer_vulkan/nvn/nvn_compute_descriptors.h"
 
 namespace Vulkan {
 class Device;
@@ -54,6 +54,9 @@ struct MergeRange {
     /// too). Only for ranges whose guest pages no CPU store can reach during the merge
     /// (MirrorLineGuard); false: the exact word merge.
     bool lines{false};
+
+    /// Appends a contiguous range if the join respects word/line boundaries and fits one dispatch.
+    [[nodiscard]] bool TryAppend(const MergeRange& next, u64 join_alignment, u64 max_size);
 };
 
 /// MergeChangedWords on the GPU (host_shaders/nvn_wb_merge.comp): one dispatch per range (per 64
@@ -64,16 +67,13 @@ struct MergeRange {
 /// (compute shader reads of the result and snapshot, shader writes of the guest buffer).
 class WriteBackMerge {
 public:
-    /// Push descriptors for the four storage buffers.
-    [[nodiscard]] static bool Supported(const Device& device);
-
     WriteBackMerge();
     ~WriteBackMerge();
     WriteBackMerge(const WriteBackMerge&) = delete;
     WriteBackMerge& operator=(const WriteBackMerge&) = delete;
 
     /// Creates the pipeline. False (and logged) when the device cannot run it.
-    bool Init(const Device& device);
+    bool Init(const Device& device, bool allow_push_descriptors = true);
     /// Diagnostic counters (EDEN_NX2_NVN_WB_MONITOR): a storage buffer of 2 words per slot that
     /// merges of ranges with a `stat_slot` add their changed words and the dirty 32-word lines of the
     /// guest buffer to.
@@ -98,11 +98,14 @@ public:
     }
 
     /// Records the merges of `ranges`. Returns how many ranges were recorded: a range whose offsets
-    /// differ modulo 4 is not (logged), an empty one needs nothing.
-    u64 Record(vk::CommandBuffer cmd, std::span<const MergeRange> ranges) const;
+    /// differ modulo 4 is not (logged), an empty one needs nothing. With regular descriptor sets,
+    /// allocate_set must keep each set alive until the command buffer completes.
+    u64 Record(vk::CommandBuffer cmd, std::span<const MergeRange> ranges,
+               const AllocateComputeSet& allocate_set = {}) const;
 
 private:
-    void RecordPart(vk::CommandBuffer cmd, const MergeRange& range, u64 begin, u64 end) const;
+    void RecordPart(vk::CommandBuffer cmd, const MergeRange& range, u64 begin, u64 end,
+                    const AllocateComputeSet& allocate_set) const;
 
     vk::DescriptorSetLayout set_layout;
     vk::PipelineLayout pipeline_layout;
@@ -111,6 +114,8 @@ private:
     u64 alignment{};
     u64 part_bytes{};
     VkBuffer stats{VK_NULL_HANDLE};
+    const vk::Device* logical{};
+    bool push_descriptors{};
     bool line_mode{false};
     u32 unit_words{8};
 };

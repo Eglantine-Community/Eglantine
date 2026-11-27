@@ -89,6 +89,8 @@ public:
     void DrawTexture() override;
     void Clear(u32 layer_count) override;
     void DispatchCompute() override;
+    VideoCommon::NativeTensorLowering NativeTensorComputeSupport(
+        const std::array<u32, 3>& workgroup_size) const override;
     void ResetCounter(VideoCommon::QueryType type) override;
     void Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) override;

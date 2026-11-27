@@ -1,26 +1,72 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-
 #version 450
 layout(local_size_x = 128) in;
 layout(std430, set = 0, binding = 0) readonly buffer Source { uint source_words[]; };
 layout(std430, set = 0, binding = 1) writeonly buffer Destination { uint dest_words[]; };
-layout(push_constant) uniform Parameters { uint source_bias; uint source_size; uint total_words; };
+layout(std430, set = 0, binding = 2) readonly buffer WordMap { uint routes[]; };
+layout(std430, set = 0, binding = 3) readonly buffer SourceTail { uint tail_word; };
+layout(push_constant) uniform Parameters {
+    uint source_bias;
+    uint source_size;
+    uint source_stride;
+    uint destination_stride;
+    uint total_words;
+    uint source_full_bytes;
+};
 
-// Diagnostic conversion of the captured 69-byte layout: insert three bytes before offset 65.
+uint read_word(uint address) {
+    if (address < source_full_bytes) {
+        return source_words[address / 4];
+    }
+    return tail_word;
+}
+
+uint gather_scattered(uint first, uint source_vertex, uint valid_bytes) {
+    uint value = 0;
+    for (uint lane = 0; lane < 4; ++lane) {
+        uint source_byte = routes[first + lane];
+        if (source_byte >= valid_bytes) continue;
+        uint address = source_bias + source_vertex + source_byte;
+        uint byte_value = (read_word(address) >> ((address % 4) * 8)) & 255;
+        value |= byte_value << (lane * 8);
+    }
+    return value;
+}
+
+uint gather_contiguous(uint route, uint source_vertex, uint valid_bytes) {
+    uint source_byte = route & 0x0fffffff;
+    if (source_byte >= valid_bytes) return 0;
+    uint count = min(((route >> 28) & 3) + 1, valid_bytes - source_byte);
+    uint destination_lane = route >> 30;
+    uint address = source_bias + source_vertex + source_byte;
+    uint first_byte = address % 4;
+    uint value = read_word(address) >> (first_byte * 8);
+    uint remaining = 4 - first_byte;
+    if (count > remaining) {
+        value |= read_word(address + remaining) << (remaining * 8);
+    }
+    if (count < 4) {
+        value &= (1u << (count * 8)) - 1;
+    }
+    return value << (destination_lane * 8);
+}
+
 void main() {
     uint word = gl_GlobalInvocationID.x;
     if (word >= total_words) return;
-    uint vertex = word / 18;
-    uint offset = (word % 18) * 4;
+
+    uint words_per_vertex = destination_stride / 4;
+    uint source_vertex = (word / words_per_vertex) * source_stride;
+    uint route = routes[word % words_per_vertex];
     uint value = 0;
-    for (uint i = 0; i < 4; ++i) {
-        uint dest_byte = offset + i;
-        if (dest_byte >= 65 && dest_byte < 68) continue;
-        uint src_byte = vertex * 69 + dest_byte - (dest_byte >= 68 ? 3 : 0);
-        if (src_byte >= source_size) continue;
-        uint address = source_bias + src_byte;
-        uint byte_value = (source_words[address / 4] >> ((address % 4) * 8)) & 255;
-        value |= byte_value << (i * 8);
+    if (route != 0xffffffff && source_vertex < source_size) {
+        uint valid_bytes = source_size - source_vertex;
+        if ((route >> 28) == 15) {
+            uint first = words_per_vertex + (route & 0x0fffffff) * 4;
+            value = gather_scattered(first, source_vertex, valid_bytes);
+        } else {
+            value = gather_contiguous(route, source_vertex, valid_bytes);
+        }
     }
     dest_words[word] = value;
 }

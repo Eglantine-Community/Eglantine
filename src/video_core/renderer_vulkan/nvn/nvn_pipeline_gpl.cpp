@@ -11,7 +11,7 @@
 //      TranslationState (what the translation reads of the state) whose texture answers still
 //      hold (ShaderSet), else translated now (one translation per key at a time, TranslationHold);
 //   2. the four library parts (GraphicsPipelineLibraryCache): vertex input and fragment output
-//      parts per state, pre-rasterization and fragment shader parts per shader set (with the
+//      parts per state, pre-rasterization and fragment shader parts per module and layout (with the
 //      DynamicFixedState states dynamic they do not depend on cull, depth or stencil state);
 //      parts not compiled yet are compiled side by side on `part_workers`; they are the cost of a
 //      "fast link" (a shader part is a full shader compile), the link itself is cheap;
@@ -28,6 +28,7 @@
 #include <chrono>
 #include <optional>
 #include <string>
+#include <thread>
 #include <unordered_set>
 
 #include <boost/container/small_vector.hpp>
@@ -35,6 +36,7 @@
 #include <fmt/format.h>
 
 #include "common/logging.h"
+#include "video_core/renderer_vulkan/nvn/nvn_debug.h"
 #include "video_core/renderer_vulkan/nvn/nvn_pipeline_impl.h"
 
 namespace Vulkan::Nvn {
@@ -101,9 +103,38 @@ PipelineCache::Impl::TranslationHold::~TranslationHold() {
     }
 }
 
-void PipelineCache::Impl::CreateShaderSetObjects(ShaderSet& set,
-                                                 const VC::DescriptorLayout& descriptors,
-                                                 VkShaderStageFlags push_stages) {
+std::shared_ptr<PipelineCache::Impl::SharedShaderModule> PipelineCache::Impl::GetShaderModule(
+    const std::shared_ptr<const Disk::ShaderRecord>& record) {
+    const auto& spirv = record->spirv;
+    const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(spirv.data()),
+                                       spirv.size() * sizeof(u32));
+    std::shared_ptr<SharedShaderModule> module;
+    {
+        std::scoped_lock lock{shader_module_mutex};
+        const auto [first, last] = shader_modules.equal_range(hash);
+        for (auto it = first; it != last; ++it) {
+            if (it->second->record->spirv == spirv) {
+                module = it->second;
+                break;
+            }
+        }
+        if (!module) {
+            module = std::make_shared<SharedShaderModule>();
+            module->record = record;
+            shader_modules.emplace(hash, module);
+        }
+    }
+    std::call_once(module->created, [&] {
+        module->handle = device.GetLogical().CreateShaderModule({
+            .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+            .codeSize = spirv.size() * sizeof(u32),
+            .pCode = spirv.data(),
+        });
+    });
+    return module;
+}
+
+void PipelineCache::Impl::CreateShaderSetModules(ShaderSet& set) {
     std::call_once(set.created, [&] {
         // A failure throws out of call_once and leaves `created` unset: the next pipeline of the
         // set tries again (the caller counts the failure).
@@ -111,17 +142,53 @@ void PipelineCache::Impl::CreateShaderSetObjects(ShaderSet& set,
             if (!stage.record) {
                 continue;
             }
-            const Disk::ShaderRecord& record = *stage.record;
-            set.modules[record.stage] = device.GetLogical().CreateShaderModule({
-                .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-                .pNext = nullptr,
-                .flags = 0,
-                .codeSize = record.spirv.size() * sizeof(u32),
-                .pCode = record.spirv.data(),
-            });
+            set.modules[stage.record->stage] = GetShaderModule(stage.record);
         }
-        set.layout = CreateLayoutObjects(descriptors, false, push_stages);
     });
+}
+
+PipelineCache::Impl::RequiredLookup::RequiredLookup(Impl* impl_)
+    : impl{impl_ && (impl_->optimize_workers ||
+                     (!impl_->vk_cache_path.empty() && Debug::Get().quiet_driver_cache))
+               ? impl_
+               : nullptr} {
+    if (impl) {
+        std::scoped_lock lock{impl->async_mutex};
+        ++impl->required_lookups;
+    }
+}
+
+PipelineCache::Impl::RequiredLookup::~RequiredLookup() {
+    if (impl) {
+        {
+            std::scoped_lock lock{impl->async_mutex};
+            --impl->required_lookups;
+            impl->last_pipeline_ready = std::chrono::steady_clock::now();
+        }
+        impl->async_cv.notify_all();
+    }
+}
+
+bool PipelineCache::Impl::WaitToOptimize() {
+    // Let a burst of misses finish before starting optional compiles that can occupy the driver.
+    using Clock = std::chrono::steady_clock;
+    constexpr auto quiet_period = std::chrono::milliseconds(50);
+    const auto busy = [this] { return required_lookups != 0 || async_outstanding != 0; };
+    const auto resume_at = [&] { return last_pipeline_ready + quiet_period; };
+    std::unique_lock lock{async_mutex};
+    if (!stopping.load() && (busy() || Clock::now() < resume_at())) {
+        ++stat_gpl_optimize_waits;
+    }
+    while (!stopping.load()) {
+        if (busy()) {
+            async_cv.wait(lock);
+        } else if (const auto resume = resume_at(); Clock::now() < resume) {
+            async_cv.wait_until(lock, resume);
+        } else {
+            return true;
+        }
+    }
+    return false;
 }
 
 void PipelineCache::Impl::QueueOptimize(std::shared_ptr<GraphicsPipeline> pipeline,
@@ -137,11 +204,7 @@ void PipelineCache::Impl::QueueOptimize(std::shared_ptr<GraphicsPipeline> pipeli
     }
     optimize_workers->QueueWork([this, pipeline = std::move(pipeline), set = std::move(set),
                                  state, targets] {
-        {
-            std::unique_lock lock{async_mutex};
-            async_cv.wait(lock, [this] { return async_outstanding == 0 || stopping.load(); });
-        }
-        if (!stopping.load()) {
+        if (WaitToOptimize()) {
             const auto start = std::chrono::steady_clock::now();
             try {
                 boost::container::small_vector<VkPipelineShaderStageCreateInfo,
@@ -158,7 +221,7 @@ void PipelineCache::Impl::QueueOptimize(std::shared_ptr<GraphicsPipeline> pipeli
                         .pNext = nullptr,
                         .flags = 0,
                         .stage = VkStageOf(stage),
-                        .module = *set->modules[stage],
+                        .module = *set->modules[stage]->handle,
                         .pName = "main",
                         .pSpecializationInfo = nullptr,
                     });
@@ -185,13 +248,10 @@ void PipelineCache::Impl::QueueOptimize(std::shared_ptr<GraphicsPipeline> pipeli
                         .dynamic_alpha_to_coverage = pipeline->dynamic_alpha_to_coverage,
                     },
                     description, issues);
-                pipeline->optimized =
-                    device.GetLogical().CreateGraphicsPipeline(description.ci, *vk_cache);
-                // Draws recorded from now on bind the whole compile (GraphicsPipeline::Handle).
-                pipeline->optimized_handle.store(*pipeline->optimized,
-                                                 std::memory_order_release);
+                const DriverCacheUse cache_use{*this};
+                pipeline->PublishOptimization(
+                    device.GetLogical().CreateGraphicsPipeline(description.ci, *vk_cache));
                 ++stat_gpl_optimized;
-                ++new_since_vk_write;
             } catch (const std::exception& e) {
                 // The fast-linked pipeline stays in use: it draws the same.
                 ++stat_gpl_optimize_failed;
@@ -206,6 +266,9 @@ void PipelineCache::Impl::QueueOptimize(std::shared_ptr<GraphicsPipeline> pipeli
             if (ns > 50'000'000) {
                 ++stat_gpl_optimize_slow;
             }
+            if (!stopping.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(8));
+            }
         }
         {
             std::scoped_lock lock{gpl_mutex};
@@ -216,7 +279,10 @@ void PipelineCache::Impl::QueueOptimize(std::shared_ptr<GraphicsPipeline> pipeli
 }
 
 void PipelineCache::Impl::OnPresent() {
-    present_counter.fetch_add(1, std::memory_order_relaxed);
+    const u64 present = present_counter.fetch_add(1, std::memory_order_relaxed);
+    if (present % 64 == 0 && Debug::Get().quiet_driver_cache) {
+        MaybeWriteVkCache();
+    }
 }
 
 void PipelineCache::Impl::DeferOptimize(std::shared_ptr<GraphicsPipeline> pipeline,

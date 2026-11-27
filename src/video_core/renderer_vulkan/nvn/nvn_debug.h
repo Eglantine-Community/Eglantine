@@ -49,6 +49,9 @@
 //                                  .raw file)
 //   EDEN_NX2_NVN_CACHE_LOG=1       logs every pipeline compiled at run time with the state words
 //                                  that differ from a cached pipeline of the same programs
+//   EDEN_NX2_NVN_PIPELINE_TRACE=1  logs graphics pipeline requests, compile jobs and first binding
+//                                  by key and job, using the timeline's steady-clock microseconds
+//   EDEN_NX2_NVN_GPL_LAYOUT_CAPACITY=1  shares GPL layouts for nearby fragment sampler counts
 //
 // Experiments (change what the replay draws; never set in normal runs):
 //   EDEN_NX2_NVN_FACE=1|2          1: invert the front face, 2: no culling
@@ -66,7 +69,9 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <filesystem>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -136,6 +141,11 @@ struct Config {
     u64 chase_offset{};
     u32 chase_words{};
     bool cache_log{};
+    bool pipeline_trace{};
+    bool gpl_layout_capacity{};
+    bool quiet_driver_cache{true};
+    bool compute_binaries{};
+    bool graphics_binaries{};
     /// EDEN_NX2_NVN_ASYNC_WORKERS=<n>: threads of the run-time pipeline compile workers (0 = the
     /// automatic count, `clamp(hardware threads / 4, 2, 6)`).
     u32 async_workers{};
@@ -163,6 +173,8 @@ struct Config {
     /// EDEN_NX2_NVN_SHADOW_STORAGE=0 switches the device-local shadows of written storage ranges in
     /// imported pools off (nvn_draw_shadow.cpp); on by default.
     bool shadow_storage{true};
+    /// EDEN_NX2_TRY_SHADOW_BOUNDS: reject disjoint ranges before scanning live shadows.
+    bool shadow_bounds{};
     /// EDEN_NX2_NVN_SHADOW_MAX_KIB: longest written storage range that is shadowed (default 1024).
     u64 shadow_max_bytes{u64{1} << 20};
     /// EDEN_NX2_NVN_SHADOW_LOG=1: logs the first shadowed ranges (pool, range, program).
@@ -307,6 +319,7 @@ struct Config {
     /// only at a point where no render pass is open; 0 interval = off); `early_pass_us`: a piece
     /// this long with a pass still open ends the pass and goes anyway (0 = never inside a pass).
     /// EDEN_NX2_NVN_EARLY_SUBMIT_US=<interval>, _EARLY_FIRST_US=<n>, _EARLY_PASS_US=<n>.
+    bool auto_early_submit{true}; ///< Explicit timing overrides bypass queue coalescing.
     u32 early_first_us{300};
     u32 early_interval_us{1500};
     u32 early_pass_us{4000};
@@ -335,6 +348,17 @@ extern Config g_config;
 }
 void Reload();
 
+struct PipelineTrace {
+    u64 key{};
+    u64 job{};
+    const char* source{};
+
+    void Event(const char* event, const char* detail = "",
+               std::chrono::steady_clock::time_point when = {}, u64 result_job = 0) const noexcept;
+};
+
+[[nodiscard]] PipelineTrace BeginPipelineTrace(u64 key, const char* source) noexcept;
+
 /// `present_index` is the 1-based present number the work being recorded belongs to.
 [[nodiscard]] bool FrameSelected(u64 present_index);
 
@@ -347,12 +371,33 @@ void Reload();
 // buffers of draw n (EDEN_NX2_NVN_DUMP_DRAW) and also writes them to `nvn-draw-<n>.txt`. Pass and
 // draw numbers are the 1-based numbers of the draw log.
 
+/// A one-frame survey in normalized coordinates (0..1000 from the top left).
+struct Survey {
+    struct Limits {
+        u32 left, top, right, bottom;
+        u32 min_width, min_height;
+        u32 first_pass, max_passes;
+        u64 max_bytes;
+
+        [[nodiscard]] bool Valid() const;
+        [[nodiscard]] VkRect2D Crop(u32 width, u32 height) const;
+    } limits;
+    u32 passes_seen{};
+    u32 passes_captured{};
+    u32 attachments{};
+    u64 bytes{};
+    bool limited{};
+
+    [[nodiscard]] bool Take(u64 size);
+};
+
 /// What a request bound to a frame asks for.
 struct RequestState {
     u64 frame{};     ///< 1-based present number of the frame the request applies to
     u32 pass{};      ///< 0: none
     u32 draw{};      ///< 0: none
     std::filesystem::path directory;
+    std::optional<Survey> survey;
 };
 
 /// 0: no request; 1: armed, waits for the next frame to start; 2: bound to a frame, running.
@@ -367,6 +412,7 @@ extern std::atomic<u32> g_request_phase;
 /// Arms a request (any thread). `pass` / `draw` of 0 leave that part as it is; requests armed
 /// before the replay binds them merge into one.
 void RequestDump(u32 pass, u32 draw, std::filesystem::path directory);
+void RequestSurvey(Survey::Limits limits, std::filesystem::path directory);
 
 /// Replay thread, once per present, after the present counter was incremented to `present_index`:
 /// binds an armed request to the frame that starts now and retires a bound request whose frame has
@@ -374,7 +420,7 @@ void RequestDump(u32 pass, u32 draw, std::filesystem::path directory);
 bool OnPresent(u64 present_index);
 
 /// Replay thread: the request bound to `frame`, null when there is none.
-[[nodiscard]] const RequestState* RequestFor(u64 frame);
+[[nodiscard]] RequestState* RequestFor(u64 frame);
 
 /// A new context starts: forgets an armed or bound request of an earlier one (its frame numbers
 /// count that context's presents).
@@ -398,6 +444,8 @@ struct PendingDump {
     /// Width cap of the written TGA (0: full size): box-downscaled by the smallest integer factor
     /// that fits; the depth .raw file is not written then.
     u32 thumb_width{};
+    /// Read back this rectangle instead of the whole mip and restore the previous layout.
+    std::optional<VkRect2D> crop;
 };
 
 /// Converts `pixels` (tightly packed, PixelBytes per pixel) to a top-down 32-bit TGA file and

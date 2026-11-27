@@ -273,8 +273,6 @@ ShaderCache::ShaderCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .max_descriptor_set_uniform_buffers_dynamic =
             Shader::HostTranslateInfo::DEFAULT_DESCRIPTOR_LIMIT,
         .max_descriptor_set_storage_buffers = Shader::HostTranslateInfo::DEFAULT_DESCRIPTOR_LIMIT,
-        .max_descriptor_set_storage_buffers_dynamic =
-            Shader::HostTranslateInfo::DEFAULT_DESCRIPTOR_LIMIT,
         .max_descriptor_set_sampled_images = Shader::HostTranslateInfo::DEFAULT_DESCRIPTOR_LIMIT,
         .max_descriptor_set_storage_images = Shader::HostTranslateInfo::DEFAULT_DESCRIPTOR_LIMIT,
         .max_descriptor_set_input_attachements =
@@ -596,7 +594,7 @@ std::unique_ptr<ComputePipeline> ShaderCache::CreateComputePipeline(
     const GPUVAddr program_base{kepler_compute->regs.code_loc.Address()};
     const auto& qmd{kepler_compute->launch_description};
     ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start,
-                           shader->lowered_native};
+                           shader->tensor_mode, shader->lowered_native};
     env.SetCachedSize(shader->size_bytes);
 
     main_pools.ReleaseContents();
@@ -619,6 +617,20 @@ std::unique_ptr<ComputePipeline> ShaderCache::CreateComputePipeline(
         env.Dump(hash, key.unique_hash);
     }
 
+    if (const auto native = env.NativeAmpereProgram()) {
+        const auto mode = native->options.tensor_mode;
+        using Shader::Ampere::TensorMode;
+        if (mode == TensorMode::Default && Shader::Ampere::HasHmma(native->code)) {
+            return nullptr;
+        }
+        if ((mode == TensorMode::Full || mode == TensorMode::Compact) &&
+            (!device.CanRunNativeTensorCompute(key.workgroup_size) ||
+             (mode == TensorMode::Compact &&
+              Settings::values.renderer_backend.GetValue() != Settings::RendererBackend::OpenGL_SPIRV))) {
+            throw Shader::NotImplementedException(
+                "Native matrix multiply mode lacks a supported compute workgroup");
+        }
+    }
     auto program{TranslateStage(pools, env, env.StartAddress(), false, host_info)};
     const u32 num_storage_buffers{Shader::NumDescriptors(program.info.storage_buffers_descriptors)};
     Shader::RuntimeInfo info;

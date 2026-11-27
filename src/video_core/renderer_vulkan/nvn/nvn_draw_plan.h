@@ -119,6 +119,8 @@ struct DrawPlan {
     /// read-only mirrors stay current and storage mirrors also reach the imported guest backing.
     /// (EDEN_NX2_TRY_RO_MIRROR_EXACT / EDEN_NX2_TRY_STORAGE_RAW_WRITE_THROUGH).
     bool raw_stores_written_through{false};
+    /// Every reachable split-pool route in the bound raw table writes the expected mirror bytes.
+    bool raw_split_writes_covered{false};
     /// The pipeline writes a bound storage image.
     bool image_writes{false};
     /// An overlapping inline uniform update must flush to the GPU pool before the draw.
@@ -138,6 +140,7 @@ struct DrawPlan {
         read_only_depth = false;
         raw_global_writes = false;
         raw_stores_written_through = false;
+        raw_split_writes_covered = false;
         raw_global = false;
         shadow_candidates = false;
         image_writes = false;

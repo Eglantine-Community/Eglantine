@@ -95,7 +95,6 @@ public:
     void F2I(const Instruction& insn);
     void FRND(const Instruction& insn);
     void I2F(const Instruction& insn);
-    void I2FP(const Instruction& insn);
 
     // Memory, atomics, barriers, attributes, geometry OUT, stage buffers
     void LDG(const Instruction& insn);

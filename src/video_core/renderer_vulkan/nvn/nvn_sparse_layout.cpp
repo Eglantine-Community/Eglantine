@@ -109,6 +109,17 @@ u64 SparseTileStagingBytes(const Storage& s, const SparseLayout& layout) {
     return static_cast<u64>(layout.tile_width) * layout.tile_height * DecodedTexelBytes(s.host);
 }
 
+AstcGpuDecoder::Level SparseAstcTileLevel(const SparseLayout& layout, const SparseRect& rect) {
+    return {
+        .width = rect.width,
+        .height = rect.height,
+        .block_width = layout.block.width,
+        .block_height = layout.block.height,
+        .tile_height = layout.shape.tile_h,
+        .source_columns = layout.shape.tile_cols,
+    };
+}
+
 void DecodeSparseTile(const Storage& s, const SparseLayout& layout, std::span<const u8> guest,
                       std::span<u8> out) {
     const u32 bytes = layout.block.bytes;

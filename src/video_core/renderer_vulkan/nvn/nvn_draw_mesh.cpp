@@ -45,6 +45,7 @@ void DrawContext::DrawMeshTasks(const VC::DrawMeshTasksPayload& p) {
     if (xy > MAX_GROUPS / p.z) {
         ++counters.draws;
         ++counters.draws_skipped;
+        ++counters.mesh_draws_skipped;
         host->HostUnsupported("DrawMeshTasks", "the workgroup count exceeds 32 bits");
         return;
     }
@@ -82,6 +83,7 @@ void DrawContext::DrawMeshTasks(const VC::DrawMeshTasksPayload& p) {
                  : (std::min)(limits.maxMeshWorkGroupCount[0], limits.maxMeshWorkGroupTotalCount);
         if (groups > limit) {
             ++counters.draws_skipped;
+            ++counters.mesh_draws_skipped;
             host->HostUnsupported("DrawMeshTasks",
                                   fmt::format("{} {} workgroups exceed the device's {}", groups,
                                               task ? "task" : "mesh", limit));
@@ -246,13 +248,13 @@ bool DrawContext::PrepareEmulatedMesh(GraphicsPipeline& graphics, DrawPlan& plan
     host->HostMarkWritten();
     host->HostFlushBarrier();
     const auto barrier = [&](bool uses_indirect) {
-        VkPipelineStageFlags dst_stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        VkPipelineStageFlags stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
         VkAccessFlags access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
         if (uses_indirect) {
-            dst_stages |= VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT;
+            stages |= VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT;
             access |= VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
         }
-        host->HostCmd().PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, dst_stages, 0,
+        host->HostCmd().PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, stages, 0,
                                        VkMemoryBarrier{
                                            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
                                            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,

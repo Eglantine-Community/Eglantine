@@ -281,19 +281,9 @@ struct GraphicsRequest {
 /// draw can be judged while its pipeline is still compiling.
 [[nodiscard]] bool StoresGlobalMemory(const GraphicsRequest& request) noexcept;
 
-/// With asynchronous shaders, whether a draw whose pipeline is still compiling may be skipped
-/// instead of waiting for the pipeline. The emulated path's rule (vk_pipeline_cache.cpp
-/// BuiltPipeline and CanSkipDraw): a draw that stores to memory waits (skipping it loses state,
-/// not a frame of geometry); else a draw with a depth target may be skipped (games do not render
-/// one-time results with depth); else only a draw of more than 6 elements may be. A fullscreen
-/// pass of 3 to 6 vertices, or an indirect or mesh draw (`element_count` 0), may build a texture
-/// the game never draws again.
-[[nodiscard]] constexpr bool MaySkipUnbuiltDraw(bool stores_memory, bool depth_target,
-                                                u32 element_count) noexcept {
-    if (stores_memory) {
-        return false;
-    }
-    return depth_target || element_count > 6;
+/// Memory stores, fullscreen passes and draws of unknown size can have one-time effects.
+[[nodiscard]] constexpr bool MaySkipUnbuiltDraw(bool stores_memory, u32 element_count) noexcept {
+    return !stores_memory && element_count > 6;
 }
 
 /// A texture-type fact a translation depended on (see "Identity" above).
@@ -340,15 +330,19 @@ union DescriptorTemplateEntry {
 };
 static_assert(sizeof(DescriptorTemplateEntry) == sizeof(VkDescriptorBufferInfo));
 
-/// Descriptor set layout, pipeline layout and descriptor update template shared across
-/// pipelines with an identical descriptor signature.
-struct SharedPipelineLayout {
+struct PipelineLayoutHandles {
     vk::DescriptorSetLayout set_layout;
     /// Set BINDLESS_SET of the layout when a stage samples through the bindless table.
     vk::DescriptorSetLayout bindless_layout;
     vk::PipelineLayout layout;
+};
+
+/// The update template describes the actual write payload for these handles.
+struct SharedPipelineLayout {
+    std::shared_ptr<const PipelineLayoutHandles> handles;
     vk::DescriptorUpdateTemplate update_template;
     bool push_descriptors{};
+    bool padded_bindings{};
     u32 push_constant_size{};
     u32 template_entry_count{};
 };
@@ -369,6 +363,10 @@ struct PipelineBase {
     u32 template_entry_count{};
     /// Descriptor bindings of every stage in pipeline order, numbered as in the SPIR-V.
     VC::DescriptorLayout descriptors;
+    /// Descriptor payload sizes, cached to reserve stable write pointers during replay.
+    size_t descriptor_buffer_count{};
+    size_t descriptor_image_count{};
+    size_t descriptor_texel_view_count{};
     /// Push-constant range size in bytes (rescaling / render-area words), 0 if none.
     u32 push_constant_size{};
     /// Stages of the push-constant range (VK_SHADER_STAGE_ALL_GRAPHICS, task|mesh|fragment for a
@@ -429,11 +427,7 @@ struct GraphicsPipeline : PipelineBase {
     bool dynamic_alpha_to_coverage{};
     u32 color_attachment_count{};
     DynamicFixedState fixed_values;
-    /// GPL path: `pipeline` was fast-linked from VK_EXT_graphics_pipeline_library parts.
-    /// `optimized` is the same pipeline compiled whole in the background (same layout, render
-    /// pass and dynamic states); the optimize worker writes it once, then publishes its handle in
-    /// `optimized_handle`, and draws recorded from then on bind it. `pipeline` stays alive (draws
-    /// in flight may use it) until the pipeline is destroyed.
+    /// GPL path: initially fast-linked from VK_EXT_graphics_pipeline_library parts.
     bool fast_linked{};
     std::atomic<bool> prefetched_unused{};
     std::atomic<bool> optimize_deferred{false};
@@ -442,11 +436,64 @@ struct GraphicsPipeline : PipelineBase {
     vk::Pipeline optimized;
     std::atomic<VkPipeline> optimized_handle{VK_NULL_HANDLE};
 
-    /// The handle draws bind: the optimized pipeline once it is published, else `pipeline`.
-    [[nodiscard]] VkPipeline Handle() const noexcept {
-        const VkPipeline best = optimized_handle.load(std::memory_order_acquire);
-        return best != VK_NULL_HANDLE ? best : *pipeline;
+    struct Binding {
+        VkPipeline handle;
+        std::shared_ptr<vk::Pipeline> fast_link_owner;
+    };
+
+    /// Initialized before publication. The first demand is tracked on the replay thread.
+    void SetTraceIdentity(u64 key, u64 job) noexcept {
+        trace_key = key;
+        trace_job = job;
+        trace_first_bind.store(job != 0, std::memory_order_relaxed);
     }
+
+    [[nodiscard]] u64 TraceJob() const noexcept {
+        return trace_job;
+    }
+
+    bool trace_demand_seen{};
+
+    /// Called during assembly, before the pipeline is published to any other thread.
+    void AdoptFastLink() {
+        fast_pipeline = std::make_shared<vk::Pipeline>(std::move(pipeline));
+        fast_linked = true;
+    }
+
+    void PublishOptimization(vk::Pipeline replacement) {
+        optimized = std::move(replacement);
+        optimized_handle.store(*optimized, std::memory_order_release);
+        std::atomic_store_explicit(&fast_pipeline, std::shared_ptr<vk::Pipeline>{},
+                                   std::memory_order_release);
+    }
+
+    /// A command buffer binding the fast link retains its owner until the submission completes.
+    [[nodiscard]] Binding AcquireBinding() const noexcept {
+        if (trace_first_bind.load(std::memory_order_relaxed)) {
+            TraceFirstBind();
+        }
+        if (const VkPipeline best = optimized_handle.load(std::memory_order_acquire);
+            best != VK_NULL_HANDLE) {
+            return {best, {}};
+        }
+        if (!fast_linked) {
+            return {*pipeline, {}};
+        }
+        auto owner = std::atomic_load_explicit(&fast_pipeline, std::memory_order_acquire);
+        if (owner) {
+            return {**owner, std::move(owner)};
+        }
+        // The optimizer released the fast link after publishing the replacement.
+        return {optimized_handle.load(std::memory_order_acquire), {}};
+    }
+
+private:
+    void TraceFirstBind() const noexcept;
+
+    u64 trace_key{};
+    u64 trace_job{};
+    mutable std::atomic<bool> trace_first_bind{};
+    std::shared_ptr<vk::Pipeline> fast_pipeline;
 };
 
 struct ComputeRequest {
@@ -460,8 +507,8 @@ struct ComputeRequest {
 struct ComputePipeline : PipelineBase {
     std::atomic<bool> prefetched_unused{};
     bool prefetched_at_creation{};
-    /// The portable record of a before-binding prefetch, held until its first matching lookup.
-    /// Guarded by the pipeline cache mutex.
+    /// Before-binding prefetches keep their record until a dispatch uses them. Guarded by
+    /// PipelineCache::Impl::pipeline_mutex.
     std::shared_ptr<const Disk::ShaderRecord> deferred_prefetch_shader;
 };
 
@@ -481,7 +528,6 @@ struct PipelineCacheOptions {
     /// Identity of the translation sources (Disk::TranslationEpoch()); empty = this binary's.
     /// Tests set it to stand for a build whose translation changed.
     std::string translation_epoch;
-    u64 title_id{};
     /// Translate and compile cached entries on worker threads at construction.
     bool preload{true};
     /// Use VK_EXT_vertex_input_dynamic_state when the device has it. False forces the static
@@ -497,15 +543,15 @@ struct PipelineCacheOptions {
     /// The nvn_pipeline_library setting: graphics pipelines are built from
     /// VK_EXT_graphics_pipeline_library parts (vertex input, pre-rasterization shaders, fragment
     /// shader, fragment output) that are compiled once and fast-linked, then compiled whole in
-    /// the background and swapped in (GraphicsPipeline::Handle). With `async_compile` the parts
+    /// the background and swapped in (GraphicsPipeline::AcquireBinding). With `async_compile` the parts
     /// and the link of a draw that may be skipped are built on the async workers like any other
     /// miss; without it (or for a draw that must not be skipped) on the calling thread. Draws
     /// whose state differs only in what the shader translation does not read reuse the
     /// translated stages and the shader parts. Ignored when the device does not have the
     /// extension with fast linking (vulkan_device.cpp enables it only when a renderer asks for it).
     bool graphics_pipeline_library{false};
-    /// Number of distinct presents a fast-linked GPL pipeline must be drawn in before background
-    /// LTO (`QueueOptimize`) starts. 0 optimizes immediately after fast-linking.
+    /// Number of distinct presents a fast-linked GPL pipeline must be drawn in before queuing its
+    /// optimized compile. 0 queues it after fast-linking. The worker waits for other misses.
     u32 gpl_optimize_after_presents{0};
     /// Settings nvn_sync_diet: the render passes (GetRenderPass) carry no external dependencies
     /// (RenderPassDependencies); the replay's explicit barrier between a pass and the next op is
@@ -553,6 +599,7 @@ struct PipelineCacheStats {
     u64 gpl_translations_reused{}; ///< GPL path: pipelines built from an earlier translation
     u64 gpl_whole{};           ///< GPL path: pipelines the libraries cannot express, compiled whole
     u64 gpl_optimized{};       ///< whole compiles published in place of a fast-linked pipeline
+    u64 gpl_optimize_waits{};  ///< optimizations that yielded to required or async lookups
     u64 gpl_shader_sets_warmed{}; ///< GPL path: shader sets whose library parts the preload compiled
     u64 programs_prepared{};   ///< program stages lowered when the game created the program
     u64 graphics_pipelines{};  ///< pipelines held now
@@ -601,14 +648,19 @@ public:
     /// (counted as rejected). Without `not_ready` the lookup is always synchronous, on the GPL
     /// path (`UsesGraphicsPipelineLibrary`) too: it translates, compiles the missing library
     /// parts and fast-links on the calling thread.
-    [[nodiscard]] std::shared_ptr<GraphicsPipeline> GetGraphics(const GraphicsRequest& request,
-                                                                bool* not_ready = nullptr,
-                const std::function<void(u64)>& look_ahead = {});
+    /// `before_wait` runs on a blocking miss before waiting or compiling on this thread.
+    [[nodiscard]] std::shared_ptr<GraphicsPipeline> GetGraphics(
+        const GraphicsRequest& request, bool* not_ready = nullptr,
+        const std::function<void(u64)>& look_ahead = {},
+        const std::function<void()>& before_wait = {});
     void PrefetchGraphics(const GraphicsRequest& request, u64 current_key);
+    /// Without an oracle, prefetch only when the workers are idle and keep the result only if
+    /// translation made no texture queries.
     void PrefetchCompute(const ComputeRequest& request, u64 skip_hash);
     [[nodiscard]] std::shared_ptr<ComputePipeline> GetCompute(
         const ComputeRequest& request, bool* not_ready = nullptr,
-        const std::function<void(u64)>& look_ahead = {});
+        const std::function<void(u64)>& look_ahead = {},
+        const std::function<void()>& before_wait = {});
     /// Shader log only (call when `ShaderLog::Enabled()`): the compute program of `request` was
     /// not compiled because the replay substituted its own implementation (`reason`, e.g. the
     /// NDSR upscale stand-in). Logs the program (bytes, control) and a Fallback pipeline record

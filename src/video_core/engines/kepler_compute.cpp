@@ -23,6 +23,7 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "shader_recompiler/exception.h"
+#include "shader_recompiler/frontend/ampere/instruction.h"
 #include "core/core.h"
 #include "video_core/gpu_split.h"
 #include "video_core/nx2_debug_control.h"
@@ -837,15 +838,16 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
         }
     }
 
-    const bool emulates_tensor = EmulatesNativeTensorPrograms();
+    const auto tensor_mode = SelectDispatchTensorMode();
+    dispatch_tensor_mode = tensor_mode;
+    const auto rejection_key = std::pair{program, tensor_mode};
     // Programs the debug server rejected failed here too: retry them once it restores any.
     if (const u64 epoch = VideoCore::Nx2Debug::UnrejectEpoch(); epoch != seen_unreject_epoch) {
         seen_unreject_epoch = epoch;
         rejected_compute_programs.clear();
     }
-    if (const auto rejected = rejected_compute_programs.find(program);
+    if (const auto rejected = rejected_compute_programs.find(rejection_key);
         rejected != rejected_compute_programs.end() &&
-        rejected->second.emulates_tensor == emulates_tensor &&
         !VideoCommon::Nx2Diag::Active()) {
         diag_note("failed", rejected->second.message);
         if (dlss_chain.active) {
@@ -876,9 +878,8 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
         dispatched = false;
         const bool matrix_multiply =
             std::string_view{error.what()}.find("matrix multiply") != std::string_view::npos;
-        auto& rejected = rejected_compute_programs[program];
+        auto& rejected = rejected_compute_programs[rejection_key];
         rejected.message = error.what();
-        rejected.emulates_tensor = emulates_tensor;
         rejected.matrix_multiply = matrix_multiply;
         rejected.upscale_failures = 0;
         if (dlss_chain.active) {
@@ -945,28 +946,39 @@ VideoCore::GameDlssReason KeplerCompute::GameDlssBlocker() const {
     return GameDlssReason::None;
 }
 
-bool KeplerCompute::EmulatesNativeTensorPrograms() const {
-    if (dlss_chain.active) {
-        return dlss_chain.failure == VideoCore::GameDlssReason::None &&
-               GameDlssBlocker() == VideoCore::GameDlssReason::None;
+Shader::Ampere::TensorMode KeplerCompute::SelectDispatchTensorMode() const {
+    using Shader::Ampere::TensorMode;
+    if (!native_mode || !rasterizer) {
+        return TensorMode::Default;
     }
-    // The titles VideoCommon::LowersNativeTensorPrograms names; the compact ones only in the
-    // compact form (UsesCompactTensorPrograms). Other titles keep the upscale stand-in. Chosen per
-    // title, not per dispatch: the shader cache keeps the result of a program's first dispatch.
-    const u64 program_id = Settings::GetCurrentProgramID();
-    return (VideoCommon::LowersNativeTensorPrograms(program_id) &&
-            !VideoCommon::UsesCompactNativeTensorPrograms(program_id)) ||
-           UsesCompactTensorPrograms();
-}
-
-bool KeplerCompute::UsesCompactTensorPrograms() const {
-    // Ocarina of Time draws its final image through an 11-program network after the tonemap. The
-    // stand-in blits the network's input instead, which leaves the frame flat and far too bright
-    // (Kokiri Forest median luma ~0.29 against ~0.10 with the network). The compact form calls a
-    // helper that shuffles across 32 lanes, so it needs compute shaders created 32 threads wide.
-    return !dlss_chain.active &&
-           VideoCommon::UsesCompactNativeTensorPrograms(Settings::GetCurrentProgramID()) &&
-           rasterizer != nullptr && rasterizer->SupportsGameDlssNetwork();
+    // Explicit diagnostics and experiment overrides use the same modes as the Ampere frontend.
+    static const TensorMode explicit_mode = [] {
+        if (const char* override = std::getenv("EDEN_NX2_TENSOR")) {
+            return Shader::Ampere::ParseTensorMode(override);
+        }
+        return TensorMode::Default;
+    }();
+    if (explicit_mode != TensorMode::Default) {
+        return explicit_mode;
+    }
+    if (dlss_chain.active &&
+        (dlss_chain.failure != VideoCore::GameDlssReason::None ||
+         GameDlssBlocker() != VideoCore::GameDlssReason::None)) {
+        return TensorMode::Disabled;
+    }
+    const auto& qmd = launch_description;
+    switch (rasterizer->NativeTensorComputeSupport(
+        {qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z})) {
+    case VideoCommon::NativeTensorLowering::Full:
+        return TensorMode::Full;
+    case VideoCommon::NativeTensorLowering::Compact:
+        return TensorMode::Compact;
+    case VideoCommon::NativeTensorLowering::Workgroup:
+        return TensorMode::Workgroup;
+    case VideoCommon::NativeTensorLowering::None:
+    default:
+        return TensorMode::Disabled;
+    }
 }
 
 // Checks the network's output against its input (on the GPU; the result arrives a few frames

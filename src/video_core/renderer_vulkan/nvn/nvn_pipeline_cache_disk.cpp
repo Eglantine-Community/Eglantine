@@ -10,12 +10,15 @@
 #include <fstream>
 #include <limits>
 #include <new>
+#include <type_traits>
 
 #include <fmt/format.h>
 
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "common/swap.h"
 #include "video_core/load_progress.h"
+#include "video_core/renderer_vulkan/nvn/nvn_debug.h"
 #include "video_core/renderer_vulkan/nvn/nvn_pipeline_impl.h"
 
 namespace Vulkan::Nvn {
@@ -105,7 +108,6 @@ void PipelineCache::Impl::PostComputePipeline(const StageArtifact& stage, const 
         .shared_memory_size = key.shared_memory_size,
         .compute_layout = pipeline.compute_layout,
     });
-    ++new_since_vk_write;
 }
 
 std::vector<u8> PipelineCache::Impl::ReadVkCacheBlob() {
@@ -154,7 +156,7 @@ std::vector<u8> PipelineCache::Impl::ReadVkCacheBlob() {
         std::memcpy(&header, data.data(), sizeof(header));
     }
     const auto properties = device.GetPhysical().GetProperties();
-    if (header.size != sizeof(header) ||
+    if (header.size != sizeof(header) || header.size > data.size() ||
         header.version != VK_PIPELINE_CACHE_HEADER_VERSION_ONE ||
         header.vendor != properties.vendorID || header.device != properties.deviceID ||
         !std::ranges::equal(header.uuid, properties.pipelineCacheUUID)) {
@@ -179,6 +181,8 @@ void PipelineCache::Impl::WriteVkCache() {
     std::vector<u8> file;
     size_t size{};
     VkResult result = VK_INCOMPLETE;
+    using Clock = std::chrono::steady_clock;
+    const auto snapshot_start = Clock::now();
     try {
         // A pipeline can grow the cache between the two queries. Keep the previous file if a
         // fresh size query still cannot capture the whole cache.
@@ -201,6 +205,7 @@ void PipelineCache::Impl::WriteVkCache() {
     if (result != VK_SUCCESS || size == 0 || size > file.size() - VK_CACHE_HEADER_SIZE) {
         return;
     }
+    const auto snapshot_end = Clock::now();
     file.resize(VK_CACHE_HEADER_SIZE + size);
     const u64 payload_size = size;
     const u32 crc = Disk::Crc32(std::span<const u8>{file}.subspan(VK_CACHE_HEADER_SIZE));
@@ -223,25 +228,72 @@ void PipelineCache::Impl::WriteVkCache() {
         saved_driver_cache = signature;
         new_since_vk_write.fetch_sub(claimed);
         LOG_INFO(Render_Vulkan, "[nvn] driver pipeline cache written: {} bytes", size);
+        if (Debug::Get().cache_log) {
+            using Ms = std::chrono::duration<double, std::milli>;
+            LOG_INFO(Render_Vulkan, "[nvn] driver pipeline cache save: snapshot {:.1f} ms, "
+                                    "checksum and write {:.1f} ms",
+                     Ms{snapshot_end - snapshot_start}.count(), Ms{Clock::now() - snapshot_end}.count());
+        }
     } else {
         LOG_ERROR(Render_Vulkan, "[nvn] driver pipeline cache {} could not be written",
                   vk_cache_path.string());
     }
 }
 
+PipelineCache::Impl::DriverCacheUse::DriverCacheUse(Impl& owner)
+    : impl{owner.vk_cache_path.empty() ? nullptr : &owner} {
+    if (impl) {
+        std::scoped_lock lock{impl->vk_cache_work_mutex};
+        ++impl->vk_cache_users;
+    }
+}
+
+PipelineCache::Impl::DriverCacheUse::~DriverCacheUse() {
+    if (impl) {
+        std::scoped_lock lock{impl->vk_cache_work_mutex};
+        impl->last_vk_cache_use = std::chrono::steady_clock::now();
+        ++impl->new_since_vk_write;
+        --impl->vk_cache_users;
+    }
+}
+
+bool PipelineCache::Impl::DriverCacheIdle() {
+    // ScarletNX's pipeline_cache_save.inc (GPL-3.0-or-later): the driver can block new
+    // pipeline creation while it copies the cache. Leave time for the current burst to finish.
+    std::scoped_lock lock{loader_mutex, async_mutex, gpl_mutex, vk_cache_work_mutex};
+    constexpr auto quiet_period = std::chrono::seconds{20};
+    return loader_done && async_outstanding == 0 && required_lookups == 0 && gpl_outstanding == 0 &&
+           vk_cache_users == 0 && std::chrono::steady_clock::now() - last_vk_cache_use >= quiet_period;
+}
+
 void PipelineCache::Impl::MaybeWriteVkCache() {
-    if (vk_cache_path.empty()) {
+    if (vk_cache_path.empty() || !DiskEnabled() || new_since_vk_write.load() == 0 ||
+        vk_write_pending.load(std::memory_order_relaxed) || vk_write_pending.exchange(true)) {
         return;
     }
+    bool queued = false;
+    SCOPE_EXIT {
+        if (!queued) {
+            vk_write_pending = false;
+        }
+    };
+    const bool quiet = Debug::Get().quiet_driver_cache;
     const auto now = std::chrono::steady_clock::now();
-    s64 last_ticks = last_vk_write_ticks.load();
-    const std::chrono::steady_clock::time_point last{
-        std::chrono::steady_clock::duration{last_ticks}};
-    if (now - last < VK_CACHE_WRITE_INTERVAL ||
-        !last_vk_write_ticks.compare_exchange_strong(last_ticks, now.time_since_epoch().count())) {
+    const auto last_ticks = last_vk_write_ticks.load();
+    const std::chrono::steady_clock::time_point last{std::chrono::steady_clock::duration{last_ticks}};
+    if ((last_ticks != 0 && now - last < VK_CACHE_WRITE_INTERVAL) ||
+        (quiet && !DriverCacheIdle())) {
         return;
     }
-    writer.Post([this] { WriteVkCache(); });
+    queued = writer.Post([this, quiet] {
+        SCOPE_EXIT { vk_write_pending = false; };
+        // Work can arrive while the writer drains portable records. Never hold the work locks
+        // while asking the driver or writing the file.
+        if (DiskEnabled() && (!quiet || DriverCacheIdle())) {
+            last_vk_write_ticks = std::chrono::steady_clock::now().time_since_epoch().count();
+            WriteVkCache();
+        }
+    });
 }
 
 void PipelineCache::Impl::NotePreloadStep() {
@@ -264,6 +316,95 @@ void PipelineCache::Impl::NotePreloadStep() {
     options.load_progress->Report(VideoCore::LoadCallbackStage::Build, done, total);
 }
 
+template <typename PendingMap, typename PipelineMap, typename Key, typename Build>
+void PipelineCache::Impl::QueuePreload(PendingMap& pending_map, PipelineMap& pipelines,
+                                      const Key& key, std::shared_ptr<PreloadVariant> variant,
+                                      Build build) {
+    constexpr bool is_graphics = std::is_same_v<Key, GraphicsKey>;
+    Debug::PipelineTrace trace;
+    if constexpr (is_graphics) {
+        if (Debug::Get().pipeline_trace) {
+            trace = Debug::BeginPipelineTrace(key.hash, "disk");
+        }
+    }
+    std::unique_lock lock{pipeline_mutex};
+    const auto it = pending_map.find(key);
+    const auto pending = it != pending_map.end() ? it->second : std::make_shared<PendingKey>();
+    pending->preload_variants.push_back(variant);
+    std::chrono::steady_clock::time_point queued;
+    try {
+        if (it == pending_map.end()) {
+            pending_map.emplace(key, pending);
+        }
+        if (trace.job != 0) {
+            queued = std::chrono::steady_clock::now();
+        }
+        workers->QueueWork([this, &pending_map, &pipelines, key, pending, variant, build, trace] {
+            const bool cancelled = stopping.load();
+            if (trace.job != 0 && !cancelled) {
+                trace.Event("compile_start");
+            }
+            auto pipeline = cancelled ? decltype(build(*variant)){} : build(*variant);
+            std::chrono::steady_clock::time_point ready;
+            {
+                std::scoped_lock pipeline_lock{pipeline_mutex};
+                if (pipeline) {
+                    auto& variants = pipelines[key];
+                    if (pipeline->log) {
+                        pipeline->log->from_disk = true;
+                        pipeline->log->variant = static_cast<u32>(variants.size());
+                    }
+                    if constexpr (is_graphics) {
+                        if (trace.job != 0) {
+                            pipeline->SetTraceIdentity(trace.key, trace.job);
+                        }
+                    }
+                    variants.push_back(pipeline);
+                    if constexpr (is_graphics) {
+                        if (trace.job != 0) {
+                            ready = std::chrono::steady_clock::now();
+                        }
+                    }
+                    ++stat_loaded;
+                }
+                if (--pending->outstanding == 0) {
+                    pending_map.erase(key);
+                }
+            }
+            {
+                std::scoped_lock pending_lock{pending->mutex};
+                variant->state =
+                    pipeline ? PreloadVariant::State::Built : PreloadVariant::State::Failed;
+            }
+            pending->cv.notify_all();
+            if constexpr (is_graphics) {
+                if (pipeline) {
+                    trace.Event("ready", "", ready);
+                } else {
+                    trace.Event(cancelled ? "cancelled" : "compile_failed",
+                                cancelled ? "stopping" : "");
+                }
+            }
+            NotePreloadStep();
+        }, variant.get());
+    } catch (...) {
+        pending->preload_variants.pop_back();
+        if (pending->outstanding == 0) {
+            pending_map.erase(key);
+        }
+        lock.unlock();
+        if (trace.job != 0) {
+            trace.Event("cancelled", "enqueue_failed");
+        }
+        throw;
+    }
+    ++pending->outstanding;
+    lock.unlock();
+    if (trace.job != 0) {
+        trace.Event("queued", "", queued);
+    }
+}
+
 void PipelineCache::Impl::PreloadGraphics(
     const Disk::GraphicsPipelineRecord& record,
     const std::unordered_map<Disk::ContentId, StageArtifact, Disk::ContentIdHash>& shaders) {
@@ -274,7 +415,7 @@ void PipelineCache::Impl::PreloadGraphics(
         return;
     }
     GraphicsKey key;
-    std::array<StageArtifact, GRAPHICS_STAGE_COUNT> artifacts;
+    auto variant = std::make_shared<PreloadVariant>();
     u32 binding_count = 0;
     for (u32 stage = 0; stage < GRAPHICS_STAGE_COUNT; ++stage) {
         if (record.shaders[stage].IsZero()) {
@@ -294,7 +435,7 @@ void PipelineCache::Impl::PreloadGraphics(
             NotePreloadStep();
             return;
         }
-        artifacts[stage] = it->second;
+        variant->stages[stage] = it->second;
         key.hashes[stage] = shader.program_hash;
         binding_count = std::max(binding_count, shader.layout.binding_count);
     }
@@ -307,54 +448,17 @@ void PipelineCache::Impl::PreloadGraphics(
     key.targets = record.targets;
     key.Finalize();
 
-    std::shared_ptr<PendingKey> pk;
-    {
-        std::scoped_lock lock{pipeline_mutex};
-        auto& slot = pending_graphics[key];
-        if (!slot) {
-            slot = std::make_shared<PendingKey>();
-        }
-        pk = slot;
-        ++pk->outstanding;
-    }
-    workers->QueueWork([this, key, pk, artifacts = std::move(artifacts), record] {
-        std::shared_ptr<GraphicsPipeline> pipeline;
-        if (!stopping.load()) {
+    QueuePreload(pending_graphics, graphics, key, std::move(variant),
+        [this, state = record.state, targets = record.targets,
+         mesh = record.emulated_mesh](const PreloadVariant& cached) {
             std::array<const StageArtifact*, GRAPHICS_STAGE_COUNT> stages{};
             for (u32 stage = 0; stage < GRAPHICS_STAGE_COUNT; ++stage) {
-                if (artifacts[stage].record) {
-                    stages[stage] = &artifacts[stage];
+                if (cached.stages[stage].record) {
+                    stages[stage] = &cached.stages[stage];
                 }
             }
-            pipeline = AssembleGraphics(record.state, record.targets, stages, {}, false,
-                                        record.emulated_mesh ? &*record.emulated_mesh : nullptr);
-        }
-        {
-            std::scoped_lock lock{pipeline_mutex};
-            if (pipeline) {
-                auto& variants = graphics[key];
-                if (pipeline->log) {
-                    pipeline->log->from_disk = true;
-                    pipeline->log->variant = static_cast<u32>(variants.size());
-                }
-                variants.push_back(pipeline);
-            }
-            if (--pk->outstanding == 0) {
-                pending_graphics.erase(key);
-            }
-        }
-        {
-            std::scoped_lock lock{pk->mutex};
-        }
-        pk->cv.notify_all();
-        if (pipeline) {
-            ++stat_loaded;
-            if (!vk_cache_path.empty()) {
-                ++new_since_vk_write;
-            }
-        }
-        NotePreloadStep();
-    });
+            return AssembleGraphics(state, targets, stages, {}, false, mesh ? &*mesh : nullptr);
+        });
 }
 
 void PipelineCache::Impl::PreloadCompute(
@@ -371,47 +475,12 @@ void PipelineCache::Impl::PreloadCompute(
     key.environment_flags = record.environment_flags;
     key.local_memory_size = record.local_memory_size;
     key.shared_memory_size = record.shared_memory_size;
-    std::shared_ptr<PendingKey> pk;
-    {
-        std::scoped_lock lock{pipeline_mutex};
-        auto& slot = pending_compute[key];
-        if (!slot) {
-            slot = std::make_shared<PendingKey>();
-        }
-        pk = slot;
-        ++pk->outstanding;
-    }
-    workers->QueueWork([this, key, pk, artifact = it->second, layout = record.compute_layout] {
-        std::shared_ptr<ComputePipeline> pipeline;
-        if (!stopping.load()) {
-            pipeline = AssembleCompute(artifact, layout);
-        }
-        {
-            std::scoped_lock lock{pipeline_mutex};
-            if (pipeline) {
-                auto& variants = compute[key];
-                if (pipeline->log) {
-                    pipeline->log->from_disk = true;
-                    pipeline->log->variant = static_cast<u32>(variants.size());
-                }
-                variants.push_back(pipeline);
-            }
-            if (--pk->outstanding == 0) {
-                pending_compute.erase(key);
-            }
-        }
-        {
-            std::scoped_lock lock{pk->mutex};
-        }
-        pk->cv.notify_all();
-        if (pipeline) {
-            ++stat_loaded;
-            if (!vk_cache_path.empty()) {
-                ++new_since_vk_write;
-            }
-        }
-        NotePreloadStep();
-    });
+    auto variant = std::make_shared<PreloadVariant>();
+    variant->stages.front() = it->second;
+    QueuePreload(pending_compute, compute, key, std::move(variant),
+        [this, layout = record.compute_layout](const PreloadVariant& cached) {
+            return AssembleCompute(cached.stages.front(), layout);
+        });
 }
 
 void PipelineCache::Impl::RunLoader(std::stop_token stop) {
@@ -433,8 +502,14 @@ void PipelineCache::Impl::RunLoader(std::stop_token stop) {
     };
     bool complete_reported = false;
     try {
+        using Clock = std::chrono::steady_clock;
+        const auto ms = [](Clock::duration elapsed) {
+            return std::chrono::duration<double, std::milli>{elapsed}.count();
+        };
+        const auto read_start = Clock::now();
         Disk::Contents contents;
         const Disk::LoadResult result = Disk::LoadFile(disk_path, disk_header, contents);
+        const auto read_done = Clock::now();
         switch (result.status) {
         case Disk::LoadStatus::Missing:
             break;
@@ -488,7 +563,8 @@ void PipelineCache::Impl::RunLoader(std::stop_token stop) {
         for (Disk::GraphicsPipelineRecord& record : contents.graphics) {
             Disk::CanonicalizeState(record.state, vertex_input_mode);
         }
-        const auto preload_start = std::chrono::steady_clock::now();
+        const auto preload_start = Clock::now();
+        auto queue_done = preload_start;
         if (options.preload && workers && !stop.stop_requested()) {
             const size_t total = contents.graphics.size() + contents.compute.size();
             if (options.load_progress != nullptr && total != 0) {
@@ -527,6 +603,7 @@ void PipelineCache::Impl::RunLoader(std::stop_token stop) {
             }
             // Every cached key is now pending: draws that missed so far may look again.
             mark_queued();
+            queue_done = Clock::now();
             workers->WaitForRequests(stop);
             if (GplEnabled() && !stop.stop_requested()) {
                 // Background: the loading screen and the loader's completion do not wait for it.
@@ -551,13 +628,21 @@ void PipelineCache::Impl::RunLoader(std::stop_token stop) {
         }
         if (!stop.stop_requested()) {
             if (result.status == Disk::LoadStatus::Loaded) {
+                const auto finished = Clock::now();
                 LOG_INFO(Render_Vulkan,
                          "[nvn] pipeline cache preload: {} shader, {} graphics, {} compute "
                          "records read, {} ms",
                          contents.shaders.size(), contents.graphics.size(), contents.compute.size(),
                          std::chrono::duration_cast<std::chrono::milliseconds>(
-                             std::chrono::steady_clock::now() - preload_start)
+                             finished - preload_start)
                              .count());
+                if (options.preload) {
+                    LOG_INFO(Render_Vulkan,
+                             "[nvn] pipeline preload stages: read {:.1f} ms, prepare records "
+                             "{:.1f} ms, queue {:.1f} ms, finish {:.1f} ms",
+                             ms(read_done - read_start), ms(preload_start - read_done),
+                             ms(queue_done - preload_start), ms(finished - queue_done));
+                }
             }
             LogCounts();
         }

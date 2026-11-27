@@ -14,9 +14,13 @@ set(FIDELITYFX_FILES
 set(GLSL_INCLUDES
     fidelityfx_fsr.frag
     ${FIDELITYFX_FILES}
+    ${CMAKE_CURRENT_SOURCE_DIR}/astc_bc.glsl
+    ${CMAKE_CURRENT_SOURCE_DIR}/astc_decode.glsl
+    ${CMAKE_CURRENT_SOURCE_DIR}/bcn_encode.glsl
 )
 
 set(SHADER_FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/astc_bc.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/astc_decoder.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/bc_encoder.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/nvn_bc_copy.comp
@@ -26,10 +30,12 @@ set(SHADER_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/blit_color_square.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/block_linear_unswizzle_2d.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_plain_unswizzle.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_msaa_depth_stencil_staging.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/blit_color_msaa.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/blit_depth.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/blit_depth_msaa.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/blit_depth_stencil_msaa.frag
+    ${CMAKE_CURRENT_SOURCE_DIR}/blit_stencil_bits_msaa.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/block_linear_unswizzle_3d.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/block_linear_unswizzle_3d_bcn.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/convert_abgr8_to_d24s8.frag
@@ -42,10 +48,12 @@ set(SHADER_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/convert_msaa_to_non_msaa.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/convert_msaa_to_non_msaa_depth.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/convert_msaa_to_non_msaa_depth_stencil.frag
+    ${CMAKE_CURRENT_SOURCE_DIR}/convert_msaa_to_non_msaa_stencil_bit.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/convert_non_msaa_to_msaa.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/convert_non_msaa_to_msaa.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/convert_non_msaa_to_msaa_depth.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/convert_non_msaa_to_msaa_depth_stencil.frag
+    ${CMAKE_CURRENT_SOURCE_DIR}/convert_non_msaa_to_msaa_stencil_bit.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/convert_s8d24_to_abgr8.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/full_screen_triangle.vert
     ${CMAKE_CURRENT_SOURCE_DIR}/fxaa.frag
@@ -54,6 +62,7 @@ set(SHADER_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/nvn_counter.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/nvn_mesh_indirect.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/nvn_quad_indirect.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/nvn_quad_indexed.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/nvn_vertex_stage.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/nvn_wb_merge.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/opengl_convert_s8d24.comp
@@ -103,6 +112,7 @@ set(SHADER_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_quad_indexed.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_turbo_mode.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_uint8.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_uint16.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_vertex_repack.comp
 
     # Snapdragon Game Super Resolution
@@ -176,6 +186,16 @@ foreach(SOURCE_FILE IN ITEMS ${SHADER_FILES})
     endif()
     # Skip compiling to SPIR-V OpenGL exclusive files
     if (NOT ${FILENAME} MATCHES "opengl.*")
+        set(SPIRV_DEPENDS)
+        if (FILENAME MATCHES "^convert_non_msaa_to_msaa.*[.]frag$")
+            set(SPIRV_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/msaa_sample_grid.glsl)
+        elseif (FILENAME STREQUAL "astc_bc.comp")
+            set(SPIRV_DEPENDS
+                ${CMAKE_CURRENT_SOURCE_DIR}/astc_bc.glsl
+                ${CMAKE_CURRENT_SOURCE_DIR}/astc_decode.glsl
+                ${CMAKE_CURRENT_SOURCE_DIR}/bcn_encode.glsl
+            )
+        endif()
         string(TOUPPER ${SHADER_NAME}_SPV SPIRV_VARIABLE_NAME)
         set(SPIRV_HEADER_FILE ${SHADER_DIR}/${SHADER_NAME}_spv.h)
         add_custom_command(
@@ -185,10 +205,23 @@ foreach(SOURCE_FILE IN ITEMS ${SHADER_FILES})
                 ${GLSLANGVALIDATOR} -V ${QUIET_FLAG} -I"${FIDELITYFX_INCLUDE_DIR}" ${GLSL_FLAGS} --variable-name ${SPIRV_VARIABLE_NAME} -o ${SPIRV_HEADER_FILE} ${SOURCE_FILE} --target-env ${SPIR_V_VERSION}
             MAIN_DEPENDENCY
                 ${SOURCE_FILE}
+            DEPENDS
+                ${SPIRV_DEPENDS}
         )
         set(SHADER_HEADERS ${SHADER_HEADERS} ${SPIRV_HEADER_FILE})
     endif()
 endforeach()
+
+set(NVN_ALIAS_WORDS_HEADER ${SHADER_DIR}/nvn_alias_transfer_words_comp_spv.h)
+set(NVN_ALIAS_TRANSFER_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/nvn_alias_transfer.comp)
+add_custom_command(
+    OUTPUT ${NVN_ALIAS_WORDS_HEADER}
+    COMMAND ${GLSLANGVALIDATOR} -V ${QUIET_FLAG} -DNVN_ALIAS_WORDS_ONLY=1
+        --variable-name NVN_ALIAS_TRANSFER_WORDS_COMP_SPV -o ${NVN_ALIAS_WORDS_HEADER}
+        ${NVN_ALIAS_TRANSFER_SOURCE} --target-env ${SPIR_V_VERSION}
+    MAIN_DEPENDENCY ${NVN_ALIAS_TRANSFER_SOURCE}
+)
+list(APPEND SHADER_HEADERS ${NVN_ALIAS_WORDS_HEADER})
 
 # Integer variants of the MSAA conversion shaders. They only differ from the float
 # source in the sampler and output types, so they are generated from it via defines.
@@ -207,6 +240,10 @@ foreach(VARIANT IN ITEMS ${SHADER_TYPE_VARIANTS})
     list(GET VARIANT_PARTS 3 VARIANT_TEXEL)
 
     set(VARIANT_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/${VARIANT_FILENAME})
+    set(VARIANT_DEPENDS)
+    if (VARIANT_FILENAME STREQUAL "convert_non_msaa_to_msaa.frag")
+        set(VARIANT_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/msaa_sample_grid.glsl)
+    endif()
     get_filename_component(VARIANT_STEM ${VARIANT_FILENAME} NAME_WE)
     get_filename_component(VARIANT_EXT ${VARIANT_FILENAME} EXT)
     string(REPLACE "." "" VARIANT_EXT ${VARIANT_EXT})
@@ -224,6 +261,8 @@ foreach(VARIANT IN ITEMS ${SHADER_TYPE_VARIANTS})
             --target-env ${SPIR_V_VERSION}
         MAIN_DEPENDENCY
             ${VARIANT_SOURCE}
+        DEPENDS
+            ${VARIANT_DEPENDS}
     )
     set(SHADER_HEADERS ${SHADER_HEADERS} ${VARIANT_HEADER_FILE})
 endforeach()

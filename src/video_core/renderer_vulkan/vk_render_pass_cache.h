@@ -21,12 +21,9 @@ struct RenderPassKey {
     std::array<VideoCore::Surface::PixelFormat, 8> color_formats;
     VideoCore::Surface::PixelFormat depth_format;
     VkSampleCountFlagBits samples;
-    bool resolve_color;
     bool resolve_depth_stencil;
     u32 color_clear_mask;
     bool depth_stencil_clear;
-    u32 color_discard_mask;
-    bool depth_stencil_discard;
 };
 
 } // namespace Vulkan
@@ -47,11 +44,8 @@ struct hash<Vulkan::RenderPassKey> {
         const u64 state = static_cast<u64>(key.depth_format) |
                           (static_cast<u64>(key.samples) << 8) |
                           (static_cast<u64>(key.color_clear_mask) << 16) |
-                          (static_cast<u64>(key.color_discard_mask) << 24) |
-                          (static_cast<u64>(key.resolve_color) << 32) |
-                          (static_cast<u64>(key.depth_stencil_clear) << 33) |
-                          (static_cast<u64>(key.resolve_depth_stencil) << 34) |
-                          (static_cast<u64>(key.depth_stencil_discard) << 35);
+                          (static_cast<u64>(key.depth_stencil_clear) << 24) |
+                          (static_cast<u64>(key.resolve_depth_stencil) << 25);
         size_t seed = 0;
         Common::HashCombine(seed, formats);
         Common::HashCombine(seed, state);

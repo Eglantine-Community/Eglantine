@@ -397,6 +397,13 @@ void RasterizerOpenGL::DrawTexture() {
     ++num_queued_commands;
 }
 
+VideoCommon::NativeTensorLowering RasterizerOpenGL::NativeTensorComputeSupport(
+    const std::array<u32, 3>& workgroup_size) const {
+    using VideoCommon::NativeTensorLowering;
+    return device.CanRunNativeTensorCompute(workgroup_size) ? NativeTensorLowering::Full
+                                                            : NativeTensorLowering::None;
+}
+
 void RasterizerOpenGL::DispatchCompute() {
     gpu_memory->FlushCaching();
     ComputePipeline* const pipeline{shader_cache.CurrentComputePipeline()};

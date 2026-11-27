@@ -5,12 +5,15 @@
 #include <array>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <iterator>
 #include <string>
 #include <tuple>
 #include <utility>
 
 #include <fmt/format.h>
 
+#include "common/frame_stats.h"
 #include "common/logging.h"
 #include "video_core/renderer_vulkan/nvn/nvn_costsplit.h"
 #include "video_core/renderer_vulkan/nvn/nvn_debug.h"
@@ -330,7 +333,25 @@ std::unique_ptr<Profiler> Profiler::Create(const Device& device, u32 mode, bool 
 Profiler::Profiler(const Device& device_, u32 mode_, double period_ns_, u64 mask_, bool quiet_,
                    CostSplit::Recorder* costsplit_)
     : device{device_}, mode{mode_}, period_ns{period_ns_}, mask{mask_}, quiet{quiet_},
-      costsplit{costsplit_}, run_start{std::chrono::steady_clock::now()}, window_start{run_start} {}
+      costsplit{costsplit_}, run_start{std::chrono::steady_clock::now()}, window_start{run_start} {
+    if (!FrameOnly() || quiet) {
+        return;
+    }
+    const char* frame_stats_path = Common::FrameStats::NvNGpuFrameStatsCsvPath();
+    if (frame_stats_path == nullptr) {
+        return;
+    }
+    std::filesystem::path path{frame_stats_path};
+    path.replace_extension(".gpu.csv");
+    frame_csv.open(path, std::ios::trunc);
+    if (frame_csv) {
+        frame_csv << "present,seq,prev_seq,gpu_busy_ms,gpu_span_ms,segments,unavailable,"
+                     "dropped_stamps\n";
+        LOG_INFO(Render_Vulkan, "[nvn] gpuprof: frame CSV {}", path.string());
+    } else {
+        LOG_ERROR(Render_Vulkan, "[nvn] gpuprof: cannot open frame CSV {}", path.string());
+    }
+}
 
 Profiler::~Profiler() = default;
 
@@ -574,22 +595,33 @@ void Profiler::Complete(Flight& flight) {
     }
     if (have_line) {
         frame_flights.push_back(line);
+        frame_last_end = line.last_end;
     }
-    if (flight.is_present && !frame_flights.empty()) {
-        // One frame: the command buffers since the previous present, this one's included.
-        double busy_ns = frame_busy_carry_ns;
-        for (const FlightLine& f : frame_flights) {
-            busy_ns += f.busy_ns;
-        }
-        const u64 first = have_frame_first ? frame_first_begin : frame_flights.front().first_begin;
-        const u64 last = frame_flights.back().last_end;
-        const double span_ns = static_cast<double>((last - first) & mask) * period_ns;
-        for (Window* w : {&window, &total}) {
-            w->frame_busy_ms.push_back(static_cast<float>(busy_ns / 1e6));
-            w->frame_span_ms.push_back(static_cast<float>(span_ns / 1e6));
-        }
+    if (frame_csv.is_open()) {
+        const u32 segments = line.kind_n[static_cast<size_t>(Kind::Segment)];
+        frame_segments += segments;
+        frame_unavailable += flight.segments_added - segments;
+        frame_dropped += flight.dropped;
     }
     if (flight.is_present) {
+        double busy_ns = frame_busy_carry_ns;
+        double span_ns = 0.0;
+        if (have_frame_first || !frame_flights.empty()) {
+            // One frame: the command buffers since the previous present, this one's included.
+            for (const FlightLine& f : frame_flights) {
+                busy_ns += f.busy_ns;
+            }
+            const u64 first =
+                have_frame_first ? frame_first_begin : frame_flights.front().first_begin;
+            span_ns = static_cast<double>((frame_last_end - first) & mask) * period_ns;
+            for (Window* w : {&window, &total}) {
+                w->frame_busy_ms.push_back(static_cast<float>(busy_ns / 1e6));
+                w->frame_span_ms.push_back(static_cast<float>(span_ns / 1e6));
+            }
+        }
+        if (frame_csv.is_open()) {
+            WriteFrameCsv(flight.seq, busy_ns, span_ns);
+        }
         if (!quiet && total.presents % 200 == 100) {
             ReportFrame();
         }
@@ -620,6 +652,7 @@ void Profiler::Complete(Flight& flight) {
 
     const auto now = std::chrono::steady_clock::now();
     if (now - window_start >= REPORT_INTERVAL) {
+        FlushFrameCsv();
         const double seconds = std::chrono::duration<double>(now - window_start).count();
         if (!quiet) {
             Report(window, "10 s window", seconds, &busy_ns_per_second);
@@ -627,6 +660,30 @@ void Profiler::Complete(Flight& flight) {
         window = {};
         busy_ns_per_second.clear();
         window_start = now;
+    }
+}
+
+void Profiler::WriteFrameCsv(u64 seq, double busy_ns, double span_ns) {
+    fmt::memory_buffer row;
+    auto out = std::back_inserter(row);
+    fmt::format_to(out, "{},{},{},", total.presents, seq, previous_present_seq);
+    if (frame_segments != 0) {
+        fmt::format_to(out, "{:.6f},{:.6f}", busy_ns / 1e6, span_ns / 1e6);
+    } else {
+        row.push_back(',');
+    }
+    fmt::format_to(out, ",{},{},{}\n", frame_segments, frame_unavailable, frame_dropped);
+    frame_csv.write(row.data(), static_cast<std::streamsize>(row.size()));
+    previous_present_seq = seq;
+    frame_segments = 0;
+    frame_unavailable = 0;
+    frame_dropped = 0;
+}
+
+void Profiler::FlushFrameCsv() {
+    if (frame_csv.is_open() && !frame_csv.flush()) {
+        LOG_ERROR(Render_Vulkan, "[nvn] gpuprof: failed to write frame CSV");
+        frame_csv.close();
     }
 }
 
@@ -660,6 +717,7 @@ void Profiler::ReportFrame() {
 }
 
 void Profiler::ReportTotals() {
+    FlushFrameCsv();
     if (costsplit) {
         costsplit->ReportRun();
     }

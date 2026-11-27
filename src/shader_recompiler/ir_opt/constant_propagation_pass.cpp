@@ -1065,9 +1065,8 @@ void ConstantPropagation(Environment& env, IR::Block& block, IR::Inst& inst) {
     case IR::Opcode::IAdd64:
         return FoldAdd<u64>(block, inst);
     case IR::Opcode::PackHalf2x16:
+        // The reverse order rounds the original f32 components to binary16.
         return FoldInverseFunc(inst, IR::Opcode::UnpackHalf2x16);
-    case IR::Opcode::UnpackHalf2x16:
-        return FoldInverseFunc(inst, IR::Opcode::PackHalf2x16);
     case IR::Opcode::PackFloat2x16:
         return FoldInverseFunc(inst, IR::Opcode::UnpackFloat2x16);
     case IR::Opcode::UnpackFloat2x16:

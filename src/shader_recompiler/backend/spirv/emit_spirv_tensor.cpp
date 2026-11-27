@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
+#include <iterator>
 #include <optional>
 #include <vector>
 
@@ -17,6 +19,94 @@ namespace Shader::Backend::SPIRV {
 namespace {
 
 constexpr u32 GUEST_WARP_LANES = 32;
+
+struct WarpScratch {
+    Id words;
+    Id pointer;
+    u32 threads;
+
+    Id At(EmitContext& ctx, Id lane, Id word) const {
+        const Id index{ctx.OpIAdd(ctx.U32[1], lane,
+                                 ctx.OpIMul(ctx.U32[1], word, ctx.Const(threads)))};
+        if (ctx.uses_explicit_workgroup_layout) {
+            return ctx.OpAccessChain(pointer, words, ctx.Const(1u), index);
+        }
+        return ctx.OpAccessChain(pointer, words, index);
+    }
+};
+
+bool HasSingleWorkgroupPath(const IR::Program& program) {
+    using Type = IR::AbstractSyntaxNode::Type;
+    const auto& syntax = program.syntax_list;
+    if (syntax.size() < 2 || syntax.back().type != Type::Return ||
+        program.info.removed_conditional_barrier) {
+        return false;
+    }
+    return std::all_of(syntax.begin(), std::prev(syntax.end()),
+                       [](const auto& node) { return node.type == Type::Block; });
+}
+
+void VerifyWorkgroupWarpProgram(const IR::Program& program) {
+    if (program.stage != Stage::Compute || !HasSingleWorkgroupPath(program)) {
+        throw NotImplementedException("Guest warp scratch requires convergent straight-line compute");
+    }
+    for (const auto* block : program.blocks) {
+        for (const auto& inst : block->Instructions()) {
+            switch (inst.GetOpcode()) {
+            case IR::Opcode::DemoteToHelperInvocation:
+            case IR::Opcode::QuadBroadcast:
+            case IR::Opcode::QuadSwap:
+            case IR::Opcode::FSwizzleAdd:
+                throw NotImplementedException("Unsupported collective in guest warp scratch mode");
+            default:
+                break;
+            }
+        }
+    }
+}
+
+WarpScratch DefineWarpScratch(EmitContext& ctx, const IR::Program& program, u32 words_per_thread,
+                              u32 budget, const char* name, bool requires_complete_warps) {
+    const auto [x, y, z] = program.workgroup_size;
+    const u32 max_threads = budget / (words_per_thread * sizeof(u32));
+    if (x == 0 || y == 0 || z == 0 || x > max_threads / y / z) {
+        throw NotImplementedException("Guest warp scratch exceeds the shared memory limit");
+    }
+    const u32 threads = x * y * z;
+    if (requires_complete_warps && threads % GUEST_WARP_LANES != 0) {
+        throw NotImplementedException("Workgroup HMMA requires complete guest warps");
+    }
+    const u64 alignment = ctx.uses_explicit_workgroup_layout ? 16 : 4;
+    const u64 guest_bytes = (u64{program.shared_memory_size} + alignment - 1) & ~(alignment - 1);
+    const u64 scratch_offset = ctx.uses_explicit_workgroup_layout ? (std::max)(guest_bytes, alignment) : 0;
+    if ((std::max)(guest_bytes, scratch_offset) + u64{threads} * words_per_thread * sizeof(u32) > budget) {
+        throw NotImplementedException("Guest warp scratch exceeds the shared memory limit");
+    }
+    const Id u32_type = ctx.U32[1];
+    const Id array = ctx.TypeArray(u32_type, ctx.Const(threads * words_per_thread));
+    Id type = array;
+    const bool explicit_layout = ctx.uses_explicit_workgroup_layout;
+    if (explicit_layout) {
+        ctx.AddExtension("SPV_KHR_workgroup_memory_explicit_layout");
+        ctx.AddCapability(spv::Capability::WorkgroupMemoryExplicitLayoutKHR);
+        ctx.Decorate(array, spv::Decoration::ArrayStride, 4u);
+        // An unused first member makes this type distinct from the guest shared blocks.
+        type = ctx.TypeStruct(u32_type, array);
+        ctx.Decorate(type, spv::Decoration::Block);
+        ctx.MemberDecorate(type, 0, spv::Decoration::Offset, 0u);
+        ctx.MemberDecorate(type, 1, spv::Decoration::Offset, static_cast<u32>(scratch_offset));
+    }
+    const Id words = ctx.AddGlobalVariable(ctx.TypePointer(spv::StorageClass::Workgroup, type),
+                                          spv::StorageClass::Workgroup);
+    if (explicit_layout) {
+        ctx.Decorate(words, spv::Decoration::Aliased);
+    }
+    if (ctx.profile.supported_spirv >= 0x00010400) {
+        ctx.interfaces.push_back(words);
+    }
+    ctx.Name(words, name);
+    return {words, ctx.TypePointer(spv::StorageClass::Workgroup, u32_type), threads};
+}
 
 // A cooperative matrix needs its whole subgroup: every row of the workgroup fills whole warps and
 // the pipeline is created with full subgroups. Cooperative matrices also need the Vulkan memory
@@ -101,11 +191,16 @@ Id EmitCooperativeHmma(Sirit::Module& module, const CooperativeHmmaTypes& types,
 } // Anonymous namespace
 
 void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program) {
-    const bool cooperative{ctx.profile.support_cooperative_hmma && SupportsCooperativeHmma(program)};
+    const u32 workgroup_budget = ctx.runtime_info.warp_scratch_memory_limit;
+    const bool cooperative{workgroup_budget == 0 && ctx.profile.support_cooperative_hmma &&
+                           SupportsCooperativeHmma(program)};
     std::array<bool, 2> needed{};
     for (const auto* block : program.blocks) {
         for (const auto& inst : block->Instructions()) {
             if (inst.GetOpcode() != IR::Opcode::TensorMulAdd || inst.Flags<u32>() == 0) continue;
+            if (ctx.HasScalarWarp()) {
+                throw NotImplementedException("HMMA requires a complete guest warp");
+            }
             const u32 depth = inst.Flags<u32>();
             if (depth != 8 && depth != 16) throw LogicError("Invalid software HMMA depth");
             if (depth == 16 && cooperative) {
@@ -118,13 +213,31 @@ void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program)
             needed[depth == 16] = true;
         }
     }
+    std::optional<WarpScratch> scratch;
+    if (workgroup_budget != 0 && !ctx.HasScalarWarp()) {
+        const bool matrix = needed[0] || needed[1];
+        VerifyWorkgroupWarpProgram(program);
+        if (matrix) {
+            scratch = DefineWarpScratch(ctx, program, needed[1] ? 6 : 3, workgroup_budget,
+                                        "hmma_scratch", true);
+        }
+        if (program.info.UsesWarpCollectives()) {
+            const auto warp_scratch = scratch ? *scratch :
+                DefineWarpScratch(ctx, program, 1, workgroup_budget, "guest_warp_scratch", false);
+            ctx.workgroup_warp_scratch = warp_scratch.words;
+            ctx.workgroup_warp_threads = warp_scratch.threads;
+        }
+    }
     for (u32 variant = 0; variant < 2; ++variant) {
         if (!needed[variant]) continue;
-        ctx.AddCapability(spv::Capability::GroupNonUniform);
-        ctx.AddCapability(spv::Capability::GroupNonUniformShuffle);
-        if (!ctx.SupportsSubgroups() ||
-            ctx.profile.has_broken_spirv_subgroup_shuffle)
-            throw NotImplementedException("Software HMMA requires subgroup shuffle support");
+        if (!scratch) {
+            ctx.AddCapability(spv::Capability::GroupNonUniform);
+            ctx.AddCapability(spv::Capability::GroupNonUniformShuffle);
+            if (!ctx.SupportsSubgroups() || !ctx.profile.support_shuffle ||
+                ctx.profile.has_broken_spirv_subgroup_shuffle) {
+                throw NotImplementedException("Software HMMA requires subgroup shuffle support");
+            }
+        }
         const Id u32ty = ctx.U32[1], f32ty = ctx.F32[1];
         const auto imm = [&](u32 v) { return ctx.Const(v); };
         const auto add = [&](Id a, Id b) { return ctx.OpIAdd(u32ty, a, b); };
@@ -175,7 +288,20 @@ void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program)
                 ctx.OpStore(accumulators[row * 2 + col], ctx.OpCompositeExtract(f32ty, c, col));
         }
         ctx.OpStore(counter, imm(0));
-        const Id lane = ctx.OpLoad(u32ty, ctx.subgroup_local_invocation_id);
+        const Id lane = ctx.OpLoad(u32ty, scratch ? ctx.local_invocation_index
+                                                 : ctx.subgroup_local_invocation_id);
+        if (scratch) {
+            ctx.OpStore(scratch->At(ctx, lane, imm(0)), inputs[0]);
+            ctx.OpStore(scratch->At(ctx, lane, imm(1)), inputs[1]);
+            ctx.OpStore(scratch->At(ctx, lane, imm(2)), inputs[4]);
+            if (variant == 1) {
+                ctx.OpStore(scratch->At(ctx, lane, imm(3)), inputs[2]);
+                ctx.OpStore(scratch->At(ctx, lane, imm(4)), inputs[3]);
+                ctx.OpStore(scratch->At(ctx, lane, imm(5)), inputs[5]);
+            }
+            // Every invocation publishes its own fragment before any invocation reads it.
+            EmitBarrier(ctx);
+        }
         const Id warp_base = and_(lane, ~31U);
         const Id row_base = and_(lane, 28);
         const Id col_base = ctx.OpShiftLeftLogical(u32ty, and_(lane, 3), imm(3));
@@ -183,17 +309,22 @@ void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program)
         const Id b_base = add(warp_base, col_base);
         // Unrolling a K=8 group lets its shuffles overlap, which latency-bound small dispatches
         // need; unrolling all of K=16 raises register pressure and slows large dispatches.
-        const auto emit_group = [&](auto pick) {
+        const auto emit_group = [&](Id group, auto pick) {
+            const Id first_word = scratch ? ctx.OpIMul(u32ty, group, imm(3)) : Id{};
+            const auto read = [&](Id from, u32 word, Id low, Id high) {
+                if (scratch) {
+                    return ctx.OpLoad(u32ty, scratch->At(ctx, from, add(first_word, imm(word))));
+                }
+                return ctx.OpGroupNonUniformShuffle(u32ty, imm(3), pick(low, high), from);
+            };
             for (u32 component = 0; component < 4; ++component) {
-                const Id b = pick(inputs[4], inputs[5]);
                 std::array<Id, 2> bs;
                 for (u32 col = 0; col < 2; ++col)
-                    bs[col] = unpack(ctx.OpGroupNonUniformShuffle(
-                        u32ty, imm(3), b, add(b_base, imm(component + col * 4))));
+                    bs[col] = unpack(read(add(b_base, imm(component + col * 4)),
+                                          2, inputs[4], inputs[5]));
                 for (u32 row = 0; row < 2; ++row) {
-                    const Id as = unpack(ctx.OpGroupNonUniformShuffle(
-                        u32ty, imm(3), pick(inputs[row], inputs[row + 2]),
-                        add(a_base, imm(component))));
+                    const Id as = unpack(read(add(a_base, imm(component)), row,
+                                              inputs[row], inputs[row + 2]));
                     for (u32 col = 0; col < 2; ++col) {
                         Id value = ctx.OpLoad(f32ty, accumulators[row * 2 + col]);
                         for (u32 half = 0; half < 2; ++half) {
@@ -205,12 +336,12 @@ void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program)
                     }
                 }
             }
-            // HMMA.F16 rounds after each K=8 group, including the midpoint of K=16.
+            // Match inline HMMA at each K=8 boundary. PTX leaves accumulation order and rounding unspecified.
             for (const Id accumulator : accumulators)
                 ctx.OpStore(accumulator, round_half(ctx.OpLoad(f32ty, accumulator)));
         };
         if (variant == 0) {
-            emit_group([](Id low, Id) { return low; });
+            emit_group(imm(0), [](Id low, Id) { return low; });
         } else {
             const Id header = ctx.OpLabel(), body = ctx.OpLabel(), next = ctx.OpLabel(),
                      end = ctx.OpLabel();
@@ -222,12 +353,16 @@ void DefineSoftwareMatrixFunctions(EmitContext& ctx, const IR::Program& program)
             ctx.OpBranchConditional(more, body, end);
             ctx.AddLabel(body);
             const Id upper = ctx.OpIEqual(ctx.U1, group, imm(1));
-            emit_group([&](Id low, Id high) { return ctx.OpSelect(u32ty, upper, high, low); });
+            emit_group(group, [&](Id low, Id high) { return ctx.OpSelect(u32ty, upper, high, low); });
             ctx.OpBranch(next);
             ctx.AddLabel(next);
             ctx.OpStore(counter, add(group, imm(1)));
             ctx.OpBranch(header);
             ctx.AddLabel(end);
+        }
+        if (scratch) {
+            // The next HMMA may reuse the same words as soon as this helper returns.
+            EmitBarrier(ctx);
         }
         std::array<Id, 2> packed;
         for (u32 row = 0; row < 2; ++row)
@@ -245,6 +380,12 @@ Id EmitTensorMulAdd(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c) {
     }
     if (depth == 16 && ctx.cooperative_hmma) {
         return EmitCooperativeHmma(ctx, *ctx.cooperative_hmma, ctx.U32[1], ctx.U32[2], a, b, c);
+    }
+    if (ctx.workgroup_warp_payload.value) {
+        // Bank zero is shared with warp publications. Finish all reads before the helper
+        // overwrites it. Its final barrier makes the bank safe to reuse on return.
+        EmitBarrier(ctx);
+        ctx.workgroup_warp_payload = {};
     }
     return ctx.OpFunctionCall(ctx.U32[2], ctx.software_matrix_functions[depth == 16], a, b, c);
 }

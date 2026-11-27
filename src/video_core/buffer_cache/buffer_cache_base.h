@@ -150,6 +150,8 @@ public:
     BufferCacheChannelInfo& operator=(const BufferCacheChannelInfo&) = delete;
 
     Binding index_buffer;
+    boost::container::small_vector<MultiRangeSegment, 8> index_segments;
+    u32 index_buffer_first{};
     std::array<Binding, NUM_VERTEX_BUFFERS> vertex_buffers;
     std::array<std::array<Binding, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES> uniform_buffers;
     std::array<std::array<Binding, NUM_STORAGE_BUFFERS>, NUM_STAGES> storage_buffers;
@@ -172,9 +174,6 @@ public:
     std::array<u64, NUM_STAGES> written_storage_buffers{};
     u64 enabled_compute_storage_buffers = 0;
     u64 written_compute_storage_buffers = 0;
-
-    u32 total_graphics_storage_buffers = 0;
-    u32 total_compute_storage_buffers = 0;
 
     std::array<u32, NUM_STAGES> enabled_texture_buffers{};
     std::array<u32, NUM_STAGES> written_texture_buffers{};
@@ -345,7 +344,7 @@ public:
 
     void UpdateComputeBuffers();
 
-    void BindHostGeometryBuffers(bool is_indexed);
+    bool BindHostGeometryBuffers(bool is_indexed);
 
     void BindHostStageBuffers(size_t stage);
 
@@ -377,12 +376,6 @@ public:
         if (channel_state->enabled_storage_buffers[stage] == 0) {
             return;
         }
-        if constexpr (requires { runtime.ShouldLimitDynamicStorageBuffers(); }) {
-            if (runtime.ShouldLimitDynamicStorageBuffers()) {
-                channel_state->total_graphics_storage_buffers -=
-                    static_cast<u32>(std::popcount(channel_state->enabled_storage_buffers[stage]));
-            }
-        }
         channel_state->enabled_storage_buffers[stage] = 0;
         channel_state->written_storage_buffers[stage] = 0;
     }
@@ -406,12 +399,6 @@ public:
         if (channel_state->enabled_compute_storage_buffers == 0 &&
             channel_state->image_compute_texture_buffers == 0) {
             return;
-        }
-        if constexpr (requires { runtime.ShouldLimitDynamicStorageBuffers(); }) {
-            if (runtime.ShouldLimitDynamicStorageBuffers()) {
-                channel_state->total_compute_storage_buffers -=
-                    static_cast<u32>(std::popcount(channel_state->enabled_compute_storage_buffers));
-            }
         }
         channel_state->enabled_compute_storage_buffers = 0;
         channel_state->written_compute_storage_buffers = 0;
@@ -764,7 +751,7 @@ private:
 
     void SynchronizeGeometryBuffer(GeometryMemo& memo, Buffer& buffer, const Binding& binding);
 
-    void BindHostIndexBuffer();
+    bool BindHostIndexBuffer();
 
     void BindHostVertexBuffers();
 

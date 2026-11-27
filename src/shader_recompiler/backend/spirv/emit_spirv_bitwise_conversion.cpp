@@ -47,7 +47,12 @@ Id EmitUnpackFloat2x16(EmitContext& ctx, Id value) {
 }
 
 Id EmitPackHalf2x16(EmitContext& ctx, Id value) {
-    return ctx.OpPackHalf2x16(ctx.U32[1], value);
+    const Id u32_type{ctx.U32[1]};
+    const Id halves{Float32ToHalfBitsRTE(ctx, value, 2)};
+    const Id lo{ctx.OpCompositeExtract(u32_type, halves, 0)};
+    const Id hi{ctx.OpCompositeExtract(u32_type, halves, 1)};
+    return ctx.OpBitwiseOr(u32_type, lo,
+                           ctx.OpShiftLeftLogical(u32_type, hi, ctx.Const(16U)));
 }
 
 Id EmitUnpackHalf2x16(EmitContext& ctx, Id value) {

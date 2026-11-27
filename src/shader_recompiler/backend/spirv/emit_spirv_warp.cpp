@@ -12,7 +12,13 @@
 
 namespace Shader::Backend::SPIRV {
 namespace {
-Id SubgroupScope(EmitContext& ctx) {
+using spv::Capability;
+
+Id SubgroupScope(EmitContext& ctx, Capability capability) {
+    if (capability == Capability::GroupNonUniformBallot && !ctx.profile.support_ballot) {
+        throw NotImplementedException("SPIR-V subgroup operation requires BALLOT support");
+    }
+    ctx.AddCapability(capability);
     return ctx.Const(static_cast<u32>(spv::Scope::Subgroup));
 }
 
@@ -93,52 +99,145 @@ Id GuestLane(EmitContext& ctx, Id index) {
     return ctx.OpBitwiseAnd(ctx.U32[1], index, ctx.Const(31U));
 }
 
-bool UseShuffleFallback(EmitContext& ctx) {
+Id ScratchPointer(EmitContext& ctx, Id index) {
+    const Id pointer{ctx.TypePointer(spv::StorageClass::Workgroup, ctx.U32[1])};
+    if (ctx.uses_explicit_workgroup_layout) {
+        return ctx.OpAccessChain(pointer, ctx.workgroup_warp_scratch, ctx.Const(1u), index);
+    }
+    return ctx.OpAccessChain(pointer, ctx.workgroup_warp_scratch, index);
+}
+
+Id LocalWarpBase(EmitContext& ctx) {
+    const Id local{ctx.OpLoad(ctx.U32[1], ctx.local_invocation_index)};
+    return ctx.OpBitwiseAnd(ctx.U32[1], local, ctx.Const(~31u));
+}
+
+Id ActiveWarpMask(EmitContext& ctx) {
+    const u32 threads = ctx.workgroup_warp_threads;
+    const u32 tail = threads % 32;
+    if (tail == 0) {
+        return ctx.Const(~0u);
+    }
+    const Id is_tail{ctx.OpIEqual(ctx.U1, LocalWarpBase(ctx), ctx.Const(threads - tail))};
+    return ctx.OpSelect(ctx.U32[1], is_tail, ctx.Const((1u << tail) - 1), ctx.Const(~0u));
+}
+
+Id PublishWarpValue(EmitContext& ctx, Id value) {
+    const Id local{ctx.OpLoad(ctx.U32[1], ctx.local_invocation_index)};
+    // The setup pass proved a single straight-line path. Equal SSA IDs refer to the same
+    // immutable value in every invocation until another payload overwrites the scratch.
+    if (ctx.workgroup_warp_payload.value != value.value) {
+        // Wait for readers before reusing the allocation. The first publication has no readers.
+        if (ctx.workgroup_warp_payload.value) {
+            EmitBarrier(ctx);
+        }
+        ctx.OpStore(ScratchPointer(ctx, local), value);
+        EmitBarrier(ctx);
+        ctx.workgroup_warp_payload = value;
+    }
+    return ctx.OpBitwiseAnd(ctx.U32[1], local, ctx.Const(~31u));
+}
+
+Id ReadWarpValue(EmitContext& ctx, Id warp_base, Id lane) {
+    const Id local_id{ctx.OpBitwiseOr(ctx.U32[1], warp_base, GuestLane(ctx, lane))};
+    if (ctx.workgroup_warp_threads % 32 == 0) {
+        return ctx.OpLoad(ctx.U32[1], ScratchPointer(ctx, local_id));
+    }
+    const Id valid{ctx.OpULessThan(ctx.U1, local_id, ctx.Const(ctx.workgroup_warp_threads))};
+    const Id safe_id{ctx.OpSelect(ctx.U32[1], valid, local_id, warp_base)};
+    const Id word{ctx.OpLoad(ctx.U32[1], ScratchPointer(ctx, safe_id))};
+    // Inactive lanes contribute zero to ballots. Shuffle from an inactive lane has no
+    // guest-defined payload; returning zero keeps the load defined and preserves clamp flags.
+    return ctx.OpSelect(ctx.U32[1], valid, word, ctx.u32_zero_value);
+}
+
+bool HasBrokenShuffle(EmitContext& ctx) {
     return ctx.profile.has_broken_spirv_subgroup_shuffle ||
            (ctx.profile.has_broken_spirv_fragment_shuffle && ctx.stage == Stage::Fragment);
 }
 
+bool HasNativeShuffle(EmitContext& ctx) {
+    return ctx.profile.support_shuffle && !HasBrokenShuffle(ctx);
+}
+
 Id ShuffleAbsolute(EmitContext& ctx, Id value, Id src_thread_id) {
-    if (!UseShuffleFallback(ctx)) {
-        return ctx.OpGroupNonUniformShuffle(ctx.U32[1], SubgroupScope(ctx), value, src_thread_id);
+    if (HasNativeShuffle(ctx)) {
+        return ctx.OpGroupNonUniformShuffle(ctx.U32[1],
+                                            SubgroupScope(ctx, Capability::GroupNonUniformShuffle),
+                                            value, src_thread_id);
+    }
+    const Id scope{SubgroupScope(ctx, Capability::GroupNonUniformBallot)};
+    const u32 lanes{ctx.profile.max_subgroup_size};
+    if (lanes == 0 || lanes > 128) {
+        throw NotImplementedException("Invalid subgroup lane limit {} for shader shuffle", lanes);
     }
     Id result{ctx.u32_zero_value};
-    for (u32 lane = 0; lane < ctx.profile.max_subgroup_size; ++lane) {
-        const Id read{
-            ctx.OpGroupNonUniformBroadcast(ctx.U32[1], SubgroupScope(ctx), value, ctx.Const(lane))};
+    for (u32 lane = 0; lane < lanes; ++lane) {
+        const Id read{ctx.BroadcastSubgroupU32(scope, value, lane)};
         const Id matches{ctx.OpIEqual(ctx.U1, src_thread_id, ctx.Const(lane))};
         result = ctx.OpSelect(ctx.U32[1], matches, read, result);
     }
     return result;
 }
 
+Id ReadScalarWarp(EmitContext& ctx, Id value, Id lane) {
+    // An inactive source has no defined guest payload. Choosing zero never reads another lane.
+    const Id is_self{ctx.OpIEqual(ctx.U1, lane, ctx.u32_zero_value)};
+    return ctx.OpSelect(ctx.U32[1], is_self, value, ctx.u32_zero_value);
+}
+
 Id ShuffleRelative(EmitContext& ctx, Id value, Id delta, Id src_thread_id, spv::Op op) {
-    if (!ctx.profile.support_shuffle_relative || UseShuffleFallback(ctx)) {
+    if (ctx.HasScalarWarp()) {
+        return ReadScalarWarp(ctx, value, src_thread_id);
+    }
+    if (ctx.workgroup_warp_scratch.value) {
+        return ReadWarpValue(ctx, PublishWarpValue(ctx, value), src_thread_id);
+    }
+    if (!ctx.profile.support_shuffle_relative || HasBrokenShuffle(ctx)) {
         return ShuffleAbsolute(ctx, value, HostThreadId(ctx, src_thread_id));
     }
-    const Id result{ctx.OpGroupNonUniformShuffleXor(ctx.U32[1], SubgroupScope(ctx), value, delta)};
+    const Id result{ctx.OpGroupNonUniformShuffleXor(
+        ctx.U32[1], SubgroupScope(ctx, Capability::GroupNonUniformShuffleRelative), value, delta)};
     ctx.opcode_rewrites.emplace_back(result.value, op);
     return result;
 }
 
 Id BroadcastLane(EmitContext& ctx, Id value, u32 lane) {
-    Id result{
-        ctx.OpGroupNonUniformBroadcast(ctx.U32[1], SubgroupScope(ctx), value, ctx.Const(lane))};
+    if (!ctx.profile.support_ballot) {
+        return ShuffleAbsolute(ctx, value, HostThreadId(ctx, ctx.Const(lane)));
+    }
+    const Id scope{SubgroupScope(ctx, Capability::GroupNonUniformBallot)};
+    Id result{ctx.BroadcastSubgroupU32(scope, value, lane)};
     if (!ctx.profile.warp_size_potentially_larger_than_guest) {
         return result;
     }
     const Id partition_idx{ctx.OpShiftRightLogical(ctx.U32[1], GetThreadId(ctx), ctx.Const(5u))};
     for (u32 base = 32; base < ctx.profile.max_subgroup_size; base += 32) {
-        const Id read{ctx.OpGroupNonUniformBroadcast(ctx.U32[1], SubgroupScope(ctx), value,
-                                                     ctx.Const(base + lane))};
+        const Id read{ctx.BroadcastSubgroupU32(scope, value, base + lane)};
         const Id matches{ctx.OpIEqual(ctx.U1, partition_idx, ctx.Const(base >> 5))};
         result = ctx.OpSelect(ctx.U32[1], matches, read, result);
     }
     return result;
 }
+void ValidateQuadShuffles(const EmitContext& ctx) {
+    if (!ctx.SupportsSubgroups()) {
+        throw NotImplementedException("SPIR-V quad shuffle requires subgroup support in the shader stage");
+    }
+    // Ordinary subgroup operations may treat fragment helper invocations as inactive.
+    if (ctx.stage == Stage::Fragment && !ctx.SupportsQuadShuffles()) {
+        throw NotImplementedException("SPIR-V fragment quad shuffle requires native quad support");
+    }
+}
 } // Anonymous namespace
 
 Id EmitLaneId(EmitContext& ctx) {
+    if (ctx.HasScalarWarp()) {
+        return ctx.u32_zero_value;
+    }
+    if (ctx.local_invocation_index.value) {
+        const Id index{ctx.OpLoad(ctx.U32[1], ctx.local_invocation_index)};
+        return GuestLane(ctx, index);
+    }
     const Id id{GetThreadId(ctx)};
     if (!ctx.profile.warp_size_potentially_larger_than_guest) {
         return id;
@@ -147,59 +246,81 @@ Id EmitLaneId(EmitContext& ctx) {
 }
 
 Id EmitVoteAll(EmitContext& ctx, Id pred) {
-    if (!StageSupportsSubgroups(ctx)) {
+    if (ctx.workgroup_warp_scratch.value) {
+        return ctx.OpIEqual(ctx.U1, EmitSubgroupBallot(ctx, pred), ActiveWarpMask(ctx));
+    }
+    if (ctx.HasScalarWarp() || !StageSupportsSubgroups(ctx)) {
         return pred;
     }
-    if (!ctx.profile.warp_size_potentially_larger_than_guest) {
-        return ctx.OpGroupNonUniformAll(ctx.U1, SubgroupScope(ctx), pred);
+    if (!ctx.profile.warp_size_potentially_larger_than_guest && ctx.profile.support_vote) {
+        return ctx.OpGroupNonUniformAll(ctx.U1, SubgroupScope(ctx, Capability::GroupNonUniformVote),
+                                        pred);
     }
-    const Id mask_ballot{
-        ctx.OpGroupNonUniformBallot(ctx.U32[4], SubgroupScope(ctx), ctx.true_value)};
-    const Id active_mask{WarpExtract(ctx, mask_ballot)};
-    const Id ballot{
-        WarpExtract(ctx, ctx.OpGroupNonUniformBallot(ctx.U32[4], SubgroupScope(ctx), pred))};
-    const Id lhs{ctx.OpBitwiseAnd(ctx.U32[1], ballot, active_mask)};
-    return ctx.OpIEqual(ctx.U1, lhs, active_mask);
+    const Id failed{EmitSubgroupBallot(ctx, ctx.OpLogicalNot(ctx.U1, pred))};
+    return ctx.OpIEqual(ctx.U1, failed, ctx.u32_zero_value);
 }
 
 Id EmitVoteAny(EmitContext& ctx, Id pred) {
-    if (!StageSupportsSubgroups(ctx)) {
+    if (ctx.workgroup_warp_scratch.value) {
+        return ctx.OpINotEqual(ctx.U1, EmitSubgroupBallot(ctx, pred), ctx.u32_zero_value);
+    }
+    if (ctx.HasScalarWarp() || !StageSupportsSubgroups(ctx)) {
         return pred;
     }
-    if (!ctx.profile.warp_size_potentially_larger_than_guest) {
-        return ctx.OpGroupNonUniformAny(ctx.U1, SubgroupScope(ctx), pred);
+    if (!ctx.profile.warp_size_potentially_larger_than_guest && ctx.profile.support_vote) {
+        return ctx.OpGroupNonUniformAny(ctx.U1, SubgroupScope(ctx, Capability::GroupNonUniformVote),
+                                        pred);
     }
-    const Id mask_ballot{
-        ctx.OpGroupNonUniformBallot(ctx.U32[4], SubgroupScope(ctx), ctx.true_value)};
-    const Id active_mask{WarpExtract(ctx, mask_ballot)};
-    const Id ballot{
-        WarpExtract(ctx, ctx.OpGroupNonUniformBallot(ctx.U32[4], SubgroupScope(ctx), pred))};
-    const Id lhs{ctx.OpBitwiseAnd(ctx.U32[1], ballot, active_mask)};
-    return ctx.OpINotEqual(ctx.U1, lhs, ctx.u32_zero_value);
+    return ctx.OpINotEqual(ctx.U1, EmitSubgroupBallot(ctx, pred), ctx.u32_zero_value);
 }
 
 Id EmitVoteEqual(EmitContext& ctx, Id pred) {
-    if (!StageSupportsSubgroups(ctx)) {
+    if (ctx.workgroup_warp_scratch.value) {
+        const Id mask{EmitSubgroupBallot(ctx, pred)};
+        return ctx.OpLogicalOr(ctx.U1, ctx.OpIEqual(ctx.U1, mask, ctx.u32_zero_value),
+                              ctx.OpIEqual(ctx.U1, mask, ActiveWarpMask(ctx)));
+    }
+    if (ctx.HasScalarWarp() || !StageSupportsSubgroups(ctx)) {
         return ctx.true_value;
     }
-    if (!ctx.profile.warp_size_potentially_larger_than_guest) {
-        return ctx.OpGroupNonUniformAllEqual(ctx.U1, SubgroupScope(ctx), pred);
+    if (!ctx.profile.warp_size_potentially_larger_than_guest && ctx.profile.support_vote) {
+        return ctx.OpGroupNonUniformAllEqual(
+            ctx.U1, SubgroupScope(ctx, Capability::GroupNonUniformVote), pred);
     }
-    const Id mask_ballot{
-        ctx.OpGroupNonUniformBallot(ctx.U32[4], SubgroupScope(ctx), ctx.true_value)};
-    const Id active_mask{WarpExtract(ctx, mask_ballot)};
-    const Id ballot{
-        WarpExtract(ctx, ctx.OpGroupNonUniformBallot(ctx.U32[4], SubgroupScope(ctx), pred))};
-    const Id lhs{ctx.OpBitwiseXor(ctx.U32[1], ballot, active_mask)};
-    return ctx.OpLogicalOr(ctx.U1, ctx.OpIEqual(ctx.U1, lhs, ctx.u32_zero_value),
-                           ctx.OpIEqual(ctx.U1, lhs, active_mask));
+    const Id ballot{EmitSubgroupBallot(ctx, pred)};
+    const Id active{EmitSubgroupBallot(ctx, ctx.true_value)};
+    return ctx.OpLogicalOr(ctx.U1, ctx.OpIEqual(ctx.U1, ballot, ctx.u32_zero_value),
+                           ctx.OpIEqual(ctx.U1, ballot, active));
 }
 
 Id EmitSubgroupBallot(EmitContext& ctx, Id pred) {
-    if (!StageSupportsSubgroups(ctx)) {
+    if (ctx.workgroup_warp_scratch.value) {
+        if (pred.value == ctx.true_value.value) {
+            return ActiveWarpMask(ctx);
+        }
+        if (pred.value == ctx.false_value.value) {
+            return ctx.u32_zero_value;
+        }
+        if (pred.value == ctx.workgroup_warp_ballot_predicate.value) {
+            return ctx.workgroup_warp_ballot;
+        }
+        const Id lane{EmitLaneId(ctx)};
+        const Id bit{ctx.OpShiftLeftLogical(ctx.U32[1], ctx.Const(1u), lane)};
+        const Id value{ctx.OpSelect(ctx.U32[1], pred, bit, ctx.u32_zero_value)};
+        const Id warp_base{PublishWarpValue(ctx, value)};
+        Id mask{ctx.u32_zero_value};
+        for (u32 i = 0; i < 32; ++i) {
+            mask = ctx.OpBitwiseOr(ctx.U32[1], mask, ReadWarpValue(ctx, warp_base, ctx.Const(i)));
+        }
+        ctx.workgroup_warp_ballot_predicate = pred;
+        ctx.workgroup_warp_ballot = mask;
+        return mask;
+    }
+    if (ctx.HasScalarWarp() || !StageSupportsSubgroups(ctx)) {
         return ctx.OpSelect(ctx.U32[1], pred, ctx.Const(1u), ctx.u32_zero_value);
     }
-    const Id ballot{ctx.OpGroupNonUniformBallot(ctx.U32[4], SubgroupScope(ctx), pred)};
+    const Id ballot{ctx.OpGroupNonUniformBallot(
+        ctx.U32[4], SubgroupScope(ctx, Capability::GroupNonUniformBallot), pred)};
     if (!ctx.profile.warp_size_potentially_larger_than_guest) {
         return ctx.OpCompositeExtract(ctx.U32[1], ballot, 0U);
     }
@@ -207,38 +328,45 @@ Id EmitSubgroupBallot(EmitContext& ctx, Id pred) {
 }
 
 Id EmitSubgroupEqMask(EmitContext& ctx) {
-    if (!StageSupportsSubgroups(ctx)) {
-        return ctx.Const(1u);
+    if (ctx.subgroup_mask_eq.value) {
+        return LoadMask(ctx, ctx.subgroup_mask_eq);
     }
-    return LoadMask(ctx, ctx.subgroup_mask_eq);
+    return ctx.OpShiftLeftLogical(ctx.U32[1], ctx.Const(1u), EmitLaneId(ctx));
 }
 
 Id EmitSubgroupLtMask(EmitContext& ctx) {
-    if (!StageSupportsSubgroups(ctx)) {
-        return ctx.u32_zero_value;
+    if (ctx.subgroup_mask_lt.value) {
+        return LoadMask(ctx, ctx.subgroup_mask_lt);
     }
-    return LoadMask(ctx, ctx.subgroup_mask_lt);
+    return ctx.OpISub(ctx.U32[1], EmitSubgroupEqMask(ctx), ctx.Const(1u));
 }
 
 Id EmitSubgroupLeMask(EmitContext& ctx) {
-    if (!StageSupportsSubgroups(ctx)) {
-        return ctx.Const(1u);
+    if (ctx.subgroup_mask_le.value) {
+        return LoadMask(ctx, ctx.subgroup_mask_le);
     }
-    return LoadMask(ctx, ctx.subgroup_mask_le);
+    const Id greater{ctx.OpShiftLeftLogical(ctx.U32[1], ctx.Const(~1u), EmitLaneId(ctx))};
+    return ctx.OpNot(ctx.U32[1], greater);
 }
 
 Id EmitSubgroupGtMask(EmitContext& ctx) {
-    if (!StageSupportsSubgroups(ctx)) {
+    if (ctx.subgroup_mask_gt.value) {
+        return LoadMask(ctx, ctx.subgroup_mask_gt);
+    }
+    if (!ctx.HasScalarWarp() && !ctx.local_invocation_index.value && !ctx.SupportsSubgroups()) {
         return ctx.u32_zero_value;
     }
-    return LoadMask(ctx, ctx.subgroup_mask_gt);
+    return ctx.OpShiftLeftLogical(ctx.U32[1], ctx.Const(~1u), EmitLaneId(ctx));
 }
 
 Id EmitSubgroupGeMask(EmitContext& ctx) {
-    if (!StageSupportsSubgroups(ctx)) {
+    if (ctx.subgroup_mask_ge.value) {
+        return LoadMask(ctx, ctx.subgroup_mask_ge);
+    }
+    if (!ctx.HasScalarWarp() && !ctx.local_invocation_index.value && !ctx.SupportsSubgroups()) {
         return ctx.Const(1u);
     }
-    return LoadMask(ctx, ctx.subgroup_mask_ge);
+    return ctx.OpShiftLeftLogical(ctx.U32[1], ctx.Const(~0u), EmitLaneId(ctx));
 }
 
 Id EmitShuffleIndex(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id clamp,
@@ -253,6 +381,14 @@ Id EmitShuffleIndex(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id cla
     const Id in_range{ctx.OpSLessThanEqual(ctx.U1, src_thread_id, max_thread_id)};
 
     SetInBoundsFlag(inst, in_range);
+    if (ctx.workgroup_warp_scratch.value) {
+        const Id warp_base{PublishWarpValue(ctx, value)};
+        const Id shuffled{ReadWarpValue(ctx, warp_base, src_thread_id)};
+        return ctx.OpSelect(ctx.U32[1], in_range, shuffled, value);
+    }
+    if (ctx.HasScalarWarp()) {
+        return ctx.OpSelect(ctx.U32[1], in_range, ReadScalarWarp(ctx, value, src_thread_id), value);
+    }
     if (!StageSupportsSubgroups(ctx)) {
         return value;
     }
@@ -268,7 +404,8 @@ Id EmitShuffleIndex(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id cla
 
 Id EmitShuffleUp(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id clamp,
                  Id segmentation_mask) {
-    if (!StageSupportsSubgroups(ctx)) {
+    if (!ctx.HasScalarWarp() && !ctx.workgroup_warp_scratch.value &&
+        !StageSupportsSubgroups(ctx)) {
         SetInBoundsFlag(inst, ctx.false_value);
         return value;
     }
@@ -286,7 +423,8 @@ Id EmitShuffleUp(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id clamp,
 
 Id EmitShuffleDown(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id clamp,
                    Id segmentation_mask) {
-    if (!StageSupportsSubgroups(ctx)) {
+    if (!ctx.HasScalarWarp() && !ctx.workgroup_warp_scratch.value &&
+        !StageSupportsSubgroups(ctx)) {
         SetInBoundsFlag(inst, ctx.false_value);
         return value;
     }
@@ -304,7 +442,8 @@ Id EmitShuffleDown(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id clam
 
 Id EmitShuffleButterfly(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id clamp,
                         Id segmentation_mask) {
-    if (!StageSupportsSubgroups(ctx)) {
+    if (!ctx.HasScalarWarp() && !ctx.workgroup_warp_scratch.value &&
+        !StageSupportsSubgroups(ctx)) {
         SetInBoundsFlag(inst, ctx.false_value);
         return value;
     }
@@ -315,16 +454,26 @@ Id EmitShuffleButterfly(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id
     const Id in_range{ctx.OpSLessThanEqual(ctx.U1, src_thread_id, max_thread_id)};
 
     SetInBoundsFlag(inst, in_range);
-    const Id shuffled{UseShuffleFallback(ctx)
-                          ? ShuffleAbsolute(ctx, value, HostThreadId(ctx, src_thread_id))
-                          : ctx.OpGroupNonUniformShuffleXor(ctx.U32[1], SubgroupScope(ctx), value,
-                                                            mask)};
+    if (ctx.workgroup_warp_scratch.value) {
+        const Id shuffled{ReadWarpValue(ctx, PublishWarpValue(ctx, value), src_thread_id)};
+        return ctx.OpSelect(ctx.U32[1], in_range, shuffled, value);
+    }
+    if (ctx.HasScalarWarp()) {
+        return ctx.OpSelect(ctx.U32[1], in_range, ReadScalarWarp(ctx, value, src_thread_id), value);
+    }
+    const Id shuffled{
+        HasNativeShuffle(ctx)
+            ? ctx.OpGroupNonUniformShuffleXor(
+                  ctx.U32[1], SubgroupScope(ctx, Capability::GroupNonUniformShuffle), value, mask)
+            : ShuffleAbsolute(ctx, value, HostThreadId(ctx, src_thread_id))};
     return ctx.OpSelect(ctx.U32[1], in_range, shuffled, value);
 }
 
 Id EmitQuadBroadcast(EmitContext& ctx, Id value, Id lane) {
-    if (ctx.profile.support_quad_shuffles) {
-        return ctx.OpGroupNonUniformQuadBroadcast(ctx.U32[1], SubgroupScope(ctx), value, lane);
+    ValidateQuadShuffles(ctx);
+    if (ctx.SupportsQuadShuffles()) {
+        return ctx.OpGroupNonUniformQuadBroadcast(
+            ctx.U32[1], SubgroupScope(ctx, Capability::GroupNonUniformQuad), value, lane);
     }
     const Id base{ctx.OpBitwiseAnd(ctx.U32[1], GetThreadId(ctx), ctx.Const(~3u))};
     const Id local_lane{ctx.OpBitwiseAnd(ctx.U32[1], lane, ctx.Const(3u))};
@@ -333,14 +482,20 @@ Id EmitQuadBroadcast(EmitContext& ctx, Id value, Id lane) {
 }
 
 Id EmitQuadSwap(EmitContext& ctx, Id value, Id direction) {
-    if (ctx.profile.support_quad_shuffles) {
-        const Id result{
-            ctx.OpGroupNonUniformQuadBroadcast(ctx.U32[1], SubgroupScope(ctx), value, direction)};
+    ValidateQuadShuffles(ctx);
+    if (ctx.SupportsQuadShuffles()) {
+        const Id result{ctx.OpGroupNonUniformQuadBroadcast(
+            ctx.U32[1], SubgroupScope(ctx, Capability::GroupNonUniformQuad), value, direction)};
         ctx.opcode_rewrites.emplace_back(result.value, spv::Op::OpGroupNonUniformQuadSwap);
         return result;
     }
     const Id xor_mask{ctx.OpIAdd(ctx.U32[1], direction, ctx.Const(1u))};
-    return ctx.OpGroupNonUniformShuffleXor(ctx.U32[1], SubgroupScope(ctx), value, xor_mask);
+    if (HasNativeShuffle(ctx)) {
+        return ctx.OpGroupNonUniformShuffleXor(
+            ctx.U32[1], SubgroupScope(ctx, Capability::GroupNonUniformShuffle), value, xor_mask);
+    }
+    const Id lane{ctx.OpBitwiseXor(ctx.U32[1], GetThreadId(ctx), xor_mask)};
+    return ShuffleAbsolute(ctx, value, lane);
 }
 
 Id EmitFSwizzleAdd(EmitContext& ctx, Id op_a, Id op_b, Id swizzle) {

@@ -4803,16 +4803,26 @@ void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<Imag
         }
         return runtime.CopyImage(dst, src, copies);
     }
-    UNIMPLEMENTED_IF(dst.info.type != ImageType::e2D);
-    UNIMPLEMENTED_IF(src.info.type != ImageType::e2D);
     if (runtime.ShouldReinterpret(dst, src)) {
         return runtime.ReinterpretImage(dst, src, copies);
     }
+    if constexpr (requires { runtime.CanConvertImageWithShader(dst, src); }) {
+        if (!runtime.CanConvertImageWithShader(dst, src)) {
+            LOG_WARNING(HW_GPU, "No shader image conversion from {} to {}", src.info.format,
+                        dst.info.format);
+            return;
+        }
+    }
+    if (dst.info.type != ImageType::e2D || src.info.type != ImageType::e2D) {
+        LOG_WARNING(HW_GPU, "Shader image conversion requires two 2D images");
+        return;
+    }
     for (const ImageCopy& copy : copies) {
-        UNIMPLEMENTED_IF(copy.dst_subresource.num_layers != 1);
-        UNIMPLEMENTED_IF(copy.src_subresource.num_layers != 1);
-        UNIMPLEMENTED_IF(copy.src_offset != Offset3D{});
-        UNIMPLEMENTED_IF(copy.dst_offset != Offset3D{});
+        if (copy.dst_subresource.num_layers != 1 || copy.src_subresource.num_layers != 1 ||
+            copy.src_offset != Offset3D{} || copy.dst_offset != Offset3D{}) {
+            LOG_WARNING(HW_GPU, "Shader image conversion requires one origin-aligned subresource");
+            continue;
+        }
 
         const SubresourceBase dst_base{
             .level = copy.dst_subresource.base_level,
@@ -4839,7 +4849,7 @@ void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<Imag
         const ImageViewId src_view_id = FindOrEmplaceImageView(src_id, src_view_info);
         ImageView& dst_view = slot_image_views[dst_view_id];
         ImageView& src_view = slot_image_views[src_view_id];
-        [[maybe_unused]] const Extent3D expected_size{
+        const Extent3D expected_size{
             .width = (std::min)(dst_view.size.width, src_view.size.width),
             .height = (std::min)(dst_view.size.height, src_view.size.height),
             .depth = (std::min)(dst_view.size.depth, src_view.size.depth),
@@ -4855,7 +4865,10 @@ void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<Imag
                 .depth = expected_size.depth,
             };
         }();
-        UNIMPLEMENTED_IF(copy.extent != scaled_extent);
+        if (copy.extent != scaled_extent) {
+            LOG_WARNING(HW_GPU, "Shader image conversion requires a whole-subresource extent");
+            continue;
+        }
 
         runtime.ConvertImage(dst_framebuffer, dst_view, src_view);
     }

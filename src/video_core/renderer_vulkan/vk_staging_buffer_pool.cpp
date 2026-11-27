@@ -8,6 +8,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <bit>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -128,11 +130,54 @@ void StagingBufferPool::EnsureStreamBuffer() {
     ASSERT_MSG(!stream_pointer.empty(), "Stream buffer must be host visible!");
 }
 
+VkDeviceSize StagingAllocationLimit(const Device& device) {
+    const auto physical = device.GetPhysical();
+    const u32 version = (std::min)(physical.GetProperties().apiVersion, vk::ApplicationApiVersion);
+    VkPhysicalDeviceMaintenance3Properties allocation{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES,
+    };
+    VkPhysicalDeviceMaintenance4Properties buffer{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_PROPERTIES,
+    };
+    VkPhysicalDeviceProperties2 properties{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    if (version >= VK_API_VERSION_1_3 || device.IsKhrMaintenance4Supported()) {
+        properties.pNext = &buffer;
+    }
+    if (version >= VK_API_VERSION_1_1 || device.IsKhrMaintenance3Supported()) {
+        allocation.pNext = properties.pNext;
+        properties.pNext = &allocation;
+    }
+    if (properties.pNext) {
+        physical.GetProperties2(properties);
+    }
+    u64 limit = allocation.maxMemoryAllocationSize != 0 ? allocation.maxMemoryAllocationSize
+                                                        : u64{1} << 30;
+    if (buffer.maxBufferSize != 0) {
+        limit = (std::min)(limit, buffer.maxBufferSize);
+    }
+    // The staging pool rounds buffers up to a power of two and takes a u32 byte count.
+    const u64 host_size_limit = std::bit_floor(u64{(std::numeric_limits<size_t>::max)()});
+    return (std::min)({std::bit_floor(limit), u64{(std::numeric_limits<u32>::max)()}, host_size_limit});
+}
+
 StagingBufferRef StagingBufferPool::Request(size_t size, MemoryUsage usage, bool deferred) {
     if (!deferred && usage == MemoryUsage::Upload && size <= region_size) {
         return GetStreamBuffer(size);
     }
     return GetStagingBuffer(size, usage, deferred);
+}
+
+void StagingBufferPool::FlushDeferredUpload(const StagingBufferRef& ref) {
+    ASSERT(ref.usage == MemoryUsage::Upload);
+    auto& entries = GetCache(ref.usage)[ref.log2_level].entries;
+    auto it = std::lower_bound(entries.begin(), entries.end(), ref.index,
+                               [](const StagingBuffer& entry, u64 index) {
+                                   return entry.index < index;
+                               });
+    ASSERT(it != entries.end() && it->index == ref.index && it->deferred);
+    // This is a dedicated, pinned allocation, so VMA may round the whole flush to atom bounds
+    // without including a different in-flight region of the shared upload ring.
+    it->buffer.Flush();
 }
 
 void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {

@@ -7,6 +7,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdlib>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <unordered_set>
@@ -24,6 +25,30 @@ std::function<u64()> tick_source;
 std::mutex guest_clock_mutex;
 std::function<u64()> guest_clock;
 std::atomic<int> mode_override{-1};
+
+constexpr s64 SaturatingDifference(s64 a, s64 b) {
+    constexpr s64 low = std::numeric_limits<s64>::min();
+    constexpr s64 high = std::numeric_limits<s64>::max();
+    if (b > 0 && a < low + b) {
+        return low;
+    }
+    if (b < 0 && a > high + b) {
+        return high;
+    }
+    return a - b;
+}
+
+constexpr s64 SaturatingSum(s64 a, s64 b) {
+    constexpr s64 low = std::numeric_limits<s64>::min();
+    constexpr s64 high = std::numeric_limits<s64>::max();
+    if (b < 0 && a < low - b) {
+        return low;
+    }
+    if (b > 0 && a > high - b) {
+        return high;
+    }
+    return a + b;
+}
 
 } // namespace
 
@@ -80,24 +105,24 @@ void SetTimestampModeOverride(std::optional<TimestampMode> mode) {
 }
 
 s64 GpuClockMap::Map(s64 gpu_ns, s64 now_ns) {
-    const s64 candidate = now_ns - gpu_ns;
+    const s64 candidate = SaturatingDifference(now_ns, gpu_ns);
     if (policy == Policy::Global) {
         if (!started || candidate < offset) {
             started = true;
             offset = candidate;
         }
-        return gpu_ns + offset;
+        return (std::min)(now_ns, SaturatingSum(gpu_ns, offset));
     }
     if (!started) {
         started = true;
         bucket_start = now_ns;
         current_min = candidate;
-    } else if (now_ns - bucket_start >= 2 * WindowNs) {
+    } else if (SaturatingDifference(now_ns, bucket_start) >= 2 * WindowNs) {
         // Nothing was read for two windows: both buckets are stale.
         has_previous = false;
         bucket_start = now_ns;
         current_min = candidate;
-    } else if (now_ns - bucket_start >= WindowNs) {
+    } else if (SaturatingDifference(now_ns, bucket_start) >= WindowNs) {
         previous_min = current_min;
         has_previous = true;
         bucket_start = now_ns;
@@ -106,7 +131,7 @@ s64 GpuClockMap::Map(s64 gpu_ns, s64 now_ns) {
         current_min = std::min(current_min, candidate);
     }
     offset = has_previous ? std::min(current_min, previous_min) : current_min;
-    return gpu_ns + offset;
+    return (std::min)(now_ns, SaturatingSum(gpu_ns, offset));
 }
 
 GpuClockMap::Policy GpuClockMap::PolicyFromEnvironment() {

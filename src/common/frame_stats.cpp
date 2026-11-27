@@ -42,6 +42,7 @@ struct State {
     std::array<u64, CauseCount> window_ns{};     // cause time over the whole window
     u64 lost_33_us{};                            // sum of (dt - 16.7 ms) over frames above 33 ms
     std::ofstream csv;
+    bool csv_has_seq{};
 };
 
 State& GetState() {
@@ -112,7 +113,17 @@ const bool g_enabled = Env() != nullptr;
 std::array<std::atomic<u64>, CauseCount> g_stall_ns{};
 } // namespace Detail
 
-void OnPresent(std::chrono::steady_clock::time_point now) {
+const char* NvNGpuFrameStatsCsvPath() {
+    const char* path = Env();
+    const char* mode = std::getenv("EDEN_NX2_NVN_GPU_PROFILE");
+    if (path == nullptr || std::strcmp(path, "1") == 0 || mode == nullptr ||
+        std::strcmp(mode, "frame") != 0) {
+        return nullptr;
+    }
+    return path;
+}
+
+void OnPresent(std::chrono::steady_clock::time_point now, u64 seq) {
     Detail::g_present_count.fetch_add(1, std::memory_order_relaxed);
     if (!Detail::g_enabled) {
         return;
@@ -133,9 +144,13 @@ void OnPresent(std::chrono::steady_clock::time_point now) {
         if (env != nullptr && std::strcmp(env, "1") != 0) {
             state.csv.open(env, std::ios::trunc);
             if (state.csv) {
+                state.csv_has_seq = seq != 0 && NvNGpuFrameStatsCsvPath() != nullptr;
                 state.csv << "present,t_ms,dt_us";
                 for (const char* name : CauseNames) {
                     state.csv << ',' << name;
+                }
+                if (state.csv_has_seq) {
+                    state.csv << ",seq";
                 }
                 state.csv << '\n';
             } else {
@@ -168,6 +183,9 @@ void OnPresent(std::chrono::steady_clock::time_point now) {
                   << ',' << dt_us;
         for (size_t i = 0; i < CauseCount; ++i) {
             state.csv << ',' << delta[i] / 1000;
+        }
+        if (state.csv_has_seq) {
+            state.csv << ',' << seq;
         }
         state.csv << '\n';
     }

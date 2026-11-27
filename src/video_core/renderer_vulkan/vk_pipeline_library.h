@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <array>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -17,15 +19,20 @@ namespace Vulkan {
 
 class Device;
 
+struct LibraryPartDynamicState {
+    std::array<VkDynamicState, 64> states;
+    VkPipelineDynamicStateCreateInfo info;
+};
+
 /// The create info of the library part named by `library_info.flags` (one subset): `ci`, a
 /// complete monolithic create info, reduced to the state of that subset, with `stages` as its
-/// stages. Points into `ci`, `library_info` and `stages`. The vertex input interface part never
+/// stages. Points into `ci`, `library_info`, `stages` and `dynamic`. The vertex input part never
 /// has null vertex input or input assembly state, even when `ci` has none (mesh pipelines).
 /// Public for the tests; GraphicsPipelineLibraryCache::Link is the user.
 [[nodiscard]] VkGraphicsPipelineCreateInfo MakeLibraryPartCreateInfo(
     const VkGraphicsPipelineCreateInfo& ci,
     const VkGraphicsPipelineLibraryCreateInfoEXT& library_info,
-    std::span<const VkPipelineShaderStageCreateInfo> stages);
+    std::span<const VkPipelineShaderStageCreateInfo> stages, LibraryPartDynamicState& dynamic);
 
 /// Builds graphics pipelines with VK_EXT_graphics_pipeline_library: from four parts compiled
 /// separately ("libraries") instead of one monolithic compile.
@@ -46,17 +53,23 @@ class Device;
 /// Thread safe. A thread that needs a part another thread is compiling waits for it.
 class GraphicsPipelineLibraryCache {
 public:
-    explicit GraphicsPipelineLibraryCache(const Device& device);
+    using ShaderPartFactory =
+        std::function<vk::Pipeline(const VkGraphicsPipelineCreateInfo& part)>;
+    explicit GraphicsPipelineLibraryCache(const Device& device, ShaderPartFactory shader_part = {});
     ~GraphicsPipelineLibraryCache();
 
     GraphicsPipelineLibraryCache(const GraphicsPipelineLibraryCache&) = delete;
     GraphicsPipelineLibraryCache& operator=(const GraphicsPipelineLibraryCache&) = delete;
 
+    struct ShaderObjects {
+        std::shared_ptr<const void> modules;
+        std::shared_ptr<const void> layout;
+    };
+
     /// Builds the pipeline that `ci`, a complete monolithic create info, describes by
     /// fast-linking libraries, compiling the parts not cached yet (none with
-    /// `cached_parts_only`). `shaders` owns the shader modules `ci` names and stands for its
-    /// pipeline layout: its address is in the keys of the shader parts, and the cache keeps it
-    /// alive with the parts compiled from it. With `part_workers`, parts that are not cached are
+    /// `cached_parts_only`). The handles of the modules and layout in the shader parts' keys
+    /// remain valid through `shader_objects`. With `part_workers`, parts that are not cached are
     /// compiled side by side on those threads and the calling thread (it returns once all are
     /// done); the workers must not be busy with other long jobs.
     ///
@@ -66,7 +79,7 @@ public:
     /// driver fails.
     [[nodiscard]] vk::Pipeline Link(const VkGraphicsPipelineCreateInfo& ci,
                                     VkPipelineCache pipeline_cache,
-                                    const std::shared_ptr<const void>& shaders,
+                                    const ShaderObjects& shader_objects,
                                     bool cached_parts_only,
                                     Common::ThreadWorker* part_workers = nullptr);
 
@@ -87,12 +100,13 @@ private:
     /// Returns the part `part_ci` creates, compiling it if it is not cached.
     VkPipeline GetLibrary(Key key, const VkGraphicsPipelineCreateInfo& part_ci,
                           VkPipelineCache pipeline_cache,
-                          const std::shared_ptr<const void>& shaders);
+                          const ShaderObjects& shader_objects);
 
     /// Returns the part if it is compiled already, else a null handle.
     VkPipeline FindLibrary(const Key& key);
 
     const Device& device;
+    ShaderPartFactory shader_part;
     std::mutex mutex;
     std::unordered_map<Key, std::shared_ptr<Library>, KeyHash> libraries;
 };

@@ -111,8 +111,8 @@ struct ContextOptions {
     /// ends (needs the host query reset). When false a query spans whole passes and every report
     /// ends the pass. The renderer's context takes the nvn_in_pass_queries setting (on).
     bool in_pass_queries{false};
-    /// Early submission of a long submission's recorded part (EDEN_NX2_NVN_EARLY_SUBMIT_US). Tests
-    /// that count render passes turn it off: a piece ends the open pass after a recording time.
+    /// Send recorded work to the GPU during long submissions or before a pipeline wait
+    /// (EDEN_NX2_NVN_EARLY_SUBMIT_US). Tests that count render passes turn it off.
     bool early_submit{true};
     /// Test hook: every queue submission with a sequence number from this on reports
     /// VK_ERROR_DEVICE_LOST (the real submission has already run), exercising the loss handling.
@@ -168,6 +168,12 @@ struct ContextOptions {
     std::optional<u64> storage_cache_budget_bytes{};
     /// Override the device-local sparse page limit.
     std::optional<u64> sparse_device_budget_bytes{};
+    /// Queue-side sparse synchronization for MKW. Unset: EDEN_NX2_NVN_GPU_SPARSE_WAIT.
+    std::optional<bool> gpu_sparse_wait{};
+    /// Partial residency for fallback pool mirrors. Unset: EDEN_NX2_NVN_SPARSE_BUFFER_MIRRORS.
+    std::optional<bool> sparse_buffer_mirrors{};
+    /// Experimental full-tile ASTC to BC3 conversion. Unset: EDEN_NX2_NVN_SPARSE_ASTC_BC3.
+    std::optional<bool> sparse_astc_bc3{};
     /// Presents after which an idle render target that can be rebuilt leaves the cache even under
     /// the budget (0: never). Unset: EDEN_NX2_NVN_TRIM_AGE_PRESENTS, else 0 (off: the age rule dropped GPU-written lighting targets in OoT).
     std::optional<u64> storage_trim_age_presents{};
@@ -204,6 +210,7 @@ struct ContextStats {
     u64 mirror_pages_hashed{};          ///< guest pages compared with what the mirror holds
     u64 mirror_pages_trusted{};         ///< ... not compared: the page tracker saw no write
     u64 staging_chunks_reused{};
+    u64 staging_chunks_allocated{};
     u64 mirror_pages_gpu_owned{};       ///< ... not compared: pending GPU writes own the page
     // Pool mirrors (EDEN_NX2_NVN_POOL_MIRROR; Context::Impl::AtomicStats vram_* for the meaning).
     u64 vram_mirrors{};
@@ -259,7 +266,11 @@ struct ContextStats {
     u64 virtual_maps{};
     u64 virtual_unresolved{};
     u64 virtual_sparse_binds{};
+    u64 virtual_sparse_queued_batches{};
+    u64 sparse_buffer_bound_bytes{};
+    u64 sparse_buffer_mirrors{};
     u64 sparse_write_pool_checks{};
+    u64 sparse_astc_bc3_tiles{};
     u64 driver_bank_uploads{};
     u64 handle_bank_uploads{};
     u64 pipeline_state_reuses{};
@@ -267,6 +278,7 @@ struct ContextStats {
     u64 ops_unsupported{};
     u64 ops_failed{};
     u64 submissions{};
+    u64 pipeline_wait_submits{};
     u64 presents{};
     u64 held_back_submissions{}; ///< Submissions that waited for a sync nobody had fenced yet.
     u64 parked_timeouts{};       ///< Submissions run without a wait whose fence was never submitted.

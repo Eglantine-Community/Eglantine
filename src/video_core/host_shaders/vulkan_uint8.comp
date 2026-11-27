@@ -1,30 +1,38 @@
 // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#version 460 core
-#extension GL_EXT_shader_16bit_storage : require
-#extension GL_EXT_shader_8bit_storage : require
+#version 450 core
 
-layout (local_size_x = 1024) in;
+layout(local_size_x = 128) in;
 
-layout (std430, set = 0, binding = 0) readonly buffer InputBuffer {
-    uint8_t input_indexes[];
+layout(std430, set = 0, binding = 0) readonly buffer InputBuffer {
+    uint input_words[];
 };
 
-layout (std430, set = 0, binding = 1) writeonly buffer OutputBuffer {
-    uint16_t output_indexes[];
+layout(std430, set = 0, binding = 1) writeonly buffer OutputBuffer {
+    uint output_words[];
 };
 
-uint AssembleIndex(uint id) {
-    // Most primitive restart indices are 0xFF
-    // Hardcode this to 0xFF for now
-    uint index = uint(input_indexes[id]);
-    return index == 0xFF ? 0xFFFF : index;
+layout(push_constant) uniform PushConstants {
+    uint index_count;
+    uint restart_index;
+};
+
+uint WidenIndex(uint index) {
+    return index == restart_index ? 0xffff : index;
 }
 
 void main() {
-    uint id = gl_GlobalInvocationID.x;
-    if (id < input_indexes.length()) {
-        output_indexes[id] = uint16_t(AssembleIndex(id));
+    uint count = index_count / 2 + index_count % 2;
+    uint step = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    // Each invocation owns one output word. The host can cap the grid to device limits.
+    for (uint word = gl_GlobalInvocationID.x; word < count; word += step) {
+        uint input_pair = input_words[word / 2] >> ((word % 2) * 16);
+        uint packed = WidenIndex(input_pair & 0xff);
+        if (word * 2 + 1 < index_count) {
+            packed |= WidenIndex((input_pair >> 8) & 0xff) << 16;
+        }
+        output_words[word] = packed;
+        if (step >= count - word) break;
     }
 }

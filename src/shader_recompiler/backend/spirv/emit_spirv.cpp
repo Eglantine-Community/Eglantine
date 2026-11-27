@@ -19,6 +19,7 @@
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "shader_recompiler/frontend/ir/basic_block.h"
+#include "shader_recompiler/frontend/ir/modifiers.h"
 #include "shader_recompiler/frontend/ir/program.h"
 
 namespace Shader::Backend::SPIRV {
@@ -171,6 +172,9 @@ void Traverse(EmitContext& ctx, IR::Program& program) {
             }
             current_block = node.data.block;
             ctx.AddLabel(label);
+            if (&node == &program.syntax_list.front()) {
+                ctx.BeginEntryBroadcastReuse();
+            }
             for (IR::Inst& inst : node.data.block->Instructions()) {
                 EmitInst(ctx, &inst);
             }
@@ -280,8 +284,13 @@ void DefineEntryPoint(const IR::Program& program, EmitContext& ctx, Id main) {
     case Stage::Compute: {
         const std::array<u32, 3> workgroup_size{program.workgroup_size};
         execution_model = spv::ExecutionModel::GLCompute;
-        ctx.AddExecutionMode(main, spv::ExecutionMode::LocalSize, workgroup_size[0],
-                             workgroup_size[1], workgroup_size[2]);
+        if (ctx.RemapsGuestComputeLocalId() && ctx.profile.compute_warp_flatten_workgroup) {
+            const auto [x, y, z] = workgroup_size;
+            ctx.AddExecutionMode(main, spv::ExecutionMode::LocalSize, x * y * z, 1U, 1U);
+        } else {
+            ctx.AddExecutionMode(main, spv::ExecutionMode::LocalSize, workgroup_size[0],
+                                 workgroup_size[1], workgroup_size[2]);
+        }
         break;
     }
     case Stage::VertexB:
@@ -399,6 +408,61 @@ void DefineEntryPoint(const IR::Program& program, EmitContext& ctx, Id main) {
     ctx.AddEntryPoint(execution_model, main, "main", interfaces);
 }
 
+bool CanUseNativeFloat16RTE(const Profile& profile, const IR::Program& program) {
+    if (program.stage != Stage::Compute || !profile.support_float_controls ||
+        !profile.native_float16_controls.available || profile.has_broken_fp16_float_controls ||
+        !profile.support_fp16_signed_zero_nan_preserve ||
+        !profile.support_fp32_signed_zero_nan_preserve ||
+        !program.info.uses_fp16 || program.info.uses_fp64 || program.info.uses_fp16_denorms_flush ||
+        program.info.uses_atomic_f16x2_add || program.info.uses_atomic_f16x2_min ||
+        program.info.uses_atomic_f16x2_max) {
+        return false;
+    }
+
+    constexpr auto half_or_double = IR::Type::F16 | IR::Type::F16x2 | IR::Type::F16x3 |
+                                    IR::Type::F16x4 | IR::Type::F64 | IR::Type::F64x2 |
+                                    IR::Type::F64x3 | IR::Type::F64x4;
+    bool needs_rte{};
+    for (const IR::Block* block : program.blocks) {
+        for (const IR::Inst& inst : block->Instructions()) {
+            switch (inst.GetOpcode()) {
+            case IR::Opcode::ConvertF16F32: {
+                const auto control = inst.Flags<IR::FpControl>();
+                if (control.fmz_mode == IR::FmzMode::FTZ || control.fmz_mode == IR::FmzMode::FMZ) {
+                    return false;
+                }
+                if (control.rounding == IR::FpRounding::RN) {
+                    needs_rte = true;
+                    break;
+                }
+                const auto operand = inst.Arg(0);
+                if (control.rounding != IR::FpRounding::DontCare || !operand.IsImmediate() ||
+                    operand.F32() != 0.0f) {
+                    return false;
+                }
+                break;
+            }
+            case IR::Opcode::CompositeConstructF16x2:
+            case IR::Opcode::PackFloat2x16:
+                break;
+            case IR::Opcode::TensorMulAdd:
+                return false;
+            default:
+                if ((inst.Type() & half_or_double) != IR::Type::Void) {
+                    return false;
+                }
+                for (size_t arg = 0; arg < inst.NumArgs(); ++arg) {
+                    if ((inst.Arg(arg).Type() & half_or_double) != IR::Type::Void) {
+                        return false;
+                    }
+                }
+                break;
+            }
+        }
+    }
+    return needs_rte;
+}
+
 void SetupDenormControl(const Profile& profile, const IR::Program& program, EmitContext& ctx,
                         Id main_func) {
     const Info& info{program.info};
@@ -418,6 +482,14 @@ void SetupDenormControl(const Profile& profile, const IR::Program& program, Emit
         } else {
             LOG_DEBUG(Shader_SPIRV, "Fp32 denorm preserve used in shader without host support");
         }
+    }
+    if (ctx.UsesNativeFloat16RTE()) {
+        ctx.AddCapability(spv::Capability::DenormPreserve);
+        ctx.AddExecutionMode(main_func, spv::ExecutionMode::DenormPreserve, 16U);
+        if (profile.native_float16_controls.preserve_denorm_float64) {
+            ctx.AddExecutionMode(main_func, spv::ExecutionMode::DenormPreserve, 64U);
+        }
+        return;
     }
     if (!profile.support_separate_denorm_behavior || profile.has_broken_fp16_float_controls) {
         // No separate denorm behavior
@@ -514,25 +586,6 @@ void SetupCapabilities(const Profile& profile, const Info& info, EmitContext& ct
         ctx.AddExtension("SPV_KHR_shader_draw_parameters");
         ctx.AddCapability(spv::Capability::DrawParameters);
     }
-    if ((info.uses_subgroup_vote || info.uses_subgroup_invocation_id ||
-         info.uses_subgroup_shuffles || info.uses_subgroup_mask) &&
-        profile.support_vote && ctx.SupportsSubgroups()) {
-        ctx.AddCapability(spv::Capability::GroupNonUniformBallot);
-        ctx.AddCapability(spv::Capability::GroupNonUniformShuffle);
-        if (info.uses_subgroup_shuffles && profile.support_shuffle_relative) {
-            ctx.AddCapability(spv::Capability::GroupNonUniformShuffleRelative);
-        }
-        if (!profile.warp_size_potentially_larger_than_guest) {
-            // vote ops are only used when not taking the long path
-            ctx.AddCapability(spv::Capability::GroupNonUniformVote);
-        }
-    }
-    if (info.uses_quad_shuffles) {
-        if (profile.support_quad_shuffles) {
-            ctx.AddCapability(spv::Capability::GroupNonUniformQuad);
-        }
-        ctx.AddCapability(spv::Capability::GroupNonUniformShuffle);
-    }
     if (info.uses_int64_bit_atomics && profile.support_int64_atomics) {
         ctx.AddCapability(spv::Capability::Int64Atomics);
     }
@@ -552,7 +605,9 @@ void SetupCapabilities(const Profile& profile, const Info& info, EmitContext& ct
         ctx.AddCapability(spv::Capability::DerivativeControl);
     }
     // TODO: Track this usage
-    ctx.AddCapability(spv::Capability::ImageGatherExtended);
+    if (profile.support_image_gather_extended) {
+        ctx.AddCapability(spv::Capability::ImageGatherExtended);
+    }
     ctx.AddCapability(spv::Capability::ImageQuery);
     ctx.AddCapability(spv::Capability::SampledBuffer);
     if (!ctx.non_uniform_ids.empty()) {
@@ -672,6 +727,9 @@ void PatchMeshInstructions(std::vector<u32>& code, const EmitContext& ctx) {
 
 std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info, IR::Program& program, Bindings& bindings) {
     EmitContext ctx{profile, runtime_info, program, bindings};
+    if (CanUseNativeFloat16RTE(profile, program)) {
+        ctx.EnableNativeFloat16RTE();
+    }
     DefineSoftwareMatrixFunctions(ctx, program);
     const Id main{DefineMain(ctx, program)};
     DefineEntryPoint(program, ctx, main);
@@ -679,6 +737,13 @@ std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_in
         ctx.AddExtension("SPV_KHR_float_controls");
         SetupDenormControl(profile, program, ctx, main);
         SetupSignedNanCapabilities(profile, program, ctx, main);
+        if (ctx.UsesNativeFloat16RTE()) {
+            ctx.AddCapability(spv::Capability::RoundingModeRTE);
+            ctx.AddExecutionMode(main, spv::ExecutionMode::RoundingModeRTE, 16U);
+            if (profile.native_float16_controls.round_float64) {
+                ctx.AddExecutionMode(main, spv::ExecutionMode::RoundingModeRTE, 64U);
+            }
+        }
     }
     SetupCapabilities(profile, program.info, ctx);
     SetupTransformFeedbackCapabilities(ctx, main);
@@ -690,6 +755,18 @@ std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_in
         PatchCooperativeHmma(code, *ctx.cooperative_hmma);
     }
     program.info.uses_cooperative_matrix = ctx.cooperative_hmma.has_value();
+    if (runtime_info.warp_scratch_memory_limit != 0) {
+        // Verification proved that the shader has no remaining physical warp collective.
+        program.info.uses_subgroup_shuffles = false;
+        if (ctx.workgroup_warp_scratch.value) {
+            program.info.uses_subgroup_vote = false;
+        }
+    }
+    if (ctx.HasScalarWarp()) {
+        program.info.uses_subgroup_shuffles = false;
+        program.info.uses_subgroup_vote = false;
+        program.info.removed_conditional_barrier = false;
+    }
     return code;
 }
 

@@ -15,6 +15,12 @@ namespace Shader {
 
 enum class Stage : u32;
 
+struct NativeFloat16Controls {
+    bool available{};
+    bool round_float64{};
+    bool preserve_denorm_float64{};
+};
+
 struct Profile {
     u32 supported_spirv{0x00010000};
     bool unified_descriptor_binding{};
@@ -52,6 +58,9 @@ struct Profile {
     bool support_int64_atomics{};
     bool support_shared_int64_atomics{};
     bool support_derivative_control{};
+    bool support_image_gather_extended{true};
+    s32 min_texel_gather_offset{-8};
+    u32 max_texel_gather_offset{7};
     bool support_geometry_shader_passthrough{};
     bool support_native_ndc{};
     bool support_gl_nv_gpu_shader_5{};
@@ -146,6 +155,21 @@ struct Profile {
     static constexpr u32 RAW_GLOBAL_ALIAS_ADDRESS_OFFSET{0xF20};
     static constexpr u32 RAW_GLOBAL_ALIAS_LOW_OFFSET{0xF28};
     static constexpr u32 RAW_GLOBAL_ALIAS_HIGH_OFFSET{0xF30};
+
+    bool support_uniform_buffer_standard_layout{};
+    bool support_ballot{};
+    bool support_shuffle{};
+    bool support_quad_shuffles_all_stages{};
+    NativeFloat16Controls native_float16_controls{};
+
+    // Compute guest coordinates reconstructed from a guaranteed full physical subgroup.
+    bool compute_warp_local_id_from_subgroup{};
+    u32 compute_warp_subgroup_size{}; // Zero uses the SubgroupSize built-in.
+    bool compute_warp_flatten_workgroup{};
+
+    bool UsesTypedUniformBuffers() const {
+        return support_descriptor_aliasing && support_uniform_buffer_standard_layout;
+    }
 
     bool SupportsSubgroupStage(Stage stage) const {
         return (supported_subgroup_stages & (1u << static_cast<u32>(stage))) != 0;

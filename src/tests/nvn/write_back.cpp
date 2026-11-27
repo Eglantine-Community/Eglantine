@@ -17,6 +17,7 @@
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include "common/common_types.h"
 #include "video_core/renderer_vulkan/nvn/nvn_write_back.h"
@@ -76,6 +77,41 @@ struct Bytes {
 };
 
 } // Anonymous namespace
+
+TEST_CASE("NVN write-back merge: contiguous ranges respect word and line boundaries", "[nvn]") {
+    const MergeRange first{.result_off = 4, .snapshot_off = 132, .guest_off = 36, .size = 28};
+    const MergeRange second{.result_off = 32, .snapshot_off = 160, .guest_off = 64, .size = 32};
+    MergeRange combined = first;
+    CHECK_FALSE(combined.TryAppend(second, 32, 59)); // would need two dispatches
+    CHECK(combined.size == first.size);
+    CHECK(combined.TryAppend(second, 32, 60));
+    CHECK(combined.size == 60);
+
+    combined = first;
+    MergeRange other = second;
+    other.stat_slot = 1;
+    CHECK_FALSE(combined.TryAppend(other, 32, 64));
+    other = second;
+    ++other.snapshot_off;
+    CHECK_FALSE(combined.TryAppend(other, 32, 64));
+
+    combined = first;
+    combined.size -= 4;
+    other = second;
+    other.result_off -= 4;
+    other.snapshot_off -= 4;
+    other.guest_off -= 4;
+    CHECK_FALSE(combined.TryAppend(other, 32, 64));
+    CHECK(combined.TryAppend(other, 4, 64));
+
+    combined = first;
+    --combined.size;
+    other = second;
+    --other.result_off;
+    --other.snapshot_off;
+    --other.guest_off;
+    CHECK_FALSE(combined.TryAppend(other, 4, 64));
+}
 
 TEST_CASE("NVN write-back merge: only changed words reach guest memory", "[nvn]") {
     Bytes guest(64);
@@ -222,9 +258,10 @@ TEST_CASE("NVN write-back merge: the GPU merge writes what the CPU merge writes"
         SKIP("no Vulkan device");
     }
     const Device& device = *vulkan->device;
-    if (!WriteBackMerge::Supported(device)) {
-        SKIP("the device has no push descriptors");
-    }
+    const bool allow_push = GENERATE(false, true);
+    const bool pushes = allow_push && device.IsKhrPushDescriptorSupported() &&
+                        device.MaxPushDescriptors() >= 4;
+    CAPTURE(allow_push, pushes);
 
     constexpr u64 BUFFER_SIZE = 64 * 1024;
     // Offsets equal modulo 4 but not aligned to anything else; the range ends in a partial word.
@@ -232,6 +269,10 @@ TEST_CASE("NVN write-back merge: the GPU merge writes what the CPU merge writes"
     constexpr u64 RESULT_OFF = 0x2005;
     constexpr u64 SNAPSHOT_OFF = 0x109;
     constexpr u64 SIZE = 0x8002;
+    constexpr u64 OTHER_GUEST_OFF = 0xA100;
+    constexpr u64 OTHER_RESULT_OFF = 0xBA00;
+    constexpr u64 OTHER_SNAPSHOT_OFF = 0xB200;
+    constexpr u64 OTHER_SIZE = 0x100;
 
     std::mt19937 random(77);
     Bytes snapshot(BUFFER_SIZE);
@@ -282,6 +323,9 @@ TEST_CASE("NVN write-back merge: the GPU merge writes what the CPU merge writes"
     MergeChangedWords(std::span<u8>{expected.data() + GUEST_OFF, SIZE},
                       std::span<const u8>{snapshot.data() + SNAPSHOT_OFF, SIZE},
                       std::span<const u8>{result.data() + RESULT_OFF, SIZE});
+    MergeChangedWords(std::span<u8>{expected.data() + OTHER_GUEST_OFF, OTHER_SIZE},
+                      std::span<const u8>{snapshot.data() + OTHER_SNAPSHOT_OFF, OTHER_SIZE},
+                      std::span<const u8>{result.data() + OTHER_RESULT_OFF, OTHER_SIZE});
 
     VmaAllocator vma = device.CreateThreadSafeAllocator();
     {
@@ -308,7 +352,7 @@ TEST_CASE("NVN write-back merge: the GPU merge writes what the CPU merge writes"
         vk::Buffer guest_buffer = make(guest, MemoryUsage::Download);
 
         WriteBackMerge merge;
-        REQUIRE(merge.Init(device));
+        REQUIRE(merge.Init(device, allow_push));
         REQUIRE(merge.Ready());
         // Diagnostic counters of EDEN_NX2_NVN_WB_MONITOR: slot 1 counts the main range's changes.
         vk::Buffer stats_buffer = allocator.CreateBuffer(
@@ -344,6 +388,27 @@ TEST_CASE("NVN write-back merge: the GPU merge writes what the CPU merge writes"
             std::memset(stats_buffer.Mapped().data(), 0, 64);
             stats_buffer.Flush();
             const vk::Device& logical = device.GetLogical();
+            constexpr u32 SETS = 3;
+            constexpr VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, SETS * 4};
+            auto descriptors = logical.CreateDescriptorPool({
+                .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                .maxSets = SETS,
+                .poolSizeCount = 1,
+                .pPoolSizes = &pool_size,
+            });
+            u32 allocated_sets = 0;
+            const auto allocate_set = [&](VkDescriptorSetLayout layout) {
+                const VkDescriptorSetAllocateInfo info{
+                    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                    .descriptorPool = *descriptors,
+                    .descriptorSetCount = 1,
+                    .pSetLayouts = &layout,
+                };
+                VkDescriptorSet set = VK_NULL_HANDLE;
+                vk::Check(device.GetDispatchLoader().vkAllocateDescriptorSets(*logical, &info, &set));
+                ++allocated_sets;
+                return set;
+            };
             vk::CommandPool pool = logical.CreateCommandPool({
                 .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
                 .pNext = nullptr,
@@ -359,15 +424,22 @@ TEST_CASE("NVN write-back merge: the GPU merge writes what the CPU merge writes"
                 .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
                 .pInheritanceInfo = nullptr,
             });
-            const std::array<MergeRange, 3> ranges{{
+            // The two ranges meet on a full line and can share one dispatch.
+            constexpr u64 SPLIT = 0x4000 - GUEST_OFF;
+            const std::array<MergeRange, 5> ranges{{
                 {*result_buffer, RESULT_OFF, *snapshot_buffer, SNAPSHOT_OFF, *guest_buffer, GUEST_OFF,
-                 SIZE, 1, range_lines},
+                 SPLIT, 1, range_lines},
+                {*result_buffer, RESULT_OFF + SPLIT, *snapshot_buffer, SNAPSHOT_OFF + SPLIT,
+                 *guest_buffer, GUEST_OFF + SPLIT, SIZE - SPLIT, 1, range_lines},
+                {*result_buffer, OTHER_RESULT_OFF, *snapshot_buffer, OTHER_SNAPSHOT_OFF,
+                 *guest_buffer, OTHER_GUEST_OFF, OTHER_SIZE},
                 // Offsets of different phases cannot be merged word by word: refused, nothing written.
                 {*result_buffer, RESULT_OFF + 1, *snapshot_buffer, SNAPSHOT_OFF, *guest_buffer, 0x9000,
                  0x100},
                 {*result_buffer, 0, *snapshot_buffer, 0, *guest_buffer, 0xA000, 0},
             }};
-            CHECK(merge.Record(cmd, ranges) == 1);
+            CHECK(merge.Record(cmd, ranges, allocate_set) == 3);
+            CHECK(allocated_sets == (pushes ? 0 : 2));
             const VkMemoryBarrier to_host{
                 .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
                 .pNext = nullptr,
@@ -470,8 +542,8 @@ TEST_CASE("NVN write-back merge: bench", "[.write-back-bench]") {
         SKIP("no Vulkan device");
     }
     const Device& device = *vulkan->device;
-    if (!WriteBackMerge::Supported(device)) {
-        SKIP("the device has no push descriptors");
+    if (!device.IsKhrPushDescriptorSupported() || device.MaxPushDescriptors() < 4) {
+        SKIP("the benchmark uses push descriptors");
     }
     constexpr u64 SIZE = 16u << 20;
     constexpr u32 WORDS = static_cast<u32>(SIZE / 4);

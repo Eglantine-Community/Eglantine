@@ -9,7 +9,6 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <map>
 #include <span>
 #include <string>
 #include <vector>
@@ -49,20 +48,40 @@ std::vector<u32> EmitAtomicHelpers(bool native_half, bool explicit_shared) {
     program.syntax_list = {{{.block = &block}, IR::AbstractSyntaxNode::Type::Block},
                            {{}, IR::AbstractSyntaxNode::Type::Return}};
     auto& info = program.info;
-    info.storage_buffers_descriptors = {{0, 0, 1, true}};
+    info.storage_buffers_descriptors = {{0, 0, 1, true}, {0, 16, 1, true}};
+    IR::IREmitter ir{block};
+    block.AppendNewInst(IR::Opcode::WriteStorageU16, {ir.Imm32(0), ir.Imm32(2), ir.Imm32(12)});
+    block.AppendNewInst(IR::Opcode::WriteStorageS8, {ir.Imm32(1), ir.Imm32(3), ir.Imm32(45)});
+    block.AppendNewInst(IR::Opcode::StorageAtomicInc32,
+                        {ir.Imm32(0), ir.Imm32(4), ir.Imm32(9)});
+    block.AppendNewInst(IR::Opcode::StorageAtomicInc32,
+                        {ir.Imm32(1), ir.Imm32(4), ir.Imm32(9)});
+    block.AppendNewInst(IR::Opcode::StorageAtomicInc32,
+                        {ir.Imm32(1), ir.Imm32(8), ir.Imm32(9)});
+    block.AppendNewInst(IR::Opcode::StorageAtomicDec32,
+                        {ir.Imm32(1), ir.Imm32(4), ir.Imm32(9)});
+    block.AppendNewInst(IR::Opcode::StorageAtomicAddF32,
+                        {ir.Imm32(0), ir.Imm32(8), ir.Imm32(1.0f)});
+    const auto a = ir.Imm32(1.0f);
+    const auto b = ir.Imm32(2.0f);
+    const auto pair = native_half
+                          ? ir.CompositeConstruct(ir.FPConvert(16, a), ir.FPConvert(16, b))
+                          : ir.CompositeConstruct(a, b);
+    const std::array vector_ops =
+        native_half ? std::array{IR::Opcode::StorageAtomicAddF16x2,
+                                 IR::Opcode::StorageAtomicMinF16x2,
+                                 IR::Opcode::StorageAtomicMaxF16x2}
+                    : std::array{IR::Opcode::StorageAtomicAddF32x2,
+                                 IR::Opcode::StorageAtomicMinF32x2,
+                                 IR::Opcode::StorageAtomicMaxF32x2};
+    for (size_t i = 0; i < vector_ops.size(); ++i) {
+        block.AppendNewInst(vector_ops[i], {ir.Imm32(1), ir.Imm32(12 + static_cast<u32>(i) * 4),
+                                            pair});
+    }
     info.used_storage_buffer_types = IR::Type::U32;
     info.uses_shared_increment = true;
     info.uses_shared_decrement = true;
-    info.uses_global_increment = true;
-    info.uses_global_decrement = true;
-    info.uses_atomic_f32_add = true;
     info.uses_fp16 = native_half;
-    info.uses_atomic_f16x2_add = native_half;
-    info.uses_atomic_f16x2_min = native_half;
-    info.uses_atomic_f16x2_max = native_half;
-    info.uses_atomic_f32x2_add = !native_half;
-    info.uses_atomic_f32x2_min = !native_half;
-    info.uses_atomic_f32x2_max = !native_half;
     info.uses_int8 = true;
     info.uses_int16 = true;
     Profile profile;
@@ -92,11 +111,28 @@ TEST_CASE("SPIR-V CAS retries use the exchange result as the next expected word"
             const auto code = EmitAtomicHelpers(native_half, explicit_shared);
             const auto exchanges = Instructions(code, spv::Op::OpAtomicCompareExchange);
             const auto loads = Instructions(code, spv::Op::OpLoad);
+            const auto atomic_loads = Instructions(code, spv::Op::OpAtomicLoad);
             const auto stores = Instructions(code, spv::Op::OpStore);
             const auto variables = Instructions(code, spv::Op::OpVariable);
             const auto integers = Instructions(code, spv::Op::OpTypeInt);
             const auto comparisons = Instructions(code, spv::Op::OpIEqual);
-            REQUIRE(exchanges.size() == (explicit_shared ? 9u : 11u));
+            const auto return_values = Instructions(code, spv::Op::OpReturnValue);
+            const auto access_chains = Instructions(code, spv::Op::OpAccessChain);
+            const auto capabilities = Instructions(code, spv::Op::OpCapability);
+            const auto pointers = Instructions(code, spv::Op::OpTypePointer);
+            const auto parameters = Instructions(code, spv::Op::OpFunctionParameter);
+            CHECK(std::ranges::none_of(capabilities, [](const auto& cap) {
+                return cap[0] == static_cast<u32>(spv::Capability::VariablePointersStorageBuffer) ||
+                       cap[0] == static_cast<u32>(spv::Capability::VariablePointers);
+            }));
+            for (const auto& parameter : parameters) {
+                CHECK(std::ranges::none_of(pointers, [&](const auto& pointer) {
+                    return pointer[0] == parameter[0];
+                }));
+            }
+            // Seven storage atomic loops, two storage subword loops and two or four shared loops.
+            REQUIRE(exchanges.size() == (explicit_shared ? 11u : 13u));
+            size_t integer_storage_returns{};
             for (const auto& exchange : exchanges) {
                 REQUIRE(exchange.size() == 8);
                 const u32 type = exchange[0];
@@ -119,18 +155,35 @@ TEST_CASE("SPIR-V CAS retries use the exchange result as the next expected word"
                 }) == 2);
                 CHECK(std::ranges::find(stores, std::vector<u32>{retry, result}) != stores.end());
                 const auto initial = std::ranges::find_if(
-                    loads, [=](const auto& load) { return load[2] == memory; });
-                REQUIRE(initial != loads.end());
+                    atomic_loads, [=](const auto& load) { return load[2] == memory; });
+                REQUIRE(initial != atomic_loads.end());
+                CHECK((*initial)[3] == exchange[3]);
+                CHECK((*initial)[4] == exchange[4]);
+                CHECK((*initial)[4] == exchange[5]);
                 CHECK((*initial)[0] == type);
+                const auto chain = std::ranges::find_if(access_chains, [=](const auto& access) {
+                    return access[1] == memory;
+                });
+                REQUIRE(chain != access_chains.end());
+                const auto base = std::ranges::find_if(variables, [&](const auto& var) {
+                    return var[1] == (*chain)[2];
+                });
+                REQUIRE(base != variables.end());
+                if ((*base)[2] == static_cast<u32>(spv::StorageClass::StorageBuffer) &&
+                    std::ranges::find(return_values, std::vector<u32>{expected}) !=
+                        return_values.end()) {
+                    ++integer_storage_returns;
+                }
                 CHECK(std::ranges::count_if(loads, [=](const auto& load) {
                     return load[2] == memory;
-                }) == 1);
+                }) == 0);
                 CHECK(std::ranges::find(stores, std::vector<u32>{retry, (*initial)[1]}) != stores.end());
                 CHECK(std::ranges::any_of(comparisons, [=](const auto& comparison) {
                     return (comparison[2] == result && comparison[3] == expected) ||
                            (comparison[3] == result && comparison[2] == expected);
                 }));
             }
+            CHECK(integer_storage_returns == 3);
         }
     }
 }

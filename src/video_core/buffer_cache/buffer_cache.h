@@ -639,17 +639,18 @@ void BufferCache<P>::UpdateComputeBuffers() {
 }
 
 template <class P>
-void BufferCache<P>::BindHostGeometryBuffers(bool is_indexed) {
+bool BufferCache<P>::BindHostGeometryBuffers(bool is_indexed) {
     ++native_indirect_uniform_draw_ticket;
     last_synced_count = 0;
     if (is_indexed) {
-        BindHostIndexBuffer();
+        if (!BindHostIndexBuffer()) {
+            return false;
+        }
     } else if constexpr (!HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT) {
         const auto& draw_state = maxwell3d->draw_manager.draw_state;
         if (draw_state.topology == Maxwell::PrimitiveTopology::Quads ||
             draw_state.topology == Maxwell::PrimitiveTopology::QuadStrip) {
-            runtime.BindQuadIndexBuffer(draw_state.topology, draw_state.vertex_buffer.first,
-                                        draw_state.vertex_buffer.count);
+            runtime.BindQuadIndexBuffer(draw_state.topology, draw_state.vertex_buffer.count);
         }
     }
     BindHostVertexBuffers();
@@ -657,6 +658,7 @@ void BufferCache<P>::BindHostGeometryBuffers(bool is_indexed) {
     if (current_draw_indirect) {
         BindHostDrawIndirectBuffers();
     }
+    return true;
 }
 
 template <class P>
@@ -743,25 +745,8 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
                   ssbo_index);
         return false;
     }
-    const bool already_enabled =
-        ((channel_state->enabled_storage_buffers[stage] >> ssbo_index) & 1U) != 0;
-    if constexpr (requires { runtime.ShouldLimitDynamicStorageBuffers(); }) {
-        if (runtime.ShouldLimitDynamicStorageBuffers() && !already_enabled) {
-            const u32 max_bindings = runtime.GetMaxDynamicStorageBuffers();
-            if (channel_state->total_graphics_storage_buffers >= max_bindings) {
-                LOG_WARNING(HW_GPU, "Skipping graphics storage buffer {} due to driver limit {}",
-                            ssbo_index, max_bindings);
-                return false;
-            }
-        }
-    }
     channel_state->enabled_storage_buffers[stage] |= u64{1} << ssbo_index;
     channel_state->written_storage_buffers[stage] |= u64{is_written ? 1U : 0U} << ssbo_index;
-    if constexpr (requires { runtime.ShouldLimitDynamicStorageBuffers(); }) {
-        if (runtime.ShouldLimitDynamicStorageBuffers() && !already_enabled) {
-            ++channel_state->total_graphics_storage_buffers;
-        }
-    }
 
     const auto& cbufs = maxwell3d->state.shader_stages[stage];
     GPUVAddr ssbo_addr = cbufs.const_buffers[cbuf_index].address + cbuf_offset;
@@ -811,25 +796,8 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
                   ssbo_index);
         return;
     }
-    const bool already_enabled =
-        ((channel_state->enabled_compute_storage_buffers >> ssbo_index) & 1U) != 0;
-    if constexpr (requires { runtime.ShouldLimitDynamicStorageBuffers(); }) {
-        if (runtime.ShouldLimitDynamicStorageBuffers() && !already_enabled) {
-            const u32 max_bindings = runtime.GetMaxDynamicStorageBuffers();
-            if (channel_state->total_compute_storage_buffers >= max_bindings) {
-                LOG_WARNING(HW_GPU, "Skipping compute storage buffer {} due to driver limit {}",
-                            ssbo_index, max_bindings);
-                return;
-            }
-        }
-    }
     channel_state->enabled_compute_storage_buffers |= u64{1} << ssbo_index;
     channel_state->written_compute_storage_buffers |= u64{is_written ? 1U : 0U} << ssbo_index;
-    if constexpr (requires { runtime.ShouldLimitDynamicStorageBuffers(); }) {
-        if (runtime.ShouldLimitDynamicStorageBuffers() && !already_enabled) {
-            ++channel_state->total_compute_storage_buffers;
-        }
-    }
 
     const auto& launch_desc = kepler_compute->launch_description;
     if (((launch_desc.const_buffer_enable_mask >> cbuf_index) & 1) == 0) {
@@ -1392,15 +1360,67 @@ void BufferCache<P>::SynchronizeGeometryBuffer(GeometryMemo& memo, Buffer& buffe
 }
 
 template <class P>
-void BufferCache<P>::BindHostIndexBuffer() {
-    Buffer& buffer = slot_buffers[channel_state->index_buffer.buffer_id];
-    const u32 offset = buffer.Offset(channel_state->index_buffer.device_addr);
-    const u32 size = channel_state->index_buffer.size;
+bool BufferCache<P>::BindHostIndexBuffer() {
+    const Binding& binding = channel_state->index_buffer;
+    const u32 size = binding.size;
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    const auto& index = draw_state.index_buffer;
+    const bool indirect = current_draw_indirect != nullptr;
+    if constexpr (!HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT) {
+        const auto& index_segments = channel_state->index_segments;
+        const u32 index_buffer_first = channel_state->index_buffer_first;
+        if (!index_segments.empty()) {
+            if (binding.map_serial != gpu_memory->GetMapSerial()) {
+                runtime.RejectIndexAssembly();
+                return false;
+            }
+            using IndexSource = typename Runtime::IndexSource;
+            boost::container::small_vector<IndexSource, 8> sources;
+            for (const auto& segment : index_segments) {
+                Buffer& source = slot_buffers[segment.buffer_id];
+                if (!source.IsInBounds(segment.device_addr, segment.size)) {
+                    runtime.RejectIndexAssembly();
+                    return false;
+                }
+                TouchBuffer(source, segment.buffer_id);
+                SynchronizeBuffer(source, segment.device_addr, segment.size);
+                const u32 offset = source.Offset(segment.device_addr);
+                source.MarkUsage(offset, segment.size);
+                sources.push_back({&source, offset, segment.size});
+            }
+            runtime.BindGatheredIndexBuffer(draw_state.topology, index.format,
+                                            index.first - index_buffer_first, index.count,
+                                            {sources.data(), sources.size()}, size,
+                                            maxwell3d->regs.primitive_restart, indirect,
+                                            index_buffer_first);
+            return !runtime.IndexAssemblyFailed();
+        }
+    }
+    if (binding.buffer_id == NULL_BUFFER_ID) {
+        const bool empty_quads = !HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT && !indirect &&
+                                 index.count < 4 &&
+                                 (draw_state.topology == Maxwell::PrimitiveTopology::Quads ||
+                                  draw_state.topology == Maxwell::PrimitiveTopology::QuadStrip);
+        if (indirect || (index.count != 0 && !empty_quads)) {
+            if constexpr (!HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT) {
+                runtime.RejectIndexAssembly();
+            }
+            return false;
+        }
+        if constexpr (!HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT) {
+            // Even an empty Vulkan indexed draw requires a bound index buffer.
+            runtime.BindIndexBuffer(draw_state.topology, index.format, 0, 0,
+                                    slot_buffers[NULL_BUFFER_ID], 0, 0,
+                                    maxwell3d->regs.primitive_restart, false);
+        }
+        return true;
+    }
+    Buffer& buffer = slot_buffers[binding.buffer_id];
+    const u32 offset = buffer.Offset(binding.device_addr);
     if (draw_state.inline_index_draw_indexes.empty()) {
-        SynchronizeGeometryBuffer(geometry_index_memo, buffer, channel_state->index_buffer);
+        SynchronizeGeometryBuffer(geometry_index_memo, buffer, binding);
     } else {
-        TouchBuffer(buffer, channel_state->index_buffer.buffer_id);
+        TouchBuffer(buffer, binding.buffer_id);
         if constexpr (USE_MEMORY_MAPS_FOR_UPLOADS) {
             auto upload_staging = runtime.UploadStagingBuffer(size);
             std::array<BufferCopy, 1> copies{
@@ -1413,25 +1433,27 @@ void BufferCache<P>::BindHostIndexBuffer() {
         }
     }
     if constexpr (HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT) {
-        const u32 new_offset = offset + draw_state.index_buffer.first *
-                                            u32(draw_state.index_buffer.FormatSizeInBytes());
-        runtime.BindIndexBuffer(buffer, new_offset, size);
+        const u64 prefix = u64{index.first} * index.FormatSizeInBytes();
+        if (prefix > size || offset + prefix > (std::numeric_limits<u32>::max)()) {
+            return false;
+        }
+        runtime.BindIndexBuffer(buffer, static_cast<u32>(offset + prefix),
+                                size - static_cast<u32>(prefix));
+        return true;
     } else {
         buffer.MarkUsage(offset, size);
-        runtime.BindIndexBuffer(draw_state.topology, draw_state.index_buffer.format,
-                                draw_state.index_buffer.first, draw_state.index_buffer.count,
-                                buffer, offset, size);
+        const u32 binding_first = channel_state->index_buffer_first;
+        runtime.BindIndexBuffer(draw_state.topology, index.format, index.first - binding_first,
+                                index.count, buffer, offset, size, maxwell3d->regs.primitive_restart,
+                                indirect, binding_first);
+        return !runtime.IndexAssemblyFailed();
     }
 }
 
 template <class P>
 void BufferCache<P>::BindHostVertexBuffer(u32 index, Buffer& buffer, u32 offset, u32 size,
                                           u32 stride) {
-    if constexpr (IS_OPENGL) {
-        runtime.BindVertexBuffer(index, buffer, offset, size, stride);
-    } else {
-        runtime.BindVertexBuffer(index, buffer.Handle(), offset, size, stride);
-    }
+    runtime.BindVertexBuffer(index, buffer, offset, size, stride);
 }
 
 template <class P>
@@ -2357,16 +2379,18 @@ void BufferCache<P>::DoUpdateComputeBuffers() {
 template <class P>
 void BufferCache<P>::UpdateIndexBuffer() {
     const VideoCommon::Nx2DrawStats::FindCaller find_caller{VideoCommon::Nx2DrawStats::Site::FindBufferIndex};
-    // We have to check for the dirty flags and index count
-    // The index count is currently changed without updating the dirty flags
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
     const auto& index_buffer_ref = draw_state.index_buffer;
-    auto& flags = maxwell3d->dirty.flags;
-    if (!flags[Dirty::IndexBuffer]) {
-        return;
-    }
-    flags[Dirty::IndexBuffer] = false;
+    auto& dirty = maxwell3d->dirty.flags;
+    auto& current = channel_state->index_buffer;
+    auto& index_segments = channel_state->index_segments;
+    index_segments.clear();
+    channel_state->index_buffer_first = 0;
     if (!draw_state.inline_index_draw_indexes.empty()) [[unlikely]] {
+        if (!dirty[Dirty::IndexBuffer]) {
+            return;
+        }
+        dirty[Dirty::IndexBuffer] = false;
         auto inline_index_size = static_cast<u32>(draw_state.inline_index_draw_indexes.size());
         u32 buffer_size = Common::AlignUp(inline_index_size, CACHING_PAGESIZE);
         if (inline_buffer_id == NULL_BUFFER_ID) [[unlikely]] {
@@ -2377,7 +2401,7 @@ void BufferCache<P>::UpdateIndexBuffer() {
             slot_buffers.erase(inline_buffer_id);
             inline_buffer_id = CreateBuffer(0, buffer_size, false);
         }
-        channel_state->index_buffer = Binding{
+        current = Binding{
             .device_addr = 0,
             .size = inline_index_size,
             .buffer_id = inline_buffer_id,
@@ -2386,33 +2410,136 @@ void BufferCache<P>::UpdateIndexBuffer() {
     }
 
     const GPUVAddr gpu_addr_begin = index_buffer_ref.StartAddress();
-    const GPUVAddr gpu_addr_end = index_buffer_ref.EndAddress();
-    const u32 address_size = static_cast<u32>(gpu_addr_end - gpu_addr_begin);
-    const u32 draw_size = (index_buffer_ref.count + index_buffer_ref.first) *
-                          u32(index_buffer_ref.FormatSizeInBytes());
-    const u32 size = (std::min)(address_size, draw_size);
-    if (size == 0) {
-        channel_state->index_buffer = NULL_BINDING;
-        return;
+    const u64 available = maxwell3d->regs.IndexBufferSizeBytes(
+        index_buffer_ref, maxwell3d->GetNativeMacroEngine().native_turing);
+    const u64 width = index_buffer_ref.FormatSizeInBytes();
+    const u64 prefix = u64{index_buffer_ref.first} * width;
+    u32 count = index_buffer_ref.count;
+    if constexpr (!HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT) {
+        // A restart can shift the start of the final quad to any input index.
+        const auto& restart = maxwell3d->regs.primitive_restart;
+        const bool can_restart = restart.enabled && (u64{restart.index} >> (8 * width)) == 0;
+        if (current_draw_indirect == nullptr && (count < 4 || !can_restart)) {
+            if (draw_state.topology == Maxwell::PrimitiveTopology::Quads) {
+                count &= ~3u;
+            } else if (draw_state.topology == Maxwell::PrimitiveTopology::QuadStrip) {
+                count = count >= 4 ? count & ~1u : 0;
+            }
+        }
     }
-    auto& current = channel_state->index_buffer;
+    const u64 size = index_buffer_ref.DrawSizeBytes(count);
+    constexpr u64 max_size = (std::numeric_limits<u32>::max)();
     const u64 map_serial = gpu_memory->GetMapSerial();
-    const std::optional<DAddr> device_addr =
-        (current.gpu_addr == gpu_addr_begin && current.map_serial == map_serial &&
-         current.device_addr != 0)
-            ? std::optional<DAddr>{current.device_addr}
-            : gpu_memory->GpuToCpuAddress(gpu_addr_begin);
-    if (!device_addr) {
+    if (count == 0 || size > available ||
+        !gpu_memory->IsWithinGPUAddressRange(gpu_addr_begin + size - 1)) {
+        dirty[Dirty::IndexBuffer] = false;
         current = NULL_BINDING;
         return;
     }
-    current = Binding{
-        .device_addr = *device_addr,
-        .gpu_addr = gpu_addr_begin,
-        .map_serial = map_serial,
-        .size = size,
-        .buffer_id = FindBuffer(*device_addr, size, false),
+    const auto same_mapping = [&](GPUVAddr begin) {
+        return current.buffer_id != NULL_BUFFER_ID && current.gpu_addr == begin &&
+               current.map_serial == map_serial;
     };
+    const auto bind_contiguous = [&](u64 skipped_bytes) {
+        const GPUVAddr begin = gpu_addr_begin + skipped_bytes;
+        const u64 window_size = size - skipped_bytes;
+        const bool cached = same_mapping(begin);
+        channel_state->index_buffer_first = static_cast<u32>(skipped_bytes / width);
+        if (!dirty[Dirty::IndexBuffer] && cached && current.size == window_size) {
+            return true;
+        }
+        // A smaller window of the same mapping needs no new page-table walk.
+        if (window_size > max_size ||
+            (!(cached && window_size <= current.size) &&
+             !gpu_memory->IsGranularRange(begin, window_size) &&
+             gpu_memory->MaxContinuousRange(begin, window_size) != window_size)) {
+            return false;
+        }
+        const auto device_addr = cached ? std::optional<DAddr>{current.device_addr}
+                                        : gpu_memory->GpuToCpuAddress(begin);
+        if (!device_addr || *device_addr == 0) {
+            return false;
+        }
+        dirty[Dirty::IndexBuffer] = false;
+        const u32 binding_size = static_cast<u32>(window_size);
+        const BufferId id = FindBuffer(*device_addr, binding_size, false);
+        if (id == NULL_BUFFER_ID) {
+            return false;
+        }
+        current = Binding{
+            .device_addr = *device_addr,
+            .gpu_addr = begin,
+            .map_serial = map_serial,
+            .size = binding_size,
+            .buffer_id = id,
+        };
+        return true;
+    };
+
+    u64 skipped_bytes = 0;
+    if constexpr (!HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT) {
+        if (!current_draw_indirect) {
+            // Keep the binding stable within each cache page, without preparing a large
+            // unused prefix. Reuse an exact window when the previous draw needed one.
+            skipped_bytes = Common::AlignDown(prefix, CACHING_PAGESIZE);
+            if (same_mapping(gpu_addr_begin + prefix)) {
+                skipped_bytes = prefix;
+            }
+        }
+    }
+    if (bind_contiguous(skipped_bytes)) {
+        return;
+    }
+    if constexpr (!HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT) {
+        if (!current_draw_indirect && skipped_bytes != prefix && bind_contiguous(prefix)) {
+            return;
+        }
+    }
+    dirty[Dirty::IndexBuffer] = false;
+    current = NULL_BINDING;
+
+    if constexpr (!HAS_FULL_INDEX_AND_PRIMITIVE_SUPPORT) {
+        // BufferOperations retries the update after any overlapping cache allocation invalidates
+        // a source id. Replace the entire segment list on every attempt.
+        // Indirect arguments remain GPU-owned and their firstIndex addresses the original binding.
+        // For a direct draw the unused prefix may be unmapped, and need not be gathered.
+        const u64 gather_prefix = current_draw_indirect ? 0 : prefix;
+        const u64 gather_size = size - gather_prefix;
+        if (!runtime.CanGatherIndexBuffer(gather_size)) {
+            return;
+        }
+        const GPUVAddr gather_begin = gpu_addr_begin + gather_prefix;
+        const GPUVAddr gather_end = gather_begin + gather_size;
+        GPUVAddr next = gather_begin;
+        for (const auto& [addr, length] : gpu_memory->GetSubmappedRange(gather_begin, gather_size)) {
+            if (addr != next || length == 0 || length > gather_end - next) {
+                break;
+            }
+            const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(addr);
+            if (!device_addr || *device_addr == 0) {
+                break;
+            }
+            const u32 segment_size = static_cast<u32>(length);
+            const BufferId id = FindBuffer(*device_addr, segment_size, false);
+            if (id == NULL_BUFFER_ID) {
+                break;
+            }
+            index_segments.push_back(MultiRangeSegment{
+                .buffer_id = id,
+                .device_addr = *device_addr,
+                .size = segment_size,
+            });
+            next += length;
+        }
+        if (next != gather_end || map_serial != gpu_memory->GetMapSerial()) {
+            index_segments.clear();
+            return;
+        }
+        channel_state->index_buffer_first = current_draw_indirect ? 0 : index_buffer_ref.first;
+        current.gpu_addr = gather_begin;
+        current.map_serial = map_serial;
+        current.size = static_cast<u32>(gather_size);
+    }
 }
 
 template <class P>
@@ -3200,11 +3327,24 @@ void BufferCache<P>::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
 
 template <class P>
 BufferId BufferCache<P>::CreateBuffer(DAddr device_addr, u32 wanted_size, bool sparse_compatible) {
-    DAddr device_addr_end = Common::AlignUp(device_addr + wanted_size, CACHING_PAGESIZE);
+    const DAddr address_limit = DAddr{page_table.size()} * CACHING_PAGESIZE;
+    if (device_addr >= address_limit || wanted_size > address_limit - device_addr) {
+        return NULL_BUFFER_ID;
+    }
+    const DAddr end = Common::AlignUp(device_addr + wanted_size, CACHING_PAGESIZE);
     device_addr = Common::AlignDown(device_addr, CACHING_PAGESIZE);
-    wanted_size = static_cast<u32>(device_addr_end - device_addr);
-    const OverlapResult overlap = ResolveOverlaps(device_addr, wanted_size);
-    const u32 size = static_cast<u32>(overlap.end - overlap.begin);
+    const u64 aligned_size = end - device_addr;
+    if (aligned_size > (std::numeric_limits<u32>::max)()) {
+        return NULL_BUFFER_ID;
+    }
+    const OverlapResult overlap = ResolveOverlaps(device_addr, static_cast<u32>(aligned_size));
+    const u64 size = overlap.end - overlap.begin;
+    if (size > (std::numeric_limits<u32>::max)()) {
+        for (const BufferId id : overlap.ids) {
+            slot_buffers[id].Unpick();
+        }
+        return NULL_BUFFER_ID;
+    }
     memory_tracker.BumpGpuEpoch();
     const BufferId new_buffer_id =
         slot_buffers.insert(runtime, overlap.begin, size, sparse_compatible);

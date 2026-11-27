@@ -1,0 +1,112 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#version 450
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) buffer Packed {
+    uint packed_words[];
+};
+layout(std430, binding = 1) buffer Planar {
+    uint plane_words[];
+};
+
+layout(push_constant) uniform Parameters {
+    uint count;
+    uint guest_layout;
+    uint host_float;
+    uint download;
+};
+
+const uint Z24S8 = 0u;
+const uint S8Z24 = 1u;
+const uint Z32S8 = 2u;
+const uint DEPTH_MASK = 0x00ffffffu;
+
+uint Unorm24ToFloatBits(uint depth) {
+    // For positive n, n / (2^24 - 1) rounds to the float immediately above n / 2^24.
+    const uint scaled_bits = floatBitsToUint(float(depth) * (1.0 / 16777216.0));
+    return scaled_bits + uint(depth != 0u);
+}
+
+uint FloatBitsToUnorm24(uint bits) {
+    // Clamp infinities and choose zero for NaNs and negative values.
+    if (bits >= 0x80000000u || bits > 0x7f800000u) {
+        return 0u;
+    }
+    if (bits >= 0x3f800000u) {
+        return DEPTH_MASK;
+    }
+    const float depth = uintBitsToFloat(bits);
+    const float scaled = depth * 16777216.0;
+    const uint whole = uint(scaled);
+    // The target is scaled - depth. Above 0.5, scaled is integral and nearest is whole - 1.
+    // At 0.5 the tie rounds to even. Below it, round up only if the remainder exceeds depth + 0.5.
+    if (depth > 0.5) {
+        return whole - 1u;
+    }
+    precise float fraction = scaled - float(whole);
+    precise float above_half = fraction - 0.5;
+    return whole + uint(above_half > depth);
+}
+
+void main() {
+    const uint group = gl_GlobalInvocationID.x;
+    const uint first = group * 4u;
+    if (first >= count) {
+        return;
+    }
+
+    uint stencil_word = 0u;
+    if (download != 0u) {
+        stencil_word = plane_words[count + group];
+    }
+    for (uint lane = 0u; lane < min(count - first, 4u); ++lane) {
+        const uint index = first + lane;
+        const uint shift = lane * 8u;
+        if (download != 0u) {
+            uint depth = plane_words[index];
+            const uint stencil = (stencil_word >> shift) & 0xffu;
+            if (guest_layout == Z32S8) {
+                if (host_float == 0u) {
+                    depth = Unorm24ToFloatBits(depth & DEPTH_MASK);
+                }
+                packed_words[2u * index] = depth;
+                packed_words[2u * index + 1u] = stencil;
+            } else {
+                if (host_float != 0u) {
+                    depth = FloatBitsToUnorm24(depth);
+                }
+                depth &= DEPTH_MASK;
+                packed_words[index] = guest_layout == Z24S8 ? (depth << 8u) | stencil
+                                                           : depth | (stencil << 24u);
+            }
+        } else {
+            const uint word = packed_words[guest_layout == Z32S8 ? 2u * index : index];
+            uint depth = word;
+            uint stencil = word >> 24u;
+            if (guest_layout == Z32S8) {
+                stencil = packed_words[2u * index + 1u] & 0xffu;
+                if (host_float == 0u) {
+                    depth = FloatBitsToUnorm24(depth);
+                }
+            } else {
+                if (guest_layout == Z24S8) {
+                    depth = word >> 8u;
+                    stencil = word & 0xffu;
+                } else {
+                    depth &= DEPTH_MASK;
+                }
+                if (host_float != 0u) {
+                    depth = Unorm24ToFloatBits(depth);
+                }
+            }
+            plane_words[index] = depth;
+            stencil_word |= stencil << shift;
+        }
+    }
+    if (download == 0u) {
+        plane_words[count + group] = stencil_word;
+    }
+}

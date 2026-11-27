@@ -279,8 +279,9 @@ void MemoryCommit::Release() {
 MemoryAllocator::MemoryAllocator(const Device &device_)
         : MemoryAllocator{device_, device_.GetAllocator()} {}
 
-MemoryAllocator::MemoryAllocator(const Device &device_, VmaAllocator allocator_)
-        : device{device_}, allocator{allocator_},
+MemoryAllocator::MemoryAllocator(const Device &device_, VmaAllocator allocator_,
+                                 std::atomic<u64>* device_memory_releases_)
+        : device{device_}, allocator{allocator_}, device_memory_releases{device_memory_releases_},
             properties{device_.GetPhysical().GetMemoryProperties().memoryProperties},
             buffer_image_granularity{
                     device_.GetPhysical().GetProperties().limits.bufferImageGranularity} {
@@ -379,12 +380,11 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
     VkImage handle{};
     VmaAllocation allocation{};
     VmaAllocationInfo alloc_info{};
-    // Images this large (title 1's sparse texture arrays reach 4.5G texels, ~23 GB) are never
-    // backed: VMA would quietly place them in system memory once VRAM is full. They take the
-    // unbacked sparse fallback below.
+    // Keep very large dense allocations within the driver budget. Only callers that have
+    // established sparse semantics may request unbound pages via CreateUnbackedImage.
     const u64 texels = u64{ci.extent.width} * ci.extent.height * ci.extent.depth * ci.arrayLayers;
-    bool huge = false;
-    if (texels > UnbackedImageTexelThreshold) {
+    bool budget_only = false;
+    if (texels > LargeImageTexelThreshold) {
         // What counts is the memory the image needs, not its texels (see the policy header).
         const auto& dld = device.GetDispatchLoader();
         VkMemoryRequirements requirements{};
@@ -393,19 +393,16 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
             dld.vkGetImageMemoryRequirements(*device.GetLogical(), probe, &requirements);
             dld.vkDestroyImage(*device.GetLogical(), probe, nullptr);
         }
-        huge = ShouldLeaveImageUnbacked(texels, requirements.size,
-                                        device.GetDeviceLocalMemory());
+        budget_only = KeepImageWithinBudget(texels, requirements.size, device.GetDeviceLocalMemory());
     }
-    VkResult result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
-    if (!huge) {
-        if (transient && !dedicated &&
-            CreateImageInSeparatePool(ci, alloc_ci, handle, allocation, alloc_info)) {
-            result = VK_SUCCESS;
-        } else {
-            result = vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
-        }
+    VkResult result;
+    if (transient && !dedicated &&
+        CreateImageInSeparatePool(ci, alloc_ci, handle, allocation, alloc_info)) {
+        result = VK_SUCCESS;
+    } else {
+        result = vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
     }
-    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !budget_only) {
         // Over the device memory budget (Switch 2 titles fill 8 GB cards): let the driver page
         // it out rather than failing the draw and aborting.
         static u32 logged{};
@@ -433,16 +430,17 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
             }
         }
     }
-    if (result == VK_ERROR_FEATURE_NOT_PRESENT && device_strict && !huge) {
+    if (result == VK_ERROR_FEATURE_NOT_PRESENT && device_strict) {
         // Strict mode's required device-local flag matched no memory type the image accepts:
         // take the host fallback below instead of failing.
         result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
     }
-    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
-        // Still out of device memory: a real image in host memory (slow, but valid) beats one
-        // with nothing bound, which AMD's drivers do not survive being sampled.
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+        // A host-visible heap may still have room for the fully backed image.
         VmaAllocationCreateInfo host = alloc_ci;
-        host.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+        if (!budget_only) {
+            host.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+        }
         host.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
         host.requiredFlags = 0;
         host.preferredFlags = 0;
@@ -467,21 +465,8 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
                         ci.arrayLayers, static_cast<u32>(ci.format));
         }
     }
-    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && ci.imageType != VK_IMAGE_TYPE_1D) {
-        if (!huge) {
-            pressure_events.fetch_add(1, std::memory_order_relaxed);
-        }
-        // Too big to back at all, e.g. title 1's sparse virtual texture arrays (8192x8192,
-        // 68 layers, ~23 GB): on the console only resident tiles have memory. Use an image with
-        // nothing bound, so views and copies still work, instead of aborting.
-        if (vk::Image sparse = CreateUnbackedImage(ci)) {
-            LOG_WARNING(Render_Vulkan,
-                        "Image {}x{}x{} ({} levels, {} layers, format {}) does not fit; using an "
-                        "unbacked sparse image",
-                        ci.extent.width, ci.extent.height, ci.extent.depth, ci.mipLevels,
-                        ci.arrayLayers, static_cast<u32>(ci.format));
-            return sparse;
-        }
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+        pressure_events.fetch_add(1, std::memory_order_relaxed);
     }
     if (result != VK_SUCCESS) {
         LOG_CRITICAL(Render_Vulkan, "Image {}x{}x{} ({} levels, {} layers, format {}) failed: {}",
@@ -506,12 +491,17 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
         );
     }
 
+    const bool device_local = (properties.memoryTypes[alloc_info.memoryType].propertyFlags &
+                               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
     return vk::Image(handle, ci.usage, *device.GetLogical(), allocator, allocation,
-                        device.GetDispatchLoader());
+                     device.GetDispatchLoader(), device_local ? device_memory_releases : nullptr);
 }
 
 vk::Image MemoryAllocator::CreateUnbackedImage(const VkImageCreateInfo &ci, bool aliased) const {
-    if (ci.imageType == VK_IMAGE_TYPE_1D) {
+    if (!device.IsSparseResidencyImageSupported(ci.imageType, ci.samples) ||
+        (aliased ? !device.IsSparseResidencyAliasedSupported() : !device.CanUseUnbackedSparseImages()) ||
+        ci.tiling != VK_IMAGE_TILING_OPTIMAL || (ci.usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) ||
+        (ci.flags & (VK_IMAGE_CREATE_PROTECTED_BIT | VK_IMAGE_CREATE_DISJOINT_BIT))) {
         return vk::Image{};
     }
     VkImageCreateInfo sparse_ci = ci;
@@ -519,18 +509,68 @@ vk::Image MemoryAllocator::CreateUnbackedImage(const VkImageCreateInfo &ci, bool
     if (aliased) {
         sparse_ci.flags |= VK_IMAGE_CREATE_SPARSE_ALIASED_BIT;
     }
-    VkImage sparse{};
-    if (device.GetDispatchLoader().vkCreateImage(*device.GetLogical(), &sparse_ci, nullptr,
-                                                 &sparse) != VK_SUCCESS) {
-        return vk::Image{};
+    // The format list and separate stencil usage are valid in both image query and creation chains.
+    for (auto* node = static_cast<const VkBaseInStructure*>(ci.pNext); node; node = node->pNext) {
+        if (node->sType != VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO &&
+            node->sType != VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO) {
+            return {};
+        }
     }
-    return vk::Image(sparse, ci.usage, *device.GetLogical(), allocator, VK_NULL_HANDLE,
-                     device.GetDispatchLoader());
+    const VkPhysicalDeviceImageFormatInfo2 query{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
+        .pNext = ci.pNext,
+        .format = ci.format,
+        .type = ci.imageType,
+        .tiling = ci.tiling,
+        .usage = ci.usage,
+        .flags = sparse_ci.flags,
+    };
+    VkImageFormatProperties2 props{.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2};
+    const VkResult support = device.GetPhysical().GetImageFormatProperties2(query, props);
+    if (support == VK_ERROR_FORMAT_NOT_SUPPORTED) {
+        return {};
+    }
+    vk::Check(support);
+    const auto& limits = props.imageFormatProperties;
+    if (ci.extent.width > limits.maxExtent.width || ci.extent.height > limits.maxExtent.height ||
+        ci.extent.depth > limits.maxExtent.depth || ci.mipLevels > limits.maxMipLevels ||
+        ci.arrayLayers > limits.maxArrayLayers || !(ci.samples & limits.sampleCounts)) {
+        return {};
+    }
+    VkImage sparse{};
+    const VkResult result = device.GetDispatchLoader().vkCreateImage(
+        *device.GetLogical(), &sparse_ci, nullptr, &sparse);
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY ||
+        result == VK_ERROR_FORMAT_NOT_SUPPORTED) {
+        return {};
+    }
+    vk::Check(result);
+    vk::Image image(sparse, ci.usage, *device.GetLogical(), allocator, VK_NULL_HANDLE,
+                    device.GetDispatchLoader());
+    // These paths bind data pages only. Explicit metadata must be resident before any image use.
+    const auto requirements = device.GetLogical().GetImageSparseMemoryRequirements(sparse);
+    if (std::ranges::any_of(requirements, [](const auto& entry) {
+            return (entry.formatProperties.aspectMask & VK_IMAGE_ASPECT_METADATA_BIT) != 0;
+        })) {
+        return {};
+    }
+    return image;
 }
 
 VmaAllocation MemoryAllocator::AllocateSparseMemory(const VkMemoryRequirements &requirements,
                                                    VkDeviceMemory &memory,
                                                    VkDeviceSize &offset) const {
+    VmaAllocationInfo info{};
+    const VmaAllocation allocation = AllocateSparseMemory(requirements, info);
+    if (allocation != VK_NULL_HANDLE) {
+        memory = info.deviceMemory;
+        offset = info.offset;
+    }
+    return allocation;
+}
+
+VmaAllocation MemoryAllocator::AllocateSparseMemory(const VkMemoryRequirements& requirements,
+                                                   VmaAllocationInfo& info) const {
     const VmaAllocationCreateInfo alloc_ci{
         .flags = 0,
         .usage = VMA_MEMORY_USAGE_UNKNOWN,
@@ -542,7 +582,6 @@ VmaAllocation MemoryAllocator::AllocateSparseMemory(const VkMemoryRequirements &
         .priority = 0.f,
     };
     VmaAllocation allocation{};
-    VmaAllocationInfo info{};
     // In a pool of their own (see Device::SeparatePool); anything over half a block, or a pool
     // allocation that fails, takes the default blocks.
     u32 memory_type{};
@@ -556,8 +595,6 @@ VmaAllocation MemoryAllocator::AllocateSparseMemory(const VkMemoryRequirements &
             pool_ci.pool = pool;
             if (vmaAllocateMemory(allocator, &requirements, &pool_ci, &allocation, &info) ==
                 VK_SUCCESS) {
-                memory = info.deviceMemory;
-                offset = info.offset;
                 return allocation;
             }
         }
@@ -565,14 +602,15 @@ VmaAllocation MemoryAllocator::AllocateSparseMemory(const VkMemoryRequirements &
     if (vmaAllocateMemory(allocator, &requirements, &alloc_ci, &allocation, &info) != VK_SUCCESS) {
         return VK_NULL_HANDLE;
     }
-    memory = info.deviceMemory;
-    offset = info.offset;
     return allocation;
 }
 
 void MemoryAllocator::FreeSparseMemory(VmaAllocation allocation) const {
     if (allocation != VK_NULL_HANDLE) {
         vmaFreeMemory(allocator, allocation);
+        if (device_memory_releases) {
+            device_memory_releases->fetch_add(1, std::memory_order_release);
+        }
     }
 }
 
@@ -709,8 +747,10 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
         .offset = alloc_info.offset,
         .memory_type = alloc_info.memoryType,
     };
+    const bool device_local = (property_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
     return vk::Buffer(handle, *device.GetLogical(), allocator, allocation, mapped_data, is_coherent,
-                      location, device.GetDispatchLoader());
+                      location, device.GetDispatchLoader(),
+                      device_local ? device_memory_releases : nullptr);
 }
 
 vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage,
@@ -759,8 +799,10 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
         .offset = alloc_info.offset,
         .memory_type = alloc_info.memoryType,
     };
+    const bool device_local = (property_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
     return vk::Buffer(handle, *device.GetLogical(), allocator, allocation, mapped_data, is_coherent,
-                      location, device.GetDispatchLoader());
+                      location, device.GetDispatchLoader(),
+                      device_local ? device_memory_releases : nullptr);
 }
 
 MemoryCommit MemoryAllocator::Commit(const VkMemoryRequirements &reqs, MemoryUsage usage)

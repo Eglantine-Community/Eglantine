@@ -250,7 +250,8 @@ private:
 };
 
 /// Writes `data` beside `path` and renames it over `path`.
-[[nodiscard]] bool WriteFileAtomic(const std::filesystem::path& path, std::span<const u8> data);
+[[nodiscard]] bool WriteFileAtomic(const std::filesystem::path& path, std::span<const u8> data,
+                                   std::string_view temporary_suffix = "");
 
 /// Identity of the translation sources this binary was built from: SHA-256 (hex) over every file
 /// that decides translated SPIR-V (shader_recompiler, the NVN shader lowering, the pipeline

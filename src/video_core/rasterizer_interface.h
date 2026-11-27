@@ -21,6 +21,7 @@
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/game_dlss_status.h"
 #include "video_core/gpu.h"
+#include "video_core/native_tensor_programs.h"
 #include "video_core/query_cache/types.h"
 #include "video_core/rasterizer_download_area.h"
 
@@ -228,6 +229,12 @@ public:
     /// 32-wide shuffles, and its output must be checkable (ProbeGameDlssOutput).
     [[nodiscard]] virtual bool SupportsGameDlssNetwork() const {
         return false;
+    }
+
+    /// Tensor lowering supported by the backend for this compute workgroup.
+    [[nodiscard]] virtual VideoCommon::NativeTensorLowering NativeTensorComputeSupport(
+        const std::array<u32, 3>& workgroup_size) const {
+        return VideoCommon::NativeTensorLowering::None;
     }
 
     /// Whether NVIDIA DLSS (the "Use NVIDIA DLSS" setting) would draw a game's DLSS evaluation.

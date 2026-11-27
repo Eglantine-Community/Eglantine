@@ -19,6 +19,8 @@ namespace Vulkan {
 class Device;
 class Scheduler;
 
+[[nodiscard]] VkDeviceSize StagingAllocationLimit(const Device& device);
+
 struct StagingBufferRef {
     VkBuffer buffer;
     VkDeviceAddress device_address;
@@ -38,6 +40,8 @@ public:
     ~StagingBufferPool();
 
     StagingBufferRef Request(size_t size, MemoryUsage usage, bool deferred = false);
+    /// Flush an exclusive mapped upload acquired with Request(..., Upload, true).
+    void FlushDeferredUpload(const StagingBufferRef& ref);
     void FreeDeferred(StagingBufferRef& ref);
 
     [[nodiscard]] VkBuffer StreamBuf() const noexcept {

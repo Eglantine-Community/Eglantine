@@ -18,6 +18,8 @@
 
 #pragma once
 
+#include <optional>
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstring>
@@ -76,6 +78,30 @@ struct FeedbackEpoch {
     }
 };
 
+/// Changes to the contents of a source image. An attachment write affects one mip;
+/// unclassified writes invalidate every mip.
+class FeedbackMipVersions {
+public:
+    explicit FeedbackMipVersions(u32 levels) : levels_(levels) {}
+
+    void Write(u32 level) noexcept {
+        levels_[level] = ++serial_;
+    }
+
+    void WriteAll() noexcept {
+        whole_ = ++serial_;
+    }
+
+    [[nodiscard]] u64 At(u32 level) const noexcept {
+        return (std::max)(whole_, levels_[level]);
+    }
+
+private:
+    std::vector<u64> levels_;
+    u64 serial_{};
+    u64 whole_{};
+};
+
 /// What a feedback scratch holds: the source it was copied from, who copied it, in which epoch and
 /// which levels/layers.
 template <typename Source>
@@ -84,20 +110,57 @@ struct FeedbackSnapshot {
     const void* by{nullptr};
     u64 epoch{0};
     SubresourceSpan span;
+    u32 image_generation{};
+    std::vector<u64> mip_versions;
 
     void Record(const std::shared_ptr<Source>& source, const void* context, u64 now,
-                const SubresourceSpan& copied) {
+                const SubresourceSpan& copied, const FeedbackMipVersions* versions = nullptr,
+                u32 generation = 0) {
         from = source;
         by = context;
         epoch = now;
         span = copied;
+        image_generation = generation;
+        mip_versions.clear();
+        if (versions) {
+            mip_versions.reserve(copied.levels);
+            for (u32 level = copied.level; level < copied.level + copied.levels; ++level) {
+                mip_versions.push_back(versions->At(level));
+            }
+        }
     }
     /// True when a draw of `context` in epoch `now` that samples `wanted` of `source` can use the
     /// scratch without copying again.
     [[nodiscard]] bool Serves(const std::shared_ptr<Source>& source, const void* context, u64 now,
                               const SubresourceSpan& wanted) const {
-        return by == context && epoch == now && !from.owner_before(source) &&
-               !source.owner_before(from) && span.Covers(wanted);
+        return epoch == now && CoversSource(source, context, wanted);
+    }
+
+    [[nodiscard]] bool HasVersions(const std::shared_ptr<Source>& source, const void* context,
+                                   u32 generation, const SubresourceSpan& wanted) const {
+        return !mip_versions.empty() && image_generation == generation &&
+               CoversSource(source, context, wanted);
+    }
+
+    [[nodiscard]] bool MipIsCurrent(u32 level, const FeedbackMipVersions& versions) const noexcept {
+        return mip_versions[level - span.level] == versions.At(level);
+    }
+
+    [[nodiscard]] bool MipsAreCurrent(const SubresourceSpan& wanted,
+                                      const FeedbackMipVersions& versions) const noexcept {
+        for (u32 level = wanted.level; level < wanted.level + wanted.levels; ++level) {
+            if (!MipIsCurrent(level, versions)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+private:
+    [[nodiscard]] bool CoversSource(const std::shared_ptr<Source>& source, const void* context,
+                                    const SubresourceSpan& wanted) const {
+        return by == context && !from.owner_before(source) && !source.owner_before(from) &&
+               span.Covers(wanted);
     }
 };
 
@@ -134,7 +197,7 @@ public:
         constants_ = false;
         area_ = false;
         descriptors_ = false;
-        template_descriptors_ = false;
+        descriptor_template_ = VK_NULL_HANDLE;
         bindless_set_ = VK_NULL_HANDLE;
         streams_valid_ = 0;
         index_valid_ = false;
@@ -148,7 +211,7 @@ public:
         }
         layout_ = layout;
         descriptors_ = false;
-        template_descriptors_ = false;
+        descriptor_template_ = VK_NULL_HANDLE;
         bindless_set_ = VK_NULL_HANDLE;
         if (!uses_push_constants) {
             constants_ = false;
@@ -183,28 +246,29 @@ public:
         buffers_ = buffers;
         images_ = images;
         descriptors_ = layout == layout_;
-        template_descriptors_ = false;
+        descriptor_template_ = VK_NULL_HANDLE;
         return false;
     }
-    /// Fast path when `layout` uses a fixed DescriptorUpdateTemplate shape: skips building
-    /// WriteSig / ImageSig vectors and compares only the bound buffer and image infos.
+    /// The update template identifies the write shape even when layouts are shared.
     [[nodiscard]] bool TakeTemplateDescriptors(VkPipelineLayout layout,
+                                               VkDescriptorUpdateTemplate update_template,
                                                std::span<const VkDescriptorBufferInfo> buffers,
                                                std::span<const VkDescriptorImageInfo> images) {
-        if (template_descriptors_ && layout == layout_ && SameBuffers(buffers) &&
+        if (descriptor_template_ != VK_NULL_HANDLE && descriptor_template_ == update_template &&
+            layout == layout_ && SameBuffers(buffers) &&
             SameImages(images)) {
             return true;
         }
         buffers_.assign(buffers.begin(), buffers.end());
         raw_images_.assign(images.begin(), images.end());
-        template_descriptors_ = layout == layout_;
+        descriptor_template_ = layout == layout_ ? update_template : VK_NULL_HANDLE;
         descriptors_ = false;
         return false;
     }
     /// The next descriptor push is not comparable (a write carries texel buffer views).
     void ForgetDescriptors() noexcept {
         descriptors_ = false;
-        template_descriptors_ = false;
+        descriptor_template_ = VK_NULL_HANDLE;
     }
 
     /// True when the bindless descriptor set for `layout` is already bound in this pass.
@@ -236,16 +300,17 @@ public:
         return false;
     }
 
-    [[nodiscard]] bool TakeIndexBuffer(VkBuffer buffer, VkDeviceSize offset,
-                                       VkIndexType type) noexcept {
+    [[nodiscard]] bool TakeIndexBuffer(VkBuffer buffer, VkDeviceSize offset, VkIndexType type,
+                                       std::optional<u32> restart_marker = std::nullopt) noexcept {
         if (index_valid_ && index_buffer_ == buffer && index_offset_ == offset &&
-            index_type_ == type) {
+            index_type_ == type && index_restart_marker_ == restart_marker) {
             return true;
         }
         index_valid_ = true;
         index_buffer_ = buffer;
         index_offset_ = offset;
         index_type_ = type;
+        index_restart_marker_ = restart_marker;
         return false;
     }
     /// An index buffer was bound outside TakeIndexBuffer (generated indices).
@@ -278,7 +343,7 @@ private:
     bool area_{false};
     PushWords words_{};
     bool descriptors_{false};
-    bool template_descriptors_{false};
+    VkDescriptorUpdateTemplate descriptor_template_{VK_NULL_HANDLE};
     VkDescriptorSet bindless_set_{VK_NULL_HANDLE};
     std::vector<WriteSig> writes_;
     std::vector<VkDescriptorBufferInfo> buffers_;
@@ -291,6 +356,7 @@ private:
     VkBuffer index_buffer_{VK_NULL_HANDLE};
     VkDeviceSize index_offset_{0};
     VkIndexType index_type_{VK_INDEX_TYPE_UINT16};
+    std::optional<u32> index_restart_marker_;
 };
 
 /// Images that flip between attachment and sampled use, with the layout they are sampled in

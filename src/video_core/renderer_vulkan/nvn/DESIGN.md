@@ -553,7 +553,9 @@ D24S8/D32S8 are not stand-ins: copies, clears and attachments work on the host f
   are scattered into a window of the pool's bytes at the
   offsets its layout gives them (Switch 2 GOBs, as `UnswizzleTexture` with native tiling, or
   linear rows), the writer's texels are scattered over them the same way, the window is gathered
-  back into the reader's texels and copied into its image. Any non-compressed format of a
+  back into the reader's texels and copied into its image. Devices without 8-bit storage use
+  masked 32-bit atomic writes for partial words. Devices without push descriptors use a set
+  from the submission's descriptor pool. Any non-compressed format of a
   single aspect (colour, D32F, D16) with 1 to 16 bytes per texel, mip chains, layers and 3D
   included; ASTC/BCn stand-ins, depth+stencil layouts and multisampled images are not moved and
   stay one `alias_unsupported` per pair, logged with the reason. Reading without a more recent
@@ -604,18 +606,43 @@ range of its own (`0x7D00...`, 2 MiB aligned) and `nvnMemoryPoolMapVirtual` reac
 
 ### Storage cache budget
 
-**MKW sparse binding batches (2026-11-14).** `SparseBacking::Prepare` compacts image binds
-into horizontal host-block runs for MKW only, following the row-batching idea in
-[`mkw-recomp` commit 30af22d](https://github.com/adriadam10/mkw-recomp/commit/30af22de9062367d3831d3787d136a6f43ebe275).
-Only adjacent blocks of the same aspect, layer, mip, row, height, memory object and flags
-merge; bound blocks also need consecutive physical offsets. Unbinds merge without a
-physical-offset condition. Each record remains one host-block row, including clipped edge
-blocks. Sorting and compacting do not change page ownership, residency, uploads, mip tails,
-the memory budget or the existing wait before changing atlas residency. With the current
-BC3 page allocation a full 512x512 guest tile uses two row binds instead of four individual
-256x256 block binds, with the same 256 KiB backing. The neighboring-tile GPU test and the
-per-block mapping comparison cover holes, remaps and physical-offset preservation. These
-checks pass in the incremental build; no gameplay speedup is claimed.
+**Sparse image selection.** NVN checks enabled sparse image features, the graphics queue,
+the nonresident access guarantee and the exact image format, flags, usage and dimensions.
+A format needing a separate metadata bind uses a fully backed image until this backend
+implements metadata binding. Tile sharing also requires support for sparse aliasing on
+the requested image. The reported sparse block extent is in texels, including for compressed
+formats. See the [Vulkan sparse memory chapter](https://docs.vulkan.org/spec/latest/chapters/sparsemem.html),
+[image format query](https://docs.vulkan.org/refpages/latest/refpages/source/VkPhysicalDeviceImageFormatInfo2.html)
+and [sparse format properties](https://docs.vulkan.org/refpages/latest/refpages/source/VkSparseImageFormatProperties.html).
+
+The page pool takes its initial allocation budget from the main device-local heap. With
+`VK_EXT_memory_budget` this is the estimate for that particular heap. Without the extension
+the pool uses the heap size, subject to the same configured limits. Usage in other heaps is
+relevant to aggregate cache pressure accounting and cannot raise this allocation budget.
+See [Khronos memory budget properties](https://docs.vulkan.org/refpages/latest/refpages/source/VkPhysicalDeviceMemoryBudgetPropertiesEXT.html).
+
+**Sparse binding batches and ordering.** A batch containing unbinds can merge adjacent
+blocks within a row if the aspect, mip, layer, height, memory and flags match. Bound blocks
+also require consecutive physical offsets. Rebinding waits for earlier graphics work that
+used the old mapping, including recorded commands that precede a retry in the same list.
+The implementation selects a queue-side semaphore wait or a host fence based on the enabled
+synchronization path. See [vkQueueBindSparse](https://docs.vulkan.org/refpages/latest/refpages/source/vkQueueBindSparse.html).
+
+**Sparse timing.** `EDEN_NX2_NVN_SPARSE_TIMING=1` reports slow mapping, binding and wait phases.
+The mapping report includes sparse allocator requests, time spent in the allocator, and the page
+pool's used and reserved bytes. The reserved count excludes allocator block overhead.
+
+**Fused sparse ASTC to BC3.** `EDEN_NX2_NVN_SPARSE_ASTC_BC3=1` converts batches of up to 32
+complete 512×512 ASTC 8×8 tiles in one compute dispatch. The packed output uses at most 8 MiB of
+scratch per atlas, retained by its submission. Partial tiles and mip tails use the normal upload.
+The pipeline builds on a worker, and an upload that arrives before it is ready uses the normal
+path. The switch defaults off. The measured GTX 1060 and Radeon Renoir have different costs for
+the fused shader.
+
+**Unresolved NVN2 coarse mip behavior.** Vulkan specifies the host behavior of unbound
+sparse memory. We have no official NVN2 reference establishing when a GPU write to a coarse
+level with no guest mapping must survive. An explicit guest mapping is covered by the general
+path. The title-specific retention rule described below is a legacy compatibility exception.
 
 **MKW coarse atlas levels.** The host blocks and opaque mip tail outside the guest's
 tiled levels now retain backing for every MKW array layer even when no guest virtual
@@ -1004,8 +1031,9 @@ condition without the CPU seeing the completion.
   submission the draws were in. Draws are counted from a counter op on unless the rest of the
   submission shows the next `ResetCounter` before any SAMPLES_PASSED report (those samples count for
   nobody); when the submission ends first, they are counted (a later submission may report them).
-  Draws only: clears are not counted, the masked clears drawn as triangles included
-  (`HostPauseCounting`).
+  Clears do not count, including masked clears drawn as triangles (`HostPauseCounting`).
+  Rasterizer-discard draws contribute zero samples. They run outside the active query, with
+  the earlier samples kept in the accumulator or in the current pass's batch.
   - **In-pass queries** (the default, `nvn_in_pass_queries` setting, needs `hostQueryReset`; the
     first OoT HLE run with them lost the Vulkan device: OoT issues ~2200 resets in a row in one frame
     outside any pass, which overflowed the 256-event batch, fixed by the room check below. On by
@@ -1042,11 +1070,10 @@ condition without the CPU seeing the completion.
     and reset around ~700 draws) ended its pass ~8 times for a full batch (`render_pass_break:
     ResetCounter`, ~15 per gameplay frame).
   - **Queries across passes** (`nvn_in_pass_queries` off, or no `hostQueryReset`): a query runs
-    outside render passes (it spans whole passes) and starts lazily before the first draw after a
-    counter op
-    (`Recorder::BeginRenderCondition`); `EndDrawPass` + fold (copy the query result,
-    `nvn_counter.comp` adds it to the queue's accumulator) happen at every report and at every
-    command buffer end. The report copies the accumulator into the report address.
+    outside render passes (it spans whole passes) and starts lazily before the first rasterizing
+    draw (`HostPrepareOcclusion`). An open query folds into the queue's accumulator before a
+    discard draw, a report or the end of the command buffer. The report copies the accumulator
+    into the report address.
 - Other counter types are reported as 0 (`counter_type_unsupported` in the unsupported TSV).
 - `ReportValue`: 4 bytes by `vkCmdFillBuffer`, and (recorder) at completion.
 - `SetRenderEnable(false)` skips draws and clears (`BeginRenderCondition` returns false).
@@ -1785,13 +1812,19 @@ Per-call, per-draw, per-submit and per-present cost with every debug switch unse
   an alias texture of the view format over the level's bytes (`BlockViewAliasOf`: the level's size in
   blocks, its GOB columns, block height and block depth, at the layer's offset). A 2D level's alias
   is one layer; a 3D level's alias is 3D with all its slices (block-linear slices interleave in
-  blocks of 2^tile_d), and the target keeps its slice range on it. The blocks reach the compressed
-  texture through the overlap transfers (`TransferOverlapBytes`) when it is read. A view of several
-  layers of a 2D array is reported unsupported.
+  blocks of 2^tile_d), and the target keeps its slice range on it. Matching layouts transfer
+  the mip or layer directly between images, or through a tightly packed buffer when the mip has
+  a partial edge block. The general byte-layout transfer handles other overlaps. A view of
+  several layers of a 2D array is reported unsupported.
 - **A texture sampled while it is a render target of the draw** (`feedback_copy`): the pass is ended,
   the sampled levels/layers of the target are copied into a scratch image of the same shape
-  (`DrawResources::GetScratch`, one per draw slot, created lazily and kept), the draw samples the copy
-  and the pass restarts. `VK_EXT_attachment_feedback_loop_layout` is not used: copy-on-read is exact
+  (`DrawResources::GetScratch`, one per draw slot, created lazily), the draw samples the copy
+  and the pass restarts. Ordinary multi-mip color images remember which mips still match the
+  source. A pass marks its attachment mip changed, while uploads, alias resolutions and other
+  writes invalidate the earlier copy. The next snapshot refreshes only the affected mips.
+  The submission keeps the scratch and its views alive until GPU completion. Idle scratches are
+  evicted oldest first above the cache budget or under device memory pressure.
+  `VK_EXT_attachment_feedback_loop_layout` is not used: copy-on-read is exact
   for shaders that read what the draw does not write and needs no pipeline/render-pass variants.
   Multisampled targets and storage images that are also targets are counted
   (`feedback_unsupported`).
@@ -1961,16 +1994,10 @@ graphics pipeline create info), `nvn_pipeline_disk.*` (file format), `nvn_pipeli
   `Settings::values.use_asynchronous_shaders` when the cache opens; off = every lookup is
   synchronous exactly as described above). `GetGraphics` / `GetCompute` take an optional
   `bool* not_ready`; only a caller that can skip passes it (the draw path; dispatches never skip).
-  - **Which draws may skip** (`MaySkipUnbuiltDraw`, the emulated path's rule from
-    vk_pipeline_cache.cpp `BuiltPipeline` / `CanSkipDraw`): `ResolvePipeline` passes `not_ready`
-    only when the draw may skip; any other draw looks up synchronously and waits for a compile in
-    flight (`WaitPending`). A draw whose programs store to memory (`StoresGlobalMemory`: the SPH
-    DoesGlobalStore bit, word 0 bit 16, of any present stage, known before translation) always
-    waits: skipping it loses state, not a frame of geometry. Otherwise a draw with a depth target
-    may skip, and a depth-less draw only when it has more than 6 elements; a depth-less draw of
-    <= 6 vertices/indices (a fullscreen pass) and a depth-less indirect or mesh draw (counted 0)
-    wait, as they often build a texture the game never draws again (OoT's first gameplay frame
-    renders 3- and 6-index depth-less passes into the slices of its sky tables).
+  - **Which draws may skip:** the replay waits for memory stores, draws of six elements or fewer,
+    indirect and mesh draws, and draws involved in conditional rendering or occlusion queries.
+    Other draws need bound targets fully cleared this frame and used repeatedly in recent frames.
+    Target reuse by itself can include one-shot passes that need to finish before their outputs are sampled.
   - A miss claims the key in `pending_*` under the same lock as the search (so a finished worker
     or a second lookup cannot slip in between), deep-copies the program bytes and asks the oracle for
     a frozen copy (`TextureOracle::Freeze(stage_mask)`), queues the compile on the `NvnPipelineAsync`
@@ -1979,7 +2006,9 @@ graphics pipeline create info), `nvn_pipeline_disk.*` (file format), `nvn_pipeli
     `CompileGraphics` / `CompileCompute` (same translation, same disk records, same stats), inserts
     the pipeline into the key's variant list and only then releases the claim. A later draw that asks
     again finds the pipeline. A lookup that passed `not_ready` never waits for it; a draw that may
-    not skip waits for the claim to be released.
+    not skip waits for the claim to be released. Runtime graphics compiles are limited to two
+    batches of the worker count, including active work. A newly queued key can trigger lookahead
+    when workers are available.
   - **Frozen oracle** (`DrawContext::FreezeOracle`, nvn_draw_descriptors.cpp): a worker must not read
     replay state, and translation asks the oracle for handles it only discovers while translating.
     The copy holds the per-stage binding arrays (combined / separate texture / image words), the bytes
@@ -2071,8 +2100,8 @@ graphics pipeline create info), `nvn_pipeline_disk.*` (file format), `nvn_pipeli
     whole (`gpl_whole`).
   - **Swap:** each fast-linked pipeline is compiled whole on `optimize_workers` (background,
     `clamp(hardware threads / 8, 1, 4)`) with its own layout, render pass and dynamic states and
-    published in `GraphicsPipeline::optimized_handle`; the replay binds `Handle()` (rebinding when it
-    changes), the fast-linked one stays alive with the object.
+    published in `GraphicsPipeline::optimized_handle`; the replay binds `AcquireBinding()` (rebinding
+    when it changes). Draws recorded with the fast link keep it until their submission finishes.
   - **Program creation:** `CmdCreateProgram` lowers the program's stages on a background thread
     (`PrepareProgram`, `programs_prepared`): its first draw starts at translation. The translation
     itself needs the draw (textures behind the handles, targets, vertex formats), so it cannot move
@@ -2233,6 +2262,9 @@ whether the translated shader info marks the slot as an atomic target.
 `descriptor fallback (graphics|compute): <reason>` rows in the unsupported TSV count every dummy
 texture/buffer a draw bound, by reason.
 
+- **Storage buffer alignment.** The descriptor starts at the guest address rounded down to the
+  host's storage-buffer offset alignment, as assumed by the translated shader. The bound range
+  includes the leading bytes. Mirror uploads and shadow tracking use that same range.
 - **Empty and unsized buffer bindings** (`DescReasonIsFallback`; counted in the same rows but not
   warned about). A uniform buffer bound with address 0 or with size 0 reads zeros (the dummy
   buffer; constant-buffer reads are bounds checked and nxnative reads its all-zero bank); DK has
@@ -2251,12 +2283,12 @@ texture/buffer a draw bound, by reason.
 
 - **Depth EQUAL after a pre-pass.** DK draws a depth pre-pass (color mask 0, LESS) and then its
   G-buffer draws with depth func EQUAL, no depth write, with *different* vertex shaders. The replay
-  tests EQUAL exactly (`EDEN_NX2_NVN_RELAX_DEPTH_EQUAL=1` tests it as LESS_OR_EQUAL). The NVN profile
-  decorates the vertex position output `Invariant` (`Profile::position_invariant`) and every
-  floating point add/mul/fma of the position stages `NoContraction` (`Profile::position_precise`;
-  the guest's FADD/FMUL/FFMA already are). Measured on a town frame: the canonical position
-  expression of a pre-pass and a G-buffer vertex shader of the same mesh is identical, with strict
-  EQUAL the terrain of the first area and the platform render the same as with LESS_OR_EQUAL; a
+  tests EQUAL exactly (`EDEN_NX2_NVN_RELAX_DEPTH_EQUAL=1` tests it as LESS_OR_EQUAL). Direct Ampere
+  FADD, FMUL and FFMA mark their results `NoContraction` so the driver preserves the rounding
+  point of each instruction. FFMA still maps to an explicit fused operation. In a captured town
+  frame, the pre-pass and G-buffer vertex shaders of the same mesh have identical canonical
+  position expressions. The terrain of the first area and the platform render identically with
+  strict EQUAL and LESS_OR_EQUAL. A
   LEQUAL+depth-write probe (`EDEN_NX2_NVN_DEPTH_PROBE=1`) only moves depth for fur shells and a few
   alpha-tested props (1.7% of the pixels, not ulp-level).
 - **Window origin.** NVN clip space is OpenGL's and row 0 of a render target is its top, so viewports
@@ -2270,9 +2302,25 @@ texture/buffer a draw bound, by reason.
 - More experiments: `_DEPTH_PROBE=1|2`, `_ONLY_DRAWS=a,b,..`; depth dumps also write `.raw` floats.
 - Validation findings fixed: sampled depth images without DEPTH_STENCIL_ATTACHMENT usage use
   SHADER_READ_ONLY layout; storage image views use the identity swizzle and do not claim
-  STORAGE usage for formats without storage support. Not ours: StencilExportEXT capability
-  without the extension, shader_quad_control without maximal reconvergence (device setup), and a
-  geometry shader whose inputs exceed maxGeometryInputComponents.
+  STORAGE usage for formats without storage support. The separate device setup findings involved
+  shader_quad_control without maximal reconvergence and geometry input above
+  maxGeometryInputComponents.
+- The multisample copy path transfers individual sample values. The cache retains the
+  multisample attachment across render passes because a later copy can read any sample.
+  Explicit depth/stencil resolves can use SAMPLE_ZERO for an eligible full matching view.
+  Scaled, flipped and partial regions use the shader path. [Vulkan render-pass resolves](https://docs.vulkan.org/spec/latest/chapters/renderpass.html#renderpass-resolve-operations)
+- A shader with stencil export writes depth and stencil in one draw. Without that extension,
+  the depth draw also clears the stencil of the affected samples. Eight masked draws set
+  the source stencil bits using fragment discard and fixed-function REPLACE. In partial
+  uploads, sample-grid bounds protect neighboring samples, including ones in the same pixel.
+  [Vulkan stencil test](https://docs.vulkan.org/spec/latest/chapters/fragops.html#fragops-stencil)
+- Multisample staging separates packed depth/stencil into two Vulkan buffer-image copy regions.
+  Row and layer padding stay outside the payload. On readback the two aspects are packed again.
+  NVIDIA documents the bit layouts of T_Z24S8, T_S8Z24 and T_X24S8Z32_F. The public sources
+  cited here establish the host operations and NVIDIA formats. They do not establish the
+  complete Switch 2 guest sample ordering. The tests verify the emulator's existing sample grid.
+  [NVIDIA Thor TRM, Pixel Memory Formats, p. 254](https://cdck-file-uploads-global.s3.dualstack.us-west-2.amazonaws.com/nvidia/original/4X/a/0/8/a0808d84bcb2524b5ee54ddea208b294887cd42e.pdf#page=254)
+  · [Vulkan buffer-image copies](https://docs.vulkan.org/spec/latest/chapters/copies.html#copies-buffers-images)
 
 ## Black terrain root cause (cave, DK gsys terrain) and more diagnostics
 
@@ -2392,18 +2440,18 @@ ETW of the `NvnReplay` thread in the DK town (about 2,260 draws and 9,500 NVN ca
 showed the cost in per-draw lookups, not in Vulkan. What was removed, with the invariant that keeps
 each cache exact:
 
-- **Early submission.** `Recorder::MaybeSubmitEarly` (checked every 32 ops, between ops) ends the
-  command buffer, submits every segment recorded so far and starts a new one once the piece has
-  taken `EDEN_NX2_NVN_EARLY_FIRST_US` (300 µs, the first piece) or `EDEN_NX2_NVN_EARLY_SUBMIT_US`
-  (1,500 µs, later ones; 0 turns it off) of recording, at a point where no render pass is open
-  (`EDEN_NX2_NVN_EARLY_PASS_US`, default 4,000: a pass that is still open that long is ended). The
-  GPU then runs the first part of the frame while the rest is recorded; before, it idled for the
-  whole recording of the submission. It is the `WaitSync`/`FlushAndWait` segment machinery: every
-  segment signals its own timeline value in submission order, `MarkSubmitted` still publishes the
-  last one and the binary present signal is only on the last segment. `SubmitSegments` flushes only
-  the arena/staging chunks it has not flushed yet. A recorder that fails after an early piece
-  waits for the pieces before it lets the flight go (`Recorder::Abort`). Counted in the log line
-  `[nvn] early submits: N ...` at shutdown.
+- **Early submission.** Between operations, `Recorder::MaybeSubmitEarly` checks every 32 ops
+  whether the recorded GPU work can be submitted. The default host scheduling intervals are
+  300 µs for the first piece and 1,500 µs thereafter. An open pass or live storage shadows
+  raise the minimum to 4,000 µs. If the timeline value from the last graphics submission is
+  still pending, the recorder continues recording and polls again after at least 300 µs.
+  This query only guides optional submissions. Fences and other ordering requirements keep
+  their own submission points. Explicit timing overrides bypass queue polling and shadow
+  coalescing. Setting `EDEN_NX2_NVN_EARLY_SUBMIT_US=0` disables timed submissions.
+  Each submitted segment signals its own timeline value in queue order. `MarkSubmitted`
+  publishes the last one, and only the last segment carries the binary present signal.
+  `SubmitSegments` flushes the outstanding arena and staging chunks. If recording fails,
+  `Recorder::Abort` waits for submitted pieces before releasing the flight.
 - **Buffer range lookups** (`Impl::ResolveBuffer`): 16 recent results, valid while
   `pool_generation` is unchanged, each limited to the part of its pool in which no other pool
   starts (the address map's answer is the same for every address in it). `EnsureBacking` returns
@@ -2411,8 +2459,9 @@ each cache exact:
 - **Texture of descriptor id** (`DrawContext::TextureOfId`): direct-mapped slots keyed by (id,
   serial) holding the `textures` node; `Impl::texture_epoch` is bumped when a texture is erased.
   The draw plan holds raw `Texture*` for its image bindings (the textures outlive the draw).
-- **Views** (`DrawResources::GetView`): the texture remembers its `texture_views` node
-  (`views_epoch`, bumped by `TakeViews`).
+- **Views** (`DrawResources::GetView`): each texture remembers its `texture_views` node until
+  `TakeViews` detaches that texture's views. A node seen by multiple texture instances uses the
+  shared invalidation epoch. Taking all views of a storage leaves the nodes in place.
 - **`NoteUse`**: 256 recent (serial, seq) pairs in front of the `last_use` map.
 - **`StorageNeedsCommands`**: the storage remembers its `storage_index` node
   (`storage_index_epoch`, bumped when a pool's index is evicted).

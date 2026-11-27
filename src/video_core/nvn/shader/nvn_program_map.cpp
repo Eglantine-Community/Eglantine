@@ -6,6 +6,7 @@
 #include "video_core/nvn/shader/nvn_program_map.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <utility>
 
@@ -44,6 +45,9 @@ Shader::Ampere::LoweringOptions MakeLoweringOptions(ShaderStage stage,
         .geometry = stage == ShaderStage::Geometry,
         .tensor = compute && tensor != NativeTensorLowering::None,
         .compact_tensor = compute && tensor == NativeTensorLowering::Compact,
+        .tensor_mode = compute && tensor == NativeTensorLowering::Workgroup
+                           ? Shader::Ampere::TensorMode::Workgroup
+                           : Shader::Ampere::TensorMode::Default,
     };
 }
 
@@ -289,8 +293,18 @@ std::shared_ptr<const LoweredNvnProgram> PrepareNvnProgram(const NvnProgramBinar
         return std::shared_ptr<const LoweredNvnProgram>{std::move(result)};
     }
 
-    auto analysis =
-        Shader::Ampere::AnalyzeProgram(result->native, MakeLoweringOptions(binary.stage, tensor));
+    if (tensor == NativeTensorLowering::Workgroup) {
+        const char* requested = std::getenv("EDEN_NX2_TENSOR");
+        if (!Shader::Ampere::HasHmma(result->native) ||
+            (requested && Shader::Ampere::ParseTensorMode(requested) == Shader::Ampere::TensorMode::Stub)) {
+            result->tensor_lowering = NativeTensorLowering::None;
+        } else if (requested) {
+            result->error = "lower: explicit HMMA mode needs a supported physical subgroup";
+            return result;
+        }
+    }
+    auto analysis = Shader::Ampere::AnalyzeProgram(
+        result->native, MakeLoweringOptions(binary.stage, result->tensor_lowering));
     if (!analysis) {
         const size_t failed = analysis.error_offset / sizeof(Instruction);
         result->error_offset = analysis.error_offset;
@@ -588,7 +602,10 @@ Shader::Profile MakeReferenceProfile() {
     profile.support_explicit_workgroup_layout = false;
     profile.support_shader_quad_control = false;
     profile.support_quad_shuffles = true;
+    profile.support_quad_shuffles_all_stages = true;
     profile.support_vote = true;
+    profile.support_ballot = true;
+    profile.support_shuffle = true;
     profile.support_shuffle_relative = true;
     profile.supported_subgroup_stages = 0x7F;
     profile.support_viewport_index_layer_non_geometry = true;

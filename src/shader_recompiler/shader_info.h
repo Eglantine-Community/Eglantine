@@ -470,11 +470,13 @@ struct Info {
     std::vector<std::vector<u32>> handle_programs;
     ImageDescriptors image_descriptors;
 
-    /// True when the shader only runs correctly if a subgroup spans a whole guest warp.
+    [[nodiscard]] bool UsesWarpCollectives() const noexcept {
+        return removed_conditional_barrier || uses_subgroup_vote || uses_subgroup_shuffles ||
+               uses_quad_shuffles || uses_fswzadd || uses_cooperative_matrix;
+    }
+
     [[nodiscard]] bool UsesWarpOps() const noexcept {
-        return removed_conditional_barrier || uses_subgroup_vote || uses_subgroup_invocation_id ||
-               uses_subgroup_shuffles || uses_subgroup_mask || uses_quad_shuffles ||
-               uses_fswzadd || uses_cooperative_matrix;
+        return UsesWarpCollectives() || uses_subgroup_invocation_id || uses_subgroup_mask;
     }
 
     bool operator==(const Info&) const = default;

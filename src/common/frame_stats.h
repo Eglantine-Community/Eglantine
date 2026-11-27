@@ -14,10 +14,10 @@
 ///
 /// Off unless `EDEN_NX2_FRAME_STATS` is set (anything but `0`); then every guest present calls
 /// `OnPresent` and the subsystems add the time they spent stalling the frame with `AddStall` or
-/// `Scope`. A value other than `1` is also the path of a CSV with one line per present
-/// (`present,t_ms,dt_us,<cause us...>`). Every 600 presents one log line gives the present-to-present
-/// percentiles, the counts over 16.7/33/50/100 ms and, for the frames over 33 ms, which causes
-/// were active and for how long.
+/// `Scope`. A value other than `1` is also the path of a CSV with one line per present after the first
+/// (`present,t_ms,dt_us,<cause us...>`, plus `seq` in NVN GPU frame profiling mode).
+/// Every 600 presents one log line gives the present-to-present percentiles, the counts over
+/// 16.7/33/50/100 ms and, for the frames over 33 ms, which causes were active and for how long.
 namespace Common::FrameStats {
 
 enum class Cause : u32 {
@@ -90,7 +90,9 @@ private:
 };
 
 /// Called by the guest present on either path (the frame boundary). No-op when disabled.
-void OnPresent(std::chrono::steady_clock::time_point now);
+void OnPresent(std::chrono::steady_clock::time_point now, u64 seq = 0);
+/// Frame stats path when `EDEN_NX2_NVN_GPU_PROFILE=frame` enables CSV correlation.
+[[nodiscard]] const char* NvNGpuFrameStatsCsvPath();
 /// Guest presents observed by this instance, for request/event logs.
 [[nodiscard]] u64 PresentCount();
 

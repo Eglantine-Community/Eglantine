@@ -46,7 +46,8 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
                                  Common::ThreadWorker* thread_worker,
                                  PipelineStatistics* pipeline_statistics,
                                  VideoCore::ShaderNotify* shader_notify, const Shader::Info& info_,
-                                 vk::ShaderModule spv_module_, u64 shader_hash_)
+                                 vk::ShaderModule spv_module_, u64 shader_hash_,
+                                 const std::array<u32, 3>& workgroup_size)
     : device{device_},
       pipeline_cache(pipeline_cache_), guest_descriptor_queue{guest_descriptor_queue_},
       descriptor_buffer_ring{descriptor_buffer_ring_}, info{info_},
@@ -97,28 +98,22 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
     }
 
     const auto queued_at = std::chrono::steady_clock::now();
-    auto func{[this, shader_notify, pipeline_statistics, queued_at] {
+    auto func{[this, shader_notify, pipeline_statistics, queued_at, workgroup_size] {
         const auto started_at = std::chrono::steady_clock::now();
         const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
             .pNext = nullptr,
             .requiredSubgroupSize = GuestWarpSize,
         };
-        // Only warp-level ops observe the subgroup size. Forcing 32 on other shaders makes Intel
-        // compile SIMD32, which can spill a register-heavy kernel for minutes (Mario Kart World).
-        // A shader that lost a conditional barrier counts too: it relies on a whole warp running
-        // in step, and at a smaller subgroup size it reads stale shared memory, which shows as
-        // banding over the image in Mario Kart World on Intel's Windows driver.
-        const bool uses_warp_ops = info.UsesWarpOps() || info.uses_cooperative_matrix;
-        VkPipelineCreateFlags flags{};
+        // A subgroup size is observable only when the translated shader uses warp collectives.
+        const bool uses_warp_ops = info.UsesWarpCollectives();
+        const bool full_subgroups = uses_warp_ops && device.CanSetFullComputeSubgroups(workgroup_size);
+        VkPipelineCreateFlags flags = ComputeOptimizationFlags();
         if (device.IsKhrPipelineExecutablePropertiesEnabled() && Settings::values.renderer_debug.GetValue()) {
             flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
         }
         if (uses_descriptor_buffer) {
             flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
-        }
-        if (BuildsUnoptimized(device.GetDriverID(), shader_hash)) {
-            flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
         }
         const VkComputePipelineCreateInfo compute_ci{
             .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
@@ -126,11 +121,10 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             .flags = flags,
             .stage{
                 .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                .pNext = device.IsExtSubgroupSizeControlSupported() && uses_warp_ops &&
-                                 device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT)
+                .pNext = uses_warp_ops && device.CanRequireGuestWarpForCompute(workgroup_size)
                              ? &subgroup_size_ci
                              : nullptr,
-                .flags = info.uses_cooperative_matrix
+                .flags = full_subgroups
                              ? VkPipelineShaderStageCreateFlags{
                                    VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT}
                              : VkPipelineShaderStageCreateFlags{},

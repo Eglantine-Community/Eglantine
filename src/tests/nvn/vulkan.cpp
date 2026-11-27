@@ -833,6 +833,50 @@ TEST_CASE("NVN Vulkan: NVN formats map to pixel formats", "[nvn]") {
     REQUIRE(!NvnToPixelFormat(0x1000).has_value());
 }
 
+TEST_CASE("NVN Vulkan: explicit texture view depth/stencil mode overrides the builder", "[nvn]") {
+    using Vulkan::Nvn::TextureViewAspect;
+    constexpr VkImageAspectFlags DEPTH = VK_IMAGE_ASPECT_DEPTH_BIT;
+    constexpr VkImageAspectFlags STENCIL = VK_IMAGE_ASPECT_STENCIL_BIT;
+    constexpr VkImageAspectFlags COMBINED = DEPTH | STENCIL;
+    constexpr VkImageAspectFlags COLOR = VK_IMAGE_ASPECT_COLOR_BIT;
+
+    CHECK(TextureViewAspect(COMBINED, false, false, 1) == DEPTH);
+    CHECK(TextureViewAspect(COMBINED, true, false, 0) == STENCIL);
+    CHECK(TextureViewAspect(COMBINED, false, true, 0) == DEPTH);
+    CHECK(TextureViewAspect(COMBINED, false, true, 1) == STENCIL);
+    CHECK(TextureViewAspect(COMBINED, true, true, 0) == DEPTH);
+    CHECK(TextureViewAspect(COMBINED, true, true, 1) == STENCIL);
+
+    CHECK(TextureViewAspect(COLOR, true, true, 1) == COLOR);
+    CHECK(TextureViewAspect(DEPTH, true, true, 1) == DEPTH);
+    CHECK(TextureViewAspect(STENCIL, false, true, 0) == STENCIL);
+}
+
+TEST_CASE("NVN Vulkan: stencil views sample unsigned texels", "[nvn]") {
+    using VideoCore::Surface::PixelFormat;
+    using VideoCore::Surface::IsPixelFormatInteger;
+    using Vulkan::Nvn::TextureSampleFormat;
+    using Vulkan::Nvn::TextureViewAspect;
+    constexpr VkImageAspectFlags DEPTH = VK_IMAGE_ASPECT_DEPTH_BIT;
+    constexpr VkImageAspectFlags STENCIL = VK_IMAGE_ASPECT_STENCIL_BIT;
+    constexpr VkImageAspectFlags COMBINED = DEPTH | STENCIL;
+    constexpr VkImageAspectFlags COLOR = VK_IMAGE_ASPECT_COLOR_BIT;
+
+    const auto stencil_view = TextureViewAspect(COMBINED, false, true, 1);
+    const auto depth_view = TextureViewAspect(COMBINED, true, true, 0);
+    const auto stencil_format = TextureSampleFormat(PixelFormat::D24_UNORM_S8_UINT,
+                                                     stencil_view);
+    CHECK(stencil_format == PixelFormat::R8_UINT);
+    CHECK(IsPixelFormatInteger(stencil_format));
+    CHECK_FALSE(IsPixelFormatInteger(TextureSampleFormat(PixelFormat::D24_UNORM_S8_UINT,
+                                                         depth_view)));
+    CHECK(TextureSampleFormat(PixelFormat::D32_FLOAT_S8_UINT, STENCIL) == PixelFormat::R8_UINT);
+    CHECK(TextureSampleFormat(PixelFormat::S8_UINT, STENCIL) == PixelFormat::R8_UINT);
+    CHECK(TextureSampleFormat(PixelFormat::D32_FLOAT, DEPTH) == PixelFormat::D32_FLOAT);
+    CHECK(TextureSampleFormat(PixelFormat::R8_SNORM, COLOR) == PixelFormat::R8_SNORM);
+    CHECK(TextureSampleFormat(PixelFormat::R16_UINT, COLOR) == PixelFormat::R16_UINT);
+}
+
 #ifdef _WIN32
 TEST_CASE("NVN Vulkan: MakeResident brings committed pages in and skips the others",
           "[nvn][import]") {
@@ -1231,6 +1275,26 @@ TEST_CASE("NVN Vulkan: pools backed in the background see bytes the game wrote l
     SECTION("backing on demand") {
         RunLateFilledPools(*vulkan, false);
     }
+}
+
+TEST_CASE("NVN Vulkan: recording state alone needs no early queue submission", "[nvn][early-submit]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    std::atomic<u32> submits{};
+    Vulkan::Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr,
+                                 {.on_queue_submit = [&] { ++submits; }});
+    std::vector<u64> list;
+    for (u32 i = 0; i < 32'768; ++i) {
+        Push(list, VC::Op::SetPointSize, VC::F32Payload{.value = 1.0f + static_cast<float>(i % 16)});
+    }
+    PushEnd(list);
+    context.Submit(MakeSubmission(1, 0, std::move(list)));
+    REQUIRE(context.Wait(1, 20s));
+    CHECK(context.Stats().ops_failed == 0);
+    CHECK(context.Stats().ops_unsupported == 0);
+    CHECK(submits.load() == 1);
 }
 
 TEST_CASE("NVN Vulkan: submissions on one queue are ordered after each other", "[nvn]") {

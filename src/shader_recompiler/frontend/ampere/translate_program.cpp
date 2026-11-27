@@ -17,7 +17,7 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
     HostTranslateInfo normalized_host_info{host_info};
     normalized_host_info.ApplyDescriptorLimitPolicy();
 
-    Flow::CFG cfg{env, flow_block_pool, code, false};
+    Flow::CFG cfg{env, flow_block_pool, code, false, ResolveTensorMode(options)};
     u32 required_texture_buffer{env.TextureBoundBuffer()};
     const bool mkw_zero_depth_fallback =
         code.size_bytes() == 0x3b0 && NativeProgramKey(code) == 0x5a4f3726590efb17ULL;

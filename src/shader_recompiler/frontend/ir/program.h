@@ -31,6 +31,13 @@ struct Program {
     u32 shared_memory_size{};
     bool is_geometry_passthrough{};
     MeshInfo mesh{};
+
+    // Ballot, vote and shuffle are local to lane zero in this compute workgroup.
+    // Quad and FSWZ operations have their own lowering.
+    [[nodiscard]] bool HasScalarWarp() const noexcept {
+        return stage == Stage::Compute && workgroup_size == std::array<u32, 3>{1, 1, 1} &&
+               !info.uses_quad_shuffles && !info.uses_fswzadd;
+    }
 };
 
 [[nodiscard]] std::string DumpProgram(const Program& program);

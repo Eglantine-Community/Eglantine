@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <array>
 #include <bit>
 #include <utility>
 
@@ -50,92 +51,20 @@ void PromoteHalfPair(IR::IREmitter& ir, IR::F16F32F64& lhs, IR::F16F32F64& rhs) 
     return IR::U32{ir.Select(is_nan, ir.Imm32(0x7fffU), clamped)};
 }
 
-[[nodiscard]] IR::F32 ConvertI32ToF32Rounded(IR::IREmitter& ir, const IR::U32& src, bool is_signed,
-                                             u32 round_mode) {
-    if (round_mode == 0U) {
-        const IR::FpControl control{
-            .no_contraction = false,
-            .rounding = IR::FpRounding::RN,
-            .fmz_mode = IR::FmzMode::DontCare,
-        };
-        return IR::F32{ir.ConvertIToF(32, 32, is_signed, src, control)};
-    }
-    const IR::U1 neg = is_signed ? ir.ILessThan(src, ir.Imm32(0U), true) : ir.Imm1(false);
-    const IR::U32 mag = is_signed ? IR::U32{ir.Select(neg, ir.INeg(src), src)} : src;
-    const IR::U1 round_up =
-        round_mode == 1U ? neg : (round_mode == 2U ? ir.LogicalNot(neg) : ir.Imm1(false));
-    const IR::U1 is_zero = ir.IEqual(mag, ir.Imm32(0U));
-    const IR::U32 msb{ir.Select(is_zero, ir.Imm32(0U), ir.FindUMsb(mag))};
-    const IR::U1 large = ir.IGreaterThan(msb, ir.Imm32(23U), false);
-    const IR::U32 shift_r{ir.Select(large, ir.ISub(msb, ir.Imm32(23U)), ir.Imm32(0U))};
-    const IR::U32 shift_l{ir.Select(large, ir.Imm32(0U), ir.ISub(ir.Imm32(23U), msb))};
-    const IR::U32 mant{
-        ir.Select(large, ir.ShiftRightLogical(mag, shift_r), ir.ShiftLeftLogical(mag, shift_l))};
-    const IR::U32 rem_mask{ir.ISub(ir.ShiftLeftLogical(ir.Imm32(1U), shift_r), ir.Imm32(1U))};
-    const IR::U1 inexact = ir.INotEqual(ir.BitwiseAnd(mag, rem_mask), ir.Imm32(0U));
-    const IR::U32 inc{ir.Select(ir.LogicalAnd(inexact, round_up), ir.Imm32(1U), ir.Imm32(0U))};
-    const IR::U32 mant_r{ir.IAdd(mant, inc)};
-    const IR::U32 exp_base{ir.ShiftLeftLogical(ir.IAdd(msb, ir.Imm32(126U)), ir.Imm32(23U))};
-    const IR::U32 bits{ir.IAdd(exp_base, mant_r)};
-    const IR::U32 signed_bits{
-        ir.BitwiseOr(bits, IR::U32{ir.Select(neg, ir.Imm32(0x80000000U), ir.Imm32(0U))})};
-    return ir.BitCast<IR::F32>(IR::U32{ir.Select(is_zero, ir.Imm32(0U), signed_bits)});
+// Adapted from ScarletNX's SM86 BF16 conversion (sm86_translate.c, GPL-3.0-or-later).
+[[nodiscard]] IR::U32 RoundToBFloat16(IR::IREmitter& ir, const IR::U32& bits) {
+    const IR::U32 half = ir.ShiftRightLogical(bits, ir.Imm32(16U));
+    const IR::U32 odd = ir.BitwiseAnd(half, ir.Imm32(1U));
+    const IR::U32 bias{ir.IAdd(ir.Imm32(0x7fffU), odd)};
+    const IR::U32 rounded = ir.ShiftRightLogical(IR::U32{ir.IAdd(bits, bias)}, ir.Imm32(16U));
+    const IR::U32 magnitude = ir.BitwiseAnd(bits, ir.Imm32(0x7fffffffU));
+    const IR::U1 is_nan = ir.IGreaterThan(magnitude, ir.Imm32(0x7f800000U), false);
+    const IR::U32 quiet_nan = ir.BitwiseOr(half, ir.Imm32(0x40U));
+    return IR::U32{ir.Select(is_nan, quiet_nan, rounded)};
 }
 
-[[nodiscard]] IR::F32 ConvertI64ToF32Rounded(IR::IREmitter& ir, const IR::U32& lo, const IR::U32& hi,
-                                             bool is_signed, u32 round_mode) {
-    if (round_mode == 0U) {
-        const IR::U64 packed = ir.PackUint2x32(ir.CompositeConstruct(lo, hi));
-        const IR::FpControl control{
-            .no_contraction = false,
-            .rounding = IR::FpRounding::RN,
-            .fmz_mode = IR::FmzMode::DontCare,
-        };
-        return IR::F32{ir.ConvertIToF(32, 64, is_signed, packed, control)};
-    }
-    const IR::U1 neg = is_signed
-                           ? ir.INotEqual(ir.BitwiseAnd(hi, ir.Imm32(0x80000000U)), ir.Imm32(0U))
-                           : ir.Imm1(false);
-    const IR::U32 neg_lo{ir.INeg(lo)};
-    const IR::U32 neg_hi{
-        ir.IAdd(ir.BitwiseNot(hi),
-                IR::U32{ir.Select(ir.INotEqual(lo, ir.Imm32(0U)), ir.Imm32(0U), ir.Imm32(1U))})};
-    const IR::U32 mag_lo = is_signed ? IR::U32{ir.Select(neg, neg_lo, lo)} : lo;
-    const IR::U32 mag_hi = is_signed ? IR::U32{ir.Select(neg, neg_hi, hi)} : hi;
-    const IR::U1 round_up =
-        round_mode == 1U ? neg : (round_mode == 2U ? ir.LogicalNot(neg) : ir.Imm1(false));
-    const IR::U1 hi_nz = ir.INotEqual(mag_hi, ir.Imm32(0U));
-    const IR::U1 lo_nz = ir.INotEqual(mag_lo, ir.Imm32(0U));
-    const IR::U1 is_zero = ir.LogicalNot(ir.LogicalOr(hi_nz, lo_nz));
-    const IR::U32 msb_lo{ir.Select(lo_nz, ir.FindUMsb(mag_lo), ir.Imm32(0U))};
-    const IR::U32 msb{ir.Select(hi_nz, ir.IAdd(ir.FindUMsb(mag_hi), ir.Imm32(32U)), msb_lo)};
-    const IR::U1 case_a = ir.ILessThan(msb, ir.Imm32(24U), false);
-    const IR::U1 case_c = ir.IGreaterThanEqual(msb, ir.Imm32(55U), false);
-    const IR::U32 shift_a{ir.Select(case_a, ir.ISub(ir.Imm32(23U), msb), ir.Imm32(0U))};
-    const IR::U32 mant_a{ir.ShiftLeftLogical(mag_lo, shift_a)};
-    const IR::U32 s_b{ir.Select(ir.LogicalOr(case_a, case_c), ir.Imm32(1U),
-                                ir.ISub(msb, ir.Imm32(23U)))};
-    const IR::U32 inv_s_b{ir.ISub(ir.Imm32(32U), s_b)};
-    const IR::U32 mant_b{
-        ir.BitwiseOr(ir.ShiftRightLogical(mag_lo, s_b), ir.ShiftLeftLogical(mag_hi, inv_s_b))};
-    const IR::U1 inexact_b = ir.INotEqual(ir.ShiftLeftLogical(mag_lo, inv_s_b), ir.Imm32(0U));
-    const IR::U32 s_c{ir.Select(case_c, ir.ISub(msb, ir.Imm32(55U)), ir.Imm32(0U))};
-    const IR::U32 mant_c{ir.ShiftRightLogical(mag_hi, s_c)};
-    const IR::U32 rem_mask_c{ir.ISub(ir.ShiftLeftLogical(ir.Imm32(1U), s_c), ir.Imm32(1U))};
-    const IR::U1 inexact_c =
-        ir.LogicalOr(lo_nz, ir.INotEqual(ir.BitwiseAnd(mag_hi, rem_mask_c), ir.Imm32(0U)));
-    const IR::U32 mant{
-        ir.Select(case_a, mant_a, IR::U32{ir.Select(case_c, mant_c, mant_b)})};
-    const IR::U1 inexact{
-        ir.Select(case_a, ir.Imm1(false), IR::U1{ir.Select(case_c, inexact_c, inexact_b)})};
-    const IR::U32 inc{ir.Select(ir.LogicalAnd(inexact, round_up), ir.Imm32(1U), ir.Imm32(0U))};
-    const IR::U32 mant_r{ir.IAdd(mant, inc)};
-    const IR::U32 exp_base{ir.ShiftLeftLogical(ir.IAdd(msb, ir.Imm32(126U)), ir.Imm32(23U))};
-    const IR::U32 bits{ir.IAdd(exp_base, mant_r)};
-    const IR::U32 signed_bits{
-        ir.BitwiseOr(bits, IR::U32{ir.Select(neg, ir.Imm32(0x80000000U), ir.Imm32(0U))})};
-    return ir.BitCast<IR::F32>(IR::U32{ir.Select(is_zero, ir.Imm32(0U), signed_bits)});
-}
+constexpr std::array RoundingModes{
+    IR::FpRounding::RN, IR::FpRounding::RM, IR::FpRounding::RP, IR::FpRounding::RZ};
 
 } // Anonymous namespace
 
@@ -204,23 +133,30 @@ void TranslatorVisitor::F2F(const Instruction& insn) {
 void TranslatorVisitor::F2FP(const Instruction& insn) {
     const u32 dest = insn.Bits(16, 8);
     const bool merge = insn.Bits(78, 1) != 0U;
+    const IR::U32 b = AluSourceU32(insn, 1U);
+    if (!merge && insn.Bits(76, 1) != 0U) {
+        const IR::U32 hi = RoundToBFloat16(ir, AluSourceU32(insn, 0U));
+        const IR::U32 lo = RoundToBFloat16(ir, b);
+        R(dest, ir.BitwiseOr(ir.ShiftLeftLogical(hi, ir.Imm32(16U)), lo));
+        return;
+    }
     const IR::FpControl control{
         .no_contraction = false,
         .rounding = IR::FpRounding::RN,
         .fmz_mode = IR::FmzMode::None,
     };
-    const IR::F32 b = ir.BitCast<IR::F32>(AluSourceU32(insn, 1U));
-    const IR::F16 lo_h{ir.FPConvert(16, b, control)};
-    const IR::F16 zero_h{ir.FPConvert(16, ir.Imm32(0.0f))};
+    const IR::F16 lo{ir.FPConvert(16, ir.BitCast<IR::F32>(b), control)};
     if (merge) {
         const IR::U32 c = AluSourceU32(insn, 2U);
-        const IR::U32 low_packed =
-            ir.BitwiseAnd(ir.PackFloat2x16(ir.CompositeConstruct(lo_h, zero_h)), ir.Imm32(0xffffU));
-        R(dest, ir.BitwiseOr(ir.ShiftLeftLogical(c, ir.Imm32(16U)), low_packed));
+        const IR::U32 hi = insn.Bits(72, 1) != 0U ? ir.BitwiseAnd(c, ir.Imm32(0xffff0000U))
+                                                  : IR::U32{ir.ShiftLeftLogical(c, ir.Imm32(16U))};
+        const IR::F16 zero{ir.FPConvert(16, ir.Imm32(0.0f))};
+        const IR::U32 packed = ir.PackFloat2x16(ir.CompositeConstruct(lo, zero));
+        R(dest, ir.BitwiseOr(hi, ir.BitwiseAnd(packed, ir.Imm32(0xffffU))));
     } else {
         const IR::F32 a = ir.BitCast<IR::F32>(AluSourceU32(insn, 0U));
-        const IR::F16 hi_h{ir.FPConvert(16, a, control)};
-        R(dest, ir.PackFloat2x16(ir.CompositeConstruct(lo_h, hi_h)));
+        const IR::F16 hi{ir.FPConvert(16, a, control)};
+        R(dest, ir.PackFloat2x16(ir.CompositeConstruct(lo, hi)));
     }
 }
 
@@ -492,8 +428,8 @@ void TranslatorVisitor::F2I_64(const Instruction& insn) {
 void TranslatorVisitor::I2F_64(const Instruction& insn) {
     const u32 dest = insn.Bits(16, 8);
     const u32 src = insn.Bits(32, 8);
-    F(dest, ConvertI64ToF32Rounded(ir, R(src), R(src + 1U), insn.Bits(74, 1) != 0U,
-                                   insn.Bits(78, 2)));
+    F(dest, ir.ConvertI64ToF32Rounded(R(src), R(src + 1U), insn.Bits(74, 1) != 0U,
+                                     RoundingModes[insn.Bits(78, 2)]));
 }
 
 void TranslatorVisitor::F2IP(const Instruction& insn) {
@@ -643,37 +579,20 @@ void TranslatorVisitor::FRND(const Instruction& insn) {
 }
 
 void TranslatorVisitor::I2F(const Instruction& insn) {
-    const u32 opcode = insn.Bits(0, 12);
-    const u32 dest = insn.Bits(16, 8);
+    const u32 src_size = insn.Bits(84, 2);
     const bool is_signed = insn.Bits(74, 1) != 0U;
-
-    if (opcode == 0x906U) {
-        F(dest, ConvertI32ToF32Rounded(ir, ir.Imm32(insn.words[1]), is_signed, insn.Bits(78, 2)));
-        return;
+    const bool requires_rounding = src_size == 2U;
+    IR::U32 value = AluSourceU32(insn, 1U);
+    if (!requires_rounding) {
+        const u32 width = src_size == 1U ? 16U : 8U;
+        value = ir.BitFieldExtract(value, ir.Imm32(insn.Bits(60, 2) * width), ir.Imm32(width),
+                                   is_signed);
     }
-
-    const bool uniform = opcode == 0xd06U;
-    const IR::U32 raw = uniform ? UR(insn.Bits(32, 8)) : R(insn.Bits(32, 8));
-    if ((insn.words[2] & ~0xc400U) == (uniform ? 0x08201000U : 0x00201000U)) {
-        F(dest, ConvertI32ToF32Rounded(ir, raw, is_signed, insn.Bits(78, 2)));
-        return;
-    }
-
-    const bool is_16bit = (insn.words[2] & ~0x400U) == (uniform ? 0x08101000U : 0x00101000U);
-    const u32 sel = insn.Bits(60, 2);
-    const IR::U32 extracted = ir.BitFieldExtract(
-        raw, ir.Imm32(sel * (is_16bit ? 16U : 8U)), ir.Imm32(is_16bit ? 16U : 8U), is_signed);
     const IR::FpControl control{
-        .no_contraction = false,
-        .rounding = IR::FpRounding::RN,
-        .fmz_mode = IR::FmzMode::DontCare,
+        .rounding = RoundingModes[insn.Bits(78, 2)],
+        .require_rounding = requires_rounding,
     };
-    F(dest, IR::F32{ir.ConvertIToF(32, 32, is_signed, extracted, control)});
-}
-
-void TranslatorVisitor::I2FP(const Instruction& insn) {
-    F(insn.Bits(16, 8), ConvertI32ToF32Rounded(ir, AluSourceU32(insn, 1U), insn.Bits(74, 1) != 0U,
-                                               insn.Bits(78, 2)));
+    F(insn.Bits(16, 8), IR::F32{ir.ConvertIToF(32, 32, is_signed, value, control)});
 }
 
 } // namespace Shader::Ampere

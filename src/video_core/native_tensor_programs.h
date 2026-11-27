@@ -3,45 +3,49 @@
 
 #pragma once
 
+#include <algorithm>
+#include <array>
+
 #include "common/common_types.h"
 
 namespace VideoCommon {
 
-/// How a game's native matrix multiplies (HMMA, its own DLSS-style network) are lowered.
+/// Translation strategy for native Ampere matrix instructions.
 enum class NativeTensorLowering : u8 {
     None,    ///< rejected (the program is skipped or replaced)
     Full,    ///< inline expansion
     Compact, ///< one call of a shared helper per HMMA; needs compute shaders 32 threads wide
+    Workgroup, ///< scratch-backed HMMA for straight-line compute with complete guest warps
 };
 
-inline constexpr u64 DonkeyKongBananzaProgramId = 0x040074A01BF12000ULL;
-inline constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
-
-/// The titles whose tensor programs are lowered at all, chosen per title, not per dispatch.
-/// Donkey Kong Bananza's programs write nothing when rejected (the screen is purple from its mode
-/// select on). Ocarina of Time draws its final image through an 11-program network after the
-/// tonemap. Other titles keep them rejected: emulating title 4's network takes the host driver
-/// minutes to compile.
-[[nodiscard]] constexpr bool LowersNativeTensorPrograms(u64 program_id) noexcept {
-    return program_id == DonkeyKongBananzaProgramId || program_id == OcarinaOfTimeProgramId;
+/// Callers pass the physical limits before multiplying untrusted local dimensions.
+[[nodiscard]] constexpr bool ValidTensorWorkgroup(const std::array<u32, 3>& group,
+                                                   const u32 (&max_dim)[3],
+                                                   u32 max_invocations) noexcept {
+    const auto [x, y, z] = group;
+    return x != 0 && y != 0 && z != 0 && x <= max_dim[0] && y <= max_dim[1] && z <= max_dim[2] &&
+           x <= max_invocations / y / z;
 }
 
-/// Of those, the titles lowered in the compact form where compute shaders can be created 32
-/// threads wide (the helper shuffles across 32 lanes).
-[[nodiscard]] constexpr bool UsesCompactNativeTensorPrograms(u64 program_id) noexcept {
-    return program_id == OcarinaOfTimeProgramId;
+[[nodiscard]] constexpr bool CanUseWorkgroupTensor(const std::array<u32, 3>& group) noexcept {
+    constexpr u32 warp_size = 32;
+    const auto [x, y, z] = group;
+    // Only the low five bits of the product are needed.
+    return x != 0 && y != 0 && z != 0 && (x * y * z) % warp_size == 0;
 }
 
-/// The lowering for `program_id`'s compute programs when the host can (`guest_warp_compute`) or
-/// cannot create compute shaders with a required subgroup size of 32.
+/// Compact helpers use native shuffles. Inline HMMA can also use constant broadcasts.
 [[nodiscard]] constexpr NativeTensorLowering NativeTensorLoweringFor(
-    u64 program_id, bool guest_warp_compute) noexcept {
-    if (!LowersNativeTensorPrograms(program_id)) {
+    const std::array<u32, 3>& workgroup, u32 subgroup_width, bool native_shuffle, bool ballot) noexcept {
+    constexpr u32 warp_size = 32;
+    const auto [x, y, z] = workgroup;
+    // Only the first warp matters for this limit. Capping each factor keeps the product in range.
+    const u32 threads = (std::min)(x, warp_size) * (std::min)(y, warp_size) * (std::min)(z, warp_size);
+    if (threads < warp_size || subgroup_width < warp_size || (!native_shuffle && !ballot)) {
         return NativeTensorLowering::None;
     }
-    return UsesCompactNativeTensorPrograms(program_id) && guest_warp_compute
-               ? NativeTensorLowering::Compact
-               : NativeTensorLowering::Full;
+    return native_shuffle && x % subgroup_width == 0 ? NativeTensorLowering::Compact
+                                                     : NativeTensorLowering::Full;
 }
 
 } // namespace VideoCommon

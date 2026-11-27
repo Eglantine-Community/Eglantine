@@ -16,6 +16,7 @@
 #include <array>
 #include <chrono>
 #include <compare>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -361,7 +362,16 @@ private:
     double frame_busy_carry_ns{0.0};
     u64 frame_first_begin{0};
     bool have_frame_first{false};
+    u64 frame_last_end{0}; ///< Last available timestamp, including trimmed lines.
     void ReportFrame();
+    /// One row per profiled present in `frame` mode, beside the frame stats CSV as `*.gpu.csv`.
+    std::ofstream frame_csv;
+    u64 previous_present_seq{};
+    u64 frame_segments{};
+    u64 frame_unavailable{};
+    u64 frame_dropped{};
+    void WriteFrameCsv(u64 seq, double busy_ns, double span_ns);
+    void FlushFrameCsv();
 };
 
 } // namespace Vulkan::Nvn::GpuProf

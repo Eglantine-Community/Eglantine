@@ -50,9 +50,10 @@ constexpr u32 AmpereLocationBase = 16;
 /// True for opcodes natively translated by the direct Ampere -> IR frontend (Tier 2).
 [[nodiscard]] bool IsDirectTier2Opcode(u32 opcode) noexcept;
 
-/// True if a predicated native Ampere instruction is pure and side-effect-free,
-/// allowing inline SSA Select if-conversion instead of splitting basic blocks.
-[[nodiscard]] bool CanIfConvertPredicated(const Instruction& insn) noexcept;
+/// Eligible for inline SSA Select if-conversion instead of splitting basic blocks.
+/// A predicated Workgroup HMMA additionally requires a proof in the translator.
+[[nodiscard]] bool CanIfConvertPredicated(const Instruction& insn,
+                                          TensorMode tensor_mode = TensorMode::Disabled) noexcept;
 
 /// Scans backward within the current basic block for a constant 4x8-bit per-tap offset immediate
 /// feeding a `TLD4` (`0xb63`) PTP gather instruction. Returns std::nullopt when no constant is
@@ -94,6 +95,8 @@ class CFG {
 public:
     explicit CFG(Environment& env, ObjectPool<Block>& block_pool,
                  std::span<const Instruction> code, bool exits_to_dispatcher = false);
+    CFG(Environment& env, ObjectPool<Block>& block_pool, std::span<const Instruction> code,
+        bool exits_to_dispatcher, TensorMode tensor_mode);
     CFG(const CFG&) = delete;
     CFG(CFG&&) = delete;
 
@@ -143,6 +146,7 @@ private:
     std::span<const Instruction> code;
     boost::container::small_vector<Function, 1> functions;
     bool exits_to_dispatcher{};
+    TensorMode tensor_mode{};
     Block* dispatch_block{};
     // Call targets discovered during CFG traversal, used to validate RET return links.
     struct CallSiteInfo {

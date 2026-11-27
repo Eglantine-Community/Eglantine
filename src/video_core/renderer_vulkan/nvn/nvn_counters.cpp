@@ -5,7 +5,9 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstring>
+#include <limits>
 
 #include "common/assert.h"
 #include "common/logging.h"
@@ -595,23 +597,54 @@ void CounterEngine::WriteTimestamp(vk::CommandBuffer cmd, CounterFlight& flight,
     flight.timestamps.push_back(std::move(report));
 }
 
-u64 CounterEngine::TicksToNanoseconds(u64 ticks) {
-    u64 raw = ticks & timestamp_mask;
-    if (timestamp_mask != ~u64{0}) {
-        // Counters narrower than 64 bits wrap; reports arrive roughly in time order.
-        if (raw < last_ticks && last_ticks - raw > (timestamp_mask >> 1)) {
-            ++tick_epoch;
-        }
-        last_ticks = raw;
-        raw += tick_epoch * (timestamp_mask + 1);
+std::optional<s64> TimestampTickClock::Convert(u64 sample, u64 mask, double period) {
+    if (mask == 0 || !std::isfinite(period) || period <= 0) {
+        return std::nullopt;
     }
-    const s64 gpu_ns = static_cast<s64>(static_cast<double>(raw) * timestamp_period);
+    const u64 raw = sample & mask;
+    if (newest_ticks < 0) {
+        newest_raw = raw;
+        newest_ticks = 0;
+        return 0;
+    }
+    const u64 forward = (raw - newest_raw) & mask;
+    const u64 half = (mask >> 1) + 1;
+    if (forward == half) {
+        return std::nullopt;
+    }
+    s64 elapsed = newest_ticks;
+    if (forward < half) {
+        if (forward > static_cast<u64>(std::numeric_limits<s64>::max() - newest_ticks)) {
+            return std::nullopt;
+        }
+        elapsed += static_cast<s64>(forward);
+    } else {
+        // A late sample may precede the latest rollover. It must not move the anchor backwards.
+        elapsed -= static_cast<s64>((newest_raw - raw) & mask);
+    }
+    const long double ns = static_cast<long double>(elapsed) * period;
+    // A comparison against the exact power of two also works when long double is binary64.
+    if (ns < -0x1p63L || ns >= 0x1p63L) {
+        return std::nullopt;
+    }
+    if (elapsed > newest_ticks) {
+        newest_ticks = elapsed;
+        newest_raw = raw;
+    }
+    return static_cast<s64>(ns);
+}
+
+u64 CounterEngine::TicksToNanoseconds(u64 ticks) {
+    const u64 now = VideoCommon::Nvn::GuestClockNanoseconds();
+    const auto gpu_ns = tick_clock.Convert(ticks, timestamp_mask, timestamp_period);
+    if (!gpu_ns || now > static_cast<u64>(std::numeric_limits<s64>::max())) {
+        return now;
+    }
     // A report is processed some time after the GPU wrote it, and the GPU clock drifts against the
     // guest clock (the epoch of the title's own tick counter and of
-    // nvnDeviceGetCurrentTimestampInNanoseconds): GpuClockMap takes the offset with the least
-    // delay over the last few seconds.
-    return static_cast<u64>(
-        clock_map.Map(gpu_ns, static_cast<s64>(VideoCommon::Nvn::GuestClockNanoseconds())));
+    // nvnDeviceGetCurrentTimestampInNanoseconds). GpuClockMap includes the first sample's epoch
+    // in the guest offset and takes the offset with the least delay over the last few seconds.
+    return static_cast<u64>((std::max)(s64{0}, clock_map.Map(*gpu_ns, static_cast<s64>(now))));
 }
 
 void CounterEngine::Complete(CounterFlight& flight, VideoCommon::Nvn::GuestMemory* memory) {

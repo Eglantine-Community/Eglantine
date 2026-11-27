@@ -123,7 +123,10 @@ Shader::Profile MakeProfile() {
     profile.support_int16 = true;
     profile.support_int64 = true;
     profile.support_vote = true;
+    profile.support_ballot = true;
+    profile.support_shuffle = true;
     profile.support_quad_shuffles = true;
+    profile.support_quad_shuffles_all_stages = true;
     profile.support_shuffle_relative = true;
     profile.supported_subgroup_stages = 0x7f;
     profile.max_subgroup_size = 32;
@@ -1005,13 +1008,31 @@ TEST_CASE("Direct Ampere translates Batch B3 textures, gathers, fetches, queries
     CHECK(b3_tex_analysis.required_texture_buffer == 2U);
     {
         IrPools pools;
-        const auto prog = TranslateDirect(pools, b3_tex_sunk);
+        auto prog = TranslateDirect(pools, b3_tex_sunk);
         CHECK(CountOpcode(prog, Shader::IR::Opcode::ImageGather) >= 1U);
         CHECK(CountOpcode(prog, Shader::IR::Opcode::ImageFetch) >= 1U);
         CHECK(CountOpcode(prog, Shader::IR::Opcode::ImageQueryLod) >= 1U);
         CHECK(CountOpcode(prog, Shader::IR::Opcode::ImageGradient) == 1U);
         CHECK(CountOpcode(prog, Shader::IR::Opcode::ImageRead) == 1U);
         CHECK(CountOpcode(prog, Shader::IR::Opcode::ImageAtomicIAdd32) == 1U);
+
+        Shader::Profile native = MakeProfile();
+        native.min_texel_gather_offset = -32;
+        native.max_texel_gather_offset = 31;
+        const auto spirv = Shader::Backend::SPIRV::EmitSPIRV(native, prog);
+        u32 gathers = 0;
+        for (size_t i = 5; i < spirv.size();) {
+            const u32 words = spirv[i] >> 16;
+            REQUIRE(words != 0);
+            REQUIRE(words <= spirv.size() - i);
+            if (static_cast<spv::Op>(spirv[i] & 0xffffU) == spv::Op::OpImageGather) {
+                REQUIRE(words >= 8);
+                CHECK(spirv[i + 6] == static_cast<u32>(spv::ImageOperandsMask::ConstOffsets));
+                ++gathers;
+            }
+            i += words;
+        }
+        CHECK(gathers == 1);
     }
 
     // 3. Invalid per-tap gather offset (>31 && <224) must be rejected by AnalyzeProgram
@@ -1127,6 +1148,23 @@ TEST_CASE("Direct Ampere translates Batch B3 SHFL, MATCH.ALL, MOVM, LDSM, and HM
         CHECK(CountOpcode(expanded, Shader::IR::Opcode::FPFma32) == 64U);
         CHECK(CountOpcode(expanded, Shader::IR::Opcode::FPRoundEven32) == 8U);
     }
+
+    // Each HMMA consumes the previous result so all the calls must survive optimization.
+    std::vector<Instruction> chain(hmma_code.begin(), hmma_code.begin() + 3);
+    Instruction chained_hmma = hmma_code[2];
+    chained_hmma.words[2] = 0x82cU; // HMMA's C accumulator is now R44/R45.
+    chain.insert(chain.end(), 15, chained_hmma);
+    chain.insert(chain.end(), hmma_code.end() - 3, hmma_code.end());
+    const auto spirv_size = [&](bool compact) {
+        IrPools pools;
+        auto program =
+            TranslateDirect(pools, chain, {}, {.tensor = true, .compact_tensor = compact});
+        return Shader::Backend::SPIRV::EmitSPIRV(MakeProfile(), program).size();
+    };
+    const size_t compact_words = spirv_size(true);
+    const size_t inline_words = spirv_size(false);
+    CAPTURE(compact_words, inline_words);
+    CHECK(compact_words < inline_words / 2);
 }
 
 TEST_CASE("Direct Ampere validates and translates KIL (0x95b) and TRAP (0x95c)",
@@ -1326,4 +1364,30 @@ TEST_CASE("SPIR-V backend deduplicates bindless texture lookups per basic block"
     // Note: entry block dedups 2 -> 1, block 2 emits 1 => 2 OpSampledImage total.
     CHECK(count_spv_op(spirv, spv::Op::OpImageSampleExplicitLod) == 3U);
     CHECK(count_spv_op(spirv, spv::Op::OpSampledImage) == 2U);
+}
+
+TEST_CASE("Single-invocation Ampere compute refuses matrix peer loads", "[scalar_warp]") {
+    struct SingleComputeEnv : TestEnv {
+        std::array<u32, 3> WorkgroupSize() const override {
+            return {1, 1, 1};
+        }
+    };
+    const std::array operations{
+        Instruction{{0x0812723aU, 0U, 0U, Sched}},              // MOVM.16.MT88
+        Instruction{{0x1613783bU, 0U, 0U, Sched}},              // LDSM.16.M88.1
+        Instruction{{0x040c723cU, 8U, 0x80aU, 0x004fe200U}},   // HMMA.16816.F16
+    };
+    constexpr LoweringOptions options{.tensor_mode = Shader::Ampere::TensorMode::Compact};
+    for (const auto& operation : operations) {
+        const std::array code{operation, EXIT};
+        const auto analysis = AnalyzeProgram(code, options);
+        REQUIRE(static_cast<bool>(analysis));
+        SingleComputeEnv env;
+        IrPools pools;
+        Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_pool;
+        REQUIRE_THROWS_AS(
+            TranslateProgram(pools.inst, pools.block, flow_pool, env, code, options,
+                             analysis.uses_async_copy, &analysis.branch_targets, MakeHostInfo()),
+            Shader::NotImplementedException);
+    }
 }

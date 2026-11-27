@@ -17,6 +17,7 @@
 #include "common/dynamic_library.h"
 #include "common/logging.h"
 #include <ranges>
+#include <string_view>
 #include <vulkan/vulkan_core.h>
 #include "core/frontend/emu_window.h"
 #include "video_core/vulkan_common/vulkan_instance.h"
@@ -30,22 +31,13 @@
 namespace Vulkan {
 namespace {
 
-[[nodiscard]] bool AreExtensionsSupported(const vk::InstanceDispatch& dld, std::vector<VkExtensionProperties> const& properties, std::span<const char* const> extensions) {
-    for (const char* extension : extensions) {
-        const auto it = std::ranges::find_if(properties, [extension](const auto& prop) {
-            return std::strcmp(extension, prop.extensionName) == 0;
-        });
-        if (it == properties.end()) {
-            LOG_ERROR(Render_Vulkan, "Required instance extension {} is not available", extension);
-            return false;
-        }
-    }
-    return true;
+[[nodiscard]] bool HasExtension(std::span<const VkExtensionProperties> properties, std::string_view name) {
+    return std::ranges::any_of(properties, [name](const auto& p) { return name == p.extensionName; });
 }
 
 [[nodiscard]] std::vector<const char*> RequiredExtensions(
-    const vk::InstanceDispatch& dld, std::vector<VkExtensionProperties> const& properties,
-    Core::Frontend::WindowSystemType window_type, bool enable_validation) {
+    std::span<const VkExtensionProperties> properties, Core::Frontend::WindowSystemType window_type,
+    bool enable_validation) {
     std::vector<const char*> extensions;
     extensions.reserve(6);
     switch (window_type) {
@@ -84,23 +76,20 @@ namespace {
     }
     // Probe optional extensions against the same snapshot the caller verifies against, so the
     // check here and the verification in CreateInstance can never disagree (see TOCTOU note below).
-#ifdef __APPLE__
-    if (AreExtensionsSupported(dld, properties, std::array{VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME}))
+    if (HasExtension(properties, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
         extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
-#endif
-    if (enable_validation && AreExtensionsSupported(dld, properties, std::array{VK_EXT_DEBUG_UTILS_EXTENSION_NAME}))
+    }
+    if (enable_validation && HasExtension(properties, VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) {
         extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    }
 #ifdef EGLANTINE_STREAMLINE
     // What NVIDIA's DLSS asks for through Streamline, where available. Static: the returned
     // pointers must outlive this call.
     static std::vector<std::string> streamline;
     streamline = Streamline::InstanceExtensions();
     for (const std::string& name : streamline) {
-        const bool available = std::ranges::any_of(properties, [&](const VkExtensionProperties& p) {
-            return name == p.extensionName;
-        });
         const bool listed = std::ranges::any_of(extensions, [&](const char* e) { return name == e; });
-        if (available && !listed) {
+        if (!listed && HasExtension(properties, name)) {
             extensions.push_back(name.c_str());
         }
     }
@@ -162,9 +151,13 @@ vk::Instance CreateInstance(const Common::DynamicLibrary& library, vk::InstanceD
         throw vk::Exception(VK_ERROR_EXTENSION_NOT_PRESENT);
     }
     std::vector<const char*> const extensions =
-        RequiredExtensions(dld, *properties, window_type, enable_validation);
-    if (!AreExtensionsSupported(dld, *properties, extensions))
-        throw vk::Exception(VK_ERROR_EXTENSION_NOT_PRESENT);
+        RequiredExtensions(*properties, window_type, enable_validation);
+    for (const char* name : extensions) {
+        if (!HasExtension(*properties, name)) {
+            LOG_ERROR(Render_Vulkan, "Required instance extension {} is not available", name);
+            throw vk::Exception(VK_ERROR_EXTENSION_NOT_PRESENT);
+        }
+    }
     std::vector<const char*> layers = Layers(enable_validation);
     RemoveUnavailableLayers(dld, layers);
 

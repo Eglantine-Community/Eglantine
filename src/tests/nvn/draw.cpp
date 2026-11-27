@@ -321,6 +321,47 @@ TEST_CASE("NVN draw: a color clear honours the channel write mask", "[nvn]") {
     CHECK(stats.ops_unsupported == 0);
 }
 
+TEST_CASE("NVN draw: LOAD after an alias write preserves color outside the scissor", "[nvn]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    Rig rig{*vulkan, {.early_submit = false}};
+    rig.context.CreateTexture(MakeTexture(10, 0x25, 0));
+    auto alias = MakeTexture(11, 0x25, 0);
+    alias.levels = 2; // a distinct storage overlapping the complete level of texture 10
+    rig.context.CreateTexture(alias);
+
+    std::vector<u64> initial;
+    SetTargets(initial, {Target(10)});
+    ClearColor(initial, {1.0f, 0.0f, 0.0f, 1.0f});
+    rig.Run(std::move(initial), {10, 11});
+
+    std::vector<u64> alias_write;
+    SetTargets(alias_write, {Target(11)});
+    ClearColor(alias_write, {0.0f, 1.0f, 0.0f, 1.0f});
+    rig.Run(std::move(alias_write), {10, 11});
+
+    std::vector<u64> partial;
+    SetTargets(partial, {Target(10)});
+    Push(partial, VC::Op::SetScissors, VC::SetScissorsPayload{0, 1},
+         Bytes(VC::ScissorRect{16, 16, 16, 16}));
+    // A masked clear is rasterized through a scissored draw and writes R/B only.
+    // Both the preserved G/A of an inside texel and the outside region must reflect B's write.
+    ClearColor(partial, {0.0f, 0.0f, 1.0f, 1.0f}, 0x5);
+    CopyToBuffer(partial, 10, BUFFER_POOL_VA);
+    rig.Run(std::move(partial), {10, 11});
+
+    const std::array<u8, 4> cyan{0, 255, 255, 255};
+    const std::array<u8, 4> green{0, 255, 0, 255};
+    CHECK(Texel(rig.readback, 0, 20, 20) == cyan);
+    CHECK(Texel(rig.readback, 0, 8, 8) == green);
+    CHECK(Texel(rig.readback, 0, 40, 40) == green);
+    CHECK(rig.context.Stats().alias_transfers + rig.context.Stats().alias_byte_transfers > 0);
+    CHECK(rig.context.Stats().ops_failed == 0);
+    CHECK(rig.context.Stats().ops_unsupported == 0);
+}
+
 TEST_CASE("NVN draw: switching render targets keeps both images' contents", "[nvn]") {
     auto vulkan = MakeHeadlessVulkan();
     if (!vulkan) {
@@ -342,6 +383,68 @@ TEST_CASE("NVN draw: switching render targets keeps both images' contents", "[nv
     CHECK((Near(a[0], 255) && Near(a[2], 0)));
     CHECK((Near(b[0], 0) && Near(b[2], 255)));
     CHECK(rig.context.Stats().ops_failed == 0);
+}
+
+TEST_CASE("NVN draw: overwritten targets keep the open pass across bindings and lists", "[nvn]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    const bool split_lists = GENERATE(false, true);
+    CAPTURE(split_lists);
+    Rig rig{*vulkan, {.early_submit = false}};
+    rig.context.CreateTexture(MakeTexture(10, 0x25, 0));
+    rig.context.CreateTexture(MakeTexture(11, 0x25, 64 * 1024));
+
+    std::vector<u64> list;
+    SetTargets(list, {Target(10)});
+    ClearColor(list, {1.0f, 0.0f, 0.0f, 1.0f});
+    Push(list, VC::Op::SetScissors, VC::SetScissorsPayload{0, 1},
+         Bytes(VC::ScissorRect{16, 16, 16, 16}));
+    ClearColor(list, {1.0f, 0.0f, 0.0f, 1.0f}); // Open the pass.
+    SetTargets(list, {});
+    VC::Submission submission{};
+    submission.seq = ++rig.seq;
+    submission.retained_serials = {10, 11};
+    if (split_lists) {
+        PushEnd(list);
+        submission.lists.push_back(std::move(list));
+        list.clear();
+    }
+    SetTargets(list, {Target(11)});
+    Push(list, VC::Op::SetScissors, VC::SetScissorsPayload{0, 1},
+         Bytes(VC::ScissorRect{20, 20, 8, 8}));
+    SetTargets(list, {Target(10)});
+    ClearColor(list, {0.0f, 1.0f, 0.0f, 1.0f});
+
+    SetTargets(list, {Target(11)});
+    Push(list, VC::Op::SetScissors, VC::SetScissorsPayload{0, 1},
+         Bytes(VC::ScissorRect{0, 0, TEX_SIZE, TEX_SIZE}));
+    ClearColor(list, {0.0f, 0.0f, 1.0f, 1.0f});
+    CopyToBuffer(list, 10, BUFFER_POOL_VA);
+    CopyToBuffer(list, 11, BUFFER_POOL_VA + 64 * 1024);
+    PushEnd(list);
+    submission.lists.push_back(std::move(list));
+    rig.context.Submit(std::move(submission));
+    REQUIRE(rig.context.Wait(rig.seq, 20s));
+    REQUIRE(rig.context.Stats().ops_failed == 0);
+    const auto inside = Texel(rig.readback, 0, 24, 24);
+    const auto outside = Texel(rig.readback, 0, 18, 18);
+    const auto other_target = Texel(rig.readback, 64 * 1024, 24, 24);
+    CHECK((Near(inside[0], 0) && Near(inside[1], 255)));
+    CHECK((Near(outside[0], 255) && Near(outside[1], 0)));
+    CHECK((Near(other_target[1], 0) && Near(other_target[2], 255)));
+
+    std::vector<VC::SinkStat> rows;
+    rig.context.CollectStats(rows);
+    const auto breaks =
+        std::ranges::find(rows, "render_pass_break: SetRenderTargets", &VC::SinkStat::reason);
+    REQUIRE(breaks != rows.end());
+    CHECK(breaks->count == 1);
+    const auto overwritten =
+        std::ranges::find(rows, "set_render_targets: overwritten before use", &VC::SinkStat::reason);
+    REQUIRE(overwritten != rows.end());
+    CHECK(overwritten->count == 2);
 }
 
 // EDEN_NX2_TRY_BARRIER_MERGE: barrier requests with no command between them (the flush of inline
@@ -813,9 +916,11 @@ TEST_CASE("NVN draw: rendering through a block view writes the compressed textur
     }
     constexpr s32 BC4 = 0x49;
     constexpr s32 RGBA16_UINT = 0x2C;
+    const u32 width = GENERATE(64u, 63u);
     Rig rig{*vulkan};
     VC::TextureDesc bc4 = MakeTexture(20, BC4, 0);
-    bc4.levels = 2; // 64x64 and 32x32 texels: 16x16 and 8x8 blocks
+    bc4.width = width;
+    bc4.levels = 2; // 16x16 and 8x8 blocks, with a partial last column when width is 63
     rig.context.CreateTexture(bc4);
 
     constexpr std::array<u32, 4> A{0x1111, 0x2222, 0x3333, 0x4444};
@@ -838,8 +943,8 @@ TEST_CASE("NVN draw: rendering through a block view writes the compressed textur
         VC::CopyBufferTexturePayload copy{};
         copy.buffer = BUFFER_POOL_VA + level * 64 * 1024;
         copy.texture = {.serial = 20, .level = level, .layer = 0};
-        const s32 size = static_cast<s32>(TEX_SIZE >> level);
-        copy.region = {0, 0, 0, size, size, 1};
+        copy.region = {0, 0, 0, static_cast<s32>(width >> level),
+                       static_cast<s32>(TEX_SIZE >> level), 1};
         Push(list, VC::Op::CopyTextureToBuffer, copy);
     }
     rig.Run(std::move(list), {20});
@@ -859,7 +964,38 @@ TEST_CASE("NVN draw: rendering through a block view writes the compressed textur
         INFO("level 1 block " << index);
         CHECK(Block(rig.readback, 64 * 1024, index) == words(C));
     }
+    CHECK(rig.context.Stats().alias_transfers == 2);
+    // Write new blocks through the compressed image. An ordinary texture with the view's layout
+    // must read the newer bytes from that image, even if it shares the previously rendered alias.
+    VC::TextureDesc view = MakeTexture(21, RGBA16_UINT, 0);
+    view.width = 16;
+    view.height = 16;
+    view.pkg_block_h = 2; // two GOBs high, like the base level of the compressed texture
+    rig.context.CreateTexture(view);
+    std::vector<u64> reverse;
+    constexpr u64 UPLOAD = BUFFER_POOL_VA + 128_KiB;
+    constexpr u64 DOWNLOAD = BUFFER_POOL_VA + 192_KiB;
+    constexpr u32 VALUE = 0x10203040;
+    Push(reverse, VC::Op::ClearBuffer,
+         VC::ClearBufferPayload{.address = UPLOAD, .size = 16 * 16 * 8, .value = VALUE});
+    VC::CopyBufferTexturePayload upload{};
+    upload.buffer = UPLOAD;
+    upload.texture = {.serial = 20};
+    upload.region = {0, 0, 0, static_cast<s32>(width), TEX_SIZE, 1};
+    Push(reverse, VC::Op::CopyBufferToTexture, upload);
+    VC::CopyBufferTexturePayload download{};
+    download.buffer = DOWNLOAD;
+    download.texture = {.serial = 21};
+    download.region = {0, 0, 0, 16, 16, 1};
+    Push(reverse, VC::Op::CopyTextureToBuffer, download);
+    rig.Run(std::move(reverse), {20, 21});
+    for (u32 i = 0; i < 16 * 16; ++i) {
+        CHECK(Block(rig.readback, DOWNLOAD - BUFFER_POOL_VA, i) ==
+              std::array<u16, 4>{0x3040, 0x1020, 0x3040, 0x1020});
+    }
     const auto stats = rig.context.Stats();
+    CHECK(stats.alias_transfers == 3);
+    CHECK(stats.alias_byte_transfers == 0);
     CHECK(stats.ops_failed == 0);
     CHECK(stats.ops_unsupported == 0);
 }

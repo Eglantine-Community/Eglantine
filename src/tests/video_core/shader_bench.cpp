@@ -144,8 +144,11 @@ u64 TranslateDirect(std::span<const Shader::Ampere::Instruction> native, Shader:
     profile.support_int16 = true;
     profile.support_int8 = true;
     profile.support_descriptor_aliasing = true;
+    profile.support_uniform_buffer_standard_layout = true;
     profile.support_explicit_workgroup_layout = true;
     profile.support_vote = true;
+    profile.support_ballot = true;
+    profile.support_shuffle = true;
     profile.warp_size_potentially_larger_than_guest = false;
 
     const auto begin = Clock::now();

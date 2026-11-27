@@ -3,7 +3,9 @@
 
 #version 450
 
+#ifndef NVN_ALIAS_WORDS_ONLY
 #extension GL_EXT_shader_8bit_storage : require
+#endif
 
 // NVN HLE (Vulkan::Nvn::AliasTransferGpu). Moves the bytes two textures of different shapes share
 // in a memory pool from one image to the other, the way the memory would: every texel of a piece
@@ -13,13 +15,15 @@
 // window of the pool's bytes.
 //   mode 0 (scatter): tightly copied texel bytes -> window.
 //   mode 1 (gather):  window -> tightly copied texel bytes (only texels inside the window).
-// One invocation per texel; all byte moves are exclusive to their texel, so no atomics.
+// One invocation per texel. Without 8-bit storage, byte stores use masked 32-bit atomics.
 
 layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
 
+#ifndef NVN_ALIAS_WORDS_ONLY
 layout(std430, binding = 0) buffer Memory {
     uint8_t bytes[];
 };
+#endif
 
 layout(std430, binding = 1) buffer MemoryWords {
     uint words[];
@@ -39,6 +43,20 @@ layout(push_constant) uniform PushConstants {
     uint tile_d;        // log2 of the block depth in GOBs
     uint pitch;         // linear: bytes per row, 0 = block-linear
 } pc;
+
+void CopyByte(uint tight, uint window) {
+    const uint src = pc.mode == 0u ? tight : window;
+    const uint dst = pc.mode == 0u ? window : tight;
+#ifdef NVN_ALIAS_WORDS_ONLY
+    const uint value = (words[src >> 2] >> ((src & 3u) * 8u)) & 255u;
+    const uint shift = (dst & 3u) * 8u;
+    // Each destination byte belongs to one invocation. The masks leave adjacent bytes alone.
+    atomicAnd(words[dst >> 2], ~(255u << shift));
+    atomicOr(words[dst >> 2], value << shift);
+#else
+    bytes[dst] = bytes[src];
+#endif
+}
 
 // GOB offsets of Tegra::Texture (SWIZZLE_X_BITS = 0b100101111, SWIZZLE_Y_BITS = 0b011010000)
 // with the Switch 2 adjustment of bits 5 and 6 (NativeGobOffset).
@@ -95,14 +113,8 @@ void main() {
                     }
                 }
             } else {
-                if (pc.mode == 0u) {
-                    for (uint b = 0u; b < pc.bpp; ++b) {
-                        bytes[window_addr + b] = bytes[tight + b];
-                    }
-                } else {
-                    for (uint b = 0u; b < pc.bpp; ++b) {
-                        bytes[tight + b] = bytes[window_addr + b];
-                    }
+                for (uint b = 0u; b < pc.bpp; ++b) {
+                    CopyByte(tight + b, window_addr + b);
                 }
             }
             return;
@@ -112,12 +124,7 @@ void main() {
             if (at < 0 || uint(at) >= pc.window_size) {
                 continue;
             }
-            const uint window = pc.window_offset + uint(at);
-            if (pc.mode == 0u) {
-                bytes[window] = bytes[tight + b];
-            } else {
-                bytes[tight + b] = bytes[window];
-            }
+            CopyByte(tight + b, pc.window_offset + uint(at));
         }
         return;
     }
@@ -132,11 +139,6 @@ void main() {
         if (at < 0 || uint(at) >= pc.window_size) {
             continue;
         }
-        const uint window = pc.window_offset + uint(at);
-        if (pc.mode == 0u) {
-            bytes[window] = bytes[tight + b];
-        } else {
-            bytes[tight + b] = bytes[window];
-        }
+        CopyByte(tight + b, pc.window_offset + uint(at));
     }
 }

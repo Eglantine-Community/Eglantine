@@ -19,6 +19,7 @@
 #include "common/logging.h"
 #include "video_core/renderer_vulkan/nvn/nvn_bindless.h"
 #include "video_core/renderer_vulkan/nvn/nvn_draw.h"
+#include "video_core/renderer_vulkan/nvn/nvn_sparse.h"
 #include "video_core/renderer_vulkan/nvn/nvn_texture_layout.h"
 #include "video_core/surface.h"
 
@@ -126,7 +127,8 @@ VkImageViewType BindlessViewType(Shader::TextureType type) {
 }
 
 vk::DescriptorSetLayout MakeBindlessSetLayout(const Device& device) {
-    constexpr VkShaderStageFlags stages = VK_SHADER_STAGE_ALL_GRAPHICS;
+    constexpr VkShaderStageFlags stages =
+        VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_COMPUTE_BIT;
     std::array<VkDescriptorSetLayoutBinding, Shader::BINDLESS_BINDING_COUNT> bindings{};
     std::array<VkDescriptorBindingFlags, Shader::BINDLESS_BINDING_COUNT> flags{};
     constexpr VkDescriptorBindingFlags update_flags =
@@ -458,8 +460,6 @@ void DrawContext::BindlessSync(bool force, DrawPlan* plan) {
                 const auto target_types = TypesOfTarget(target);
                 if (ready) {
                     layout = ReadLayoutOf(s);
-                    const bool is_integer =
-                        VideoCore::Surface::IsPixelFormatInteger(texture->host.pixel_format);
                     for (const std::optional<Shader::TextureType>& type : target_types) {
                         if (!type ||
                             (state.requested_types_mask & (1u << static_cast<u32>(*type))) == 0) {
@@ -490,6 +490,8 @@ void DrawContext::BindlessSync(bool force, DrawPlan* plan) {
                         if (!view) {
                             continue;
                         }
+                        const bool is_integer = VideoCore::Surface::IsPixelFormatInteger(
+                            TextureSampleFormat(texture->host.pixel_format, key.aspect));
                         for (const u32 klass : {0u, 1u, 2u}) {
                             // Float and depth-compare samplers share the views; an integer
                             // sampler takes only an integer format.
@@ -527,8 +529,13 @@ void DrawContext::BindlessSync(bool force, DrawPlan* plan) {
         if (retry) {
             state.retry_slots.push_back(id);
         }
-        if (any && storage_sp && storage_sp->current_layout != ReadLayoutOf(*storage_sp)) {
-            impl.NoteBindlessLayoutDirty(*storage_sp);
+        if (any && storage_sp) {
+            if (storage_sp->current_layout != ReadLayoutOf(*storage_sp)) {
+                impl.NoteBindlessLayoutDirty(*storage_sp);
+            }
+            if (storage_sp->sparse) {
+                impl.NoteBindlessSparsePending(*storage_sp);
+            }
         }
         for (u32 binding = 1; binding <= TEXTURE_BINDINGS; ++binding) {
             const BindlessState::WrittenEntry desired{want[binding], want_layout[binding]};
@@ -601,6 +608,7 @@ void DrawContext::BindlessSync(bool force, DrawPlan* plan) {
             Shader::BindlessTextureBinding(Shader::TextureType::ColorArrayCube, 0);
         constexpr s32 RT_HINT_FLAGS =
             0x01 /* Display */ | TexFlag::Compressible | TexFlag::LinearRenderTarget;
+        std::vector<std::string> unprimed_other_samples;
         for (u32 id = 0; id < state.synced_count; ++id) {
             cube += state.written[cube_binding][id].view != state.dummy[cube_binding];
             d2 += state.written[d2_binding][id].view != state.dummy[d2_binding];
@@ -619,6 +627,20 @@ void DrawContext::BindlessSync(bool force, DrawPlan* plan) {
                     ++unprimed_rt_flag;
                 } else {
                     ++unprimed_other;
+                    if (!state.logged_unprimed_other && unprimed_other_samples.size() < 8) {
+                        const s32 tex_target =
+                            (state.entries[id].texture != nullptr && *state.entries[id].texture)
+                                ? (*state.entries[id].texture)->desc.target
+                                : st->desc.target;
+                        unprimed_other_samples.push_back(fmt::format(
+                            "id={} target={} fmt={}x{:#x} size={}x{}x{} vram={}B usage={:#x} "
+                            "flags={:#x} virt={} pflags={:#x} needs_prime={} req_mask={:#x}",
+                            id, tex_target, st->desc.format, static_cast<u32>(st->host.format),
+                            st->extent.width, st->extent.height, st->extent.depth, st->vram_bytes,
+                            st->usage, st->desc.flags, pool ? pool->IsVirtual() : false,
+                            pool ? pool->flags : 0, NeedsBindlessPrime(impl, *st),
+                            state.requested_types_mask));
+                    }
                 }
             }
         }
@@ -632,6 +654,12 @@ void DrawContext::BindlessSync(bool force, DrawPlan* plan) {
                  static_cast<u32>(std::count_if(sampler_ids.begin(), sampler_ids.end(),
                                                 [](u64 serial) { return serial != 0; })),
                  writes.size());
+        if (!state.logged_unprimed_other && !unprimed_other_samples.empty() && registered >= 1000) {
+            state.logged_unprimed_other = true;
+            for (const std::string& sample : unprimed_other_samples) {
+                LOG_INFO(Render_Vulkan, "[nvn] bindless unprimed_other sample: {}", sample);
+            }
+        }
     }
 
     // Samplers: entry `id` is the sampler the game registered at that slot.
@@ -701,80 +729,116 @@ void DrawContext::BindlessPrime(DrawPlan& plan) {
         const char* text = std::getenv("EDEN_NX2_NVN_BINDLESS_PRIME_MB");
         return (text ? std::strtoull(text, nullptr, 10) : 128ull) << 20;
     }();
+    static const bool fit_under_pressure = [] {
+        const char* text = std::getenv("EDEN_NX2_NVN_BINDLESS_PRIME_FIT_BUDGET");
+        return text && text[0] == '1';
+    }();
     constexpr u32 BUDGET_COUNT = 256;
     const u64 seq = host->HostFlight().seq;
     if (state.prime_seq != seq) {
         state.prime_seq = seq;
         state.prime_bytes = 0;
         state.prime_count = 0;
+        state.prime_limit_bytes = budget_bytes;
+        state.prime_limit_count = BUDGET_COUNT;
     }
-    if (budget_bytes == 0 || state.unprimed_slots.empty()) {
+    if (state.prime_bytes >= state.prime_limit_bytes ||
+        state.prime_count >= state.prime_limit_count || state.unprimed_slots.empty()) {
         return;
     }
-    const u64 device_budget = impl.device.GetDeviceMemoryBudget();
-    u64 device_used =
-        device_budget != 0
-            ? impl.device.GetDeviceMemoryUsage() + impl.device.GetDeviceMemorySlack()
-            : 0;
-    if (device_budget != 0 &&
-        (device_used >= device_budget - device_budget / 8 ||
+    auto memory = impl.device.CanReportMemoryUsage()
+                      ? impl.device.GetDeviceMemoryBudgetSnapshot()
+                      : Device::DeviceMemoryBudget{};
+    u64 device_used = memory.usage + memory.slack;
+    if (memory.budget != 0 &&
+        (device_used >= memory.budget - memory.budget / 8 ||
          impl.storage_cache_bytes >= impl.storage_cache_budget)) {
         impl.TrimStorageCache();
-        device_used = impl.device.GetDeviceMemoryUsage() + impl.device.GetDeviceMemorySlack();
+        memory = impl.device.GetDeviceMemoryBudgetSnapshot();
+        device_used = memory.usage + memory.slack;
     }
-    if (device_budget != 0 && device_used >= device_budget) {
+    if (memory.budget != 0 && device_used >= memory.budget) {
+        state.prime_limit_count = 0;
         if (state.prime_paused_logs++ % 600 == 0) {
             LOG_INFO(Render_Vulkan,
                      "[nvn] bindless prime paused at VRAM budget: device {}/{} MiB, "
                      "storage cache {}/{} MiB, {} slots queued",
-                     device_used >> 20, device_budget >> 20, impl.storage_cache_bytes >> 20,
+                     device_used >> 20, memory.budget >> 20, impl.storage_cache_bytes >> 20,
                      impl.storage_cache_budget >> 20, state.unprimed_slots.size());
         }
         return;
     }
-    u64 sub_budget_bytes = budget_bytes;
-    u32 sub_budget_count = BUDGET_COUNT;
     const bool device_pressure =
-        device_budget != 0 && device_used > device_budget - (device_budget * 15) / 100;
-    if (impl.storage_cache_bytes >= impl.storage_cache_budget || device_pressure) {
-        sub_budget_bytes = (std::min)(sub_budget_bytes, u64{16} << 20);
-        sub_budget_count = (std::min)(sub_budget_count, 32u);
+        memory.budget != 0 && device_used > memory.budget - (memory.budget * 15) / 100;
+    const bool under_pressure =
+        impl.storage_cache_bytes >= impl.storage_cache_budget || device_pressure;
+    if (under_pressure) {
+        state.prime_limit_bytes = (std::min)(state.prime_limit_bytes, u64{16} << 20);
+        state.prime_limit_count = (std::min)(state.prime_limit_count, 32u);
     }
-    if (state.prime_count >= sub_budget_count || state.prime_bytes >= sub_budget_bytes) {
+    if (state.prime_count >= state.prime_limit_count || state.prime_bytes >= state.prime_limit_bytes) {
         return;
     }
     const std::vector<u64>& texture_ids = submission->texture_pool_snapshot.Values();
-    while (!state.unprimed_slots.empty()) {
-        const u32 id = state.unprimed_slots.back();
+    const bool defer_oversized = fit_under_pressure && under_pressure;
+    const u64 byte_limit =
+        defer_oversized && memory.budget != 0
+            ? (std::min)(state.prime_limit_bytes, memory.budget - device_used)
+            : state.prime_limit_bytes;
+    size_t next = state.unprimed_slots.size();
+    u32 deferred = 0;
+    while (next != 0) {
+        const size_t index = --next;
+        const u32 id = state.unprimed_slots[index];
+        const auto dequeue = [&] {
+            if (id < state.unprimed_queued.size()) {
+                state.unprimed_queued[id] = 0;
+            }
+            state.unprimed_slots[index] = state.unprimed_slots.back();
+            state.unprimed_slots.pop_back();
+        };
         std::shared_ptr<Storage> storage;
         if (id != 0 && id < texture_ids.size() && texture_ids[id] != 0 &&
             state.entries[id].serial == texture_ids[id]) {
             storage = state.entries[id].storage_ref.lock();
         }
         if (!storage || !NeedsBindlessPrime(impl, *storage)) {
-            if (id < state.unprimed_queued.size()) {
-                state.unprimed_queued[id] = 0;
-            }
-            state.unprimed_slots.pop_back();
+            dequeue();
             continue;
         }
         const u64 vram_bytes = storage->vram_bytes;
-        if (state.prime_bytes + vram_bytes > sub_budget_bytes && state.prime_count != 0) {
-            return;
+        if (defer_oversized && vram_bytes > byte_limit) {
+            // Keep the slot queued so a later prime can load it when pressure falls.
+            if (state.prime_paused_logs++ % 600 == 0) {
+                LOG_INFO(Render_Vulkan,
+                         "[nvn] bindless prime deferred slot {} ({}, {}x{}x{} lv {}, estimate "
+                         "{} MiB, available {} MiB)",
+                         id, texture_ids[id], storage->extent.width, storage->extent.height,
+                         storage->layers, storage->levels, vram_bytes >> 20,
+                         byte_limit >> 20);
+            }
+            if (++deferred == BUDGET_COUNT) {
+                break;
+            }
+            continue;
         }
-        if (id < state.unprimed_queued.size()) {
-            state.unprimed_queued[id] = 0;
+        if (state.prime_bytes + vram_bytes > byte_limit && state.prime_count != 0) {
+            break;
         }
-        state.unprimed_slots.pop_back();
+        dequeue();
         const VkImageLayout layout = ReadLayoutOf(*storage);
         plan.UseImage(std::move(storage), layout, true, false, false, false, VK_FORMAT_UNDEFINED,
                       false, true);
         state.prime_bytes += vram_bytes;
         ++state.primed_total;
         state.dirty = true;
-        if (++state.prime_count >= sub_budget_count || state.prime_bytes >= sub_budget_bytes) {
+        if (++state.prime_count >= state.prime_limit_count || state.prime_bytes >= byte_limit) {
             break;
         }
+    }
+    if (deferred != 0) {
+        // Revisit deferred slots once per submission while the budget is constrained.
+        state.prime_limit_count = state.prime_count;
     }
 }
 
@@ -816,6 +880,38 @@ bool DrawContext::BindlessPrepare(DrawPlan& plan, u32 types_mask) {
         ++out;
     }
     impl.bindless_layout_dirty.resize(out);
+
+    // A registered sparse image can need new binds or uploads without changing its view or layout.
+    std::erase_if(impl.bindless_sparse_pending, [&](const std::weak_ptr<Storage>& entry) {
+        const auto storage = entry.lock();
+        if (!storage) {
+            return true;
+        }
+        Storage& s = *storage;
+        if (s.bindless_active_count == 0 || !s.sparse || !s.sparse->HasPendingUnits()) {
+            s.bindless_sparse_queued = false;
+            return true;
+        }
+        if (!s.sparse->HasWork() || IsBoundTarget(&s)) {
+            return false;
+        }
+        const auto slots = bindless.storage_slots.find(&s);
+        if (slots == bindless.storage_slots.end() || slots->second.Empty()) {
+            return false;
+        }
+        const auto active = [&](u32 id) { return bindless.entries[id].any; };
+        if (!active(slots->second.single) && !std::ranges::any_of(slots->second.extra, active)) {
+            return false;
+        }
+        const VkImageLayout wanted = ReadLayoutOf(s);
+        const auto use = std::ranges::find(plan.images, storage, &DrawPlan::ImageUse::owner);
+        if (use == plan.images.end()) {
+            plan.UseImage(storage, wanted, true);
+        } else if (use->layout == wanted) {
+            use->layout_only = false;
+        }
+        return false;
+    });
     return true;
 }
 

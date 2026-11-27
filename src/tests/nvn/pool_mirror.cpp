@@ -173,7 +173,7 @@ TEST_CASE("NVN pool mirror: MarkWanted tracks wanted_dirty cleanly", "[nvn][pool
     mirror.pages = MirrorPages{16 * PAGE};
     mirror.wanted_dirty = false;
     mirror.MarkWanted(16 * PAGE, 2 * PAGE, PAGE);
-    CHECK(mirror.prefetch);
+    CHECK_FALSE(mirror.prefetch);
     REQUIRE(mirror.wanted != nullptr);
     CHECK(mirror.wanted_dirty);
 

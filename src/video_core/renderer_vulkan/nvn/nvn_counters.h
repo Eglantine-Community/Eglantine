@@ -30,6 +30,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <unordered_set>
 #include <utility>
@@ -46,6 +47,17 @@ class GuestMemory;
 }
 
 namespace Vulkan::Nvn {
+
+/// Unwraps Vulkan query samples around the newest sample and converts relative ticks to ns.
+/// Without calibration, samples more than half the counter range apart are ambiguous.
+class TimestampTickClock {
+public:
+    [[nodiscard]] std::optional<s64> Convert(u64 sample, u64 mask, double period);
+
+private:
+    u64 newest_raw{};
+    s64 newest_ticks{-1}; ///< Elapsed from the first sample, or -1 before the first sample.
+};
 
 /// NVNcounterType values the replay gives a meaning to.
 namespace CounterType {
@@ -414,8 +426,7 @@ private:
     // Completion thread.
     /// GPU clock -> guest clock (see GpuClockMap: a sliding minimum, so it follows clock drift).
     VideoCommon::Nvn::GpuClockMap clock_map{VideoCommon::Nvn::GpuClockMap::PolicyFromEnvironment()};
-    u64 last_ticks{};
-    u64 tick_epoch{};
+    TimestampTickClock tick_clock;
 
     CounterEngineStats stats;
 };

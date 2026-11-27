@@ -32,8 +32,10 @@
 #include "common/settings.h"
 #include "common/settings_enums.h"
 #include "shader_recompiler/bindless_table.h"
+#include "video_core/native_tensor_programs.h"
 #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
 #include "video_core/vulkan_common/vma.h"
+#include "shader_recompiler/profile.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
@@ -487,7 +489,6 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     const bool is_nvidia = driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY;
     const bool is_mvk = driver_id == VK_DRIVER_ID_MOLTENVK;
     const bool is_qualcomm = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY;
-    const bool is_turnip = driver_id == VK_DRIVER_ID_MESA_TURNIP;
 
     if (!is_suitable)
         LOG_WARNING(Render_Vulkan, "Unsuitable driver - continuing anyways");
@@ -503,6 +504,29 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     // Reuse it here.
     const void* first_next = &features2;
 
+    VkPhysicalDevicePortabilitySubsetFeaturesKHR subset_features{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR,
+    };
+    if (extensions.portability_subset) {
+        VkPhysicalDeviceFeatures2 query{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                                        .pNext = &subset_features};
+        physical.GetFeatures2(query);
+        vertex_attribute_access_beyond_stride = subset_features.vertexAttributeAccessBeyondStride;
+        subset_features.pNext = &features2;
+        first_next = &subset_features;
+
+        VkPhysicalDevicePortabilitySubsetPropertiesKHR subset_properties{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_PROPERTIES_KHR,
+        };
+        VkPhysicalDeviceProperties2 properties_query{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+            .pNext = &subset_properties,
+        };
+        physical.GetProperties2(properties_query);
+        min_vertex_input_binding_stride_alignment =
+            subset_properties.minVertexInputBindingStrideAlignment;
+    }
+
     VkDeviceDiagnosticsConfigCreateInfoNV diagnostics_nv{};
     const bool use_diagnostics_nv = Settings::values.enable_nsight_aftermath && extensions.device_diagnostics_config;
     if (use_diagnostics_nv) {
@@ -510,7 +534,7 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
 
         diagnostics_nv = {
             .sType = VK_STRUCTURE_TYPE_DEVICE_DIAGNOSTICS_CONFIG_CREATE_INFO_NV,
-            .pNext = &features2,
+            .pNext = first_next,
             .flags = VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_SHADER_DEBUG_INFO_BIT_NV |
                      VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_RESOURCE_TRACKING_BIT_NV |
                      VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_AUTOMATIC_CHECKPOINTS_BIT_NV,
@@ -680,11 +704,6 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
             (std::min)(properties.properties.limits.maxVertexInputBindings, 16U);
     }
 
-    if (is_turnip || is_qualcomm) {
-        LOG_WARNING(Render_Vulkan, "Driver requires higher-than-reported binding limits");
-        properties.properties.limits.maxVertexInputBindings = 32;
-    }
-
     const auto clear_ds3_flags = [&] {
         dynamic_state3_blending = false;
         dynamic_state3_enables = false;
@@ -699,6 +718,12 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         dynamic_state3_alpha_to_one = false;
     };
     const auto dyna_state = Settings::values.dyna_state.GetValue();
+    // Vulkan 1.3 promotes these states without promoting the EXT feature structures.
+    const bool core_dynamic_state = instance_version >= VK_API_VERSION_1_3;
+    use_extended_dynamic_state = dyna_state >= Settings::ExtendedDynamicState::EDS1 &&
+                                 (core_dynamic_state || extensions.extended_dynamic_state);
+    use_extended_dynamic_state2 = dyna_state >= Settings::ExtendedDynamicState::EDS2 &&
+                                  (core_dynamic_state || extensions.extended_dynamic_state2);
     switch (dyna_state) {
     case Settings::ExtendedDynamicState::Disabled:
         // Level 0: Disable all extended dynamic state extensions
@@ -741,6 +766,15 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     if (!Settings::values.vertex_input_dynamic_state.GetValue() && !Settings::ResolveNvnHle().hle) {
         RemoveExtensionFeature(extensions.vertex_input_dynamic_state, features.vertex_input_dynamic_state, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
     }
+
+    // VK_EXT_legacy_vertex_attributes depends on dynamic vertex input. Use its direct
+    // unaligned fetch path only on devices reporting native unaligned performance.
+    extensions.legacy_vertex_attributes = extensions.vertex_input_dynamic_state &&
+        features.legacy_vertex_attributes.legacyVertexAttributes &&
+        properties.legacy_vertex_attributes.nativeUnalignedPerformance;
+    RemoveExtensionFeatureIfUnsuitable(extensions.legacy_vertex_attributes,
+                                       features.legacy_vertex_attributes,
+                                       VK_EXT_LEGACY_VERTEX_ATTRIBUTES_EXTENSION_NAME);
 
     // Descriptors feature list
     {
@@ -811,7 +845,8 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     if (host_float16_supported) {
         features.shader_float16_int8.shaderFloat16 = VK_TRUE;
     }
-    logical = vk::Device::Create(physical, queue_cis, ExtensionListForVulkan(loaded_extensions), first_next, dld);
+    logical = vk::Device::Create(physical, instance_version, queue_cis,
+                                 ExtensionListForVulkan(loaded_extensions), first_next, dld);
     features.shader_float16_int8.shaderFloat16 = float16_math;
 
     graphics_queue = logical.GetQueue(graphics_family);
@@ -1139,15 +1174,107 @@ bool Device::ShouldBoostClocks() const {
     return validated_driver && !is_steam_deck && !is_debugging;
 }
 
+u64 Device::MaxComputeInvocationsWithGuestWarp() const {
+    if (!extensions.subgroup_size_control || !IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT)) {
+        return 0;
+    }
+    return u64{GuestWarpSize} * properties.subgroup_size_control.maxComputeWorkgroupSubgroups;
+}
+
 bool Device::CanRequireGuestWarpForCompute(const std::array<u32, 3>& workgroup_size) const {
     const auto [x, y, z] = workgroup_size;
-    if (!extensions.subgroup_size_control ||
-        !IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT) || x == 0 || y == 0 || z == 0) {
+    return x != 0 && y != 0 && z != 0 && x <= MaxComputeInvocationsWithGuestWarp() / y / z;
+}
+
+Shader::NativeFloat16Controls Device::GetNativeFloat16Controls() const {
+    const auto& controls = FloatControlProperties();
+    if (!IsFloat16Supported() || !IsKhrShaderFloatControlsSupported() ||
+        !controls.shaderRoundingModeRTEFloat16 || !controls.shaderDenormPreserveFloat16 ||
+        !controls.shaderSignedZeroInfNanPreserveFloat16 ||
+        !controls.shaderSignedZeroInfNanPreserveFloat32) {
+        return {};
+    }
+
+    // NONE would also impose these modes on unrelated float32 instructions.
+    if (controls.roundingModeIndependence == VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE ||
+        controls.denormBehaviorIndependence == VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE) {
+        return {};
+    }
+    const bool round_float64 =
+        controls.roundingModeIndependence == VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_32_BIT_ONLY;
+    const bool preserve_denorm_float64 =
+        controls.denormBehaviorIndependence == VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_32_BIT_ONLY;
+    if ((round_float64 && !controls.shaderRoundingModeRTEFloat64) ||
+        (preserve_denorm_float64 && !controls.shaderDenormPreserveFloat64)) {
+        return {};
+    }
+    return {.available = true,
+            .round_float64 = round_float64,
+            .preserve_denorm_float64 = preserve_denorm_float64};
+}
+
+std::array<u32, 2> Device::DefaultComputeSubgroupRange() const {
+    if (SupportedSpirvVersion() >= 0x00010600U) {
+        return {properties.subgroup_size_control.minSubgroupSize,
+                properties.subgroup_size_control.maxSubgroupSize};
+    }
+    return {properties.subgroup_properties.subgroupSize, properties.subgroup_properties.subgroupSize};
+}
+
+bool Device::CanSetFullComputeSubgroups(const std::array<u32, 3>& host_size) const {
+    if (!SupportsFullComputeSubgroups()) {
         return false;
     }
-    const u64 max_threads =
-        u64{GuestWarpSize} * properties.subgroup_size_control.maxComputeWorkgroupSubgroups;
-    return x <= max_threads / y / z;
+    const auto layout = GetComputeWarpLayout(host_size);
+    return layout && layout->local_size == host_size;
+}
+
+std::optional<ComputeWarpLayout> Device::GetComputeWarpLayout(const std::array<u32, 3>& size) const {
+    const auto& limits = properties.properties.limits;
+    if (!(GetSubgroupSupportedStages() & VK_SHADER_STAGE_COMPUTE_BIT) ||
+        !IsSubgroupFeatureSupported(VK_SUBGROUP_FEATURE_BASIC_BIT) ||
+        (SupportedSpirvVersion() < 0x00010600U && !SupportsFullComputeSubgroups()) ||
+        !VideoCommon::ValidTensorWorkgroup(size, limits.maxComputeWorkGroupSize,
+                                          limits.maxComputeWorkGroupInvocations)) {
+        return std::nullopt;
+    }
+    const auto [min_width, max_width] = CanRequireGuestWarpForCompute(size)
+                                            ? std::array{GuestWarpSize, GuestWarpSize}
+                                            : DefaultComputeSubgroupRange();
+    if (min_width < GuestWarpSize || max_width < min_width) {
+        return std::nullopt;
+    }
+    if (size[0] % max_width == 0) {
+        return ComputeWarpLayout{size, min_width, max_width};
+    }
+    const u32 total = size[0] * size[1] * size[2];
+    if (total % max_width == 0 && total <= limits.maxComputeWorkGroupSize[0]) {
+        return ComputeWarpLayout{{total, 1, 1}, min_width, max_width};
+    }
+    return std::nullopt;
+}
+
+VideoCommon::NativeTensorLowering Device::NativeTensorComputeSupport(
+    const std::array<u32, 3>& workgroup_size) const {
+    using VideoCommon::NativeTensorLowering;
+    const auto& limits = properties.properties.limits;
+    if (!VideoCommon::ValidTensorWorkgroup(workgroup_size,
+                                          limits.maxComputeWorkGroupSize,
+                                          limits.maxComputeWorkGroupInvocations)) {
+        return NativeTensorLowering::None;
+    }
+    if (const auto layout = GetComputeWarpLayout(workgroup_size)) {
+        const bool shuffle = IsSubgroupFeatureSupported(VK_SUBGROUP_FEATURE_SHUFFLE_BIT) &&
+                             !HasBrokenSpirvSubgroupShuffle();
+        const auto mode = VideoCommon::NativeTensorLoweringFor(
+            workgroup_size, layout->max_width, shuffle,
+            IsSubgroupFeatureSupported(VK_SUBGROUP_FEATURE_BALLOT_BIT));
+        if (mode != NativeTensorLowering::None) {
+            return mode;
+        }
+    }
+    return VideoCommon::CanUseWorkgroupTensor(workgroup_size) ? NativeTensorLowering::Workgroup
+                                                              : NativeTensorLowering::None;
 }
 
 bool Device::HasTimelineSemaphore() const {
@@ -1161,22 +1288,40 @@ bool Device::MustEmulateBGR565() const {
     return Settings::values.emulate_bgr565.GetValue();
 }
 
+bool Device::SupportsPrimitiveRestart(VkPrimitiveTopology topology) const {
+    switch (topology) {
+    case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP:
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP:
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN:
+    case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY:
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY:
+        return true;
+    case VK_PRIMITIVE_TOPOLOGY_POINT_LIST:
+    case VK_PRIMITIVE_TOPOLOGY_LINE_LIST:
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST:
+    case VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY:
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY:
+        return features.primitive_topology_list_restart.primitiveTopologyListRestart;
+    case VK_PRIMITIVE_TOPOLOGY_PATCH_LIST:
+        return features.primitive_topology_list_restart.primitiveTopologyPatchListRestart;
+    default:
+        return false;
+    }
+}
+
 bool Device::GetSuitability(bool requires_swapchain) {
     // Assume we will be suitable.
     bool suitable = true;
 
     // Configure properties.
-    VkPhysicalDeviceVulkan12Features features_1_2{};
-    VkPhysicalDeviceVulkan13Features features_1_3{};
-
-    // Configure properties.
     properties.properties = physical.GetProperties();
 
-    // Set instance version.
-    instance_version = properties.properties.apiVersion;
+    instance_version = std::min(properties.properties.apiVersion, vk::ApplicationApiVersion);
 
-    // Minimum of API version 1.1 is required. (This is well-supported.)
-    ASSERT(instance_version >= VK_API_VERSION_1_1);
+    if (instance_version < VK_API_VERSION_1_1) {
+        LOG_ERROR(Render_Vulkan, "The selected physical device must support Vulkan 1.1");
+        throw vk::Exception(VK_ERROR_INCOMPATIBLE_DRIVER);
+    }
 
     // Get available extensions.
     auto extension_properties = physical.EnumerateDeviceExtensionProperties();
@@ -1208,6 +1353,16 @@ bool Device::GetSuitability(bool requires_swapchain) {
         FOR_EACH_VK_FEATURE_1_3(FEATURE_EXTENSION);
     }
 
+    if (instance_version < VK_API_VERSION_1_4) {
+        FOR_EACH_VK_FEATURE_1_4(FEATURE_EXTENSION);
+        // Older drivers can expose only the EXT name. KHR and EXT use the same feature struct.
+        if (!extensions.index_type_uint8 &&
+            supported_extensions.contains(VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME)) {
+            loaded_extensions.insert(VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME);
+            extensions.index_type_uint8 = true;
+        }
+    }
+
     FOR_EACH_VK_FEATURE_EXT(FEATURE_EXTENSION);
     FOR_EACH_VK_EXTENSION(EXTENSION);
 
@@ -1231,6 +1386,19 @@ bool Device::GetSuitability(bool requires_swapchain) {
         (instance_version >= VK_API_VERSION_1_2 || extensions.create_renderpass2);
     RemoveExtensionIfUnsuitable(extensions.depth_stencil_resolve,
                                 VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME);
+
+    // Before Vulkan 1.3 maintenance5 depends on the dynamic-rendering extension. Its own
+    // depth/stencil-resolve dependency is core in 1.2 and an extension on a 1.1 device.
+    if (instance_version < VK_API_VERSION_1_3 && extensions.maintenance5) {
+        if ((instance_version >= VK_API_VERSION_1_2 || extensions.depth_stencil_resolve) &&
+            supported_extensions.contains(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME)) {
+            loaded_extensions.insert(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
+        } else {
+            RemoveExtension(extensions.maintenance5, VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+            // The backend uses maintenance5 flags2 for its pipeline binaries.
+            RemoveExtension(extensions.pipeline_binary, VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
+        }
+    }
 
     if (supported_extensions.contains(VK_KHR_ROBUSTNESS_2_EXTENSION_NAME)) {
         loaded_extensions.erase(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
@@ -1278,11 +1446,23 @@ bool Device::GetSuitability(bool requires_swapchain) {
             LOG_INFO(Render_Vulkan, "Device doesn't support extension {}", extension_name);            \
     }
 
+    if (instance_version < VK_API_VERSION_1_3) {
+        LOG_EXTENSION(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);
+        LOG_EXTENSION(VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME);
+    }
     FOR_EACH_VK_RECOMMENDED_EXTENSION(LOG_EXTENSION);
     FOR_EACH_VK_MANDATORY_EXTENSION(CHECK_EXTENSION);
+    if (instance_version < VK_API_VERSION_1_2) {
+        CHECK_EXTENSION(VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME);
+        CHECK_EXTENSION(VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME);
+    }
 
     if (requires_swapchain) {
         CHECK_EXTENSION(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    } else {
+        RemoveExtension(extensions.swapchain, VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+        RemoveExtension(extensions.swapchain_mutable_format,
+                        VK_KHR_SWAPCHAIN_MUTABLE_FORMAT_EXTENSION_NAME);
     }
 
     if (instance_version < VK_API_VERSION_1_2) {
@@ -1297,16 +1477,6 @@ bool Device::GetSuitability(bool requires_swapchain) {
 
     // Set next pointer.
     void** next = &features2.pNext;
-
-    // Vulkan 1.2 and 1.3 features
-    if (instance_version >= VK_API_VERSION_1_2) {
-        features_1_2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
-        features_1_3.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
-
-        features_1_2.pNext = &features_1_3;
-
-        *next = &features_1_2;
-    }
 
 // Test all features we know about. If the feature is not available in core at our
 // current API version, and was not enabled by an extension, skip testing the feature.
@@ -1335,11 +1505,35 @@ bool Device::GetSuitability(bool requires_swapchain) {
         FOR_EACH_VK_FEATURE_1_3(EXT_FEATURE);
     }
 
+    if (instance_version >= VK_API_VERSION_1_4) {
+        FOR_EACH_VK_FEATURE_1_4(FEATURE);
+    } else {
+        FOR_EACH_VK_FEATURE_1_4(EXT_FEATURE);
+    }
+
 #undef EXT_FEATURE
 #undef FEATURE
 
+#ifdef VK_EXT_primitive_restart_index
+    // Keep the optional structure at the end so it can be omitted from device creation.
+    void** const restart_index_link = next;
+    if (supported_extensions.contains(VK_EXT_PRIMITIVE_RESTART_INDEX_EXTENSION_NAME)) {
+        features.primitive_restart_index.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIMITIVE_RESTART_INDEX_FEATURES_EXT;
+        SetNext(next, features.primitive_restart_index);
+    }
+#endif
+
     // Perform the feature test.
     physical.GetFeatures2(features2);
+
+#ifdef VK_EXT_primitive_restart_index
+    if (SupportsCustomRestartIndex()) {
+        loaded_extensions.insert(VK_EXT_PRIMITIVE_RESTART_INDEX_EXTENSION_NAME);
+    } else {
+        *restart_index_link = nullptr;
+    }
+#endif
 
     // Base Vulkan 1.0 features are always valid regardless of instance version.
     features.features = features2.features;
@@ -1367,6 +1561,9 @@ bool Device::GetSuitability(bool requires_swapchain) {
 #define OPTIONAL_FEATURE(feature, name) (void)features.feature.name;
 
     FOR_EACH_VK_OPTIONAL_FEATURE(OPTIONAL_FEATURE);
+    if (instance_version < VK_API_VERSION_1_3) {
+        LOG_FEATURE(extended_dynamic_state, extendedDynamicState);
+    }
     FOR_EACH_VK_RECOMMENDED_FEATURE(LOG_FEATURE);
     FOR_EACH_VK_MANDATORY_FEATURE(CHECK_FEATURE);
 
@@ -1381,15 +1578,17 @@ bool Device::GetSuitability(bool requires_swapchain) {
     next = &properties2.pNext;
 
     // Get driver info.
-    properties.driver.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
-    SetNext(next, properties.driver);
+    if (instance_version >= VK_API_VERSION_1_2 || extensions.driver_properties) {
+        properties.driver.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
+        SetNext(next, properties.driver);
+    }
 
     // Retrieve subgroup properties.
     properties.subgroup_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
     SetNext(next, properties.subgroup_properties);
 
     // Retrieve relevant extension properties.
-    if (extensions.shader_float_controls) {
+    if (IsKhrShaderFloatControlsSupported()) {
         properties.float_controls.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES;
         SetNext(next, properties.float_controls);
@@ -1414,10 +1613,16 @@ bool Device::GetSuitability(bool requires_swapchain) {
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES;
         SetNext(next, properties.descriptor_indexing);
     }
-    if (extensions.subgroup_size_control || features.subgroup_size_control.subgroupSizeControl) {
+    if (instance_version >= VK_API_VERSION_1_3 || extensions.subgroup_size_control ||
+        features.subgroup_size_control.subgroupSizeControl) {
         properties.subgroup_size_control.sType =
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES;
         SetNext(next, properties.subgroup_size_control);
+    }
+    if (extensions.legacy_vertex_attributes) {
+        properties.legacy_vertex_attributes.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LEGACY_VERTEX_ATTRIBUTES_PROPERTIES_EXT;
+        SetNext(next, properties.legacy_vertex_attributes);
     }
     if (extensions.transform_feedback) {
         properties.transform_feedback.sType =
@@ -1797,8 +2002,16 @@ void Device::RemoveUnsuitableExtensions() {
                                     VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
     }
 
-    // VK_KHR_shader_quad_control
-    extensions.shader_quad_control = features.shader_quad_control.shaderQuadControl;
+    // VK_KHR_shader_quad_control requires maximal reconvergence and the Vulkan memory model.
+    constexpr auto reconvergence = VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME;
+    extensions.shader_quad_control =
+        features.shader_quad_control.shaderQuadControl &&
+        supported_extensions.contains(reconvergence) &&
+        (instance_version >= VK_API_VERSION_1_2 ||
+         loaded_extensions.contains(VK_KHR_VULKAN_MEMORY_MODEL_EXTENSION_NAME));
+    if (extensions.shader_quad_control) {
+        loaded_extensions.insert(reconvergence);
+    }
     RemoveExtensionFeatureIfUnsuitable(extensions.shader_quad_control, features.shader_quad_control,
                                        VK_KHR_SHADER_QUAD_CONTROL_EXTENSION_NAME);
 
@@ -1808,20 +2021,17 @@ void Device::RemoveUnsuitableExtensions() {
     // 32-lane warp. The matrices hold 16-bit floats, so the device needs shaderFloat16. Shaders
     // with them use the Vulkan memory model and run with full subgroups.
     {
-        const bool has_shape = std::ranges::any_of(
-            physical.GetCooperativeMatrixPropertiesKHR(),
-            [](const VkCooperativeMatrixPropertiesKHR& shape) {
-                return shape.MSize == 16 && shape.NSize == 8 && shape.KSize == 16 &&
-                       shape.AType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
-                       shape.BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
-                       shape.CType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
-                       shape.ResultType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
-                       shape.saturatingAccumulation == VK_FALSE &&
-                       shape.scope == VK_SCOPE_SUBGROUP_KHR;
-            });
+        const auto supports_guest_shape = [](const VkCooperativeMatrixPropertiesKHR& shape) {
+            return shape.MSize == 16 && shape.NSize == 8 && shape.KSize == 16 &&
+                   shape.AType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                   shape.BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                   shape.CType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                   shape.ResultType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                   shape.saturatingAccumulation == VK_FALSE &&
+                   shape.scope == VK_SCOPE_SUBGROUP_KHR;
+        };
         extensions.cooperative_matrix =
             extensions.cooperative_matrix && features.cooperative_matrix.cooperativeMatrix &&
-            has_shape &&
             (properties.cooperative_matrix.cooperativeMatrixSupportedStages &
              VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
             (properties.subgroup_properties.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
@@ -1834,7 +2044,8 @@ void Device::RemoveUnsuitableExtensions() {
             features.subgroup_size_control.computeFullSubgroups &&
             features.vulkan_memory_model.vulkanMemoryModel &&
             features.vulkan_memory_model.vulkanMemoryModelDeviceScope &&
-            features.shader_float16_int8.shaderFloat16;
+            features.shader_float16_int8.shaderFloat16 &&
+            std::ranges::any_of(physical.GetCooperativeMatrixPropertiesKHR(), supports_guest_shape);
         features.cooperative_matrix.cooperativeMatrixRobustBufferAccess = VK_FALSE;
         RemoveExtensionFeatureIfUnsuitable(extensions.cooperative_matrix,
                                            features.cooperative_matrix,
@@ -1870,6 +2081,12 @@ void Device::RemoveUnsuitableExtensions() {
     extensions.maintenance5 = features.maintenance5.maintenance5;
     RemoveExtensionFeatureIfUnsuitable(extensions.maintenance5, features.maintenance5,
                                        VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+
+    // Use the maintenance5 dependency of VK_KHR_pipeline_binary for flags2.
+    extensions.pipeline_binary =
+        extensions.maintenance5 && features.pipeline_binary.pipelineBinaries;
+    RemoveExtensionFeatureIfUnsuitable(extensions.pipeline_binary, features.pipeline_binary,
+                                       VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
 
     // VK_KHR_maintenance6
     extensions.maintenance6 = features.maintenance6.maintenance6;
@@ -1949,24 +2166,23 @@ void Device::ReleaseCustomBorderColorSamplers(size_t count) const {
     custom_border_color_samplers_used.fetch_sub(count, std::memory_order_relaxed);
 }
 
-u64 Device::GetDeviceMemoryUsage() const {
-    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
-    budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
-    physical.GetMemoryProperties(&budget);
-    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> heap_budgets{};
-    if (allocator != nullptr) {
-        vmaGetHeapBudgets(allocator, heap_budgets.data());
-    }
-    u64 result{};
-    for (const size_t heap : valid_heap_memory) {
-        result += AllocatedUsage(budget.heapUsage[heap], heap_budgets[heap]);
-    }
-    return result;
-}
-
 u64 Device::GetMainHeapSize() const {
     const u64 size = physical.GetMemoryProperties().memoryProperties.memoryHeaps[main_heap].size;
     return heap_size_limit != 0 ? (std::min)(size, heap_size_limit) : size;
+}
+
+u64 Device::GetMainHeapAllocationBudget() const {
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    const auto properties = physical.GetMemoryProperties(extensions.memory_budget ? &budget : nullptr);
+    u64 available = properties.memoryProperties.memoryHeaps[main_heap].size;
+    if (extensions.memory_budget) {
+        available = (std::min)(available, budget.heapBudget[main_heap]);
+    }
+    if (heap_size_limit != 0) {
+        available = (std::min)(available, heap_size_limit);
+    }
+    return is_integrated ? (std::min)(available, device_access_memory) : available;
 }
 
 u64 Device::GetDeviceMemorySlack() const {
@@ -1979,10 +2195,7 @@ u64 Device::GetDeviceMemorySlack() const {
     return statistics.blockBytes - (std::min)(statistics.blockBytes, statistics.allocationBytes);
 }
 
-u64 Device::GetDeviceMemoryBudget() const {
-    if (!extensions.memory_budget) {
-        return 0;
-    }
+Device::DeviceMemoryBudget Device::GetDeviceMemoryBudgetSnapshot() const {
     VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
     budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
     physical.GetMemoryProperties(&budget);
@@ -1994,13 +2207,17 @@ u64 Device::GetDeviceMemoryBudget() const {
     // reported 8.5 GB) and kept the collector's thresholds above the heap the images fill. What
     // the other heaps use is added the way GetDeviceMemoryUsage() counts it, so the usage reaches
     // this when the main heap's does its budget.
-    u64 result = budget.heapBudget[main_heap];
+    u64 main_budget = budget.heapBudget[main_heap];
     if (heap_size_limit != 0) {
-        result = (std::min)(result, heap_size_limit);
+        main_budget = (std::min)(main_budget, heap_size_limit);
     }
+    DeviceMemoryBudget result{};
+    result.budget = main_budget;
     for (const size_t heap : valid_heap_memory) {
+        const u64 usage = AllocatedUsage(budget.heapUsage[heap], heap_budgets[heap]);
+        result.usage += usage;
         if (heap != main_heap) {
-            result += AllocatedUsage(budget.heapUsage[heap], heap_budgets[heap]);
+            result.budget += usage;
         }
     }
     if (is_integrated) {
@@ -2008,9 +2225,23 @@ u64 Device::GetDeviceMemoryBudget() const {
         // budget): following it let the texture cache fill that much RAM before collecting, and
         // kept ASTC uncompressed. Its budget is at most the share CollectPhysicalMemoryInfo
         // gives it (4 GiB, 6 GiB with aggressive VRAM use).
-        result = (std::min)(result, device_access_memory);
+        result.budget = (std::min)(result.budget, device_access_memory);
     }
+    if (!extensions.memory_budget) {
+        result.budget = 0;
+    }
+    const VmaStatistics& statistics = heap_budgets[main_heap].statistics;
+    result.slack = statistics.blockBytes - (std::min)(statistics.blockBytes,
+                                                      statistics.allocationBytes);
     return result;
+}
+
+u64 Device::GetDeviceMemoryUsage() const {
+    return GetDeviceMemoryBudgetSnapshot().usage;
+}
+
+u64 Device::GetDeviceMemoryBudget() const {
+    return extensions.memory_budget ? GetDeviceMemoryBudgetSnapshot().budget : 0;
 }
 
 void Device::CollectPhysicalMemoryInfo() {
@@ -2079,10 +2310,16 @@ void Device::CollectPhysicalMemoryInfo() {
 }
 
 void Device::CollectToolingInfo() {
-    if (!extensions.tooling_info) {
+    if (instance_version < VK_API_VERSION_1_3 && !extensions.tooling_info) {
         return;
     }
-    auto tools{physical.GetPhysicalDeviceToolProperties()};
+    std::vector<VkPhysicalDeviceToolProperties> tools;
+    try {
+        tools = physical.GetPhysicalDeviceToolProperties(instance_version);
+    } catch (const vk::Exception& e) {
+        LOG_WARNING(Render_Vulkan, "Cannot enumerate Vulkan tools: {}", e.what());
+        return;
+    }
     for (const VkPhysicalDeviceToolProperties& tool : tools) {
         const std::string_view name = tool.name;
         LOG_INFO(Render_Vulkan, "Attached debugging tool: {}", name);

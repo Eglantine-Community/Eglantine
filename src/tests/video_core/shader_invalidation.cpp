@@ -17,16 +17,20 @@
 
 namespace VideoCommon {
 struct ShaderCacheTestAccess {
+    using Mode = Shader::Ampere::TensorMode;
     static std::unique_ptr<ShaderCache> Create(Tegra::MaxwellDeviceMemoryManager& memory) {
         return std::unique_ptr<ShaderCache>{new ShaderCache{memory}};
     }
-    static void Register(ShaderCache& cache, VAddr address, size_t size, u64 hash) {
+    static void Register(ShaderCache& cache, VAddr address, size_t size, u64 hash,
+                         Mode mode = Mode::Default) {
         auto data = std::make_unique<ShaderInfo>();
         data->unique_hash = hash;
+        data->tensor_mode = mode;
         cache.Register(std::move(data), address, size);
     }
-    static const ShaderInfo* Find(const ShaderCache& cache, VAddr address) {
-        return cache.TryGet(address);
+    static const ShaderInfo* Find(const ShaderCache& cache, VAddr address,
+                                  Mode mode = Mode::Default) {
+        return cache.TryGet(address, mode);
     }
     static void RegisterNative(ShaderCache& cache, VAddr address, u64 hash, u64 key) {
         auto data = std::make_unique<ShaderInfo>();
@@ -36,9 +40,15 @@ struct ShaderCacheTestAccess {
         data->lowered_native = std::move(lowered);
         cache.Register(std::move(data), address, 0x100);
     }
-    static void Reject(ShaderCache& cache, VAddr address) {
-        cache.rejected_native.emplace(address,
-                                      std::make_exception_ptr(std::runtime_error{"rejected"}));
+    static void Reject(ShaderCache& cache, VAddr address, Mode mode = Mode::Default) {
+        try {
+            throw std::runtime_error{"rejected"};
+        } catch (...) {
+            cache.RememberRejection(address, mode);
+        }
+    }
+    static void Rethrow(ShaderCache& cache, VAddr address, Mode mode) {
+        cache.RethrowIfRejected(address, mode);
     }
     static bool IsRejected(ShaderCache& cache, VAddr address) {
         return cache.IsRejected(address);
@@ -47,6 +57,32 @@ struct ShaderCacheTestAccess {
 } // namespace VideoCommon
 
 using VideoCommon::ShaderCacheTestAccess;
+
+TEST_CASE("Shader cache separates tensor translations and rejections at one address",
+          "[shader_invalidation][tensor]") {
+    using Mode = ShaderCacheTestAccess::Mode;
+    Core::DeviceMemory memory;
+    Tegra::MaxwellDeviceMemoryManager device_memory{memory};
+    auto cache = ShaderCacheTestAccess::Create(device_memory);
+    constexpr VAddr address = 0x100000;
+    ShaderCacheTestAccess::Register(*cache, address, 0x100, 10, Mode::Full);
+    ShaderCacheTestAccess::Register(*cache, address, 0x100, 20, Mode::Compact);
+    ShaderCacheTestAccess::Reject(*cache, address, Mode::Disabled);
+
+    REQUIRE(ShaderCacheTestAccess::Find(*cache, address, Mode::Full));
+    CHECK(ShaderCacheTestAccess::Find(*cache, address, Mode::Full)->unique_hash == 10);
+    REQUIRE(ShaderCacheTestAccess::Find(*cache, address, Mode::Compact));
+    CHECK(ShaderCacheTestAccess::Find(*cache, address, Mode::Compact)->unique_hash == 20);
+    CHECK_FALSE(ShaderCacheTestAccess::Find(*cache, address, Mode::Stub));
+    CHECK_THROWS_AS(ShaderCacheTestAccess::Rethrow(*cache, address, Mode::Disabled),
+                    std::runtime_error);
+    CHECK_NOTHROW(ShaderCacheTestAccess::Rethrow(*cache, address, Mode::Compact));
+
+    cache->InvalidateRegion(address, 1);
+    CHECK_FALSE(ShaderCacheTestAccess::Find(*cache, address, Mode::Full));
+    CHECK_FALSE(ShaderCacheTestAccess::Find(*cache, address, Mode::Compact));
+    CHECK_NOTHROW(ShaderCacheTestAccess::Rethrow(*cache, address, Mode::Disabled));
+}
 
 TEST_CASE("Shader batch invalidation matches sequential cache contents", "[shader_invalidation]") {
     Core::DeviceMemory memory;

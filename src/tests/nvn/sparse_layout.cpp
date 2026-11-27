@@ -75,7 +75,23 @@ std::vector<u32> TilesIn(const Nvn::SparseLayout& layout, u64 begin, u64 end,
 
 } // Anonymous namespace
 
-TEST_CASE("nvn sparse: row batching preserves every block mapping", "[nvn][sparse]") {
+TEST_CASE("NVN sparse budget fits the usable device-local heap", "[nvn][sparse]") {
+    using PagePool = Nvn::SparsePagePool;
+    constexpr u64 MIB = u64{1} << 20;
+    constexpr u64 GIB = u64{1} << 30;
+    CHECK(PagePool::DefaultBudget(0) == 0);
+    CHECK(PagePool::DefaultBudget(64 * MIB) == 64 * MIB);
+    CHECK(PagePool::DefaultBudget(5 * GIB) == 2 * GIB);
+    CHECK(PagePool::DefaultBudget(40 * GIB) == 12 * GIB);
+
+    CHECK(PagePool::CachedBlockTarget(0, 200 * MIB, 4 * MIB) == PagePool::CachedBlockLimit);
+    CHECK(PagePool::CachedBlockTarget(64 * MIB, 60 * MIB, 0) == PagePool::CachedBlockLimit);
+    CHECK(PagePool::CachedBlockTarget(64 * MIB, 60 * MIB, 1 * MIB) == 0);
+    CHECK(PagePool::CachedBlockTarget(64 * MIB, 65 * MIB, 0) == 0);
+}
+
+TEST_CASE("nvn sparse: row unbind batching preserves every region",
+          "[nvn][sparse][sparse-compaction]") {
     constexpr u32 GRANULE = 256;
     std::vector<VkSparseImageMemoryBind> binds;
     // Allocation boundaries, gaps, unbinds, layers, mips, and clipped edge blocks.
@@ -88,7 +104,7 @@ TEST_CASE("nvn sparse: row batching preserves every block mapping", "[nvn][spars
                         .subresource{VK_IMAGE_ASPECT_COLOR_BIT, mip, layer},
                         .offset{static_cast<s32>(x * GRANULE), static_cast<s32>(y * GRANULE), 0},
                         .extent{x == 31 ? 37u : GRANULE, y == 1 ? 53u : GRANULE, 1},
-                        .memory = x % 7 == 0 ? VK_NULL_HANDLE
+                        .memory = x % 7 <= 2 || x == 31 ? VK_NULL_HANDLE
                                              : std::bit_cast<VkDeviceMemory>(u64{1} + page / 64),
                         .memoryOffset = (page % 64 + 2) * Nvn::SPARSE_TILE_BYTES,
                     });
@@ -127,7 +143,7 @@ TEST_CASE("nvn sparse: row batching preserves every block mapping", "[nvn][spars
     std::mt19937 random{41};
     std::shuffle(binds.begin(), binds.end(), random);
     Nvn::CompactSparseImageBinds(binds, GRANULE, GRANULE);
-    CHECK(binds.size() < original_count / 2);
+    CHECK(binds.size() == (original_count / 32) * 21);
     CHECK(expand(binds) == expected);
     const size_t compact_count = binds.size();
     Nvn::CompactSparseImageBinds(binds, GRANULE, GRANULE);
@@ -135,25 +151,18 @@ TEST_CASE("nvn sparse: row batching preserves every block mapping", "[nvn][spars
     CHECK(expand(binds) == expected);
 }
 
-TEST_CASE("nvn sparse: row batching keeps incompatible binds separate", "[nvn][sparse]") {
-    const VkSparseImageMemoryBind first{
+TEST_CASE("nvn sparse: row unbind batching keeps incompatible regions separate",
+          "[nvn][sparse][sparse-compaction]") {
+    VkSparseImageMemoryBind first{
         .subresource{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0},
         .offset{0, 0, 0},
         .extent{256, 256, 1},
-        .memory = std::bit_cast<VkDeviceMemory>(u64{1}),
-        .memoryOffset = 0,
+        .memory = VK_NULL_HANDLE,
     };
     VkSparseImageMemoryBind second = first;
     second.offset.x = 256;
-    second.memoryOffset = Nvn::SPARSE_TILE_BYTES;
-    SECTION("discontiguous physical pages") {
-        second.memoryOffset *= 2;
-    }
-    SECTION("different memory objects") {
-        second.memory = std::bit_cast<VkDeviceMemory>(u64{2});
-    }
-    SECTION("bound followed by unbound") {
-        second.memory = VK_NULL_HANDLE;
+    SECTION("unbound followed by bound") {
+        second.memory = std::bit_cast<VkDeviceMemory>(u64{1});
     }
     SECTION("different binding flags") {
         second.flags = VK_SPARSE_MEMORY_BIND_METADATA_BIT;
@@ -176,6 +185,9 @@ TEST_CASE("nvn sparse: row batching keeps incompatible binds separate", "[nvn][s
     SECTION("gap between blocks") {
         second.offset.x = 512;
     }
+    SECTION("gap after a clipped block") {
+        first.extent.width = 73;
+    }
     SECTION("different row height") {
         second.extent.height = 128;
     }
@@ -188,6 +200,38 @@ TEST_CASE("nvn sparse: row batching keeps incompatible binds separate", "[nvn][s
     std::vector<VkSparseImageMemoryBind> binds{first, second};
     Nvn::CompactSparseImageBinds(binds, 256, 256);
     CHECK(binds.size() == 2);
+}
+
+TEST_CASE("nvn sparse: contiguous physical bindings remain individual",
+          "[nvn][sparse][sparse-compaction]") {
+    constexpr u32 GRANULE = 256;
+    const VkSparseImageMemoryBind first{
+        .subresource{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0},
+        .offset{0, 0, 0},
+        .extent{GRANULE, GRANULE, 1},
+        .memory = std::bit_cast<VkDeviceMemory>(u64{1}),
+        .memoryOffset = 0,
+    };
+    VkSparseImageMemoryBind second = first;
+    second.offset.x = GRANULE;
+    second.memoryOffset = Nvn::SPARSE_TILE_BYTES;
+    VkSparseImageMemoryBind third = second;
+    third.offset.x = 2 * GRANULE;
+    third.memory = VK_NULL_HANDLE;
+    VkSparseImageMemoryBind fourth = third;
+    fourth.offset.x = 3 * GRANULE;
+    fourth.extent.width = 73; // final block of the subresource
+    fourth.memoryOffset = 8 * Nvn::SPARSE_TILE_BYTES;
+    std::vector<VkSparseImageMemoryBind> binds{fourth, first, third, second};
+    Nvn::CompactSparseImageBinds(binds, GRANULE, GRANULE);
+    REQUIRE(binds.size() == 3);
+    std::ranges::sort(binds, {}, [](const auto& bind) { return bind.offset.x; });
+    CHECK(binds[0].extent.width == GRANULE);
+    CHECK(binds[1].extent.width == GRANULE);
+    CHECK(binds[1].memoryOffset == Nvn::SPARSE_TILE_BYTES);
+    CHECK(binds[2].memory == VK_NULL_HANDLE);
+    CHECK(binds[2].offset.x == 2 * GRANULE);
+    CHECK(binds[2].extent.width == GRANULE + 73);
 }
 
 TEST_CASE("nvn sparse: a tile is 64 KiB of one block row of GOB columns", "[nvn][sparse]") {

@@ -7,19 +7,25 @@
 // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <optional>
 #include <utility>
+
+#include <boost/container/small_vector.hpp>
 
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 
 #include "common/assert.h"
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "common/div_ceil.h"
 #include "common/vector_math.h"
 #include "video_core/host_shaders/astc_decoder_comp_spv.h"
@@ -29,8 +35,11 @@
 #include "video_core/host_shaders/resolve_conditional_render_comp_spv.h"
 #include "video_core/host_shaders/vulkan_quad_indexed_comp_spv.h"
 #include "video_core/host_shaders/vulkan_uint8_comp_spv.h"
+#include "video_core/host_shaders/vulkan_uint16_comp_spv.h"
+#include "video_core/renderer_vulkan/index_restart.h"
 #include "video_core/host_shaders/vulkan_vertex_repack_comp_spv.h"
 #include "video_core/host_shaders/vulkan_plain_unswizzle_comp_spv.h"
+#include "video_core/host_shaders/vulkan_msaa_depth_stencil_staging_comp_spv.h"
 #include "video_core/host_shaders/block_linear_unswizzle_3d_bcn_comp_spv.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vertex_repack.h"
@@ -195,6 +204,7 @@ struct AstcPushConstants {
     u32 block_height;
     u32 block_height_mask;
     u32 native_tiling;
+    std::array<u32, 2> decode_extent;
 };
 
 constexpr std::array<VkDescriptorSetLayoutBinding, 2> BC_ENCODER_DESCRIPTOR_SET_BINDINGS{{
@@ -330,62 +340,310 @@ ComputePass::ComputePass(const Device& device_, Scheduler& scheduler, Descriptor
 
 ComputePass::~ComputePass() = default;
 
+namespace {
+
+constexpr u32 REPACK_WORKGROUP_SIZE = 128;
+constexpr u32 REPACK_PADDING = std::numeric_limits<u32>::max();
+constexpr u32 REPACK_SOURCE_INDEX_MASK = 0x0fffffff;
+constexpr u32 REPACK_SCATTER_ROUTE = 0xf0000000;
+constexpr u64 REPACK_MAX_ADDRESSABLE_BYTES = u64{REPACK_PADDING} & ~u64{3};
+constexpr size_t REPACK_BINDINGS = 4;
+
+constexpr auto REPACK_DESCRIPTOR_BINDINGS = [] {
+    std::array<VkDescriptorSetLayoutBinding, REPACK_BINDINGS> bindings{};
+    for (u32 index = 0; index < bindings.size(); ++index) {
+        bindings[index] = INPUT_OUTPUT_DESCRIPTOR_SET_BINDINGS[0];
+        bindings[index].binding = index;
+    }
+    return bindings;
+}();
+
+constexpr DescriptorBankInfo REPACK_BANK_INFO = [] {
+    auto info = INPUT_OUTPUT_BANK_INFO;
+    info.storage_buffers = REPACK_BINDINGS;
+    info.score = REPACK_BINDINGS;
+    return info;
+}();
+
+constexpr auto REPACK_DESCRIPTOR_TEMPLATE = [] {
+    auto entry = INPUT_OUTPUT_DESCRIPTOR_UPDATE_TEMPLATE;
+    entry.descriptorCount = REPACK_BINDINGS;
+    return entry;
+}();
+
+struct RepackPushConstants {
+    u32 source_bias;
+    u32 source_size;
+    u32 source_stride;
+    u32 destination_stride;
+    u32 total_words;
+    u32 source_full_bytes;
+};
+static_assert(sizeof(RepackPushConstants) == 6 * sizeof(u32));
+
+struct RepackChunk {
+    VkDeviceSize source_base;
+    VkDeviceSize destination_offset;
+    VkDeviceSize destination_size;
+    u32 dispatch_groups;
+    RepackPushConstants constants;
+};
+
+using RepackMap = boost::container::small_vector<u32, 128>;
+
+RepackMap MakeRepackWordMap(std::span<const u32> byte_map) {
+    const size_t word_count = byte_map.size() / sizeof(u32);
+    RepackMap words(word_count, REPACK_PADDING);
+    for (size_t index = 0; index < word_count; ++index) {
+        const auto lanes = byte_map.subspan(index * sizeof(u32), sizeof(u32));
+        const auto first = std::ranges::find_if(lanes, [](u32 value) {
+            return value != REPACK_PADDING;
+        });
+        if (first == lanes.end()) {
+            continue;
+        }
+
+        const u32 destination_lane = static_cast<u32>(first - lanes.begin());
+        const u32 source_first = *first;
+        if (source_first <= REPACK_SOURCE_INDEX_MASK) {
+            auto end = first + 1;
+            for (; end != lanes.end() && *end == source_first + (end - first); ++end) {
+            }
+            if (std::ranges::all_of(std::ranges::subrange(end, lanes.end()), [](u32 value) {
+                    return value == REPACK_PADDING;
+                })) {
+                // The top nibble packs the lane and span length. 0xf cannot describe a span.
+                const u32 count = static_cast<u32>(end - first);
+                words[index] = source_first | ((count - 1) << 28) | (destination_lane << 30);
+                continue;
+            }
+        }
+
+        // Keep arbitrary byte routes in a side table after the one-word descriptors.
+        const u32 scatter_index = static_cast<u32>((words.size() - word_count) / sizeof(u32));
+        ASSERT(scatter_index < REPACK_SOURCE_INDEX_MASK);
+        words[index] = REPACK_SCATTER_ROUTE | scatter_index;
+        words.insert(words.end(), lanes.begin(), lanes.end());
+    }
+    return words;
+}
+
+} // namespace
+
 VertexRepackPass::VertexRepackPass(const Device& device_, Scheduler& scheduler_,
                                  DescriptorPool& descriptor_pool, StagingBufferPool& staging_pool_,
                                  ComputePassDescriptorQueue& descriptor_queue_)
-    : ComputePass(device_, scheduler_, descriptor_pool, INPUT_OUTPUT_DESCRIPTOR_SET_BINDINGS,
-                  INPUT_OUTPUT_DESCRIPTOR_UPDATE_TEMPLATE, INPUT_OUTPUT_BANK_INFO,
-                  COMPUTE_PUSH_CONSTANT_RANGE<12>, VULKAN_VERTEX_REPACK_COMP_SPV),
-      scheduler{scheduler_}, staging_pool{staging_pool_}, descriptor_queue{descriptor_queue_} {}
+    : ComputePass(device_, scheduler_, descriptor_pool, REPACK_DESCRIPTOR_BINDINGS,
+                  REPACK_DESCRIPTOR_TEMPLATE, REPACK_BANK_INFO,
+                  COMPUTE_PUSH_CONSTANT_RANGE<sizeof(RepackPushConstants)>,
+                  VULKAN_VERTEX_REPACK_COMP_SPV),
+      scheduler{scheduler_}, staging_pool{staging_pool_}, descriptor_queue{descriptor_queue_},
+      max_allocation_size{StagingAllocationLimit(device_)} {}
 
-std::optional<std::pair<VkBuffer, VkDeviceSize>> VertexRepackPass::Assemble(VkBuffer source,
-                                                                            u32 offset, u32 size,
-                                                                            u64 buffer_size) {
-    const auto parameters = MakeVertexRepackParameters(
-        offset, size, device.GetStorageBufferAlignment(), device.GetMaxStorageBufferRange(),
-        device.GetMaxComputeWorkGroupCount()[0], buffer_size);
-    if (!parameters) {
-        LOG_ERROR(Render_Vulkan, "Vertex repack exceeds device limits: offset={}, size={}", offset, size);
+std::optional<RepackedVertexBuffer> VertexRepackPass::Assemble(
+    VkBuffer source, VkDeviceSize offset, VkDeviceSize size, VkDeviceSize buffer_size,
+    const VertexRepackLayout& vertex_layout) {
+    const u32 source_stride = vertex_layout.source_stride;
+    const u32 stride = vertex_layout.stride;
+    const u64 max_range =
+        (std::min)(device.GetMaxStorageBufferRange(), REPACK_MAX_ADDRESSABLE_BYTES) & ~u64{3};
+    const u64 alignment = (std::max)(device.GetStorageBufferAlignment(), VkDeviceSize{4});
+    if (!source || size == 0 || offset > buffer_size || size > buffer_size - offset ||
+        stride == 0 || stride % sizeof(u32) != 0 || stride > device.GetMaxVertexInputBindingStride() ||
+        stride > max_range || vertex_layout.copies.empty()) {
         return std::nullopt;
     }
-    const u32 num_vertices = parameters->vertices;
-    const u32 output_size = parameters->output_size;
-    const auto dest = staging_pool.Request(output_size, MemoryUsage::DeviceLocal);
-    const u32 base_offset = parameters->source_base;
-    const u32 bias = parameters->source_bias;
-    descriptor_queue.Acquire(scheduler, 2);
-    descriptor_queue.AddBuffer(source, base_offset, parameters->source_range);
-    descriptor_queue.AddBuffer(dest.buffer, dest.offset, output_size);
-    const void* data = descriptor_queue.UpdateData();
+
+    const u64 vertices = source_stride != 0 ? 1 + (size - 1) / source_stride : 1;
+    if (vertices > max_allocation_size / stride) {
+        return std::nullopt;
+    }
+    const u64 output_size = vertices * stride;
+    RepackMap byte_map(stride, REPACK_PADDING);
+    u64 source_end = 0;
+    for (const auto& copy : vertex_layout.copies) {
+        const u64 copy_end = u64{copy.source_offset} + copy.byte_count;
+        if (copy.byte_count == 0 || copy_end > REPACK_PADDING ||
+            u64{copy.destination_offset} + copy.byte_count > stride) {
+            return std::nullopt;
+        }
+        source_end = (std::max)(source_end, copy_end);
+        for (u32 byte = 0; byte < copy.byte_count; ++byte) {
+            auto& entry = byte_map[copy.destination_offset + byte];
+            const u32 source_byte = copy.source_offset + byte;
+            if (entry != REPACK_PADDING && entry != source_byte) {
+                return std::nullopt;
+            }
+            entry = source_byte;
+        }
+    }
+
+    const auto word_map = MakeRepackWordMap({byte_map.data(), byte_map.size()});
+    const u64 map_size = u64{word_map.size()} * sizeof(u32);
+    if (map_size > max_range || map_size > max_allocation_size) {
+        return std::nullopt;
+    }
+
+    const u64 dispatch_bytes = u64{device.GetMaxComputeWorkGroupCount()[0]} *
+                               REPACK_WORKGROUP_SIZE * sizeof(u32);
+    const u64 max_output_vertices = (std::min)(max_range, dispatch_bytes) / stride;
+    // Every non-final chunk must end at an aligned storage-buffer descriptor offset.
+    const u64 vertex_alignment = alignment / std::gcd(alignment, u64{stride});
+    boost::container::small_vector<RepackChunk, 1> chunks;
+    u64 tail_size = 0;
+    for (u64 first = 0; first < vertices;) {
+        const u64 relative = first * source_stride;
+        const u64 source_offset = offset + relative;
+        const u64 source_base = source_offset / alignment * alignment;
+        const u64 bias = source_offset - source_base;
+        const u64 readable = size - relative;
+        if (bias >= max_range) {
+            return std::nullopt;
+        }
+        const u64 source_capacity = max_range - bias;
+        u64 count = (std::min)(vertices - first, max_output_vertices);
+        if (readable > source_capacity) {
+            if (source_end > source_capacity) {
+                return std::nullopt;
+            }
+            if (source_stride != 0) {
+                count = (std::min)(count, 1 + (source_capacity - source_end) / source_stride);
+            }
+        }
+        if (count < vertices - first) {
+            count -= count % vertex_alignment;
+        }
+        if (count == 0) {
+            return std::nullopt;
+        }
+
+        const u64 source_size = (std::min)(readable, (count - 1) * source_stride + source_end);
+        const u64 end = bias + source_size;
+        const u64 rounded_end = (end + 3) & ~u64{3};
+        const u64 source_full_bytes = (std::min)(rounded_end, (buffer_size - source_base) & ~u64{3});
+        // Any chunk requiring a short word reads it from the same physical end of the buffer.
+        if (end > source_full_bytes) {
+            tail_size = (std::max)(tail_size, end - source_full_bytes);
+        }
+        const u64 destination_size = count * stride;
+        const u32 words = static_cast<u32>(destination_size / sizeof(u32));
+        chunks.push_back({
+            .source_base = source_base,
+            .destination_offset = first * stride,
+            .destination_size = destination_size,
+            .dispatch_groups = Common::DivCeil(words, REPACK_WORKGROUP_SIZE),
+            .constants{
+                .source_bias = static_cast<u32>(bias),
+                .source_size = static_cast<u32>(source_size),
+                .source_stride = source_stride,
+                .destination_stride = stride,
+                .total_words = words,
+                .source_full_bytes = static_cast<u32>(source_full_bytes),
+            },
+        });
+        first += count;
+    }
+
+    // Keep every scratch allocation reserved until recording the last command that can use it.
+    // A later graphics bind belongs to this tick. A caller that starts a new command buffer must
+    // re-establish its vertex state there.
+    auto destination = staging_pool.Request(output_size, MemoryUsage::DeviceLocal, true);
+    SCOPE_EXIT {
+        staging_pool.FreeDeferred(destination);
+    };
+    auto map = staging_pool.Request(map_size, MemoryUsage::Upload, true);
+    SCOPE_EXIT {
+        staging_pool.FreeDeferred(map);
+    };
+    std::memcpy(map.mapped_span.data(), word_map.data(), map_size);
+    staging_pool.FlushDeferredUpload(map);
+    std::optional<StagingBufferRef> tail_buffer;
+    if (tail_size != 0) {
+        tail_buffer = staging_pool.Request(sizeof(u32), MemoryUsage::DeviceLocal, true);
+    }
+    SCOPE_EXIT {
+        if (tail_buffer) {
+            staging_pool.FreeDeferred(*tail_buffer);
+        }
+    };
+    const auto& tail = tail_buffer ? *tail_buffer : map;
+    ASSERT(map.offset % alignment == 0 && destination.offset % alignment == 0 &&
+           tail.offset % alignment == 0);
+
     scheduler.RequestOutsideRenderPassOperationContext();
-    LOG_DEBUG(Render_Vulkan, "Vertex repack queued: source_size={}, output_size={}, groups={}",
-              size, output_size, parameters->dispatch_groups);
-    scheduler.Record([this, data, bias, size, num_vertices,
-                      groups = parameters->dispatch_groups](vk::CommandBuffer cmdbuf) {
-        const VkMemoryBarrier read_barrier{
-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+    if (tail_size != 0) {
+        const VkBufferCopy region{
+            .srcOffset = buffer_size & ~u64{3},
+            .dstOffset = tail.offset,
+            .size = tail_size,
         };
-        cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
-                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, read_barrier);
-        const auto set = descriptor_allocator.Commit();
-        device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, data);
-        cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
-        cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
-        const std::array<u32, 3> constants{bias, size, num_vertices * 18};
-        cmdbuf.PushConstants(*layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants), constants.data());
-        cmdbuf.Dispatch(groups, 1, 1);
+        scheduler.Record([source, tail, region](vk::CommandBuffer cmdbuf) {
+            const VkMemoryBarrier read_barrier{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            };
+            cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0, read_barrier);
+            // Copy the 1–3 physically present bytes without a uint SSBO overread.
+            cmdbuf.FillBuffer(tail.buffer, tail.offset, sizeof(u32), 0);
+            const VkBufferMemoryBarrier fill_barrier{
+                .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .buffer = tail.buffer,
+                .offset = tail.offset,
+                .size = sizeof(u32),
+            };
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0, fill_barrier);
+            cmdbuf.CopyBuffer(source, tail.buffer, region);
+        });
+    }
+    for (const auto& chunk : chunks) {
+        descriptor_queue.Acquire(scheduler, REPACK_BINDINGS);
+        const u32 source_full_bytes = chunk.constants.source_full_bytes;
+        if (source_full_bytes != 0) {
+            descriptor_queue.AddBuffer(source, chunk.source_base, source_full_bytes);
+        } else {
+            // A descriptor must still cover a valid word for the entirely partial source.
+            descriptor_queue.AddBuffer(map.buffer, map.offset, sizeof(u32));
+        }
+        descriptor_queue.AddBuffer(destination.buffer, destination.offset + chunk.destination_offset,
+                                   chunk.destination_size);
+        descriptor_queue.AddBuffer(map.buffer, map.offset, map_size);
+        descriptor_queue.AddBuffer(tail.buffer, tail.offset, sizeof(u32));
+        const void* data = descriptor_queue.UpdateData();
+        scheduler.Record([this, data, chunk](vk::CommandBuffer cmdbuf) {
+            const VkMemoryBarrier read_barrier{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+            };
+            cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, read_barrier);
+            const auto set = descriptor_allocator.Commit();
+            device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, data);
+            cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
+            cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
+            cmdbuf.PushConstants(*layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                 sizeof(chunk.constants), &chunk.constants);
+            cmdbuf.Dispatch(chunk.dispatch_groups, 1, 1);
+        });
+    }
+    scheduler.Record([](vk::CommandBuffer cmdbuf) {
         const VkMemoryBarrier write_barrier{
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
             .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
             .dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT,
         };
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                              VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, write_barrier);
+                               VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, write_barrier);
     });
     scheduler.InvalidateDescriptorBuffer();
-    return std::pair<VkBuffer, VkDeviceSize>{dest.buffer, dest.offset};
+    return RepackedVertexBuffer{destination.buffer, destination.offset, output_size};
 }
 
 PlainUnswizzlePass::PlainUnswizzlePass(const Device& device_, Scheduler& scheduler_,
@@ -430,46 +688,247 @@ void PlainUnswizzlePass::Dispatch(VkBuffer source, VkDeviceSize offset, VkBuffer
     scheduler.InvalidateDescriptorBuffer();
 }
 
-Uint8Pass::Uint8Pass(const Device& device_, Scheduler& scheduler_, DescriptorPool& descriptor_pool,
-                     StagingBufferPool& staging_buffer_pool_,
-                     ComputePassDescriptorQueue& compute_pass_descriptor_queue_)
+DepthStencilStagingPass::DepthStencilStagingPass(
+    const Device& device_, Scheduler& scheduler_, DescriptorPool& descriptor_pool,
+    ComputePassDescriptorQueue& descriptor_queue_)
     : ComputePass(device_, scheduler_, descriptor_pool, INPUT_OUTPUT_DESCRIPTOR_SET_BINDINGS,
-                  INPUT_OUTPUT_DESCRIPTOR_UPDATE_TEMPLATE, INPUT_OUTPUT_BANK_INFO, {},
-                  VULKAN_UINT8_COMP_SPV),
+                  INPUT_OUTPUT_DESCRIPTOR_UPDATE_TEMPLATE, INPUT_OUTPUT_BANK_INFO,
+                  COMPUTE_PUSH_CONSTANT_RANGE<4 * sizeof(u32)>,
+                  VULKAN_MSAA_DEPTH_STENCIL_STAGING_COMP_SPV),
+      scheduler{scheduler_}, descriptor_queue{descriptor_queue_} {}
+
+void DepthStencilStagingPass::CopyTile(
+    VkBuffer staging, VkBuffer scratch, VkDeviceSize plane_offset, VkImage image,
+    std::span<const VkBufferCopy> upload_regions, const std::array<VkBufferImageCopy, 2>& planes,
+    u32 count, u32 guest_layout, bool host_float, bool download) {
+    const VkDeviceSize packed_size = VkDeviceSize{count} * (guest_layout == 2 ? 8 : 4);
+    const VkDeviceSize plane_size = VkDeviceSize{count} * 4 + Common::AlignUp(count, 4U);
+    descriptor_queue.Acquire(scheduler, 2);
+    descriptor_queue.AddBuffer(scratch, 0, packed_size);
+    descriptor_queue.AddBuffer(scratch, plane_offset, plane_size);
+    const void* data = descriptor_queue.UpdateData();
+    const std::array<u32, 4> push{count, guest_layout, host_float, download};
+    boost::container::small_vector<VkBufferCopy, 16> regions(upload_regions.begin(),
+                                                            upload_regions.end());
+    if (download) {
+        for (auto& region : regions) {
+            std::swap(region.srcOffset, region.dstOffset);
+        }
+    }
+    scheduler.Record([this, data, push, staging, scratch, image, planes, download,
+                      regions = std::move(regions)](vk::CommandBuffer cmdbuf) {
+        const auto barrier = [&](VkPipelineStageFlags src_stage, VkAccessFlags src_access,
+                                 VkPipelineStageFlags dst_stage, VkAccessFlags dst_access) {
+            const VkMemoryBarrier memory{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask = src_access,
+                .dstAccessMask = dst_access,
+            };
+            cmdbuf.PipelineBarrier(src_stage, dst_stage, 0, memory);
+        };
+        constexpr VkPipelineStageFlags transfer = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        constexpr VkPipelineStageFlags compute = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        constexpr VkAccessFlags all_access = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        barrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, all_access, transfer,
+                VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        if (download) {
+            const u32 stencil_bytes = push[0];
+            if (stencil_bytes % 4 != 0) {
+                // The shader reads uints, including the last partial word of the S8 plane.
+                cmdbuf.FillBuffer(scratch, planes[1].bufferOffset + (stencil_bytes & ~3U), 4, 0);
+                barrier(transfer, VK_ACCESS_TRANSFER_WRITE_BIT, transfer,
+                        VK_ACCESS_TRANSFER_WRITE_BIT);
+            }
+            cmdbuf.CopyImageToBuffer(image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, scratch, planes);
+        } else {
+            cmdbuf.CopyBuffer(staging, scratch, regions);
+        }
+        barrier(transfer, VK_ACCESS_TRANSFER_WRITE_BIT, compute,
+                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        const auto set = descriptor_allocator.Commit();
+        device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, data);
+        cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
+        cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
+        cmdbuf.PushConstants(*layout, VK_SHADER_STAGE_COMPUTE_BIT, push);
+        cmdbuf.Dispatch(Common::DivCeil(push[0], 4U * LOCAL_SIZE), 1, 1);
+        barrier(compute, VK_ACCESS_SHADER_WRITE_BIT, transfer, VK_ACCESS_TRANSFER_READ_BIT);
+        if (download) {
+            cmdbuf.CopyBuffer(scratch, staging, regions);
+            barrier(transfer, VK_ACCESS_TRANSFER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+                    all_access | VK_ACCESS_HOST_READ_BIT);
+        } else {
+            cmdbuf.CopyBufferToImage(scratch, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, planes);
+        }
+    });
+    scheduler.InvalidateDescriptorBuffer();
+}
+
+namespace {
+
+// Match local_size_x in the index assembly shaders. Vulkan guarantees at least 128 invocations
+// and a size of at least 128 in the X dimension.
+constexpr u32 INDEX_ASSEMBLY_WORKGROUP_SIZE = 128;
+
+u32 IndexAssemblyGroupCount(u32 work_items, u32 max_groups) {
+    // The grid-stride shaders multiply the group count by local size in u32.
+    constexpr u32 max_shader_groups = std::numeric_limits<u32>::max() / INDEX_ASSEMBLY_WORKGROUP_SIZE;
+    const u32 limit = (std::min)(max_groups, max_shader_groups);
+    return static_cast<u32>((std::min)(
+        Common::DivCeil(u64{work_items}, u64{INDEX_ASSEMBLY_WORKGROUP_SIZE}), u64{limit}));
+}
+
+struct IndexAssemblyInput {
+    VkBuffer buffer;
+    VkDeviceSize offset;
+    VkDeviceSize range;
+    std::optional<StagingBufferRef> scratch;
+    u32 bias{};
+};
+
+std::optional<IndexAssemblyInput> PrepareIndexAssemblyInput(
+    const Device& device, Scheduler& scheduler, StagingBufferPool& staging_pool,
+    VkDeviceSize max_allocation_size, VkBuffer buffer, VkDeviceSize offset,
+    VkDeviceSize logical_size, VkDeviceSize buffer_size, VkDeviceSize bytes_read, bool word_access,
+    bool allow_source_bias = false) {
+    if (!buffer || offset > buffer_size || bytes_read > logical_size ||
+        bytes_read > buffer_size - offset) {
+        return std::nullopt;
+    }
+    const VkDeviceSize range = word_access ? (bytes_read + 3) & ~VkDeviceSize{3} : bytes_read;
+    if (range > device.GetMaxStorageBufferRange()) {
+        return std::nullopt;
+    }
+    const VkDeviceSize alignment = (std::max)(device.GetStorageBufferAlignment(),
+                                              VkDeviceSize{word_access ? 4u : 1u});
+    if (offset % alignment == 0 && range <= buffer_size - offset) {
+        return IndexAssemblyInput{buffer, offset, range, std::nullopt};
+    }
+    if (allow_source_bias) {
+        const VkDeviceSize bias = offset % alignment;
+        const VkDeviceSize base = offset - bias;
+        const VkDeviceSize direct_range = (bias + bytes_read + 3) & ~VkDeviceSize{3};
+        if (bias + bytes_read <= std::numeric_limits<u32>::max() &&
+            direct_range <= device.GetMaxStorageBufferRange() && direct_range <= buffer_size - base) {
+            return IndexAssemblyInput{buffer, base, direct_range, std::nullopt, static_cast<u32>(bias)};
+        }
+    }
+    if (range > max_allocation_size) {
+        return std::nullopt;
+    }
+
+    auto scratch = staging_pool.Request(range, MemoryUsage::DeviceLocal, true);
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record([buffer, offset, bytes_read, range, scratch](vk::CommandBuffer cmdbuf) {
+        const VkMemoryBarrier source_ready{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        };
+        cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, source_ready);
+        if (bytes_read != range) {
+            const VkDeviceSize last_word = scratch.offset + range - sizeof(u32);
+            cmdbuf.FillBuffer(scratch.buffer, last_word, sizeof(u32), 0);
+            const VkBufferMemoryBarrier fill_before_copy{
+                .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .buffer = scratch.buffer,
+                .offset = last_word,
+                .size = sizeof(u32),
+            };
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   0, fill_before_copy);
+        }
+        const VkBufferCopy region{.srcOffset = offset, .dstOffset = scratch.offset,
+                                  .size = bytes_read};
+        cmdbuf.CopyBuffer(buffer, scratch.buffer, region);
+    });
+    return IndexAssemblyInput{scratch.buffer, scratch.offset, range, scratch};
+}
+
+constexpr VkMemoryBarrier INDEX_ASSEMBLY_SOURCE_READY{
+    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+    .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+};
+
+} // namespace
+
+IndexWidenPass::IndexWidenPass(const Device& device_, Scheduler& scheduler_,
+                               DescriptorPool& descriptor_pool, StagingBufferPool& staging_buffer_pool_,
+                               ComputePassDescriptorQueue& compute_pass_descriptor_queue_,
+                               VkIndexType source)
+    : ComputePass(device_, scheduler_, descriptor_pool, INPUT_OUTPUT_DESCRIPTOR_SET_BINDINGS,
+                  INPUT_OUTPUT_DESCRIPTOR_UPDATE_TEMPLATE, INPUT_OUTPUT_BANK_INFO,
+                  COMPUTE_PUSH_CONSTANT_RANGE<2 * sizeof(u32)>,
+                  source == VK_INDEX_TYPE_UINT16 ? std::span<const u32>{VULKAN_UINT16_COMP_SPV}
+                                                 : std::span<const u32>{VULKAN_UINT8_COMP_SPV}),
       scheduler{scheduler_}, staging_buffer_pool{staging_buffer_pool_},
-      compute_pass_descriptor_queue{compute_pass_descriptor_queue_} {}
+      compute_pass_descriptor_queue{compute_pass_descriptor_queue_},
+      max_allocation_size{StagingAllocationLimit(device_)}, source_type{source} {}
 
-Uint8Pass::~Uint8Pass() = default;
+IndexWidenPass::~IndexWidenPass() = default;
 
-std::pair<VkBuffer, VkDeviceSize> Uint8Pass::Assemble(u32 num_vertices, VkBuffer src_buffer,
-                                                      u32 src_offset) {
-    const u32 staging_size = static_cast<u32>(num_vertices * sizeof(u16));
-    const auto staging = staging_buffer_pool.Request(staging_size, MemoryUsage::DeviceLocal);
-
+std::optional<std::pair<VkBuffer, VkDeviceSize>> IndexWidenPass::Assemble(
+    u32 num_indices, VkBuffer src_buffer, VkDeviceSize src_offset, VkDeviceSize logical_size,
+    VkDeviceSize buffer_size, u32 restart_index) {
+    if (num_indices == 0) {
+        return std::pair<VkBuffer, VkDeviceSize>{};
+    }
+    const auto size = GetIndexWideningSize(source_type, num_indices);
+    const u32 groups = IndexAssemblyGroupCount(size.work_items,
+                                               device.GetMaxComputeWorkGroupCount()[0]);
+    const VkDeviceSize staging_size = size.output_words * sizeof(u32);
+    if (staging_size > (std::min)(max_allocation_size, device.GetMaxStorageBufferRange())) {
+        return std::nullopt;
+    }
+    auto input = PrepareIndexAssemblyInput(device, scheduler, staging_buffer_pool,
+                                           max_allocation_size, src_buffer, src_offset,
+                                           logical_size, buffer_size, size.input_bytes, true);
+    if (!input) {
+        return std::nullopt;
+    }
+    SCOPE_EXIT {
+        if (input->scratch) {
+            staging_buffer_pool.FreeDeferred(*input->scratch);
+        }
+    };
+    auto staging = staging_buffer_pool.Request(staging_size, MemoryUsage::DeviceLocal, true);
+    SCOPE_EXIT {
+        staging_buffer_pool.FreeDeferred(staging);
+    };
     compute_pass_descriptor_queue.Acquire(scheduler, 2);
-    compute_pass_descriptor_queue.AddBuffer(src_buffer, src_offset, num_vertices);
+    compute_pass_descriptor_queue.AddBuffer(input->buffer, input->offset, input->range);
     compute_pass_descriptor_queue.AddBuffer(staging.buffer, staging.offset, staging_size);
     const void* const descriptor_data{compute_pass_descriptor_queue.UpdateData()};
 
     scheduler.RequestOutsideRenderPassOperationContext();
-    scheduler.Record([this, descriptor_data, num_vertices](vk::CommandBuffer cmdbuf) {
-        static constexpr u32 DISPATCH_SIZE = 1024;
+    scheduler.Record([this, descriptor_data, groups, num_indices, restart_index](vk::CommandBuffer cmdbuf) {
         static constexpr VkMemoryBarrier WRITE_BARRIER{
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
             .pNext = nullptr,
             .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT,
+            .dstAccessMask = VK_ACCESS_INDEX_READ_BIT,
         };
+        cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
+                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, INDEX_ASSEMBLY_SOURCE_READY);
         const VkDescriptorSet set = descriptor_allocator.Commit();
         device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptor_data);
         cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
         cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
-        cmdbuf.Dispatch(Common::DivCeil(num_vertices, DISPATCH_SIZE), 1, 1);
+        const std::array constants{num_indices, restart_index};
+        cmdbuf.PushConstants(*layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants),
+                             constants.data());
+        cmdbuf.Dispatch(groups, 1, 1);
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, WRITE_BARRIER);
     });
     scheduler.InvalidateDescriptorBuffer();
-    return {staging.buffer, staging.offset};
+    return std::pair{staging.buffer, staging.offset};
 }
 
 QuadIndexedPass::QuadIndexedPass(const Device& device_, Scheduler& scheduler_,
@@ -480,13 +939,15 @@ QuadIndexedPass::QuadIndexedPass(const Device& device_, Scheduler& scheduler_,
                   INPUT_OUTPUT_DESCRIPTOR_UPDATE_TEMPLATE, INPUT_OUTPUT_BANK_INFO,
                   COMPUTE_PUSH_CONSTANT_RANGE<sizeof(u32) * 3>, VULKAN_QUAD_INDEXED_COMP_SPV),
       scheduler{scheduler_}, staging_buffer_pool{staging_buffer_pool_},
-      compute_pass_descriptor_queue{compute_pass_descriptor_queue_} {}
+      compute_pass_descriptor_queue{compute_pass_descriptor_queue_},
+      max_allocation_size{StagingAllocationLimit(device_)} {}
 
 QuadIndexedPass::~QuadIndexedPass() = default;
 
-std::pair<VkBuffer, VkDeviceSize> QuadIndexedPass::Assemble(
+std::optional<std::pair<VkBuffer, VkDeviceSize>> QuadIndexedPass::Assemble(
     Tegra::Engines::Maxwell3D::Regs::IndexFormat index_format, u32 num_vertices, u32 base_vertex,
-    VkBuffer src_buffer, u32 src_offset, bool is_strip) {
+    VkBuffer src_buffer, VkDeviceSize src_offset, VkDeviceSize logical_size,
+    VkDeviceSize buffer_size, bool is_strip) {
     const u32 index_shift = [index_format] {
         switch (index_format) {
         case Tegra::Engines::Maxwell3D::Regs::IndexFormat::UnsignedByte:
@@ -499,21 +960,42 @@ std::pair<VkBuffer, VkDeviceSize> QuadIndexedPass::Assemble(
         ASSERT(false);
         return 2;
     }();
-    const u32 input_size = num_vertices << index_shift;
-    const u32 num_tri_vertices = (is_strip ? (num_vertices - 2) / 2 : num_vertices / 4) * 6;
-
-    const std::size_t staging_size = num_tri_vertices * sizeof(u32);
-    const auto staging = staging_buffer_pool.Request(staging_size, MemoryUsage::DeviceLocal);
-
+    if (num_vertices < 4) {
+        return std::pair<VkBuffer, VkDeviceSize>{};
+    }
+    const u32 num_primitives = is_strip ? (num_vertices - 2) / 2 : num_vertices / 4;
+    const u32 groups =
+        IndexAssemblyGroupCount(num_primitives, device.GetMaxComputeWorkGroupCount()[0]);
+    const VkDeviceSize indices_read = is_strip ? VkDeviceSize{num_primitives} * 2 + 2
+                                              : VkDeviceSize{num_primitives} * 4;
+    const VkDeviceSize staging_size = VkDeviceSize{num_primitives} * 6 * sizeof(u32);
+    if (staging_size > (std::min)(max_allocation_size, device.GetMaxStorageBufferRange())) {
+        return std::nullopt;
+    }
+    auto input = PrepareIndexAssemblyInput(device, scheduler, staging_buffer_pool,
+                                           max_allocation_size, src_buffer, src_offset,
+                                           logical_size, buffer_size, indices_read << index_shift,
+                                           true);
+    if (!input) {
+        return std::nullopt;
+    }
+    SCOPE_EXIT {
+        if (input->scratch) {
+            staging_buffer_pool.FreeDeferred(*input->scratch);
+        }
+    };
+    auto staging = staging_buffer_pool.Request(staging_size, MemoryUsage::DeviceLocal, true);
+    SCOPE_EXIT {
+        staging_buffer_pool.FreeDeferred(staging);
+    };
     compute_pass_descriptor_queue.Acquire(scheduler, 2);
-    compute_pass_descriptor_queue.AddBuffer(src_buffer, src_offset, input_size);
+    compute_pass_descriptor_queue.AddBuffer(input->buffer, input->offset, input->range);
     compute_pass_descriptor_queue.AddBuffer(staging.buffer, staging.offset, staging_size);
     const void* const descriptor_data{compute_pass_descriptor_queue.UpdateData()};
 
     scheduler.RequestOutsideRenderPassOperationContext();
-    scheduler.Record([this, descriptor_data, num_tri_vertices, base_vertex, index_shift,
+    scheduler.Record([this, descriptor_data, groups, base_vertex, index_shift,
                       is_strip](vk::CommandBuffer cmdbuf) {
-        static constexpr u32 DISPATCH_SIZE = 1024;
         static constexpr VkMemoryBarrier WRITE_BARRIER{
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
             .pNext = nullptr,
@@ -521,18 +1003,96 @@ std::pair<VkBuffer, VkDeviceSize> QuadIndexedPass::Assemble(
             .dstAccessMask = VK_ACCESS_INDEX_READ_BIT,
         };
         const std::array<u32, 3> push_constants{base_vertex, index_shift, is_strip ? 1u : 0u};
+        cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
+                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, INDEX_ASSEMBLY_SOURCE_READY);
         const VkDescriptorSet set = descriptor_allocator.Commit();
         device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptor_data);
         cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
         cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
         cmdbuf.PushConstants(*layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_constants),
                              &push_constants);
-        cmdbuf.Dispatch(Common::DivCeil(num_tri_vertices, DISPATCH_SIZE), 1, 1);
+        cmdbuf.Dispatch(groups, 1, 1);
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, WRITE_BARRIER);
     });
     scheduler.InvalidateDescriptorBuffer();
-    return {staging.buffer, staging.offset};
+    return std::pair{staging.buffer, staging.offset};
+}
+
+QuadRestartPass::QuadRestartPass(const Device& device_, Scheduler& scheduler_,
+                                 DescriptorPool& descriptor_pool, StagingBufferPool& staging_pool_)
+    : device{device_}, scheduler{scheduler_}, staging_pool{staging_pool_},
+      max_allocation_size{StagingAllocationLimit(device)}, pipeline{device},
+      descriptor_allocator{descriptor_pool.Allocator(
+          device, scheduler, pipeline.SetLayout(), DescriptorBankInfo{.storage_buffers = 3, .score = 3})} {}
+
+bool QuadRestartPass::Assemble(VkBuffer source, VkDeviceSize offset, VkDeviceSize size,
+                               VkDeviceSize buffer_size, u32 count, u32 width, u32 restart_index,
+                               bool strip, const DirectDraw& draw, StagingBufferRef& indices,
+                               StagingBufferRef& command) {
+    constexpr u32 max_u32 = std::numeric_limits<u32>::max();
+    if (count < 4 || u64{count} * width > max_u32 ||
+        (draw.first_instance != 0 && !device.SupportsDrawIndirectFirstInstance())) {
+        return false;
+    }
+    const u64 max_quads = IndexedQuadGpu::MaxQuads(count, strip);
+    const u64 index_bytes = max_quads * 6 * sizeof(u32);
+    const u64 chunks = (count - 1) / IndexedQuadGpu::CHUNK_INDICES + 1;
+    const u64 command_bytes = IndexedQuadGpu::COMMAND_SIZE + chunks * IndexedQuadGpu::CHUNK_SIZE;
+    const auto max_range = (std::min)(max_allocation_size, device.GetMaxStorageBufferRange());
+    if (index_bytes / sizeof(u32) > max_u32 || index_bytes > max_range || command_bytes > max_range) {
+        return false;
+    }
+
+    auto input = PrepareIndexAssemblyInput(device, scheduler, staging_pool, max_allocation_size,
+                                           source, offset, size, buffer_size, u64{count} * width,
+                                           true, true);
+    if (!input) {
+        return false;
+    }
+    SCOPE_EXIT {
+        if (input->scratch) {
+            staging_pool.FreeDeferred(*input->scratch);
+        }
+    };
+    auto output_indices = staging_pool.Request(index_bytes, MemoryUsage::DeviceLocal, true);
+    SCOPE_EXIT {
+        if (output_indices.buffer) {
+            staging_pool.FreeDeferred(output_indices);
+        }
+    };
+    auto output_command = staging_pool.Request(command_bytes, MemoryUsage::DeviceLocal, true);
+    SCOPE_EXIT {
+        if (output_command.buffer) {
+            staging_pool.FreeDeferred(output_command);
+        }
+    };
+    const std::array<VkDescriptorBufferInfo, 3> buffers{{
+        {input->buffer, input->offset, input->range},
+        {output_indices.buffer, output_indices.offset, index_bytes},
+        {output_command.buffer, output_command.offset, command_bytes},
+    }};
+    const IndexedQuadGpu::Constants push{
+        .index_count = count,
+        .index_width = width,
+        .source_bias = input->bias,
+        .restart_index = restart_index,
+        .flags = strip ? 1u : 0u,
+        .instance_count = draw.instances,
+        .vertex_offset = draw.vertex_offset,
+        .first_instance = draw.first_instance,
+        .draw_index_limit = max_u32,
+    };
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record([this, buffers, push](vk::CommandBuffer cmdbuf) {
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, INDEX_ASSEMBLY_SOURCE_READY);
+        pipeline.Convert(cmdbuf, descriptor_allocator.Commit(), buffers, push, true);
+    });
+    scheduler.InvalidateDescriptorBuffer();
+    indices = std::exchange(output_indices, {});
+    command = std::exchange(output_command, {});
+    return true;
 }
 
 ConditionalRenderingResolvePass::ConditionalRenderingResolvePass(
@@ -777,8 +1337,10 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
             params.layer_stride = input_layer_stride;
             const u32 num_dispatches_x = Common::DivCeil(swizzle.num_tiles.width, 8U);
             const u32 num_dispatches_y = Common::DivCeil(swizzle.num_tiles.height, 8U);
+            const std::array decode_extent{swizzle.num_tiles.width * block_dims[0],
+                                           swizzle.num_tiles.height * block_dims[1]};
             scheduler.Record([this, num_dispatches_x, num_dispatches_y, block_dims, params,
-                              descriptor_data](vk::CommandBuffer cmdbuf) {
+                              decode_extent, descriptor_data](vk::CommandBuffer cmdbuf) {
                 const AstcPushConstants uniforms{
                     .blocks_dims = block_dims,
                     .layer_stride = params.layer_stride,
@@ -787,6 +1349,7 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
                     .block_height = params.block_height,
                     .block_height_mask = params.block_height_mask,
                     .native_tiling = params.native_tiling,
+                    .decode_extent = decode_extent,
                 };
                 const VkDescriptorSet set = descriptor_allocator.Commit();
                 device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptor_data);
@@ -802,6 +1365,8 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
         const u32 num_dispatches_x = Common::DivCeil(swizzle.num_tiles.width, 8U);
         const u32 num_dispatches_y = Common::DivCeil(swizzle.num_tiles.height, 8U);
         const u32 num_dispatches_z = info.resources.layers;
+        const std::array decode_extent{swizzle.num_tiles.width * block_dims[0],
+                                       swizzle.num_tiles.height * block_dims[1]};
 
         compute_pass_descriptor_queue.Acquire(scheduler, 2);
         compute_pass_descriptor_queue.AddBuffer(map.buffer, input_offset,
@@ -817,7 +1382,7 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
         ASSERT(params.destination == (std::array<s32, 3>{0, 0, 0}));
         ASSERT(params.bytes_per_block_log2 == 4);
         scheduler.Record([this, num_dispatches_x, num_dispatches_y, num_dispatches_z, block_dims,
-                          params, descriptor_data](vk::CommandBuffer cmdbuf) {
+                          params, decode_extent, descriptor_data](vk::CommandBuffer cmdbuf) {
             const AstcPushConstants uniforms{
                 .blocks_dims = block_dims,
                 .layer_stride = params.layer_stride,
@@ -826,6 +1391,7 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
                 .block_height = params.block_height,
                 .block_height_mask = params.block_height_mask,
                 .native_tiling = params.native_tiling,
+                .decode_extent = decode_extent,
             };
             const VkDescriptorSet set = descriptor_allocator.Commit();
             device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptor_data);

@@ -280,40 +280,13 @@ void Maxwell3D::RefreshParametersImpl() {
     }
 }
 
-u32 Maxwell3D::GetMaxCurrentVertices() {
-    u32 num_vertices = 0;
-    for (size_t index = 0; index < Regs::NumVertexArrays; ++index) {
-        const auto& array = regs.vertex_streams[index];
-        if (array.enable == 0) {
-            continue;
-        }
-        const auto& attribute = regs.vertex_attrib_format[index];
-        if (attribute.constant) {
-            num_vertices = (std::max)(num_vertices, 1U);
-            continue;
-        }
-        const auto& limit = regs.vertex_stream_limits[index];
-        const GPUVAddr gpu_addr_begin = array.Address();
-        const GPUVAddr gpu_addr_end = limit.Address() + 1;
-        const u64 stream_size = GetNativeMacroEngine().native_turing
-                                    ? regs.NativeVertexStreamSize(index)
-                                    : gpu_addr_end - gpu_addr_begin;
-        const u32 address_size = static_cast<u32>((std::min<u64>)(stream_size, (std::numeric_limits<u32>::max)()));
-        num_vertices = (std::max)(
-            num_vertices, address_size / (std::max)(attribute.SizeInBytes(), array.stride.Value()));
-        break;
-    }
-    return num_vertices;
-}
-
-size_t Maxwell3D::EstimateIndexBufferSize() {
-    GPUVAddr start_address = regs.index_buffer.StartAddress();
-    GPUVAddr end_address = regs.index_buffer.EndAddress();
-    auto const byte_size = regs.index_buffer.FormatSizeInBytes();
-    auto const max_size = 1ull << (byte_size * CHAR_BIT);
-    auto const upper_cap = GetMaxCurrentVertices() * 4 * byte_size;
-    auto const lower_cap = std::min<size_t>(size_t(end_address - start_address), upper_cap);
-    return std::min<size_t>(memory_manager.GetMemoryLayoutSize(start_address, byte_size * max_size) / byte_size, lower_cap);
+u32 Maxwell3D::EstimateIndexBufferSize() {
+    const auto& buffer = regs.index_buffer;
+    const u64 size = regs.IndexBufferSizeBytes(buffer, GetNativeMacroEngine().native_turing);
+    // GPU-written indirect arguments can select any complete index in the mapped binding.
+    const u64 limit = (std::min)(size, u64{(std::numeric_limits<u32>::max)()});
+    const size_t bytes = memory_manager.MaxMappedRange(buffer.StartAddress(), limit);
+    return static_cast<u32>(bytes / buffer.FormatSizeInBytes());
 }
 
 u32 Maxwell3D::ProcessShadowRam(u32 method, u32 argument) {
@@ -1395,6 +1368,8 @@ bool FrontSkipSame() {
 
 [[nodiscard]] constexpr bool IsDrawMethod(u32 method) noexcept {
     switch (method) {
+    case MAXWELL3D_REG_INDEX(native_draw.index_count):
+    case MAXWELL3D_REG_INDEX(native_draw.vertex_count):
     case MAXWELL3D_REG_INDEX(draw.end):
     case MAXWELL3D_REG_INDEX(index_buffer32_first):
     case MAXWELL3D_REG_INDEX(index_buffer16_first):
@@ -2973,7 +2948,7 @@ void Maxwell3D::BackDrawIndexedIndirect(Core::System& system, u32 topology, GPUV
     // method arrives (the macro's draw methods did that): apply them first, or the draw uses the
     // previous draw's index buffer, vertex buffers and shaders.
     ConsumeSink(system);
-    const u32 estimate = static_cast<u32>(EstimateIndexBufferSize());
+    const u32 estimate = EstimateIndexBufferSize();
     regs.vertex_id_base = 0;
     regs.global_base_vertex_index = 0;
     regs.global_base_instance_index = 0;

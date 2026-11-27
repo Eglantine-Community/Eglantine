@@ -374,6 +374,15 @@ private:
             .preserveAttachmentCount = 0,
             .pPreserveAttachments = nullptr,
         };
+        // Each pass discards this attachment, but its layout transition still writes it.
+        const VkSubpassDependency reuse_attachment{
+            .srcSubpass = VK_SUBPASS_EXTERNAL,
+            .dstSubpass = 0,
+            .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        };
         render_pass = logical.CreateRenderPass({
             .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
             .pNext = nullptr,
@@ -382,8 +391,8 @@ private:
             .pAttachments = &attachment,
             .subpassCount = 1,
             .pSubpasses = &subpass,
-            .dependencyCount = 0,
-            .pDependencies = nullptr,
+            .dependencyCount = 1,
+            .pDependencies = &reuse_attachment,
         });
         const VkImageView attachment_view = *view;
         framebuffer = logical.CreateFramebuffer({

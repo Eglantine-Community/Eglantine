@@ -7,6 +7,7 @@
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
+#include <spirv/unified1/spirv.hpp11>
 
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/environment.h"
@@ -92,6 +93,7 @@ std::vector<u32> EmitUntrackedAtomic(IR::Opcode opcode) {
     }));
     Optimization::CollectShaderInfoPass(env, program);
     program.info.native_global_bounds = true;
+    program.info.storage_buffers_descriptors.push_back({0, 0x120, 1, true});
     program.info.constant_buffer_descriptors = {{0, 1}};
 
     Profile profile{};
@@ -106,6 +108,7 @@ std::vector<u32> EmitUntrackedAtomic(IR::Opcode opcode) {
 
 TEST_CASE("Untracked 32-bit global atomics route to their storage buffer",
           "[shader_recompiler][global_memory]") {
+    constexpr u32 OpCapability = static_cast<u32>(spv::Op::OpCapability);
     constexpr u32 OpFunctionCall = 57;
     constexpr u32 OpAtomicCompareExchange = 230;
     // OpAtomicExchange 229, IAdd 234, SMin 236, UMin 237, SMax 238, UMax 239, And 240, Or 241,
@@ -128,7 +131,11 @@ TEST_CASE("Untracked 32-bit global atomics route to their storage buffer",
         CAPTURE(static_cast<u32>(opcode));
         std::vector<u32> code;
         REQUIRE_NOTHROW(code = EmitUntrackedAtomic(opcode));
-        CHECK_FALSE(Instructions(code, atomic).empty());
+        CHECK(Instructions(code, atomic).size() == 2);
+        const auto capabilities = Instructions(code, OpCapability);
+        CHECK(std::ranges::none_of(capabilities, [](const auto& cap) {
+            return cap[0] == static_cast<u32>(spv::Capability::VariablePointersStorageBuffer);
+        }));
         CHECK_FALSE(Instructions(code, OpFunctionCall).empty());
     }
 }

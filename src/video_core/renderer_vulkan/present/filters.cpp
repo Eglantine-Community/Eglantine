@@ -29,6 +29,41 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 
 namespace Vulkan {
+namespace {
+
+bool SupportsCubicSource(const Device& device, VkFormat format) {
+    if (format == VK_FORMAT_UNDEFINED) {
+        return true;
+    }
+    if (!device.IsFormatSupported(format, VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_CUBIC_BIT_EXT,
+                                  FormatType::Optimal)) {
+        return false;
+    }
+
+    const VkPhysicalDeviceImageViewImageFormatInfoEXT view{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_VIEW_IMAGE_FORMAT_INFO_EXT,
+        .imageViewType = VK_IMAGE_VIEW_TYPE_2D,
+    };
+    const VkPhysicalDeviceImageFormatInfo2 info{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
+        .pNext = &view,
+        .format = format,
+        .type = VK_IMAGE_TYPE_2D,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT,
+    };
+    VkFilterCubicImageViewImageFormatPropertiesEXT cubic{
+        .sType = VK_STRUCTURE_TYPE_FILTER_CUBIC_IMAGE_VIEW_IMAGE_FORMAT_PROPERTIES_EXT,
+    };
+    VkImageFormatProperties2 properties{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
+        .pNext = &cubic,
+    };
+    return device.GetPhysical().GetImageFormatProperties2(info, properties) == VK_SUCCESS &&
+           cubic.filterCubic == VK_TRUE;
+}
+
+} // Anonymous namespace
 
 std::unique_ptr<WindowAdaptPass> MakeNearestNeighbor(const Device& device, VkFormat frame_format, bool push_descriptor) {
     return std::make_unique<WindowAdaptPass>(device, frame_format, CreateNearestNeighborSampler(device),
@@ -45,10 +80,13 @@ std::unique_ptr<WindowAdaptPass> MakeSpline1(const Device& device, VkFormat fram
         BuildShader(device, PRESENT_SPLINE1_FRAG_SPV), push_descriptor);
 }
 
-std::unique_ptr<WindowAdaptPass> MakeBicubic(const Device& device, VkFormat frame_format, VkCubicFilterWeightsQCOM qcom_weights, bool push_descriptor) {
-    // No need for handrolled shader -- if the VK impl can do it for us ;)
-    // Catmull-Rom is default bicubic for all implementations...
-    if (device.IsExtFilterCubicSupported() && (device.IsQcomFilterCubicWeightsSupported() || qcom_weights == VK_CUBIC_FILTER_WEIGHTS_CATMULL_ROM_QCOM)) {
+std::unique_ptr<WindowAdaptPass> MakeBicubic(const Device& device, VkFormat frame_format,
+                                             VkCubicFilterWeightsQCOM qcom_weights,
+                                             bool push_descriptor, VkFormat source_format) {
+    if (device.IsExtFilterCubicSupported() &&
+        (device.IsQcomFilterCubicWeightsSupported() ||
+         qcom_weights == VK_CUBIC_FILTER_WEIGHTS_CATMULL_ROM_QCOM) &&
+        SupportsCubicSource(device, source_format)) {
         return std::make_unique<WindowAdaptPass>(device, frame_format, CreateCubicSampler(device,
             qcom_weights), BuildShader(device, VULKAN_PRESENT_FRAG_SPV), push_descriptor);
     } else {
@@ -101,14 +139,23 @@ std::unique_ptr<WindowAdaptPass> MakeMmpx(const Device& device, VkFormat frame_f
 }
 
 std::unique_ptr<WindowAdaptPass> MakeWindowAdaptPass(
-    const Device& device, VkFormat format, Settings::ScalingFilter filter, bool push) {
+    const Device& device, VkFormat format, VkFormat source_format, Settings::ScalingFilter filter,
+    bool push) {
     using Settings::ScalingFilter;
     switch (filter) {
     case ScalingFilter::NearestNeighbor: return MakeNearestNeighbor(device, format, push);
-    case ScalingFilter::Bicubic: return MakeBicubic(device, format, VK_CUBIC_FILTER_WEIGHTS_CATMULL_ROM_QCOM, push);
-    case ScalingFilter::ZeroTangent: return MakeBicubic(device, format, VK_CUBIC_FILTER_WEIGHTS_ZERO_TANGENT_CARDINAL_QCOM, push);
-    case ScalingFilter::BSpline: return MakeBicubic(device, format, VK_CUBIC_FILTER_WEIGHTS_B_SPLINE_QCOM, push);
-    case ScalingFilter::Mitchell: return MakeBicubic(device, format, VK_CUBIC_FILTER_WEIGHTS_MITCHELL_NETRAVALI_QCOM, push);
+    case ScalingFilter::Bicubic:
+        return MakeBicubic(device, format, VK_CUBIC_FILTER_WEIGHTS_CATMULL_ROM_QCOM, push,
+                           source_format);
+    case ScalingFilter::ZeroTangent:
+        return MakeBicubic(device, format, VK_CUBIC_FILTER_WEIGHTS_ZERO_TANGENT_CARDINAL_QCOM, push,
+                           source_format);
+    case ScalingFilter::BSpline:
+        return MakeBicubic(device, format, VK_CUBIC_FILTER_WEIGHTS_B_SPLINE_QCOM, push,
+                           source_format);
+    case ScalingFilter::Mitchell:
+        return MakeBicubic(device, format, VK_CUBIC_FILTER_WEIGHTS_MITCHELL_NETRAVALI_QCOM, push,
+                           source_format);
     case ScalingFilter::Spline1: return MakeSpline1(device, format, push);
     case ScalingFilter::Gaussian: return MakeGaussian(device, format, push);
     case ScalingFilter::Lanczos: return MakeLanczos(device, format, push);
