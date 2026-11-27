@@ -14,7 +14,9 @@
 #include <optional>
 #include <string>
 
+#include "common/cpu_features.h"
 #include "common/settings.h"
+#include "common/uint128.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 
@@ -58,6 +60,24 @@ u64 TestTimerSpeed(Core::Timing::CoreTiming& core_timing) {
 }
 
 } // Anonymous namespace
+
+#if defined(ARCHITECTURE_x86_64)
+TEST_CASE("Host TSC scaling preserves guest counter rates at or above the TSC rate", "[core]") {
+    constexpr u64 host_frequency = 3'000'000'000;
+    Common::WallClock clock{true, host_frequency};
+
+    for (const u64 frequency : {host_frequency, u64{4'000'000'000}}) {
+        CAPTURE(frequency);
+        clock.SetGuestCNTFRQ(frequency);
+        const u64 before = clock.GetUptime();
+        const u64 count = clock.GetCNTPCT();
+        const u64 after = clock.GetUptime();
+
+        CHECK(count >= Common::MultiplyAndDivide64(before, frequency, host_frequency));
+        CHECK(count <= Common::MultiplyAndDivide64(after, frequency, host_frequency));
+    }
+}
+#endif
 
 TEST_CASE("CoreTiming[BasicOrder]", "[core]") {
     ScopeInit guard;

@@ -15,6 +15,7 @@
 #include <fmt/ostream.h>
 #include "common/assert.h"
 #include "common/common_types.h"
+#include "common/x64/rdtsc.h"
 #include "dynarmic/ir/terminal.h"
 #include "dynarmic/mcl/integer_of_size.hpp"
 #include <boost/container/static_vector.hpp>
@@ -546,12 +547,49 @@ void A64EmitX64::EmitA64DataMemoryBarrier(A64EmitContext&, IR::Inst*) {
     code.mfence();
 }
 
+namespace {
+
+enum class BoundaryRegisters {
+    Free,
+    CounterRead,
+    HostCall,
+};
+
+void EmitInstructionBoundary(BlockOfCode& code, RegAlloc& regs,
+                             BoundaryRegisters reserved = BoundaryRegisters::Free) {
+    using ::Common::X64::TscFence;
+    switch (::Common::X64::GetTscOrdering().fence) {
+    case TscFence::Load:
+        code.lfence();
+        break;
+    case TscFence::Memory:
+        code.mfence();
+        break;
+    case TscFence::CpuId:
+        if (reserved == BoundaryRegisters::Free) {
+            regs.ScratchGpr(code, HostLoc::RAX);
+            regs.ScratchGpr(code, HostLoc::RDX);
+        }
+        regs.ScratchGpr(code, HostLoc::RBX);
+        if (reserved != BoundaryRegisters::HostCall) {
+            regs.ScratchGpr(code, HostLoc::RCX);
+        }
+        code.mov(code.eax, 0);
+        code.cpuid();
+        break;
+    }
+}
+
+} // Anonymous namespace
+
 void A64EmitX64::EmitA64InstructionSynchronizationBarrier(A64EmitContext& ctx, IR::Inst*) {
     if (!conf.hook_isb) {
+        EmitInstructionBoundary(code, ctx.reg_alloc);
         return;
     }
 
     ctx.reg_alloc.HostCall(code, nullptr);
+    EmitInstructionBoundary(code, ctx.reg_alloc, BoundaryRegisters::HostCall);
     Devirtualize<&A64::UserCallbacks::InstructionSynchronizationBarrierRaised>(conf.callbacks).EmitCall(code);
 }
 
@@ -565,8 +603,15 @@ void A64EmitX64::EmitA64GetCNTPCT(A64EmitContext& ctx, IR::Inst* inst) {
     if (conf.wall_clock_cntpct && conf.inline_cntpct_tsc_factor != 0) {
         const Xbyak::Reg64 rax_reg = ctx.reg_alloc.ScratchGpr(code, HostLoc::RAX);
         const Xbyak::Reg64 rdx_reg = ctx.reg_alloc.ScratchGpr(code, HostLoc::RDX);
+        // Ordinary Arm reads are ordered with each other. The guest ISB orders other instructions.
+        if (::Common::X64::GetTscOrdering().ordered_read) {
+            ctx.reg_alloc.ScratchGpr(code, HostLoc::RCX);
+            code.rdtscp();
+        } else {
+            EmitInstructionBoundary(code, ctx.reg_alloc, BoundaryRegisters::CounterRead);
+            code.rdtsc();
+        }
         const Xbyak::Reg64 tmp = ctx.reg_alloc.ScratchGpr(code);
-        code.rdtsc();
         code.shl(rdx_reg, 32);
         code.or_(rax_reg, rdx_reg);
         code.mov(tmp, conf.inline_cntpct_tsc_base);

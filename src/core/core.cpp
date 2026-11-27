@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <array>
+#include <charconv>
 #include <cstdlib>
 #include <atomic>
 #include <memory>
@@ -393,9 +394,20 @@ struct System::Impl {
         // (nn::os::GetSystemTickFrequency, TickManager::ConvertToTimeSpan/ConvertToTick). At 19.2 MHz
         // every tick-based time in the game was off by 1.63x: elapsed times read short and a frame
         // deadline in ticks waited ~27 ms. EDEN_NX2_CNTFRQ=<Hz> overrides it (A/B tests).
-        static const u64 forced_cntfrq = [] {
+        static const u32 forced_cntfrq = [] {
             const char* value = std::getenv("EDEN_NX2_CNTFRQ");
-            return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
+            if (value == nullptr) {
+                return 0u;
+            }
+            const std::string_view text{value};
+            u32 frequency{};
+            const char* end = text.data() + text.size();
+            const auto [next, error] = std::from_chars(text.data(), end, frequency);
+            if (error != std::errc{} || next != end || frequency == 0) {
+                LOG_WARNING(Core, "Ignoring EDEN_NX2_CNTFRQ outside the 32-bit counter frequency field");
+                return 0u;
+            }
+            return frequency;
         }();
         const u64 cntfrq = forced_cntfrq != 0 ? forced_cntfrq
                            : switch2_program  ? Common::WallClock::Switch2CNTFRQ

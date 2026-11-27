@@ -11,6 +11,20 @@
 
 namespace Common::X64 {
 
+enum class TscFence {
+    Load,
+    Memory,
+    CpuId,
+};
+
+struct TscOrdering {
+    TscFence fence;
+    bool ordered_read;
+};
+
+const TscOrdering& GetTscOrdering();
+u64 ReadGuestCounterTsc();
+
 #ifdef _MSC_VER
 __forceinline static u64 FencedRDTSC() {
     _mm_lfence();
@@ -27,7 +41,9 @@ static inline u64 FencedRDTSC() {
     asm volatile("lfence\n\t"
                  "rdtsc\n\t"
                  "lfence\n\t"
-                 : "=a"(eax), "=d"(edx));
+                 : "=a"(eax), "=d"(edx)
+                 :
+                 : "memory");
     return (edx << 32) | eax;
 }
 #endif
