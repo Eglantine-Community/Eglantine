@@ -10,14 +10,17 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <set>
 #include <span>
 #include <string>
 #include <vector>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #define SPV_ENABLE_UTILITY_CODE
 #include <spirv/unified1/spirv.hpp11>
 
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
 
 namespace {
@@ -29,7 +32,7 @@ struct ShuffleModule {
 };
 
 ShuffleModule EmitShuffles(Stage stage, u32 subgroup_size, bool fragment_fallback,
-                           bool general_fallback = false) {
+                           bool general_fallback = false, bool native_shuffle = true) {
     ObjectPool<IR::Inst> pool;
     IR::Block block{pool};
     IR::Program program;
@@ -52,8 +55,9 @@ ShuffleModule EmitShuffles(Stage stage, u32 subgroup_size, bool fragment_fallbac
     };
     Profile profile;
     profile.supported_spirv = 0x00010500;
-    profile.support_vote = true;
-    profile.support_shuffle_relative = true;
+    profile.support_ballot = true;
+    profile.support_shuffle = native_shuffle;
+    profile.support_shuffle_relative = native_shuffle;
     profile.max_subgroup_size = subgroup_size;
     profile.warp_size_potentially_larger_than_guest = subgroup_size > 32;
     profile.has_broken_spirv_fragment_shuffle = fragment_fallback;
@@ -77,10 +81,59 @@ ShuffleModule EmitShuffles(Stage stage, u32 subgroup_size, bool fragment_fallbac
 }
 }
 
+TEST_CASE("Lane registers use only the capabilities needed by their stage",
+          "[video_core][spirv][subgroup_capabilities]") {
+    ObjectPool<IR::Inst> pool;
+    IR::Block block{pool};
+    IR::Program program;
+    program.stage = GENERATE(Stage::Compute, Stage::Fragment);
+    const bool compute = program.stage == Stage::Compute;
+    program.workgroup_size = {32, 1, 1};
+    program.blocks = {&block};
+    program.post_order_blocks = {&block};
+    program.syntax_list = {{{.block = &block}, IR::AbstractSyntaxNode::Type::Block},
+                           {{}, IR::AbstractSyntaxNode::Type::Return}};
+    program.info.uses_subgroup_invocation_id = true;
+    program.info.uses_subgroup_mask = true;
+    IR::IREmitter ir{block};
+    static_cast<void>(ir.LaneId());
+    static_cast<void>(ir.SubgroupGeMask());
+
+    Profile profile;
+    profile.supported_spirv = compute ? 0x00010000 : 0x00010500;
+    const auto code = Backend::SPIRV::EmitSPIRV(profile, program);
+    bool basic{};
+    bool lane_id{};
+    bool local_index{};
+    for (size_t offset = 5; offset < code.size();) {
+        const auto words = std::span{code}.subspan(offset);
+        const u32 count = words[0] >> 16;
+        REQUIRE(count > 0);
+        REQUIRE(count <= words.size());
+        const auto op = static_cast<spv::Op>(words[0] & 0xffff);
+        if (op == spv::Op::OpCapability) {
+            const auto capability = static_cast<spv::Capability>(words[1]);
+            basic |= capability == spv::Capability::GroupNonUniform;
+            CHECK(capability != spv::Capability::GroupNonUniformVote);
+            CHECK(capability != spv::Capability::GroupNonUniformBallot);
+            CHECK(capability != spv::Capability::GroupNonUniformShuffle);
+            CHECK(capability != spv::Capability::GroupNonUniformShuffleRelative);
+        }
+        if (op == spv::Op::OpDecorate && words[2] == static_cast<u32>(spv::Decoration::BuiltIn)) {
+            local_index |= words[3] == static_cast<u32>(spv::BuiltIn::LocalInvocationIndex);
+            lane_id |= words[3] == static_cast<u32>(spv::BuiltIn::SubgroupLocalInvocationId);
+        }
+        offset += count;
+    }
+    CHECK(basic == !compute);
+    CHECK(lane_id == !compute);
+    CHECK(local_index == compute);
+}
+
 TEST_CASE("Fragment shuffle fallback preserves host subgroup partitions",
           "[video_core][spirv][fragment_shuffle]") {
     for (const u32 subgroup_size : {32U, 64U}) {
-        const auto module = EmitShuffles(Stage::Fragment, subgroup_size, true);
+        const auto module = EmitShuffles(Stage::Fragment, subgroup_size, false, false, false);
         std::map<u32, std::vector<u32>> definitions;
         std::vector<u32> broadcast_lanes;
         u32 invocation_variable{};
@@ -165,10 +218,14 @@ TEST_CASE("Fragment workaround leaves other stages on native shuffles",
             for (const bool general_fallback : {false, true}) {
                 const auto module = EmitShuffles(stage, 64, fragment_fallback, general_fallback);
                 size_t broadcasts{}, shuffles{};
+                std::set<spv::Capability> capabilities;
                 for (size_t offset = 5; offset < module.code.size();) {
                     const u32 size = module.code[offset] >> 16;
                     REQUIRE(size != 0);
                     const auto op = static_cast<spv::Op>(module.code[offset] & 0xffffU);
+                    if (op == spv::Op::OpCapability) {
+                        capabilities.insert(static_cast<spv::Capability>(module.code[offset + 1]));
+                    }
                     broadcasts += op == spv::Op::OpGroupNonUniformBroadcast;
                     shuffles += op == spv::Op::OpGroupNonUniformShuffle ||
                                 op == spv::Op::OpGroupNonUniformShuffleUp ||
@@ -180,7 +237,122 @@ TEST_CASE("Fragment workaround leaves other stages on native shuffles",
                                       (fragment_fallback && stage == Stage::Fragment);
                 CHECK(broadcasts == (fallback ? module.results.size() * 64 : 0u));
                 CHECK(shuffles == (fallback ? 0u : module.results.size()));
+                CHECK(capabilities.contains(spv::Capability::GroupNonUniformBallot) == fallback);
+                CHECK(capabilities.contains(spv::Capability::GroupNonUniformShuffle) == !fallback);
+                CHECK(capabilities.contains(spv::Capability::GroupNonUniformShuffleRelative) ==
+                      !fallback);
             }
         }
     }
+}
+
+TEST_CASE("Compute broadcasts are reused only before divergence or a barrier",
+          "[video_core][spirv][subgroup_capabilities]") {
+    const bool memory_barrier = GENERATE(false, true);
+    const auto barrier_op = memory_barrier ? spv::Op::OpMemoryBarrier : spv::Op::OpControlBarrier;
+    constexpr u32 subgroup_size = 32;
+    ObjectPool<IR::Inst> pool;
+    IR::Block entry{pool}, branch{pool}, merge{pool};
+    IR::Program program;
+    program.stage = Stage::Compute;
+    program.workgroup_size = {subgroup_size, 1, 1};
+    program.blocks = {&entry, &branch, &merge};
+    program.post_order_blocks = {&merge, &branch, &entry};
+    program.info.uses_subgroup_invocation_id = true;
+    program.info.uses_subgroup_shuffles = true;
+
+    IR::IREmitter ir{entry};
+    const auto lane = ir.LaneId();
+    const auto value = ir.IAdd(lane, ir.Imm32(100));
+    const auto shuffles = [&](IR::IREmitter& emitter) {
+        for (const u32 mask : {2U, 4U}) {
+            const auto source = emitter.BitwiseXor(lane, emitter.Imm32(mask));
+            static_cast<void>(
+                emitter.ShuffleIndex(value, source, emitter.Imm32(31), emitter.Imm32(0)));
+        }
+    };
+    shuffles(ir);
+    if (memory_barrier) {
+        ir.WorkgroupMemoryBarrier();
+    } else {
+        ir.Barrier();
+    }
+    shuffles(ir);
+    const auto odd = ir.INotEqual(ir.BitwiseAnd(lane, ir.Imm32(1)), ir.Imm32(0));
+    IR::IREmitter inside{branch};
+    shuffles(inside);
+    program.syntax_list = {
+        {{.block = &entry}, IR::AbstractSyntaxNode::Type::Block},
+        {{.if_node = {odd, &branch, &merge}}, IR::AbstractSyntaxNode::Type::If},
+        {{.block = &branch}, IR::AbstractSyntaxNode::Type::Block},
+        {{.end_if = {&merge}}, IR::AbstractSyntaxNode::Type::EndIf},
+        {{.block = &merge}, IR::AbstractSyntaxNode::Type::Block},
+        {{}, IR::AbstractSyntaxNode::Type::Return},
+    };
+
+    Profile profile;
+    profile.supported_spirv = 0x00010300;
+    profile.support_ballot = true;
+    profile.max_subgroup_size = subgroup_size;
+    const auto code = Backend::SPIRV::EmitSPIRV(profile, program);
+
+    std::array<size_t, 4> broadcasts{};
+    size_t region{};
+    for (size_t offset = 5; offset < code.size();) {
+        const u32 count = code[offset] >> 16;
+        REQUIRE(count > 0);
+        REQUIRE(count <= code.size() - offset);
+        const auto op = static_cast<spv::Op>(code[offset] & 0xffff);
+        if (op == barrier_op || op == spv::Op::OpBranchConditional || op == spv::Op::OpBranch) {
+            ++region;
+        }
+        if (op == spv::Op::OpGroupNonUniformBroadcast) {
+            REQUIRE(region < broadcasts.size());
+            ++broadcasts[region];
+        }
+        offset += count;
+    }
+
+    REQUIRE(region == 3);
+    CHECK(broadcasts[0] == subgroup_size);
+    CHECK(broadcasts[1] == 2 * subgroup_size);
+    CHECK(broadcasts[2] == 2 * subgroup_size);
+    CHECK(broadcasts[3] == 0);
+}
+
+TEST_CASE("Quad shuffles reject stages without an equivalent lowering",
+          "[video_core][spirv][subgroup_capabilities]") {
+    ObjectPool<IR::Inst> pool;
+    IR::Block block{pool};
+    IR::Program program;
+    program.stage = Stage::Fragment;
+    program.blocks = {&block};
+    program.post_order_blocks = {&block};
+    program.syntax_list = {{{.block = &block}, IR::AbstractSyntaxNode::Type::Block},
+                           {{}, IR::AbstractSyntaxNode::Type::Return}};
+    program.info.uses_quad_shuffles = true;
+    IR::IREmitter ir{block};
+    static_cast<void>(ir.QuadSwap(ir.Imm32(30), ir.Imm32(0)));
+
+    Profile profile;
+    profile.supported_spirv = 0x00010300;
+    profile.support_shuffle = true;
+    profile.supported_subgroup_stages = 0;
+    CHECK_THROWS_AS(Backend::SPIRV::EmitSPIRV(profile, program), Shader::NotImplementedException);
+
+    profile.supported_subgroup_stages = 1U << static_cast<u32>(Stage::Fragment);
+    CHECK_THROWS_AS(Backend::SPIRV::EmitSPIRV(profile, program), Shader::NotImplementedException);
+
+    profile.support_quad_shuffles = true;
+    CHECK_NOTHROW(Backend::SPIRV::EmitSPIRV(profile, program));
+
+    RuntimeInfo runtime{};
+    runtime.mesh_as_compute = true;
+    profile.supported_subgroup_stages = 1U << static_cast<u32>(Stage::Compute);
+    Backend::Bindings bindings{};
+    CHECK_THROWS_AS(Backend::SPIRV::EmitSPIRV(profile, runtime, program, bindings),
+                    Shader::NotImplementedException);
+
+    profile.supported_spirv = 0x00010000;
+    CHECK_THROWS_AS(Backend::SPIRV::EmitSPIRV(profile, program), Shader::NotImplementedException);
 }

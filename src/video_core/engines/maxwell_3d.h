@@ -2217,6 +2217,24 @@ public:
             };
         };
 
+        struct NativeDraw {
+            union {
+                u32 control;
+                BitField<0, 4, PrimitiveTopology> topology;
+                BitField<4, 1, Draw::PrimitiveId> primitive_id;
+                BitField<5, 2, Draw::InstanceId> instance_id;
+                BitField<7, 2, Draw::SplitMode> split_mode;
+                BitField<9, 1, u32> iterate_instances;
+                BitField<10, 1, u32> ignore_base_vertex;
+                BitField<11, 1, u32> ignore_base_instance;
+            };
+            u32 instance_count;
+            u32 first_index;
+            u32 index_count;
+            u32 first_vertex;
+            u32 vertex_count;
+        };
+
         struct IndexBuffer {
             u32 start_addr_high;
             u32 start_addr_low;
@@ -2240,11 +2258,15 @@ public:
             }
 
             GPUVAddr StartAddress() const {
-                return (GPUVAddr{start_addr_high} << 32) | GPUVAddr{start_addr_low};
+                return (GPUVAddr{start_addr_high & 0xffU} << 32) | GPUVAddr{start_addr_low};
             }
 
             GPUVAddr EndAddress() const {
-                return (GPUVAddr{limit_addr_high} << 32) | GPUVAddr{limit_addr_low};
+                return (GPUVAddr{limit_addr_high & 0xffU} << 32) | GPUVAddr{limit_addr_low};
+            }
+
+            u64 DrawSizeBytes(u32 consumed_count) const {
+                return consumed_count == 0 ? 0 : (u64{first} + consumed_count) * FormatSizeInBytes();
             }
 
             /// Adjust the index buffer offset so it points to the first desired index.
@@ -2629,6 +2651,17 @@ public:
             u32 stop_shader_mask;
         };
 
+        u64 IndexBufferSizeBytes(const IndexBuffer& buffer, bool native) const {
+            if (native) {
+                // C597/C797 SET_INDEX_BUFFER_SIZE_A/B hold a byte count independent of the base.
+                return (u64{native_index_buffer_size[0] & 0xffU} << 32) | native_index_buffer_size[1];
+            }
+            const GPUVAddr start = buffer.StartAddress();
+            const GPUVAddr end = buffer.EndAddress();
+            // Cover the byte at the legacy LIMIT_ADDRESS when preparing the host binding.
+            return end >= start ? end - start + 1 : 0;
+        }
+
         // Native C597/C797 use byte counts at 0x600 rather than legacy end addresses.
         u64 NativeVertexStreamSize(std::size_t index) const {
             const std::size_t method = 0x600 / sizeof(u32) + index * 2;
@@ -2667,7 +2700,11 @@ public:
                 GeometryShaderDmFifo gs_dm_fifo;                                       ///< 0x0214
                 L2CacheControl l2_cache_control;                                       ///< 0x0218
                 InvalidateShaderCache invalidate_shader_cache;                         ///< 0x021C
-                INSERT_PADDING_BYTES_NOINIT(0xA8);
+                INSERT_PADDING_BYTES_NOINIT(0x18);
+                std::array<u32, 2> native_index_buffer_size;                           ///< 0x0238
+                INSERT_PADDING_BYTES_NOINIT(0x20);
+                NativeDraw native_draw;                                                ///< 0x0260
+                INSERT_PADDING_BYTES_NOINIT(0x50);
                 SyncInfo sync_info;                                                    ///< 0x02C8
                 INSERT_PADDING_BYTES_NOINIT(0x4);
                 u32 prim_circular_buffer_throttle;                                     ///< 0x02D0
@@ -3126,6 +3163,7 @@ public:
         void AddInstances(Maxwell3D& maxwell3d, u32 repeats);
         void DrawEnd(Maxwell3D& maxwell3d, u32 instance_count = 1, bool force_draw = false);
         void DrawIndexSmall(Maxwell3D& maxwell3d, u32 argument);
+        void DrawNative(Maxwell3D& maxwell3d, bool indexed);
         void DrawTexture(Maxwell3D& maxwell3d);
         void UpdateTopology(Maxwell3D& maxwell3d);
         void ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed, u32 instance_count);
@@ -3183,6 +3221,8 @@ public:
 
     void SetNativeTuringMacroMode(bool enabled) {
         GetNativeMacroEngine().native_turing = enabled;
+        execution_mask[MAXWELL3D_REG_INDEX(native_draw.index_count)] = enabled;
+        execution_mask[MAXWELL3D_REG_INDEX(native_draw.vertex_count)] = enabled;
         upload_state.SetNativePartialTransfers(enabled);
     }
     void SetNativeMacroContext(std::shared_ptr<NativeMacroContext> context) {
@@ -3304,9 +3344,7 @@ public:
         return current_macro_dirty;
     }
 
-    u32 GetMaxCurrentVertices();
-
-    size_t EstimateIndexBufferSize();
+    u32 EstimateIndexBufferSize();
 
     /// Handles a write to the CLEAR_BUFFERS register.
     void ProcessClearBuffers(u32 layer_count);
@@ -3510,6 +3548,13 @@ ASSERT_REG_POSITION(mandated_early_z, 0x0210);
 ASSERT_REG_POSITION(gs_dm_fifo, 0x0214);
 ASSERT_REG_POSITION(l2_cache_control, 0x0218);
 ASSERT_REG_POSITION(invalidate_shader_cache, 0x021C);
+ASSERT_REG_POSITION(native_index_buffer_size, 0x0238);
+ASSERT_REG_POSITION(native_draw.control, 0x0260);
+ASSERT_REG_POSITION(native_draw.instance_count, 0x0264);
+ASSERT_REG_POSITION(native_draw.first_index, 0x0268);
+ASSERT_REG_POSITION(native_draw.index_count, 0x026C);
+ASSERT_REG_POSITION(native_draw.first_vertex, 0x0270);
+ASSERT_REG_POSITION(native_draw.vertex_count, 0x0274);
 ASSERT_REG_POSITION(sync_info, 0x02C8);
 ASSERT_REG_POSITION(prim_circular_buffer_throttle, 0x02D0);
 ASSERT_REG_POSITION(flush_invalidate_rop_mini_cache, 0x02D4);

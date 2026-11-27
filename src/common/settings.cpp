@@ -199,6 +199,16 @@ bool IsFastmemEnabled() {
 #endif
 }
 
+CpuBackend MaxCpuBackend() {
+#if defined(HAS_SCARLETNX)
+    return CpuBackend::ScarletNx;
+#elif defined(HAS_NCE)
+    return CpuBackend::Nce;
+#else
+    return CpuBackend::Dynarmic;
+#endif
+}
+
 static bool is_nce_enabled = false;
 
 void SetNceEnabled(bool is_39bit) {

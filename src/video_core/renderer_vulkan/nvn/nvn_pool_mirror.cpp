@@ -400,10 +400,55 @@ void Context::Impl::MirrorMarkPrefetch(Pool& pool, u64 offset, u64 size) {
     if (mirror == nullptr) {
         return;
     }
-    if (!mirror->prefetch) {
-        vram_prefetch_mirrors.push_back({&pool, mirror, mirror->write_epoch.get()});
-    }
+    const bool was_dirty = mirror->wanted_dirty;
     mirror->MarkWanted(pool.size, offset, size);
+    if (!mirror->prefetch) {
+        RegisterMirrorPrefetch(pool, *mirror);
+        mirror->prefetch = true;
+    } else if (!was_dirty && mirror->wanted_dirty) {
+        WakeMirrorPrefetch(*mirror);
+    }
+}
+
+void Context::Impl::RegisterMirrorPrefetch(Pool& pool, PoolMirror& mirror) {
+    VC::GuestMemory* const memory = guest.load(std::memory_order_acquire);
+    if (memory != nullptr && mirror.write_epoch) {
+        const auto available = std::ranges::find_if(vram_prefetch_groups, [](const auto& group) {
+            return group.used != ~u64{0};
+        });
+        const size_t group_index = static_cast<size_t>(available - vram_prefetch_groups.begin());
+        if (available == vram_prefetch_groups.end()) {
+            vram_prefetch_groups.emplace_back();
+        }
+        auto& group = vram_prefetch_groups[group_index];
+        const size_t bit = static_cast<size_t>(std::countr_one(group.used));
+        const u64 mask = u64{1} << bit;
+        if (memory->TrackWriteNotification(mirror.track_id, group.pending, mask)) {
+            group.used |= mask;
+            group.pools[bit] = &pool;
+            mirror.prefetch_slot = group_index * PrefetchMirrorGroup::CAPACITY + bit;
+            // Work predating the subscription is visible at the first pass.
+            WakeMirrorPrefetch(mirror);
+            return;
+        }
+    }
+    vram_prefetch_poll.push_back({&pool, &mirror, mirror.write_epoch.get()});
+}
+
+void Context::Impl::WakeMirrorPrefetch(const PoolMirror& mirror) {
+    if (mirror.prefetch_slot != PoolMirror::NO_PREFETCH_SLOT) {
+        const auto& group =
+            vram_prefetch_groups[mirror.prefetch_slot / PrefetchMirrorGroup::CAPACITY];
+        const u64 mask = u64{1} << (mirror.prefetch_slot % PrefetchMirrorGroup::CAPACITY);
+        group.pending->fetch_or(mask, std::memory_order_relaxed);
+    }
+}
+
+void Context::Impl::InvalidateMirrorPrefetch(PoolMirror& mirror) {
+    if (!mirror.wanted_dirty) {
+        mirror.wanted_dirty = true;
+        WakeMirrorPrefetch(mirror);
+    }
 }
 
 void Context::Impl::MirrorTakeStaleWanted(Pool& pool, std::vector<std::pair<u64, u64>>& runs) {
@@ -448,7 +493,7 @@ void Context::Impl::MirrorArmRuns(Pool& pool, PoolMirror& mirror, VC::GuestMemor
 void Context::Impl::MirrorInvalidate(Pool& pool, u64 offset, u64 size) {
     if (pool.vram_mirror) {
         pool.vram_mirror->pages.Invalidate(offset, (std::max<u64>)(size, 1));
-        pool.vram_mirror->wanted_dirty = true;
+        InvalidateMirrorPrefetch(*pool.vram_mirror);
     }
 }
 
@@ -467,7 +512,7 @@ void Context::Impl::MirrorInvalidateReadOnly(bool written_through) {
             through_read_only = true;
         } else {
             mirror.pages.InvalidateAll();
-            mirror.wanted_dirty = true;
+            InvalidateMirrorPrefetch(mirror);
             any = true;
         }
     }
@@ -485,7 +530,7 @@ void Context::Impl::MirrorInvalidateAll() {
     }
     for (Pool* const pool : vram_mirrored) {
         pool->vram_mirror->pages.InvalidateAll();
-        pool->vram_mirror->wanted_dirty = true;
+        InvalidateMirrorPrefetch(*pool->vram_mirror);
     }
     stats.vram_invalidate_all.fetch_add(1, std::memory_order_relaxed);
 }
@@ -494,12 +539,27 @@ void Context::Impl::ReleaseVramMirror(Pool& pool) {
     if (!pool.vram_mirror) {
         return;
     }
-    if (VC::GuestMemory* const memory = guest.load(std::memory_order_acquire)) {
-        memory->Untrack(pool.vram_mirror->track_id);
+    PoolMirror& mirror = *pool.vram_mirror;
+    VC::GuestMemory* const memory = guest.load(std::memory_order_acquire);
+    if (memory != nullptr) {
+        memory->Untrack(mirror.track_id);
+    }
+    if (mirror.prefetch_slot != PoolMirror::NO_PREFETCH_SLOT) {
+        auto& group = vram_prefetch_groups[mirror.prefetch_slot / PrefetchMirrorGroup::CAPACITY];
+        const size_t bit = mirror.prefetch_slot % PrefetchMirrorGroup::CAPACITY;
+        const u64 mask = u64{1} << bit;
+        group.pools[bit] = nullptr;
+        group.pending->fetch_and(~mask, std::memory_order_relaxed);
+        // After detachment the old tracker can still publish. Reserve that slot until teardown.
+        if (memory != nullptr) {
+            group.used &= ~mask;
+        }
+        mirror.prefetch_slot = PoolMirror::NO_PREFETCH_SLOT;
+    } else if (mirror.prefetch) {
+        std::erase_if(vram_prefetch_poll,
+                      [&](const PrefetchMirrorEntry& entry) { return entry.pool == &pool; });
     }
     std::erase(vram_mirrored, &pool);
-    std::erase_if(vram_prefetch_mirrors,
-                  [&](const PrefetchMirrorEntry& e) { return e.pool == &pool; });
     ++ro_alias_generation; // the alias table loses this mirror
     vram_mirror_bytes -= pool.size;
     // The buffer goes with the pool, after the last submission that used it completed.

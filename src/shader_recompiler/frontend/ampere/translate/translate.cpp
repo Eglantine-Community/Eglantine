@@ -8,46 +8,21 @@
 
 namespace Shader::Ampere {
 
-void TranslateBlock(Environment& env, IR::Block* block, std::span<const Instruction> code,
-                    u32 begin_offset, u32 end_offset, const LoweringOptions& options,
-                    bool uses_async_copy, u32& required_texture_buffer,
-                    const std::vector<u8>* branch_targets, bool mkw_zero_depth_fallback) {
-    if (begin_offset >= end_offset || begin_offset < AmpereLocationBase) {
-        return;
-    }
-    TranslatorVisitor visitor{env,
-                              *block,
-                              code,
-                              options,
-                              uses_async_copy,
-                              required_texture_buffer,
-                              branch_targets};
-    if (((begin_offset - AmpereLocationBase) & 15U) == 8U) {
-        const u32 index = (begin_offset - AmpereLocationBase) / static_cast<u32>(sizeof(Instruction));
-        if (index < code.size()) {
-            visitor.LDGSTS(code[index], false);
-        }
-        return;
-    }
+namespace {
+
+void TranslateRange(TranslatorVisitor& visitor, std::span<const Instruction> code, u32 begin_offset,
+                    u32 end_offset, TensorMode tensor_mode) {
     for (u32 offset = begin_offset; offset < end_offset; offset += sizeof(Instruction)) {
         const u32 index = (offset - AmpereLocationBase) / static_cast<u32>(sizeof(Instruction));
         if (index >= code.size()) {
             break;
-        }
-        if (mkw_zero_depth_fallback && index == (0x2d0U / sizeof(Instruction))) {
-            // Workaround for a missing ground-height map in this exact MKW shader: set empty pair flag.
-            const IR::U32 both_zero = visitor.ir.BitwiseOr(visitor.R(8U), visitor.R(9U));
-            const IR::U1 is_empty = visitor.ir.IEqual(both_zero, visitor.ir.Imm32(0U));
-            const IR::U32 fallback = IR::U32{
-                visitor.ir.Select(is_empty, visitor.ir.Imm32(0x3f800000U), visitor.ir.Imm32(0U))};
-            visitor.R(4U, visitor.ir.BitwiseOr(visitor.R(4U), fallback));
         }
         const Instruction& insn = code[index];
         const u32 pred_bits = insn.Bits(12, 4);
         if (pred_bits == 15U) {
             continue; // @!PT: never executes
         }
-        if (pred_bits != 7U && CanIfConvertPredicated(insn)) {
+        if (pred_bits != 7U && CanIfConvertPredicated(insn, tensor_mode)) {
             visitor.SetActiveGuard(visitor.EvalGuard(insn));
         }
         const u32 opcode = insn.Bits(0, 12);
@@ -247,10 +222,8 @@ void TranslateBlock(Environment& env, IR::Block* block, std::span<const Instruct
             visitor.FRND(insn);
             break;
         case 0x306: case 0xd06: case 0x906:
-            visitor.I2F(insn);
-            break;
         case 0x245: case 0x845: case 0xa45: case 0xc45:
-            visitor.I2FP(insn);
+            visitor.I2F(insn);
             break;
 
         // Memory, atomics, barriers, attributes, geometry OUT, stage buffers
@@ -367,6 +340,35 @@ void TranslateBlock(Environment& env, IR::Block* block, std::span<const Instruct
         }
         visitor.SetActiveGuard(std::nullopt);
     }
+}
+
+} // Anonymous namespace
+
+void TranslateBlock(Environment& env, IR::Block* block, std::span<const Instruction> code,
+                    u32 begin_offset, u32 end_offset, const LoweringOptions& options,
+                    bool uses_async_copy, u32& required_texture_buffer,
+                    const std::vector<u8>* branch_targets) {
+    if (begin_offset >= end_offset || begin_offset < AmpereLocationBase) {
+        return;
+    }
+    TranslatorVisitor visitor{env,
+                              *block,
+                              code,
+                              options,
+                              uses_async_copy,
+                              required_texture_buffer,
+                              branch_targets};
+    const TensorMode tensor_mode = ResolveTensorMode(options);
+    const u32 begin_byte_offset = begin_offset - AmpereLocationBase;
+    const u32 instruction_byte_offset = begin_byte_offset % sizeof(Instruction);
+    if (instruction_byte_offset == 8U) {
+        const u32 index = begin_byte_offset / sizeof(Instruction);
+        if (index < code.size()) {
+            visitor.LDGSTS(code[index], false);
+        }
+        return;
+    }
+    TranslateRange(visitor, code, begin_offset, end_offset, tensor_mode);
 }
 
 } // namespace Shader::Ampere

@@ -248,21 +248,20 @@ namespace {
 using namespace AmpereExec;
 
 u32 PackOffsets(s32 x0, s32 y0, s32 x1, s32 y1) {
-    return (static_cast<u32>(x0) & 0x3f) | ((static_cast<u32>(y0) & 0x3f) << 8) |
-           ((static_cast<u32>(x1) & 0x3f) << 16) | ((static_cast<u32>(y1) & 0x3f) << 24);
+    return (static_cast<u32>(x0) & 0xff) | ((static_cast<u32>(y0) & 0xff) << 8) |
+           ((static_cast<u32>(x1) & 0xff) << 16) | ((static_cast<u32>(y1) & 0xff) << 24);
 }
 
 constexpr u32 TextureMarker(u32 x, u32 y) {
     return 16 + x + 8 * y;
 }
 
-AmpereExec::Rig::SampledTexture MakePositionTexture() {
-    constexpr u32 size = 8;
+AmpereExec::Rig::SampledTexture MakePositionTexture(u32 width, u32 height) {
     AmpereExec::Rig::SampledTexture result{};
     result.texture.target = 1; // 2D
     result.texture.format = 0x25; // RGBA8
-    result.texture.width = size;
-    result.texture.height = size;
+    result.texture.width = width;
+    result.texture.height = height;
     result.texture.depth = 1;
     result.texture.levels = 1;
     result.texture.serial = 200;
@@ -276,8 +275,8 @@ AmpereExec::Rig::SampledTexture MakePositionTexture() {
     result.sampler.serial = 201;
     result.uniform_slot = 14 - 3; // Bound texture cbuffer 14 is uniform-buffer slot 11.
     result.uniform_offset = 0x4000;
-    for (u32 y = 0; y < size; ++y) {
-        for (u32 x = 0; x < size; ++x) {
+    for (u32 y = 0; y < height; ++y) {
+        for (u32 x = 0; x < width; ++x) {
             const float red = static_cast<float>(TextureMarker(x, y)) / 255.0f;
             VC::ClearTexturePayload clear{};
             clear.texture = {.serial = result.texture.serial, .level = 0, .layer = 0};
@@ -327,25 +326,132 @@ TEST_CASE("Ampere TLD4 per-tap offsets gather the four offset texels", "[nvn][am
     gather.w[1] = (gather.w[1] & ~0xffU) | (FirstInputRegister + 2);
     gather.w[2] = (gather.w[2] & ~0xffU) | 0xffU;
 
-    const std::array body{gather};
-    const std::array<Words, 1> inputs{{{
-        AsBits(3.5f / 8.0f), AsBits(3.5f / 8.0f),
-        PackOffsets(-8, -8, -1, 1), PackOffsets(0, -1, 1, 0),
-        0, 0, 0, 0,
-    }}};
-    const auto texture = MakePositionTexture();
-    const auto result = rig->Run(body, inputs, &texture);
-    REQUIRE(result.error.empty());
-
-    // At (3.5, 3.5) texels, component .w is the lower-left tap; offsets clamp at the edge.
-    constexpr std::array<u32, 4> expected_markers{
-        TextureMarker(0, 0), TextureMarker(2, 4), TextureMarker(3, 2), TextureMarker(4, 3),
+    const auto check = [&](std::span<const Inst> body, const Words& inputs,
+                           const Rig::SampledTexture& texture,
+                           const std::array<u32, 4>& expected_markers) {
+        const auto result = rig->Run(body, std::span{&inputs, 1}, &texture);
+        INFO(result.error);
+        REQUIRE(result.error.empty());
+        for (u32 tap = 0; tap < expected_markers.size(); ++tap) {
+            const float expected = static_cast<float>(expected_markers[tap]) / 255.0f;
+            const float actual = AsFloat(result.outputs[0][tap]);
+            INFO("tap " << tap << " expected " << expected << " got " << actual);
+            CHECK(std::abs(actual - expected) < 1e-6f);
+        }
     };
-    for (u32 tap = 0; tap < expected_markers.size(); ++tap) {
-        const float expected = static_cast<float>(expected_markers[tap]) / 255.0f;
-        const float actual = AsFloat(result.outputs[0][tap]);
-        INFO("tap " << tap << " expected " << expected << " got " << actual);
-        CHECK(std::abs(actual - expected) < 1e-6f);
+
+    SECTION("Four runtime offsets with edge clamping") {
+        const std::array body{gather};
+        const Words inputs{
+            AsBits(3.5f / 8.0f), AsBits(3.5f / 8.0f),
+            PackOffsets(-8, -8, -1, 1), PackOffsets(0, -1, 1, 0),
+        };
+        check(body, inputs, MakePositionTexture(8, 8),
+              {TextureMarker(0, 0), TextureMarker(2, 4), TextureMarker(3, 2), TextureMarker(4, 3)});
+    }
+
+    SECTION("Constant offsets within and beyond the minimum Vulkan range") {
+        const std::array body{
+            Inst{{0x00007802U | ((FirstInputRegister + 2) << 16), PackOffsets(-32, 31, 31, -32),
+                  0x00000f00U, Sched}},
+            Inst{{0x00007802U | ((FirstInputRegister + 3) << 16), PackOffsets(-2, 1, 1, -2),
+                  0x00000f00U, Sched}},
+            gather,
+        };
+        const Words inputs{AsBits(3.5f / 7.0f), AsBits(2.5f / 5.0f)};
+        check(body, inputs, MakePositionTexture(7, 5),
+              {TextureMarker(0, 4), TextureMarker(6, 0), TextureMarker(1, 3), TextureMarker(4, 0)});
+    }
+
+    SECTION("One runtime offset shifts the entire gather footprint") {
+        gather.w[2] = (gather.w[2] & ~(3U << 12)) | (1U << 12);
+        const std::array body{gather};
+        const Words inputs{AsBits(3.75f / 7.0f), AsBits(2.75f / 5.0f), PackOffsets(-2, 1, 0, 0)};
+        check(body, inputs, MakePositionTexture(7, 5),
+              {TextureMarker(1, 4), TextureMarker(2, 4), TextureMarker(2, 3), TextureMarker(1, 3)});
+    }
+
+    SECTION("One constant offset keeps the footprint at an exact half texel") {
+        gather.w[2] = (gather.w[2] & ~(3U << 12)) | (1U << 12);
+        const std::array body{
+            Inst{{0x00007802U | ((FirstInputRegister + 2) << 16), PackOffsets(-2, 1, 0, 0),
+                  0x00000f00U, Sched}},
+            gather,
+        };
+        const Words inputs{AsBits(3.5f / 7.0f), AsBits(2.5f / 5.0f)};
+        check(body, inputs, MakePositionTexture(7, 5),
+              {TextureMarker(1, 4), TextureMarker(2, 4), TextureMarker(2, 3), TextureMarker(1, 3)});
+    }
+}
+
+TEST_CASE("NVN Vulkan samples the selected aspect of a combined depth/stencil texture",
+          "[nvn][ampere_exec][stencil_sample]") {
+    auto rig = Rig::Create();
+    if (!rig || !rig->SupportsDepthStencilSampling()) {
+        SKIP("no Vulkan device supporting sampled D32_SFLOAT_S8_UINT attachments");
+    }
+
+    constexpr float depth = 0.25f;
+    constexpr u32 stencil = 73;
+    constexpr u8 depth_mode = 0;
+    constexpr u8 stencil_mode = 1;
+    // TEX.LZ.2D R16, R8, R9, c[14][0x10], R. The same shader is translated for both aspects.
+    constexpr std::array body{Inst{{
+        0x00007b60U | (FirstOutputRegister << 16) | (FirstInputRegister << 24),
+        (FirstInputRegister + 1) | (4U << 8) | (14U << 22) | (1U << 29),
+        0x008e01ffU, Sched,
+    }}};
+    const Words coords{AsBits(0.5f), AsBits(0.5f)};
+
+    struct Case {
+        const char* name;
+        bool builder_stencil;
+        bool override_mode;
+        u8 view_mode;
+        u32 expected;
+    };
+    const std::array cases{
+        Case{"default depth", false, false, depth_mode, AsBits(depth)},
+        Case{"stencil view overrides depth builder", false, true, stencil_mode, stencil},
+        Case{"depth view overrides stencil builder", true, true, depth_mode, AsBits(depth)},
+        Case{"default stencil", true, false, stencil_mode, stencil},
+    };
+
+    for (u32 index = 0; index < cases.size(); ++index) {
+        const auto& mode = cases[index];
+        INFO(mode.name);
+        Rig::SampledTexture texture{};
+        texture.texture = {.target = 1, // 2D
+                           .format = 0x36, // DEPTH32F_STENCIL8
+                           .width = 16,
+                           .height = 16,
+                           .depth = 1,
+                           .levels = 1,
+                           .stencil = static_cast<u8>(mode.builder_stencil),
+                           .serial = 200 + 3 * index,
+                           .pool_serial = 1,
+                           .pool_offset = 0x20000 + 0x10000 * index};
+        texture.sampler = {.wrap_s = 7, // clamp to edge, nearest by default
+                           .wrap_t = 7,
+                           .wrap_r = 7,
+                           .serial = texture.texture.serial + 1};
+        texture.uniform_slot = 14 - 3;
+        texture.uniform_offset = 0x4000;
+        texture.depth_stencil_clear =
+            VC::ClearDepthStencilPayload{depth, 1, static_cast<s32>(stencil), 0xff};
+        if (mode.override_mode) {
+            texture.view = texture.texture;
+            texture.view->view_of = texture.texture.serial;
+            texture.view->serial += 2;
+            texture.view->view.set_dsmode = 1;
+            texture.view->view.dsmode = mode.view_mode;
+        }
+
+        const auto result = rig->Run(body, std::span{&coords, 1}, &texture);
+        INFO(result.error);
+        REQUIRE(result.error.empty());
+        REQUIRE(result.outputs.size() == 1);
+        CHECK(result.outputs[0][0] == mode.expected);
     }
 }
 
@@ -408,6 +514,34 @@ TEST_CASE("Ampere I2F from 32 bits rounds exactly in every mode", "[nvn][ampere_
                 CHECK(result.outputs[i][0] == expected[i]);
             }
         }
+    }
+}
+
+TEST_CASE("Ampere I2FP preserves exact values after masks",
+          "[nvn][ampere_exec][i2f]") {
+    auto rig = Rig::Create();
+    if (!rig) {
+        SKIP("no Vulkan device");
+    }
+    const auto samples = IntegerSamples();
+    for (const u32 mask : {0x00ffffffU, 0xffffff00U, 0xff000000U, 0x01ffffffU}) {
+        const bool signed_negative = mask == 0xff000000U;
+        const u32 lut = signed_negative ? 0xfcU : 0xc0U;
+        const std::array body{
+            Inst{{0x08097812U, mask, 0x078e00ffU | (lut << 8), Sched}},
+            Inst{{0x00107245U, 9U, 0x00201000U | (signed_negative ? 0x400U : 0U), Sched}},
+        };
+        std::string error;
+        const auto expected = [&](u32 value) {
+            return RefI2F(signed_negative ? value | mask : value & mask, signed_negative,
+                          Round::Nearest);
+        };
+        const auto mismatches = Compare(*rig, body, samples, expected, error);
+        INFO(mask);
+        INFO(error);
+        REQUIRE(error.empty());
+        INFO(mismatches.Describe());
+        CHECK(mismatches.total == 0);
     }
 }
 

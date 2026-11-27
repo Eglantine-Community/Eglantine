@@ -9,7 +9,10 @@
 
 #pragma once
 
+#include <array>
 #include <limits>
+#include <optional>
+#include <utility>
 
 #include <boost/container/small_vector.hpp>
 
@@ -17,6 +20,7 @@
 #include "video_core/buffer_cache/memory_tracker_base.h"
 #include "video_core/buffer_cache/usage_tracker.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/renderer_vulkan/vertex_repack.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_host_import.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
@@ -101,8 +105,7 @@ private:
     bool sparse_compatible{};
 };
 
-class QuadArrayIndexBuffer;
-class QuadStripIndexBuffer;
+class QuadIndexBuffer;
 
 class BufferCacheRuntime {
     friend Buffer;
@@ -119,11 +122,26 @@ public:
 
     void TickFrame(Common::SlotVector<Buffer>& slot_buffers) noexcept;
 
-    /// Returns the mask of bindings whose repacked state changed.
-    u32 SetVertexRepackLayout(const Tegra::Engines::Maxwell3D::Regs& regs, bool dynamic_input);
+    enum class VertexStrideMode : u8 { Static, Binding, Input };
 
-    bool IsVertexRepacked(u32 binding) const {
-        return (vertex_repack_mask & (1U << binding)) != 0;
+    bool SetVertexStrideMode(VertexStrideMode mode) {
+        return std::exchange(vertex_stride_mode, mode) != mode;
+    }
+
+    /// Returns the bindings whose packed data or vertex description must be refreshed.
+    u32 SetVertexRepackLayout(const Tegra::Engines::Maxwell3D::Regs& regs, bool dynamic_input,
+                              bool uses_vertex_input);
+
+    [[nodiscard]] bool IsVertexRepacked(u32 binding) const {
+        return uses_vertex_buffers && vertex_repack_layouts[binding].has_value();
+    }
+
+    [[nodiscard]] const VertexRepackLayout* GetVertexRepackLayout(u32 binding) const {
+        return IsVertexRepacked(binding) ? &*vertex_repack_layouts[binding] : nullptr;
+    }
+
+    [[nodiscard]] bool VertexRepackFailed() const {
+        return vertex_repack_failed;
     }
 
     [[nodiscard]] u64 CurrentTick() const noexcept {
@@ -157,6 +175,12 @@ public:
 
     bool CanReorderUpload(Buffer& buffer, std::span<const VideoCommon::BufferCopy> copies);
 
+    void PrepareDownloadStagingBuffer(const StagingBufferRef& ref);
+
+    void InvalidateDownloadStagingBuffer(const StagingBufferRef& ref);
+
+    void FlushDownloadStagingBuffer(const StagingBufferRef& ref);
+
     void FreeDeferredStagingBuffer(StagingBufferRef& ref);
 
     void PreCopyBarrier();
@@ -169,12 +193,60 @@ public:
 
     void ClearBuffer(VkBuffer dest_buffer, u32 offset, size_t size, u32 value);
 
-    void BindIndexBuffer(PrimitiveTopology topology, IndexFormat index_format, u32 num_indices,
-                         u32 base_vertex, VkBuffer buffer, u32 offset, u32 size);
+    void BindIndexBuffer(PrimitiveTopology topology, IndexFormat index_format, u32 first_index,
+                         u32 num_indices, Buffer& buffer, u32 offset, u32 size,
+                         const Tegra::Engines::Maxwell3D::Regs::PrimitiveRestart& restart,
+                         bool indirect, u32 removed_prefix = 0);
 
-    void BindQuadIndexBuffer(PrimitiveTopology topology, u32 first, u32 count);
+    struct IndexSource {
+        const Buffer* buffer;
+        u32 offset;
+        u32 size;
+    };
 
-    void BindVertexBuffer(u32 index, VkBuffer buffer, u32 offset, u32 size, u32 stride);
+    [[nodiscard]] bool CanGatherIndexBuffer(u64 size);
+
+    void BindGatheredIndexBuffer(PrimitiveTopology topology, IndexFormat index_format,
+                                 u32 first_index, u32 num_indices,
+                                 std::span<const IndexSource> sources, u32 size,
+                                 const Tegra::Engines::Maxwell3D::Regs::PrimitiveRestart& restart,
+                                 bool indirect, u32 removed_prefix);
+
+    void RejectIndexAssembly() {
+        index_assembly_failed = true;
+        bound_index_valid = false;
+    }
+
+    using DirectQuadDraw = QuadRestartPass::DirectDraw;
+
+    void SetDirectQuadDraw(std::optional<DirectQuadDraw> draw);
+    [[nodiscard]] std::optional<std::pair<VkBuffer, VkDeviceSize>> QuadDrawCommand() const {
+        if (!quad_assembly) {
+            return std::nullopt;
+        }
+        const auto& command = (*quad_assembly)[1];
+        return std::pair{command.buffer, command.offset};
+    }
+
+    void ResetIndexAssemblyState() {
+        if (quad_assembly) {
+            ReleaseQuadAssembly();
+        }
+        index_assembly_failed = false;
+        removed_index_prefix = 0;
+    }
+
+    [[nodiscard]] bool IndexAssemblyFailed() const {
+        return index_assembly_failed;
+    }
+
+    [[nodiscard]] u32 DrawFirstIndex(u32 guest_first) const {
+        return guest_first - removed_index_prefix;
+    }
+
+    void BindQuadIndexBuffer(PrimitiveTopology topology, u32 count);
+
+    void BindVertexBuffer(u32 index, Buffer& buffer, u32 offset, u32 size, u32 stride);
 
     void BindVertexBuffers(VideoCommon::HostBindings<Buffer>& bindings);
 
@@ -309,14 +381,6 @@ public:
                                               TexelBufferFormat(format));
     }
 
-    bool ShouldLimitDynamicStorageBuffers() const {
-        return limit_dynamic_storage_buffers;
-    }
-
-    u32 GetMaxDynamicStorageBuffers() const {
-        return max_dynamic_storage_buffers;
-    }
-
 private:
     /// Set by CanReorderUpload for the CopyBuffer that follows it: the upload can run before
     /// the held render pass.
@@ -343,17 +407,39 @@ private:
     StagingBufferPool& staging_pool;
     HostImporter host_importer;
     GuestDescriptorQueue& guest_descriptor_queue;
+    ComputePassDescriptorQueue& compute_descriptor_queue;
+    DescriptorPool& compute_descriptor_pool;
 
-    std::shared_ptr<QuadArrayIndexBuffer> quad_array_index_buffer;
-    std::shared_ptr<QuadStripIndexBuffer> quad_strip_index_buffer;
+    std::shared_ptr<QuadIndexBuffer> quad_array_index_buffer;
+    std::shared_ptr<QuadIndexBuffer> quad_strip_index_buffer;
 
     vk::Buffer null_buffer;
 
-    std::unique_ptr<Uint8Pass> uint8_pass;
+    std::unique_ptr<IndexWidenPass> widen_uint8_pass;
+    std::unique_ptr<IndexWidenPass> widen_uint16_pass;
     std::unique_ptr<VertexRepackPass> vertex_repack_pass;
-    u32 vertex_repack_mask{};
-    bool static_vertex_repack{};
+    using Regs = Tegra::Engines::Maxwell3D::Regs;
+    std::array<std::optional<VertexRepackLayout>, Regs::NumVertexArrays> vertex_repack_layouts;
+    std::array<Regs::VertexAttribute, Regs::NumVertexAttributes> repack_attributes{};
+    std::array<u32, Regs::NumVertexArrays> repack_stream_keys{};
+    std::optional<bool> repack_dynamic_input;
+    u32 repacked_bindings{};
+    u32 unsupported_repack_bindings{};
+    u32 retry_vertex_bindings{};
+    u64 repack_tick{};
+    bool uses_vertex_buffers{};
+    bool vertex_repack_failed{};
+    bool index_assembly_failed{};
+    u32 removed_index_prefix{};
+    std::optional<VkDeviceSize> index_gather_limit;
+    VertexStrideMode vertex_stride_mode{VertexStrideMode::Static};
     QuadIndexedPass quad_index_pass;
+    std::unique_ptr<QuadRestartPass> quad_restart_pass;
+    std::optional<DirectQuadDraw> direct_quad_draw;
+    std::optional<std::array<StagingBufferRef, 2>> quad_assembly;
+
+    void ReleaseQuadAssembly();
+
 
     MultiRangeBufferCache multi_range_buffers;
     boost::container::small_vector<MultiRangeSource, 16> multi_range_sources;
@@ -361,15 +447,18 @@ private:
 
     StreamUniformRef last_stream_uniform{};
 
-    bool limit_dynamic_storage_buffers = false;
-    u32 max_dynamic_storage_buffers = (std::numeric_limits<u32>::max)();
-
     /// The index buffer BindIndexBuffer recorded last, at scheduler recording epoch bound_index_epoch.
     VkBuffer bound_index_buffer = VK_NULL_HANDLE;
     VkDeviceSize bound_index_offset = 0;
     VkIndexType bound_index_type = VK_INDEX_TYPE_UINT32;
+    std::optional<u32> bound_restart_marker;
     u64 bound_index_epoch = 0;
     bool bound_index_valid = false;
+
+    void BindIndexBuffer(PrimitiveTopology topology, IndexFormat index_format, u32 first_index,
+                         u32 num_indices, VkBuffer buffer, VkDeviceSize offset, u32 size,
+                         VkDeviceSize buffer_size, const Regs::PrimitiveRestart& restart,
+                         bool indirect);
 };
 
 struct BufferCacheParams {

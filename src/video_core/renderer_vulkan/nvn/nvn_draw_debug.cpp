@@ -34,7 +34,8 @@ void DrawContext::DebugSync() {
     dbg.report_draw.clear();
     if (request != nullptr) {
         // A diag request bound to this frame replaces the environment's selection of it.
-        dbg.draw_log = 0;
+        // A frame request logs draw and pass identities without taking image readbacks.
+        dbg.draw_log = request->pass == 0 && request->draw == 0 && !request->survey ? 8192 : 0;
         dbg.dump_pass = request->pass;
         dbg.dump_draw = request->draw;
         dbg.dump_dir.clear();
@@ -111,9 +112,15 @@ void DrawContext::DebugOnPassBegin() {
 }
 
 void DrawContext::DebugOnPassEnd() {
+    if (!dbg.selected) {
+        return;
+    }
+    if (Debug::RequestState* request = Debug::RequestFor(dbg.frame);
+        request && request->survey) {
+        DebugSurveyPass(*request->survey, request->directory);
+    }
     const Debug::Config& config = Debug::Get();
-    if (!dbg.selected || dbg.dump_dir.empty() ||
-        dbg.dumped >= config.dump_max ||
+    if (dbg.dump_dir.empty() || dbg.dumped >= config.dump_max ||
         (dbg.dump_pass != 0 && dbg.pass_index != dbg.dump_pass)) {
         return;
     }
@@ -141,6 +148,67 @@ void DrawContext::DebugOnPassEnd() {
         dump(color_targets[slot], fmt::format("c{}", slot).c_str(), VK_IMAGE_ASPECT_COLOR_BIT);
     }
     dump(depth_target, "z", VK_IMAGE_ASPECT_DEPTH_BIT);
+}
+
+void DrawContext::DebugSurveyPass(Debug::Survey& survey, const std::filesystem::path& directory) {
+    const u32 pass = ++survey.passes_seen;
+    if (pass < survey.limits.first_pass) {
+        return;
+    }
+    if (survey.passes_captured >= survey.limits.max_passes) {
+        survey.limited = true;
+        return;
+    }
+    const u32 before = survey.attachments;
+    const auto capture = [&](const TargetBinding& target, std::string_view slot,
+                             VkImageAspectFlags aspect) {
+        if (!target.texture || !target.texture->storage) {
+            return;
+        }
+        Storage& storage = *target.texture->storage;
+        const u32 level = target.ref.texture.level;
+        const u32 layer = target.ref.texture.layer;
+        if (!storage.image || storage.sparse || storage.type != VK_IMAGE_TYPE_2D ||
+            storage.samples != VK_SAMPLE_COUNT_1_BIT || level >= storage.levels ||
+            layer >= storage.layers || (storage.aspect & aspect) == 0 ||
+            (storage.usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) == 0 ||
+            storage.current_layout == VK_IMAGE_LAYOUT_UNDEFINED) {
+            return;
+        }
+        const u32 width = (std::max)(storage.extent.width >> level, 1u);
+        const u32 height = (std::max)(storage.extent.height >> level, 1u);
+        const u32 bpp = Debug::PixelBytes(storage.host.format, aspect);
+        if (bpp == 0 || width < survey.limits.min_width || height < survey.limits.min_height) {
+            return;
+        }
+        const VkRect2D crop = survey.limits.Crop(width, height);
+        const u64 bytes = u64{crop.extent.width} * crop.extent.height * bpp;
+        if (!survey.Take(bytes)) {
+            return;
+        }
+
+        const std::string name =
+            fmt::format("f{:05}_p{:05}_q{}_{}.tga", dbg.frame, pass, queue, slot);
+        const u32 first_draw = dbg.pass_draws != 0 ? dbg.draw_index - dbg.pass_draws + 1 : 0;
+        const u32 last_draw = dbg.pass_draws != 0 ? dbg.draw_index : 0;
+        Debug::AppendLine(
+            directory / "nvn-survey.tsv",
+            fmt::format("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:x}\t{}\t{}\t{}\t{}\t"
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        dbg.frame, pass, queue, dbg.pass_index, host->HostFlight().seq, first_draw,
+                        last_draw, slot, target.texture->serial, static_cast<u32>(storage.host.format),
+                        static_cast<u32>(aspect), level, layer, width, height, crop.offset.x,
+                        crop.offset.y, crop.extent.width, crop.extent.height, bytes, name));
+        host->HostDumpImage(storage, level, layer, aspect,
+                            {.path = (directory / name).string(),
+                             .format = storage.host.format,
+                             .crop = crop});
+    };
+    for (u32 slot = 0; slot < color_target_count; ++slot) {
+        capture(color_targets[slot], fmt::format("c{}", slot), VK_IMAGE_ASPECT_COLOR_BIT);
+    }
+    capture(depth_target, "z", VK_IMAGE_ASPECT_DEPTH_BIT);
+    survey.passes_captured += survey.attachments != before;
 }
 
 void DrawContext::DebugReadbackIndirect(u64 address, const BufferRef& args, u32 bytes,

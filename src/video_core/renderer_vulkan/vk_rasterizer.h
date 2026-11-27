@@ -145,6 +145,8 @@ public:
                                const Tegra::Engines::Fermi2D::Surface& dst,
                                const Tegra::Engines::Fermi2D::Config& copy_config) override;
     bool SupportsGameDlssNetwork() const override;
+    VideoCommon::NativeTensorLowering NativeTensorComputeSupport(
+        const std::array<u32, 3>& workgroup_size) const override;
     bool UsesNvidiaDlss() const override;
     bool CanProbeGameDlssOutput() const override {
         return true;
@@ -373,6 +375,7 @@ private:
     /// Mesh emulation diagnostics with a task program: one draw's distribution arguments.
     struct {
         std::span<const u8> args;
+        StagingBufferRef staging;
         u64 tick{};
         u32 tasks{};
         u32 capacity{};
@@ -386,6 +389,7 @@ private:
     /// Mesh emulation diagnostics: one draw's output, read back once the GPU has written it.
     struct MeshEmulationProbe {
         std::span<const u8> data;
+        StagingBufferRef staging;
         u64 tick{};
         u64 frame{};
         u32 groups{};
@@ -397,6 +401,7 @@ private:
         std::array<u32, 4> position_lines{};
         bool pending{};
     } mesh_probe;
+    void PrepareMeshProbeReadback(const StagingBufferRef& staging);
     void ReadMeshEmulationProbe();
     /// Mesh emulation with a task program: the output arena every task draw of a submission
     /// allocates its mesh workgroups from, and its host-visible counter of allocated words.

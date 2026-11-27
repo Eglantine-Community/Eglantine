@@ -54,6 +54,17 @@ enum class MSAACopyFormatClass : u32 {
     UnsignedInteger,
 };
 
+enum class MSAACopyCoordinates {
+    DestinationPixels,
+    SampleGrid,
+};
+
+enum class MSAADepthPass {
+    Depth,
+    DepthStencil,
+    StencilBit,
+};
+
 struct MSAACopyPipelineKey {
     constexpr auto operator<=>(const MSAACopyPipelineKey&) const noexcept = default;
 
@@ -61,6 +72,7 @@ struct MSAACopyPipelineKey {
     VkSampleCountFlagBits samples;
     bool msaa_to_non_msaa;
     MSAACopyFormatClass format_class;
+    MSAADepthPass depth_pass{};
 };
 
 struct BlitMSAAPipelineKey {
@@ -110,7 +122,8 @@ public:
     void BlitDepth(const Framebuffer* dst_framebuffer, ImageView& src_image_view,
                    const Region2D& dst_region, const Region2D& src_region);
 
-    void ResolveDepthStencil(const Framebuffer* dst_framebuffer, ImageView& src_image_view,
+    void ResolveDepthStencil(RenderPassCache& render_pass_cache, const Framebuffer* dst_framebuffer,
+                             const ImageView& dst_image_view, ImageView& src_image_view,
                              const Region2D& dst_region, const Region2D& src_region);
 
     void BlitDepthStencil(const Framebuffer* dst_framebuffer, ImageView& src_image_view,
@@ -146,19 +159,21 @@ public:
     void CopyMSAA(RenderPassCache& render_pass_cache, VkImage dst_image,
                   VideoCore::Surface::PixelFormat dst_format, VkImage src_image,
                   VideoCore::Surface::PixelFormat src_format, u32 num_samples,
-                  std::span<const VideoCommon::ImageCopy> copies, bool msaa_to_non_msaa);
+                  std::span<const VideoCommon::ImageCopy> copies, bool msaa_to_non_msaa,
+                  MSAACopyCoordinates coordinates = MSAACopyCoordinates::DestinationPixels);
 
     void CopyMSAADepth(RenderPassCache& render_pass_cache, VkImage dst_image,
                        VideoCore::Surface::PixelFormat dst_format, VkImage src_image,
                        VideoCore::Surface::PixelFormat src_format, u32 num_samples,
                        std::span<const VideoCommon::ImageCopy> copies, bool copy_stencil,
-                       bool msaa_to_non_msaa);
+                       bool msaa_to_non_msaa,
+                       MSAACopyCoordinates coordinates = MSAACopyCoordinates::DestinationPixels);
 
 private:
     struct MSAACopyAspectInfo {
         VkImageAspectFlags src_view_aspect;
         VkImageAspectFlags attachment_aspect;
-        VkImageAspectFlags barrier_aspect;
+        VkImageAspectFlags src_barrier_aspect;
         VkAccessFlags pre_src_access;
         VkAccessFlags pre_src_dst_access;
         VkAccessFlags pre_dst_dst_access;
@@ -179,7 +194,8 @@ private:
                       VkImage dst_image, VkFormat dst_vk_format, VkImage src_image,
                       VkFormat src_vk_format, s32 scale_x, s32 scale_y,
                       std::span<const VideoCommon::ImageCopy> copies,
-                      const MSAACopyAspectInfo& aspect_info, bool copy_stencil);
+                      const MSAACopyAspectInfo& aspect_info, bool copy_stencil,
+                      VkPipeline stencil_bit_pipeline, MSAACopyCoordinates coordinates);
 
     void Convert(VkPipeline pipeline, const Framebuffer* dst_framebuffer,
                  const ImageView& src_image_view);
@@ -200,14 +216,20 @@ private:
         const BlitDepthStencilPipelineKey& key);
     [[nodiscard]] VkPipeline FindOrEmplaceMSAACopyPipeline(const MSAACopyPipelineKey& key);
 
-    [[nodiscard]] VkPipeline FindOrEmplaceMSAACopyDepthPipeline(const MSAACopyPipelineKey& key,
-                                                                bool copy_stencil);
+    [[nodiscard]] VkPipeline FindOrEmplaceMSAACopyDepthPipeline(const MSAACopyPipelineKey& key);
     [[nodiscard]] VkPipeline FindOrEmplaceBlitColorMSAAPipeline(const BlitMSAAPipelineKey& key);
     [[nodiscard]] VkPipeline FindOrEmplaceBlitDepthStencilMSAAPipeline(
         const BlitMSAAPipelineKey& key, bool blit_stencil);
     [[nodiscard]] VkPipeline FindOrEmplaceBlitDepthPipeline(VkRenderPass renderpass);
-    [[nodiscard]] VkPipeline FindOrEmplaceResolveDepthStencilPipeline(VkRenderPass renderpass,
-                                                                      bool resolve_stencil);
+    bool TryFixedFunctionDepthStencilResolve(RenderPassCache& render_pass_cache,
+                                             const Framebuffer& dst_framebuffer,
+                                             const ImageView& dst_view, const ImageView& src_view,
+                                             const Region2D& dst_region, const Region2D& src_region);
+
+    enum class ResolveDepthStencilMode : u8 { Depth, ExportStencil, ClearStencil, StencilBits };
+
+    [[nodiscard]] VkPipeline FindOrEmplaceResolveDepthStencilPipeline(
+        VkRenderPass renderpass, ResolveDepthStencilMode mode);
 
     void ConvertPipeline(vk::Pipeline& pipeline, VkRenderPass renderpass, bool is_target_depth);
 
@@ -236,6 +258,7 @@ private:
     DescriptorAllocator temporal_upscale_descriptor_allocator;
     vk::PipelineLayout one_texture_pipeline_layout;
     vk::PipelineLayout two_textures_pipeline_layout;
+    vk::PipelineLayout resolve_stencil_fallback_pipeline_layout;
     vk::PipelineLayout temporal_upscale_pipeline_layout;
     vk::PipelineLayout temporal_sharpen_pipeline_layout;
     vk::PipelineLayout clear_color_pipeline_layout;
@@ -252,6 +275,7 @@ private:
     vk::ShaderModule blit_depth_frag;
     vk::ShaderModule blit_depth_msaa_frag;
     vk::ShaderModule blit_depth_stencil_msaa_frag;
+    vk::ShaderModule blit_stencil_bits_msaa_frag;
     vk::ShaderModule clear_color_vert;
     vk::ShaderModule clear_color_frag;
     vk::ShaderModule clear_stencil_frag;
@@ -266,12 +290,12 @@ private:
     vk::ShaderModule convert_msaa_to_non_msaa_sint_frag;
     vk::ShaderModule convert_msaa_to_non_msaa_uint_frag;
     vk::ShaderModule convert_msaa_to_non_msaa_depth_frag;
-    vk::ShaderModule convert_msaa_to_non_msaa_depth_stencil_frag;
+    vk::ShaderModule convert_msaa_to_non_msaa_stencil_frag;
     vk::ShaderModule convert_non_msaa_to_msaa_frag;
     vk::ShaderModule convert_non_msaa_to_msaa_sint_frag;
     vk::ShaderModule convert_non_msaa_to_msaa_uint_frag;
     vk::ShaderModule convert_non_msaa_to_msaa_depth_frag;
-    vk::ShaderModule convert_non_msaa_to_msaa_depth_stencil_frag;
+    vk::ShaderModule convert_non_msaa_to_msaa_stencil_frag;
     vk::Sampler linear_sampler;
     vk::Sampler nearest_sampler;
 
@@ -289,10 +313,11 @@ private:
     std::vector<vk::Pipeline> clear_stencil_pipelines;
     std::vector<MSAACopyPipelineKey> msaa_copy_keys;
     std::vector<vk::Pipeline> msaa_copy_pipelines;
-    std::vector<MSAACopyPipelineKey> msaa_copy_depth_keys;
-    std::vector<vk::Pipeline> msaa_copy_depth_pipelines;
-    std::vector<MSAACopyPipelineKey> msaa_copy_depth_stencil_keys;
-    std::vector<vk::Pipeline> msaa_copy_depth_stencil_pipelines;
+    struct MSAACopyDepthPipeline {
+        MSAACopyPipelineKey key;
+        vk::Pipeline pipeline;
+    };
+    std::vector<MSAACopyDepthPipeline> msaa_copy_depth_pipelines;
     std::vector<BlitMSAAPipelineKey> blit_msaa_color_keys;
     std::vector<vk::Pipeline> blit_msaa_color_pipelines;
     std::vector<VkRenderPass> blit_depth_keys;
@@ -301,10 +326,17 @@ private:
     std::vector<vk::Pipeline> blit_msaa_depth_pipelines;
     std::vector<BlitMSAAPipelineKey> blit_msaa_depth_stencil_keys;
     std::vector<vk::Pipeline> blit_msaa_depth_stencil_pipelines;
-    std::vector<VkRenderPass> resolve_depth_keys;
-    std::vector<vk::Pipeline> resolve_depth_pipelines;
-    std::vector<VkRenderPass> resolve_depth_stencil_keys;
-    std::vector<vk::Pipeline> resolve_depth_stencil_pipelines;
+    struct ResolveDepthStencilPipeline {
+        VkRenderPass renderpass;
+        ResolveDepthStencilMode mode;
+        vk::Pipeline pipeline;
+    };
+    std::vector<ResolveDepthStencilPipeline> resolve_depth_stencil_pipelines;
+    struct ResolveFramebuffer {
+        u64 tick;
+        vk::Framebuffer framebuffer;
+    };
+    std::deque<ResolveFramebuffer> resolve_framebuffers;
     struct MSAACopyResources {
         u64 tick;
         vk::ImageView src_view;

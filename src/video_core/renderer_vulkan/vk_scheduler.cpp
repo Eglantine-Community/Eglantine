@@ -287,7 +287,6 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
     num_renderpass_images = framebuffer->NumImages();
     renderpass_images = framebuffer->Images();
     renderpass_image_ranges = framebuffer->ImageRanges();
-    framebuffer->MarkResolveShadowsUpToDate();
 }
 
 void Scheduler::RealizeDeferredClear() {
@@ -309,14 +308,9 @@ void Scheduler::RealizeDeferredClear() {
     if (base.depth_format != VideoCore::Surface::PixelFormat::Invalid) {
         clear_values[count++] = dc.depth_stencil_value;
     }
-    const u32 color_discard_mask =
-        dc.framebuffer->DiscardsMsaaColor() ? dc.color_clear_mask : 0u;
-    const bool depth_stencil_discard =
-        dc.depth_stencil && dc.framebuffer->DiscardsMsaaDepthStencil();
-    const VkRenderPass renderpass = dc.framebuffer->RenderPassVariant(
-        dc.color_clear_mask, dc.depth_stencil, color_discard_mask, depth_stencil_discard);
     EndRenderPass();
-    BeginRenderPassImpl(dc.framebuffer, renderpass, clear_values.data(), count);
+    BeginRenderPassImpl(dc.framebuffer, dc.framebuffer->RenderPassVariant(dc.color_clear_mask, dc.depth_stencil),
+                        clear_values.data(), count);
 }
 
 bool Scheduler::DeferColorClear(const Framebuffer* framebuffer, u32 rt_slot,
@@ -587,6 +581,8 @@ void Scheduler::EndPendingOperations() {
     // and resetting here would drop the samples counted so far (the report then reads too low).
     query_cache->CounterClose(VideoCommon::QueryType::ZPassPixelCount64);
     EndRenderPass();
+    // A predicate may have been resumed outside a pass. It must end before vkEndCommandBuffer.
+    query_cache->NotifySegment(false);
 }
 
 void Scheduler::EndRenderPass()

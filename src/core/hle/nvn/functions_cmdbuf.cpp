@@ -321,12 +321,18 @@ void nvnCommandBufferBarrier(Call& c) {
 
 // ---- Draws and dispatches -----------------------------------------------------------------------
 
+u32 DirectDrawCount(s32 count, s32 instances = 1) {
+    // The guest's counts are signed. Record an empty draw when either count is nonpositive
+    // so the replay does not interpret the instance count as an ordinary single-instance draw.
+    return count > 0 && instances > 0 ? static_cast<u32>(count) : 0;
+}
+
 void nvnCommandBufferDrawArrays(Call& c) {
     const u64 cmd = c.args.NextPointer();
     const u32 mode = c.args.NextU32();
     const s32 first = c.args.NextS32();
-    const u32 count = c.args.NextU32();
-    c.rec.DrawArrays(cmd, mode, first, count, 1, 0);
+    const s32 count = c.args.NextS32();
+    c.rec.DrawArrays(cmd, mode, first, DirectDrawCount(count), 1, 0);
 }
 
 /// (cmd, mode, first, count, base instance, instance count)
@@ -334,10 +340,11 @@ void nvnCommandBufferDrawArraysInstanced(Call& c) {
     const u64 cmd = c.args.NextPointer();
     const u32 mode = c.args.NextU32();
     const s32 first = c.args.NextS32();
-    const u32 count = c.args.NextU32();
+    const s32 count = c.args.NextS32();
     const u32 base_instance = c.args.NextU32();
-    const u32 instances = c.args.NextU32();
-    c.rec.DrawArrays(cmd, mode, first, count, instances, base_instance);
+    const s32 instances = c.args.NextS32();
+    c.rec.DrawArrays(cmd, mode, first, DirectDrawCount(count, instances),
+                     static_cast<u32>(instances), base_instance);
 }
 
 void nvnCommandBufferDrawArraysIndirect(Call& c) {
@@ -350,17 +357,18 @@ void nvnCommandBufferDrawElements(Call& c) {
     const u64 cmd = c.args.NextPointer();
     const u32 mode = c.args.NextU32();
     const u32 index_type = c.args.NextU32();
-    const u32 count = c.args.NextU32();
-    c.rec.DrawElements(cmd, mode, index_type, count, c.args.NextU64(), 0, 0, 1);
+    const s32 count = c.args.NextS32();
+    c.rec.DrawElements(cmd, mode, index_type, DirectDrawCount(count), c.args.NextU64(), 0, 0, 1);
 }
 
 void nvnCommandBufferDrawElementsBaseVertex(Call& c) {
     const u64 cmd = c.args.NextPointer();
     const u32 mode = c.args.NextU32();
     const u32 index_type = c.args.NextU32();
-    const u32 count = c.args.NextU32();
+    const s32 count = c.args.NextS32();
     const u64 indices = c.args.NextU64();
-    c.rec.DrawElements(cmd, mode, index_type, count, indices, c.args.NextS32(), 0, 1);
+    c.rec.DrawElements(cmd, mode, index_type, DirectDrawCount(count), indices, c.args.NextS32(), 0,
+                       1);
 }
 
 /// (cmd, mode, index type, count, index address, base vertex, base instance, instance count)
@@ -368,13 +376,13 @@ void nvnCommandBufferDrawElementsInstanced(Call& c) {
     const u64 cmd = c.args.NextPointer();
     const u32 mode = c.args.NextU32();
     const u32 index_type = c.args.NextU32();
-    const u32 count = c.args.NextU32();
+    const s32 count = c.args.NextS32();
     const u64 indices = c.args.NextU64();
     const s32 base_vertex = c.args.NextS32();
     const u32 base_instance = c.args.NextU32();
-    const u32 instances = c.args.NextU32();
-    c.rec.DrawElements(cmd, mode, index_type, count, indices, base_vertex, base_instance,
-                       instances);
+    const s32 instances = c.args.NextS32();
+    c.rec.DrawElements(cmd, mode, index_type, DirectDrawCount(count, instances), indices,
+                       base_vertex, base_instance, static_cast<u32>(instances));
 }
 
 void nvnCommandBufferDrawElementsIndirect(Call& c) {

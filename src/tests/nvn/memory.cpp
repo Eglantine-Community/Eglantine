@@ -18,6 +18,7 @@
 #include <mutex>
 #include <random>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -27,6 +28,7 @@
 #include "common/cityhash.h"
 #include "common/diag_image.h"
 #include "common/game_presets.h"
+#include "common/host_memory.h"
 #include "common/literals.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -34,6 +36,7 @@
 #include "video_core/nvn/guest_memory.h"
 #include "video_core/nvn/record.h"
 #include "video_core/nvn/sink.h"
+#include "video_core/renderer_vulkan/nvn/nvn_astc_gpu.h"
 #include "video_core/renderer_vulkan/nvn/nvn_context.h"
 #include "video_core/renderer_vulkan/nvn/nvn_draw_resources.h"
 #include "video_core/renderer_vulkan/nvn/nvn_format.h"
@@ -564,11 +567,15 @@ struct Rig {
                  std::optional<u64> trim_age_presents = {}, std::optional<bool> trim_legacy = {},
                  std::optional<bool> vma_device_strict = {},
                  std::unique_ptr<Nvn::PresentTarget> target = {},
-                 std::optional<u64> sparse_device_budget = {})
+                 std::optional<u64> sparse_device_budget = {},
+                 std::optional<bool> gpu_sparse_wait = {},
+                 std::optional<bool> sparse_astc_bc3 = {})
         : context(*vulkan.device, vulkan.submit_mutex, std::move(target),
                   {.allow_host_import = allow_import,
                    .storage_cache_budget_bytes = storage_cache_budget,
                    .sparse_device_budget_bytes = sparse_device_budget,
+                   .gpu_sparse_wait = gpu_sparse_wait,
+                   .sparse_astc_bc3 = sparse_astc_bc3,
                    .storage_trim_age_presents = trim_age_presents,
                    .storage_trim_legacy = trim_legacy,
                    .vma_device_strict = vma_device_strict}) {
@@ -732,6 +739,66 @@ public:
 
 } // Anonymous namespace
 
+TEST_CASE("NVN host import rejects unsupported external buffer capabilities",
+          "[nvn][host-import]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    const auto& device = *vulkan->device;
+    const Nvn::HostImporter importer{device, device.GetAllocator()};
+    if (!importer.Available()) {
+        SKIP("host import extension or entry point unavailable");
+    }
+    const auto query = reinterpret_cast<PFN_vkGetPhysicalDeviceExternalBufferProperties>(
+        vulkan->dld->vkGetInstanceProcAddr(*vulkan->instance,
+                                         "vkGetPhysicalDeviceExternalBufferProperties"));
+    REQUIRE(query != nullptr);
+    const VkBufferUsageFlags usage =
+        device.IsBufferDeviceAddressSupported() && device.IsShaderInt64Supported()
+            ? Nvn::POOL_BUFFER_USAGE_ADDRESSABLE
+            : Nvn::POOL_BUFFER_USAGE;
+    const VkPhysicalDeviceExternalBufferInfo info{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO,
+        .flags = 0,
+        .usage = usage,
+        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+    };
+    VkExternalBufferProperties capabilities{.sType = VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES};
+    query(device.GetPhysical(), &info, &capabilities);
+    const auto& external = capabilities.externalMemoryProperties;
+    if ((external.compatibleHandleTypes & info.handleType) != 0 &&
+        (external.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) != 0 &&
+        (external.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT) == 0) {
+        SKIP("this device supports the pool usage for host pointer import");
+    }
+
+    FakeMemory memory;
+    const auto alignment = importer.Alignment();
+    u8* const data = memory.Add(0x1000'0000, alignment, alignment);
+    std::string error;
+    SECTION("single buffer") {
+        Nvn::ImportedBuffer buffer;
+        CHECK(importer.Import(data, alignment, usage, buffer, error) ==
+              VK_ERROR_FEATURE_NOT_PRESENT);
+        CHECK_FALSE(buffer.buffer);
+    }
+    SECTION("chunk allocation") {
+        Nvn::ImportedChunk chunk;
+        CHECK(importer.ImportChunk(data, alignment, usage, chunk, error) ==
+              VK_ERROR_FEATURE_NOT_PRESENT);
+        CHECK_FALSE(chunk.memory);
+    }
+    SECTION("buffer within an imported chunk") {
+        Nvn::ImportedChunk chunk;
+        Vulkan::vk::Buffer buffer;
+        CHECK(importer.CreateBufferInChunk(chunk, 0, alignment, usage, buffer, error) ==
+              VK_ERROR_FEATURE_NOT_PRESENT);
+        CHECK_FALSE(buffer);
+    }
+    CHECK_FALSE(error.empty());
+}
+
 TEST_CASE("nvn memory: CPU writes to a texture's pool reach the image", "[nvn]") {
     auto vulkan = MakeHeadlessVulkan();
     if (!vulkan) {
@@ -774,6 +841,125 @@ TEST_CASE("nvn memory: CPU writes to a texture's pool reach the image", "[nvn]")
     WARN("[nvn] coherency (" << (allow_import ? "imported" : "mirror") << "): uploads="
                              << stats.uploads << " cpu_checks=" << stats.cpu_checks
                              << " cpu_changes=" << stats.cpu_changes);
+}
+
+TEST_CASE("nvn memory: an interior guest write refreshes only its texture shadow",
+          "[nvn][shadow-coherence]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    const bool mkw_title = GENERATE(false, true);
+    const bool gpu_initial = GENERATE(false, true);
+    CAPTURE(mkw_title, gpu_initial);
+    constexpr u32 SIZE = 128;
+    constexpr u64 BYTES = SIZE * SIZE * 4;
+    constexpr size_t OFFSET = BYTES / 2 + 2 * 64;
+
+    Rig rig{*vulkan, false};
+    rig.context.SetTitleId(mkw_title ? Settings::MarioKartWorldProgramId : 0x1234ULL);
+    rig.context.CreateTexture(MakeTexture(10, Rig::TEXTURE_POOL, 0, NVN_FORMAT_RGBA8, SIZE, SIZE));
+    rig.context.CreateTexture(
+        MakeTexture(11, Rig::TEXTURE_POOL, BYTES, NVN_FORMAT_RGBA8, SIZE, SIZE));
+
+    const Nvn::Storage reference = MakeStorage(NVN_FORMAT_RGBA8, SIZE, SIZE, 1,
+                                               PixelFormat::A8B8G8R8_UNORM,
+                                               VK_FORMAT_A8B8G8R8_UNORM_PACK32);
+    const std::vector<u8> initial = Gradient(SIZE, SIZE, 1);
+    const std::vector<u8> neighbor = Gradient(SIZE, SIZE, 9);
+    const std::vector<u8> guest = SwizzleLevel0(reference, initial, 4, SIZE, SIZE);
+    const std::vector<u8> neighbor_guest = SwizzleLevel0(reference, neighbor, 4, SIZE, SIZE);
+    REQUIRE(guest.size() == BYTES);
+    REQUIRE(neighbor_guest.size() == BYTES);
+    std::memcpy(rig.texture_bytes, guest.data(), guest.size());
+    std::memcpy(rig.texture_bytes + BYTES, neighbor_guest.data(), neighbor_guest.size());
+
+    std::vector<u8> visible = initial;
+    if (gpu_initial) {
+        std::vector<u64> clear;
+        Push(clear, VC::Op::ClearTexture, ClearColor(10, SIZE, SIZE, 1.0f, 0.0f, 0.0f, 1.0f),
+             0xF);
+        Run(rig.context, rig.seq, std::move(clear));
+        visible = rig.Read(10, SIZE, SIZE);
+        REQUIRE(AllTexels(visible, 255, 0, 0, 255));
+    }
+    for (u32 frame = 0; frame < 24; ++frame) {
+        rig.PresentNothing(1);
+        REQUIRE(rig.Read(10, SIZE, SIZE) == visible);
+        REQUIRE(rig.Read(11, SIZE, SIZE) == neighbor);
+    }
+
+    // This one byte lies between the lines used by either legacy signature.
+    std::vector<u8> updated = guest;
+    updated[OFFSET] ^= 0xFF;
+    for (const bool batch : {false, true}) {
+        REQUIRE(Nvn::SampleGuestBytes(guest.data(), BYTES, batch) ==
+                Nvn::SampleGuestBytes(updated.data(), BYTES, batch));
+    }
+    std::vector<u8> expected(initial.size());
+    u32 tile_h = 0;
+    u32 tile_d = 0;
+    Nvn::TextureLevelTiles(reference.desc, 0, tile_h, tile_d);
+    Tegra::Texture::UnswizzleTexture(expected, updated, 4, SIZE, SIZE, 1, tile_h, tile_d, 0, true);
+    const auto mismatch = std::ranges::mismatch(expected, initial);
+    REQUIRE(mismatch.in1 != expected.cend());
+    const size_t linear_offset = static_cast<size_t>(mismatch.in1 - expected.cbegin());
+    REQUIRE(visible[linear_offset] != expected[linear_offset]);
+    rig.texture_bytes[OFFSET] = updated[OFFSET]; // no notification and no tracking
+    const u64 changes = rig.context.Stats().cpu_changes;
+    const std::vector<u8> readback = rig.Read(10, SIZE, SIZE);
+    REQUIRE(readback[linear_offset] == expected[linear_offset]);
+    if (!gpu_initial) {
+        REQUIRE(std::ranges::equal(readback, expected));
+    }
+    REQUIRE(rig.Read(11, SIZE, SIZE) == neighbor);
+    CHECK(rig.context.Stats().cpu_changes == changes + 1);
+    CHECK(rig.context.Stats().ops_failed == 0);
+}
+
+TEST_CASE("nvn memory: a GPU clear orders guest writes before the first readback",
+          "[nvn][shadow-coherence]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    constexpr u32 SIZE = 128;
+    constexpr size_t TEXEL = (2 * SIZE) * 4;
+
+    Rig rig{*vulkan, false};
+    rig.context.CreateTexture(MakeTexture(10, Rig::TEXTURE_POOL, 0, NVN_FORMAT_RGBA8, SIZE, SIZE));
+    const Nvn::Storage reference = MakeStorage(NVN_FORMAT_RGBA8, SIZE, SIZE, 1,
+                                               PixelFormat::A8B8G8R8_UNORM,
+                                               VK_FORMAT_A8B8G8R8_UNORM_PACK32);
+    const auto store = [&](const std::vector<u8>& texels) {
+        const std::vector<u8> guest = SwizzleLevel0(reference, texels, 4, SIZE, SIZE);
+        std::memcpy(rig.texture_bytes, guest.data(), guest.size());
+    };
+    const auto clear_red = [&] {
+        std::vector<u64> list;
+        Push(list, VC::Op::ClearTexture, ClearColor(10, SIZE, SIZE, 1.0f, 0.0f, 0.0f, 1.0f),
+             0xF);
+        Run(rig.context, rig.seq, std::move(list));
+    };
+
+    const std::vector<u8> initial = Gradient(SIZE, SIZE, 1);
+    store(initial);
+    clear_red();
+    REQUIRE(AllTexels(rig.Read(10, SIZE, SIZE), 255, 0, 0, 255));
+
+    std::vector<u8> updated = initial;
+    updated[TEXEL] ^= 0xFF;
+    store(updated);
+    clear_red();
+    SECTION("only the guest store preceding the clear") {
+        CHECK(AllTexels(rig.Read(10, SIZE, SIZE), 255, 0, 0, 255));
+    }
+    SECTION("a second guest store follows the clear") {
+        const std::vector<u8> replacement = Gradient(SIZE, SIZE, 47);
+        store(replacement);
+        CHECK(std::ranges::equal(rig.Read(10, SIZE, SIZE), replacement));
+    }
+    CHECK(rig.context.Stats().ops_failed == 0);
 }
 
 TEST_CASE("nvn memory: WriteTexels-style writes replace what the GPU wrote", "[nvn]") {
@@ -1133,6 +1319,36 @@ TEST_CASE("nvn memory: an idle render target of guest bytes ages out and uploads
     REQUIRE(stats.ops_failed == 0);
 }
 
+TEST_CASE("nvn memory: new allocations do not postpone demotion of an idle live texture",
+          "[nvn]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    constexpr u32 SIZE = 64;
+    Rig rig{*vulkan, true, POOL_CPU_CACHED, 40_KiB, 0, false};
+    Nvn::Storage reference = MakeStorage(NVN_FORMAT_RGBA8, SIZE, SIZE, 1,
+                                         PixelFormat::A8B8G8R8_UNORM,
+                                         VK_FORMAT_A8B8G8R8_UNORM_PACK32);
+    const auto texels = Gradient(SIZE, SIZE, 7);
+    const auto guest = SwizzleLevel0(reference, texels, 4, SIZE, SIZE);
+    std::memcpy(rig.texture_bytes, guest.data(), guest.size());
+    rig.context.CreateTexture(MakeTexture(10, Rig::TEXTURE_POOL, 0, NVN_FORMAT_RGBA8, SIZE, SIZE));
+    REQUIRE(rig.Read(10, SIZE, SIZE) == texels);
+    rig.PresentNothing(181);
+
+    // These two render targets have no other copies. The age of texture 10 makes it the
+    // reclaimable image, but only a present pass may demote a live texture.
+    rig.Paint(11, 256_KiB, SIZE, SIZE, 0.0f, 1.0f, 0.0f);
+    rig.Paint(12, 512_KiB, SIZE, SIZE, 0.0f, 0.0f, 1.0f);
+    REQUIRE(rig.context.Stats().storage_cache_bytes == 48_KiB);
+    rig.PresentNothing(2);
+    REQUIRE(rig.context.Stats().storage_cache_bytes == 32_KiB);
+    REQUIRE(rig.context.Stats().storages_evicted == 1);
+    REQUIRE(rig.Read(10, SIZE, SIZE) == texels);
+    REQUIRE(rig.context.Stats().ops_failed == 0);
+}
+
 TEST_CASE("nvn memory: an idle GPU-written render target ages out only when it was replaced",
           "[nvn]") {
     auto vulkan = MakeHeadlessVulkan();
@@ -1289,7 +1505,6 @@ TEST_CASE("nvn memory: overlapping textures of other layouts exchange contents t
     if (!vulkan) {
         SKIP("no Vulkan device");
     }
-    const bool can_transfer = Nvn::AliasTransferGpu::Supported(*vulkan->device);
     Rig rig{*vulkan, true};
     rig.context.CreateTexture(MakeTexture(10, Rig::TEXTURE_POOL, 0, NVN_FORMAT_RGBA8, 64, 64));
     rig.context.CreateTexture(MakeTexture(11, Rig::TEXTURE_POOL, 0, NVN_FORMAT_RGBA8, 32, 64));
@@ -1298,16 +1513,14 @@ TEST_CASE("nvn memory: overlapping textures of other layouts exchange contents t
     Run(rig.context, rig.seq, std::move(list));
     const std::vector<u8> seen = rig.Read(11, 32, 64);
     const Nvn::ContextStats stats = rig.context.Stats();
-    REQUIRE(stats.alias_unsupported == (can_transfer ? 0u : 1u));
-    REQUIRE(stats.alias_byte_transfers == (can_transfer ? 1u : 0u));
-    if (can_transfer) {
-        // Every byte of the smaller texture lies in the white one's bytes, whatever the layouts.
-        CHECK(std::ranges::all_of(seen, [](u8 byte) { return byte == 0xFF; }));
-    }
+    REQUIRE(stats.alias_unsupported == 0);
+    REQUIRE(stats.alias_byte_transfers == 1);
+    // Every byte of the smaller texture lies in the white one's bytes, whatever the layouts.
+    CHECK(std::ranges::all_of(seen, [](u8 byte) { return byte == 0xFF; }));
     // Reading again is not another event for the same pair.
     rig.Read(11, 32, 64);
-    REQUIRE(rig.context.Stats().alias_unsupported == (can_transfer ? 0u : 1u));
-    REQUIRE(rig.context.Stats().alias_byte_transfers == (can_transfer ? 1u : 0u));
+    REQUIRE(rig.context.Stats().alias_unsupported == 0);
+    REQUIRE(rig.context.Stats().alias_byte_transfers == 1);
 }
 
 TEST_CASE("nvn memory: a texture reads another shape's texels at the byte offsets its own layout "
@@ -1316,9 +1529,6 @@ TEST_CASE("nvn memory: a texture reads another shape's texels at the byte offset
     auto vulkan = MakeHeadlessVulkan();
     if (!vulkan) {
         SKIP("no Vulkan device");
-    }
-    if (!Nvn::AliasTransferGpu::Supported(*vulkan->device)) {
-        SKIP("no alias transfer shader on this device");
     }
     struct Shape {
         u32 width;
@@ -1471,15 +1681,56 @@ TEST_CASE("nvn memory: a texture in a virtual pool reads the mapped bytes", "[nv
     REQUIRE(rig.context.Stats().pools_unsupported == 0);
 }
 
-TEST_CASE("nvn memory: a large sparse texture is bound and uploaded tile by tile", "[nvn][mkw]") {
+TEST_CASE("Sparse images respect nonresident access guarantees and image limits",
+          "[nvn][sparse][sparse-image-support]") {
+    const auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    const auto& device = *vulkan->device;
+    const auto props = device.GetPhysical().GetProperties();
+    const char* option = std::getenv("EDEN_NX2_SPARSE_UNBACKED");
+    const bool strict = device.IsSparseBindingSupported() &&
+                        props.sparseProperties.residencyNonResidentStrict &&
+                        (!option || *option != '0');
+    CAPTURE(strict);
+    CHECK(device.CanUseUnbackedSparseImages() == strict);
+    CHECK_FALSE(device.IsSparseResidencyImageSupported(VK_IMAGE_TYPE_1D));
+    CHECK_FALSE(device.IsSparseResidencyImageSupported(VK_IMAGE_TYPE_3D, VK_SAMPLE_COUNT_4_BIT));
+    CHECK_FALSE(device.IsSparseResidencyImageSupported(VK_IMAGE_TYPE_2D, VK_SAMPLE_COUNT_64_BIT));
+    Vulkan::MemoryAllocator allocator{device};
+    VkImageCreateInfo ci{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = VK_FORMAT_R8_UNORM,
+        .extent = {256, 256, 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    if (!strict || !device.IsSparseResidencyImage2DSupported()) {
+        CHECK_FALSE(allocator.CreateUnbackedImage(ci));
+        CHECK(allocator.CreateImage(ci));
+    }
+    ci.arrayLayers = props.limits.maxImageArrayLayers + 1;
+    CHECK_FALSE(allocator.CreateUnbackedImage(ci));
+    ci.arrayLayers = 1;
+    ci.tiling = VK_IMAGE_TILING_LINEAR;
+    CHECK_FALSE(allocator.CreateUnbackedImage(ci));
+}
+
+TEST_CASE("nvn memory: a large sparse texture preserves its mapped tiles",
+          "[nvn][mkw][sparse][sparse-image-support]") {
     auto vulkan = MakeHeadlessVulkan();
     if (!vulkan) {
         SKIP("no Vulkan device");
     }
-    if (!vulkan->device->IsSparseResidencyImageSupported(VK_IMAGE_TYPE_2D) ||
-        !vulkan->device->CanUseUnbackedSparseImages()) {
-        SKIP("no sparse residency images");
-    }
+    const bool native_sparse = vulkan->device->IsSparseResidencyImageSupported(VK_IMAGE_TYPE_2D) &&
+                               vulkan->device->CanUseUnbackedSparseImages();
     constexpr u64 PHYSICAL_POOL = 5;
     constexpr u64 VIRTUAL_POOL = 6;
     constexpr u64 PHYSICAL_VA = 0x3000'0000;
@@ -1489,7 +1740,10 @@ TEST_CASE("nvn memory: a large sparse texture is bound and uploaded tile by tile
     constexpr u32 HEIGHT = 2048;
     constexpr u64 TILE = 0x10000;
     const bool mario_kart_world = GENERATE(false, true);
-    Rig rig{*vulkan, true};
+    const bool tight_budget = GENERATE(false, true);
+    CAPTURE(tight_budget);
+    const std::optional<u64> budget = tight_budget ? std::optional{2 * TILE} : std::nullopt;
+    Rig rig{*vulkan, true, POOL_CPU_CACHED, {}, {}, {}, {}, {}, budget};
     rig.context.SetTitleId(mario_kart_world ? Settings::MarioKartWorldProgramId
                                             : Settings::OcarinaOfTimeProgramId);
     u8* physical = rig.memory.Add(PHYSICAL_VA, 1_MiB);
@@ -1544,16 +1798,42 @@ TEST_CASE("nvn memory: a large sparse texture is bound and uploaded tile by tile
     REQUIRE(read_tile(5, 0) == std::vector<u8>(256 * 256, 0));
     Nvn::ContextStats stats = rig.context.Stats();
     CHECK(stats.pools_unsupported == 0);
+    if (!native_sparse) {
+        REQUIRE(stats.virtual_sparse_binds == 0);
+    }
+    // Some devices support sparse 2D images but cannot bind this particular image shape.
+    if (stats.virtual_sparse_binds == 0) {
+        rig.context.MapVirtual(VIRTUAL_POOL, {{0, PHYSICAL_POOL, 0x30000, TILE}});
+        REQUIRE(read_tile(0, 0) == c);
+        rig.context.MapVirtual(VIRTUAL_POOL, {{0, 0, 0, TILE}});
+        REQUIRE(read_tile(0, 0) == std::vector<u8>(TILE, 0));
+        REQUIRE(read_tile(1, 1) == b);
+        CHECK(rig.context.Stats().ops_failed == 0);
+        return;
+    }
     CHECK(stats.virtual_sparse_binds >= 2);
     // Two tiles were uploaded, not the 8 MiB of the storage.
     CHECK(stats.uploads == 2);
     CHECK(stats.upload_bytes == 2 * TILE);
 
-    // An unrelated buffer flush need not search the sparse atlas mappings on MKW.
+    if (tight_budget) {
+        const std::vector<u8> unbound(TILE, 0);
+        rig.context.MapVirtual(VIRTUAL_POOL, {{2 * TILE, PHYSICAL_POOL, 0x30000, TILE}});
+        CHECK(read_tile(2, 0) == unbound);
+        CHECK(read_tile(0, 0) == a);
+        CHECK(read_tile(1, 1) == b);
+        rig.context.MapVirtual(VIRTUAL_POOL, {{17 * TILE, 0, 0, TILE}});
+        CHECK(read_tile(1, 1) == unbound);
+        CHECK(read_tile(2, 0) == c);
+        CHECK(read_tile(0, 0) == a);
+        return;
+    }
+
+    // An unrelated buffer flush does not visit the atlas mappings.
     u64 checks = stats.sparse_write_pool_checks;
     rig.context.NotifyCpuWrite(Rig::BUFFER_POOL_VA, TILE);
     Run(rig.context, rig.seq, {});
-    CHECK(rig.context.Stats().sparse_write_pool_checks == checks + (mario_kart_world ? 0 : 1));
+    CHECK(rig.context.Stats().sparse_write_pool_checks == checks);
 
     // Mapping the same bytes again changes nothing: nothing is uploaded.
     rig.context.MapVirtual(VIRTUAL_POOL, {{0, PHYSICAL_POOL, 0x10000, TILE}});
@@ -1581,7 +1861,7 @@ TEST_CASE("nvn memory: a large sparse texture is bound and uploaded tile by tile
     REQUIRE(read_tile(0, 0) == c);
     CHECK(rig.context.Stats().uploads == 4);
 
-    // Another pool object maps the same physical bytes. MKW keeps the resident texels.
+    // A different pool object mapping the same physical bytes keeps the resident texels.
     constexpr u64 ALIAS_POOL = 7;
     rig.context.CreatePool({.serial = ALIAS_POOL,
                             .guest_address = PHYSICAL_VA + 0x30000,
@@ -1589,7 +1869,7 @@ TEST_CASE("nvn memory: a large sparse texture is bound and uploaded tile by tile
                             .flags = POOL_CPU_CACHED});
     rig.context.MapVirtual(VIRTUAL_POOL, {{0, ALIAS_POOL, 0, TILE}});
     REQUIRE(read_tile(0, 0) == c);
-    CHECK(rig.context.Stats().uploads == (mario_kart_world ? 4u : 5u));
+    CHECK(rig.context.Stats().uploads == 4u);
 
     // The cached physical users must follow a remap to another pool object.
     put_tile(0x30000, a);
@@ -1598,7 +1878,7 @@ TEST_CASE("nvn memory: a large sparse texture is bound and uploaded tile by tile
     checks = rig.context.Stats().sparse_write_pool_checks;
     rig.context.NotifyCpuWrite(PHYSICAL_VA + 0x10000, TILE);
     Run(rig.context, rig.seq, {});
-    CHECK(rig.context.Stats().sparse_write_pool_checks == checks + (mario_kart_world ? 0 : 1));
+    CHECK(rig.context.Stats().sparse_write_pool_checks == checks);
 
     // Add a sparse texture after its pool is mapped and the lookup is already populated.
     constexpr u64 SECOND_VIRTUAL_POOL = 8;
@@ -1631,7 +1911,7 @@ TEST_CASE("nvn memory: a large sparse texture is bound and uploaded tile by tile
     CHECK(rig.context.Stats().sparse_write_pool_checks == checks + 1);
 }
 
-TEST_CASE("MKW sparse row binds preserve distinct neighboring tiles", "[nvn][mkw][sparse]") {
+TEST_CASE("NVN sparse row unbinds preserve distinct neighboring tiles", "[nvn][sparse]") {
     auto vulkan = MakeHeadlessVulkan();
     if (!vulkan || !vulkan->device->IsSparseResidencyImageSupported(VK_IMAGE_TYPE_2D) ||
         !vulkan->device->CanUseUnbackedSparseImages()) {
@@ -1643,8 +1923,16 @@ TEST_CASE("MKW sparse row binds preserve distinct neighboring tiles", "[nvn][mkw
     constexpr u64 VIRTUAL_VA = 0x7D00'0000'0000'0000ULL;
     constexpr u32 SIZE = 256;
     constexpr u64 TILE = 64_KiB;
-    Rig rig{*vulkan, true};
-    rig.context.SetTitleId(Settings::MarioKartWorldProgramId);
+    const bool mario_kart_world = GENERATE(false, true);
+    const bool gpu_wait = GENERATE(false, true);
+    CAPTURE(mario_kart_world, gpu_wait);
+    const bool timeline = vulkan->device->HasTimelineSemaphore();
+    const char* queued_residency_env = std::getenv("EDEN_NX2_NVN_GPU_SPARSE_NO_UPLOAD");
+    const bool queued_residency =
+        timeline && (gpu_wait || (queued_residency_env && queued_residency_env[0] == '1'));
+    const u64 queued_binds = timeline && gpu_wait ? 1 : 0;
+    Rig rig{*vulkan, true, POOL_CPU_CACHED, {}, {}, {}, {}, {}, {}, gpu_wait};
+    rig.context.SetTitleId(mario_kart_world ? Settings::MarioKartWorldProgramId : 0x1234);
     u8* physical = rig.memory.Add(PHYSICAL_VA, 4 * TILE);
     rig.context.CreatePool({.serial = PHYSICAL_POOL,
                             .guest_address = PHYSICAL_VA,
@@ -1682,19 +1970,34 @@ TEST_CASE("MKW sparse row binds preserve distinct neighboring tiles", "[nvn][mkw
     for (u32 tile = 0; tile < 3; ++tile) {
         CHECK(read(tile) == texels[tile]);
     }
-    CHECK(rig.context.Stats().virtual_sparse_binds == 1);
-    // A hole inside the compacted run must not unbind either neighbor.
+    CHECK(rig.context.Stats().virtual_sparse_binds == 3);
+    CHECK(rig.context.Stats().virtual_sparse_queued_batches == queued_binds);
+    // A hole inside the bound row must not unbind either neighbor.
     rig.context.MapVirtual(VIRTUAL_POOL, {{TILE, 0, 0, TILE}});
     CHECK(read(1) == std::vector<u8>(TILE, 0));
     CHECK(read(0) == texels[0]);
     CHECK(read(2) == texels[2]);
+    CHECK(rig.context.Stats().virtual_sparse_queued_batches == queued_binds + queued_residency);
     rig.context.MapVirtual(VIRTUAL_POOL, {{TILE, PHYSICAL_POOL, 3 * TILE, TILE}});
     CHECK(read(1) == texels[3]);
     CHECK(read(2) == texels[2]);
-    rig.context.MapVirtual(VIRTUAL_POOL, {{0, 0, 0, 3 * TILE}});
-    for (u32 tile = 0; tile < 3; ++tile) {
+    CHECK(rig.context.Stats().virtual_sparse_queued_batches ==
+          2 * queued_binds + queued_residency);
+    // Mapping a clean alias needs only a bind when the device supports shared sparse pages.
+    rig.context.MapVirtual(VIRTUAL_POOL, {{3 * TILE, PHYSICAL_POOL, 0, TILE}});
+    CHECK(read(3) == texels[0]);
+    const char* share_env = std::getenv("EDEN_NX2_NVN_SPARSE_SHARE");
+    const bool shared = vulkan->device->IsSparseResidencyAliasedSupported() &&
+                        (!share_env || share_env[0] != '0');
+    const u64 queued_alias = shared ? queued_residency : queued_binds;
+    CHECK(rig.context.Stats().virtual_sparse_queued_batches ==
+          2 * queued_binds + queued_residency + queued_alias);
+    const u64 before_unbind = rig.context.Stats().virtual_sparse_binds;
+    rig.context.MapVirtual(VIRTUAL_POOL, {{0, 0, 0, 4 * TILE}});
+    for (u32 tile = 0; tile < 4; ++tile) {
         CHECK(read(tile) == std::vector<u8>(TILE, 0));
     }
+    CHECK(rig.context.Stats().virtual_sparse_binds == before_unbind + 1);
     // Refill after reclaiming whole blocks, including allocation slots returned to VMA.
     std::vector<VC::VirtualMapping> burst;
     constexpr u32 BURST_TILES = 384;
@@ -1759,9 +2062,8 @@ TEST_CASE("MKW BC3: large atlas residency fits a constrained device heap",
     INFO("device budget MiB " << (budget >> 20));
     Nvn::Context::Impl impl(*vulkan->device, vulkan->submit_mutex, nullptr,
                             {.background_backing = false, .vma_device_strict = true});
-    impl.mario_kart_world = true;
     impl.astc_standin = Nvn::AstcStandin::Bc3;
-    REQUIRE(impl.MkwBc3AtlasSupported());
+    REQUIRE(impl.Astc8x8StandinSupported());
     // Leave 4 GiB occupied by other device-local resources while binding the atlas.
     std::vector<Vulkan::vk::Buffer> pressure;
     for (u32 i = 0; i < 4; ++i) {
@@ -1808,8 +2110,8 @@ TEST_CASE("MKW BC3: large atlas residency fits a constrained device heap",
     REQUIRE(sparse.Prepare(impl, storage, uploads));
     CHECK(sparse.StarvedUnits() == 0);
     CHECK(uploads.tiles.size() == RESIDENT_TILES);
-    // BC3 uses 2x2 host blocks per guest tile; each contiguous host row is one bind.
-    CHECK(impl.stats.virtual_sparse_binds.load() - tail_binds == u64{RESIDENT_TILES} * 2);
+    // BC3 uses 2x2 host blocks per guest tile, with one bind per host block.
+    CHECK(impl.stats.virtual_sparse_binds.load() - tail_binds == u64{RESIDENT_TILES} * 4);
     CHECK(sparse.BoundBytes() == tail_backing + u64{RESIDENT_TILES} * 256_KiB);
     CHECK(sparse.BoundBytes() < budget / 5 * 2);
     VmaTotalStatistics allocations{};
@@ -2011,7 +2313,9 @@ TEST_CASE("nvn memory: compressed textures upload and copy without unsupported o
         SKIP("no Vulkan device");
     }
     constexpr u32 SIZE = 16;
-    Rig rig{*vulkan, true};
+    // This test checks the CPU decode byte counter. Keep this small source in a mirrored
+    // pool so the GPU decoder cannot read it directly through imported host memory.
+    Rig rig{*vulkan, false};
     Nvn::Storage reference = MakeStorage(NVN_FORMAT_ASTC_4X4, SIZE, SIZE, 1,
                                          PixelFormat::ASTC_2D_4X4_UNORM,
                                          VK_FORMAT_A8B8G8R8_UNORM_PACK32, true);
@@ -2046,26 +2350,24 @@ TEST_CASE("nvn memory: compressed textures upload and copy without unsupported o
     }
 }
 
-TEST_CASE("nvn memory: MKW copies decoded ASTC 8x8 texels between UNORM and sRGB", "[nvn][mkw]") {
+TEST_CASE("nvn memory: ASTC copies between UNORM and sRGB preserve block geometry",
+          "[nvn][astc-copy]") {
     auto vulkan = MakeHeadlessVulkan();
     if (!vulkan) {
         SKIP("no Vulkan device");
     }
-    if (vulkan->device->IsOptimalAstcSupported()) {
-        SKIP("this exercises the decoded ASTC path");
-    }
-    const bool mario_kart_world = GENERATE(false, true);
+    const auto standin = GENERATE(Settings::AstcRecompression::Uncompressed,
+                                  Settings::AstcRecompression::Bc3);
     constexpr u32 SIZE = 16;
     constexpr s32 ASTC_8X8 = 0x80;
     constexpr s32 ASTC_8X8_SRGB = 0x8e;
-    // Match the host-format override installed by the frontend for VTX-HLE.
-    Settings::SetAstcRecompressionOverride(Settings::AstcRecompression::Uncompressed);
+    const auto saved_standin = Settings::values.astc_recompression.GetValue();
     SCOPE_EXIT {
-        Settings::SetAstcRecompressionOverride(std::nullopt);
+        Settings::values.astc_recompression.SetValue(saved_standin);
     };
+    Settings::values.astc_recompression.SetValue(standin);
     Rig rig{*vulkan, true};
-    rig.context.SetTitleId(mario_kart_world ? Settings::MarioKartWorldProgramId
-                                            : Settings::OcarinaOfTimeProgramId);
+    rig.context.SetTitleId(Settings::OcarinaOfTimeProgramId);
     const Nvn::Storage reference =
         MakeStorage(ASTC_8X8, SIZE, SIZE, 1, PixelFormat::ASTC_2D_8X8_UNORM,
                     VK_FORMAT_A8B8G8R8_UNORM_PACK32, true);
@@ -2089,7 +2391,34 @@ TEST_CASE("nvn memory: MKW copies decoded ASTC 8x8 texels between UNORM and sRGB
          });
     Run(rig.context, rig.seq, std::move(list));
     CHECK(rig.context.Stats().ops_failed == 0);
-    CHECK(rig.context.Stats().ops_unsupported == (mario_kart_world ? 0u : 1u));
+    CHECK(rig.context.Stats().ops_unsupported == 0);
+    if (!vulkan->device->IsOptimalAstcSupported()) {
+        const u64 backing_bytes = rig.context.Stats().storage_cache_bytes;
+        constexpr u64 BC3_BYTES = 2 * SIZE * SIZE;
+        constexpr u64 RGBA8_BYTES = BC3_BYTES * 4;
+        if (standin == Settings::AstcRecompression::Uncompressed ||
+            !vulkan->device->IsOptimalBcnSupported()) {
+            CHECK(backing_bytes == RGBA8_BYTES);
+        } else {
+            CHECK((backing_bytes == BC3_BYTES || backing_bytes == RGBA8_BYTES));
+        }
+    }
+
+    // Vulkan may see identical backing formats for different guest ASTC footprints. NVN
+    // cannot copy those blocks interchangeably.
+    rig.context.CreateTexture(
+        MakeTexture(12, Rig::TEXTURE_POOL, 0x80000, NVN_FORMAT_ASTC_4X4, SIZE, SIZE));
+    list.clear();
+    Push(list, VC::Op::CopyTextureToTexture,
+         VC::CopyTextureToTexturePayload{
+             .src = {.serial = 10},
+             .src_region = {0, 0, 0, SIZE, SIZE, 1},
+             .dst = {.serial = 12},
+             .dst_region = {0, 0, 0, SIZE, SIZE, 1},
+         });
+    Run(rig.context, rig.seq, std::move(list));
+    CHECK(rig.context.Stats().ops_failed == 0);
+    CHECK(rig.context.Stats().ops_unsupported == 1);
 }
 
 TEST_CASE("nvn memory: spills count device-local requests placed in host memory types", "[nvn]") {
@@ -2278,7 +2607,202 @@ private:
     u32 returned{};
 };
 
+void CheckSparseAstcBatches(bool fused, bool srgb) {
+    auto vulkan = MakeHeadlessVulkan();
+    const VkFormat bc3_format = srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK;
+    const VkFormat frame_format = srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+    if (!vulkan || vulkan->device->IsOptimalAstcSupported() ||
+        !vulkan->device->IsSparseResidencyImageSupported(VK_IMAGE_TYPE_2D) ||
+        !vulkan->device->CanUseUnbackedSparseImages() ||
+        !Nvn::AstcGpuDecoder::Supported(*vulkan->device) ||
+        !Nvn::BcGpuEncoder::Supported(*vulkan->device) ||
+        !vulkan->device->IsFormatSupported(bc3_format, VK_FORMAT_FEATURE_BLIT_SRC_BIT,
+                                           Vulkan::FormatType::Optimal) ||
+        !vulkan->device->IsFormatSupported(frame_format, VK_FORMAT_FEATURE_BLIT_DST_BIT,
+                                           Vulkan::FormatType::Optimal)) {
+        SKIP("no GPU ASTC decode, sparse BC3 stand-in, or BC3 blit source");
+    }
+    if (fused && !Nvn::AstcBc3::Supported(*vulkan->device)) {
+        SKIP("no fused ASTC to BC3 compute support");
+    }
+
+    constexpr u64 PHYSICAL_POOL = 5;
+    constexpr u64 VIRTUAL_POOL = 6;
+    constexpr u64 PHYSICAL_VA = 0x3000'0000;
+    constexpr u64 VIRTUAL_VA = 0x7D00'0000'0000'0000ULL;
+    constexpr u32 ATLAS_SIZE = 8192;
+    constexpr u32 TILE_WIDTH = 512;
+    constexpr u32 TILES_PER_ROW = ATLAS_SIZE / TILE_WIDTH;
+    constexpr u64 TILE_BYTES = 64_KiB;
+    // Each ASTC 8x8 tile decodes to 1 MiB. A 32 MiB batch holds 32 tiles, so five
+    // batches are needed to reuse both slots after the first batch's synchronous wait.
+    constexpr u32 TILES_PER_BATCH = 32;
+    constexpr u32 TILE_COUNT = 4 * TILES_PER_BATCH + 1;
+    constexpr u32 WARMUP_TILE = TILES_PER_ROW * TILES_PER_ROW - 1;
+    constexpr u64 WARMUP_OFFSET = TILE_COUNT * TILE_BYTES;
+    constexpr u32 PICTURE_SIZE = 16;
+    constexpr u32 CROP_OFFSET = 64;
+    constexpr u32 ASTC_BLOCK = 8;
+
+    const auto saved_filter = Settings::values.scaling_filter.GetValue();
+    const auto saved_standin = Settings::values.astc_recompression.GetValue();
+    SCOPE_EXIT {
+        Settings::values.scaling_filter.SetValue(saved_filter);
+        Settings::values.astc_recompression.SetValue(saved_standin);
+    };
+    Settings::values.scaling_filter.SetValue(Settings::ScalingFilter::NearestNeighbor);
+    Settings::values.astc_recompression.SetValue(Settings::AstcRecompression::Bc3);
+    auto target = std::make_unique<FilterReadbackTarget>(*vulkan, frame_format, PICTURE_SIZE,
+                                                         PICTURE_SIZE);
+    auto* readback = target.get();
+    Rig rig(*vulkan, true, POOL_CPU_CACHED, {}, {}, {}, {}, std::move(target), {}, {}, fused);
+    rig.context.SetTitleId(Settings::MarioKartWorldProgramId);
+    u8* physical = rig.memory.Add(PHYSICAL_VA, WARMUP_OFFSET + TILE_BYTES);
+    rig.context.CreatePool({.serial = PHYSICAL_POOL, .guest_address = PHYSICAL_VA,
+                            .size = WARMUP_OFFSET + TILE_BYTES, .flags = POOL_CPU_CACHED});
+    rig.context.CreatePool({.serial = VIRTUAL_POOL, .guest_address = VIRTUAL_VA,
+                            .size = 16_MiB, .flags = POOL_VIRTUAL});
+    auto desc = MakeTexture(10, VIRTUAL_POOL, 0, srgb ? 0x8e : 0x80, ATLAS_SIZE, ATLAS_SIZE);
+    desc.flags = 0x20;
+    rig.context.CreateTexture(desc);
+
+    const auto shape = Nvn::SparseTileShape({.target = desc.target,
+                                             .format = desc.format,
+                                             .flags = desc.flags,
+                                             .width = desc.width,
+                                             .height = desc.height,
+                                             .depth = desc.depth,
+                                             .levels = desc.levels},
+                                            desc.levels);
+    REQUIRE(shape);
+    REQUIRE(shape->tile_cols == TILE_WIDTH / ASTC_BLOCK);
+    REQUIRE(shape->tile_rows == TILE_WIDTH / ASTC_BLOCK);
+    using Color = std::array<u8, 4>;
+    std::vector<u8> linear(TILE_BYTES);
+    const auto fill_tile = [&](u64 offset, const Color& color) {
+        const auto block = VoidBlock(static_cast<u16>(color[0] * 257u),
+                                     static_cast<u16>(color[1] * 257u),
+                                     static_cast<u16>(color[2] * 257u),
+                                     static_cast<u16>(color[3] * 257u));
+        u8* const dst = fused ? linear.data() : physical + offset;
+        for (u64 at = 0; at < TILE_BYTES; at += block.size()) {
+            std::memcpy(dst + at, block.data(), block.size());
+        }
+        if (fused) {
+            // A transparent block in the crop's upper right distinguishes block order from
+            // the surrounding nonzero texels and checks all four channels.
+            const auto marker = VoidBlock(0, 0, 0, 0);
+            const u32 col = CROP_OFFSET / ASTC_BLOCK + 1;
+            const u32 row = CROP_OFFSET / ASTC_BLOCK;
+            std::memcpy(dst + (row * shape->tile_cols + col) * marker.size(), marker.data(),
+                        marker.size());
+            Tegra::Texture::SwizzleTexture({physical + offset, TILE_BYTES}, linear, block.size(),
+                                           shape->tile_cols, shape->tile_rows, 1, shape->tile_h, 0,
+                                           0, true);
+        }
+    };
+    const auto capture = [&](u32 tile) {
+        const s32 x = static_cast<s32>((tile % TILES_PER_ROW) * TILE_WIDTH + CROP_OFFSET);
+        const s32 y = static_cast<s32>((tile / TILES_PER_ROW) * TILE_WIDTH + CROP_OFFSET);
+        auto future = readback->Next();
+        rig.context.Present({.seq = ++rig.seq,
+                             .queue = 0,
+                             .texture_serial = 10,
+                             .present_interval = 1,
+                             .crop = {.x = x, .y = y, .width = PICTURE_SIZE, .height = PICTURE_SIZE}});
+        REQUIRE(future.wait_for(20s) == std::future_status::ready);
+        auto pixels = future.get();
+        REQUIRE(rig.context.Wait(rig.seq, 20s));
+        return pixels;
+    };
+
+    // The decoder pipeline starts asynchronously. Use a separate tile until one upload stages
+    // exactly the original compressed bytes, then leave it alone during the five measured batches.
+    fill_tile(WARMUP_OFFSET, {16, 0, 0, 255});
+    rig.context.MapVirtual(VIRTUAL_POOL,
+                           {{WARMUP_TILE * TILE_BYTES, PHYSICAL_POOL, WARMUP_OFFSET, TILE_BYTES}});
+    const auto decoder_deadline = std::chrono::steady_clock::now() + 5s;
+    bool decoder_ready = false;
+    u8 warmup_red = 16;
+    do {
+        const u64 before = rig.context.Stats().upload_bytes;
+        capture(WARMUP_TILE);
+        const auto stats = rig.context.Stats();
+        REQUIRE(stats.virtual_sparse_binds != 0);
+        decoder_ready = stats.upload_bytes - before == TILE_BYTES;
+        if (!decoder_ready) {
+            std::this_thread::sleep_for(25ms);
+            warmup_red = warmup_red == 16 ? 240 : 16;
+            fill_tile(WARMUP_OFFSET, {warmup_red, 0, 0, 255});
+            rig.context.NotifyCpuWrite(PHYSICAL_VA + WARMUP_OFFSET, TILE_BYTES);
+        }
+    } while (!decoder_ready && std::chrono::steady_clock::now() < decoder_deadline);
+    REQUIRE(decoder_ready);
+
+    constexpr std::array<u8, 5> colors{32, 80, 128, 176, 224};
+    const auto color_of = [&](u32 tile) -> Color {
+        const u8 red = colors[tile / TILES_PER_BATCH];
+        if (fused) {
+            return {red, static_cast<u8>(48 + tile % 11 * 16), 144,
+                    static_cast<u8>(32 + tile % 7 * 32)};
+        }
+        return {red, 0, 0, 255};
+    };
+    for (u32 tile = 0; tile < TILE_COUNT; ++tile) {
+        fill_tile(tile * TILE_BYTES, color_of(tile));
+    }
+    const auto before = rig.context.Stats();
+    rig.context.MapVirtual(VIRTUAL_POOL, {{0, PHYSICAL_POOL, 0, TILE_COUNT * TILE_BYTES}});
+    const auto check_tile = [&](u32 tile) {
+        CAPTURE(tile);
+        const auto pixels = capture(tile);
+        REQUIRE(pixels.size() == PICTURE_SIZE * PICTURE_SIZE * 4);
+        constexpr size_t background = (12 * PICTURE_SIZE + 4) * 4;
+        const Color color = color_of(tile);
+        CHECK(Close(pixels[background], color[0], 8));
+        CHECK(Close(pixels[background + 1], color[1], fused ? 8 : 1));
+        CHECK(Close(pixels[background + 2], color[2], fused ? 8 : 1));
+        if (fused) {
+            CHECK(Close(pixels[background + 3], color[3], 2));
+            constexpr size_t marker = (4 * PICTURE_SIZE + 12) * 4;
+            CHECK(std::all_of(pixels.begin() + marker, pixels.begin() + marker + 4,
+                              [](u8 value) { return Close(value, 0); }));
+        }
+    };
+    for (u32 batch = 0; batch < colors.size(); ++batch) {
+        CAPTURE(batch);
+        const u32 first = batch * TILES_PER_BATCH;
+        const u32 last = (std::min)(first + TILES_PER_BATCH, TILE_COUNT) - 1;
+        check_tile(first);
+        if (fused && last != first) {
+            check_tile(last);
+        }
+    }
+    const auto after = rig.context.Stats();
+    CHECK(after.sparse_astc_bc3_tiles - before.sparse_astc_bc3_tiles == (fused ? TILE_COUNT : 0));
+    CHECK(after.uploads - before.uploads == TILE_COUNT);
+    CHECK(after.upload_bytes - before.upload_bytes == TILE_COUNT * TILE_BYTES);
+    CHECK(after.ops_unsupported == 0);
+    CHECK(after.ops_failed == 0);
+}
+
 } // namespace
+
+TEST_CASE("NVN sparse ASTC uploads preserve tiles after reusing both staging slots",
+          "[nvn][mkw][.sparse-staging-overlap]") {
+    const char* overlap = std::getenv("EDEN_NX2_NVN_SPARSE_STAGING_OVERLAP");
+    if (!overlap || overlap[0] != '1') {
+        SKIP("run with EDEN_NX2_NVN_SPARSE_STAGING_OVERLAP=1");
+    }
+    CheckSparseAstcBatches(false, false);
+}
+
+TEST_CASE("NVN fused sparse ASTC to BC3 batches preserve tile order and RGBA",
+          "[nvn][mkw][sparse][sparse-astc-bc3]") {
+    const bool srgb = GENERATE(false, true);
+    CAPTURE(srgb);
+    CheckSparseAstcBatches(true, srgb);
+}
 
 TEST_CASE("nvn memory: cold hints, resource cleanup, and linux memory description",
           "[nvn][memory][cold-hint]") {
@@ -2419,6 +2943,74 @@ TEST_CASE("nvn memory: cold hints, resource cleanup, and linux memory descriptio
     }
 }
 
+TEST_CASE("NVN cold hinting resumes a span that exceeds its per-pass budget",
+          "[nvn][memory][cold-hint]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+
+    const auto previous_mode = Common::ColdHintModeInEffect();
+    Common::OverrideColdHintMode(Settings::ColdHintMode::Always);
+    SCOPE_EXIT {
+        Common::OverrideColdHintMode(previous_mode);
+    };
+
+    FakeMemory memory;
+    Nvn::Context::Impl impl(*vulkan->device, vulkan->submit_mutex, nullptr, {});
+    impl.guest.store(&memory, std::memory_order_release);
+    auto pool = std::make_shared<Nvn::Pool>();
+    constexpr u64 PoolAddress = 0x4000'0000;
+    pool->address = PoolAddress;
+    pool->size = 640_MiB;
+    pool->flags = POOL_CPU_NO_ACCESS;
+    pool->backing = Nvn::Pool::Backing::DeviceLocal;
+    impl.pools.emplace(1, pool);
+
+    using Hints = std::vector<std::pair<u64, u64>>;
+    impl.HintColdUploadedGuestRanges(0);
+    CHECK(memory.ColdHints() == Hints{{PoolAddress, 512_MiB}});
+    impl.HintColdUploadedGuestRanges(29);
+    CHECK(memory.ColdHints() == Hints{{PoolAddress, 512_MiB}});
+    impl.HintColdUploadedGuestRanges(30);
+    CHECK(memory.ColdHints() == Hints{{PoolAddress, 512_MiB}, {PoolAddress + 512_MiB, 128_MiB}});
+}
+
+TEST_CASE("NVN pending buffer writes invalidate only covered inline values",
+          "[nvn][memory]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    Nvn::Context::Impl impl(*vulkan->device, vulkan->submit_mutex, nullptr, {});
+    constexpr u64 Base = 0x5000'3ff8; // The first write is indexed in two blocks.
+    constexpr u64 Seq = 8;
+    std::array<u8, 32> bytes;
+    bytes.fill(0x71);
+    impl.NoteFlushedInlinePoolWrite(Base, bytes.data(), bytes.size(), Seq);
+    impl.NoteFlushedInlinePoolWrite(Base + 64, bytes.data(), 8, Seq);
+    impl.NoteFlushedInlinePoolWrite(Base + 112, bytes.data(), 8, Seq);
+    REQUIRE(impl.pending_inline == 3);
+
+    // This write partially covers the first range and fully covers the second.
+    impl.NoteNonInlinePoolWrite(Base + 4, 80, Seq);
+    CHECK(impl.pending_inline == 1);
+    CHECK(impl.NeedsGpuFlushForUniform(Base, Base + 4, Seq));
+    CHECK(impl.NeedsGpuFlushForUniform(Base + 64, Base + 72, Seq));
+    CHECK_FALSE(impl.NeedsGpuFlushForUniform(Base + 112, Base + 120, Seq));
+
+    std::array<u8, 120> overlay{};
+    impl.ApplyPendingInlineWrites(Base, overlay.data(), overlay.size(), Seq);
+    std::array<u8, 120> expected{};
+    std::fill(expected.begin() + 112, expected.end(), 0x71);
+    CHECK(overlay == expected);
+
+    impl.gpu_completed_seq.store(Seq);
+    CHECK_FALSE(impl.NeedsGpuFlushForUniform(Base, Base + 120, Seq));
+    CHECK(impl.pending_pool_writes.empty());
+    CHECK(impl.pending_inline == 0);
+}
+
 TEST_CASE("NVN storage view invalidation detaches all aliases of the replaced image",
           "[nvn][memory]") {
     auto vulkan = MakeHeadlessVulkan();
@@ -2490,6 +3082,104 @@ TEST_CASE("NVN storage view invalidation detaches all aliases of the replaced im
     CHECK(resources.GetView(first, view) != shared_view);
 }
 
+TEST_CASE("NVN shadow cache trims completed buffers and keeps busy buffers",
+          "[nvn][memory]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    Nvn::Context::Impl impl(*vulkan->device, vulkan->submit_mutex, nullptr, {});
+    auto& resources = *impl.draw_resources;
+    auto active = resources.AcquireShadow(1);
+    auto first = resources.AcquireShadow(1);
+    auto second = resources.AcquireShadow(1);
+    REQUIRE(active);
+    REQUIRE(first);
+    REQUIRE(second);
+    const u64 first_size = first->size;
+    const auto* kept = second.get();
+    std::vector<std::shared_ptr<Nvn::ShadowChunk>> completed;
+    completed.push_back(std::move(first));
+    completed.push_back(std::move(second));
+    resources.ReleaseShadows(completed);
+    CHECK(completed.empty());
+
+    CHECK(resources.TrimCachedShadows(0) == 0);
+    CHECK(resources.TrimCachedShadows(1) == first_size);
+    CHECK(resources.counters.shadow_chunks_destroyed.load() == 1);
+    const auto reused = resources.AcquireShadow(1);
+    CHECK(reused.get() == kept);
+    CHECK(resources.TrimCachedShadows(first_size) == 0);
+    CHECK(active->buffer);
+}
+
+TEST_CASE("NVN feedback scratch evicts idle images in order of last use",
+          "[nvn][memory][feedback-scratch]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    Nvn::Context::Impl impl(*vulkan->device, vulkan->submit_mutex, nullptr, {});
+    auto& resources = *impl.draw_resources;
+    const auto source = MakeStorage(NVN_FORMAT_RGBA8, 32, 32, 1, PixelFormat::A8B8G8R8_UNORM,
+                                    VK_FORMAT_A8B8G8R8_UNORM_PACK32);
+    Nvn::InFlight first{.seq = 1};
+    Nvn::InFlight second{.seq = 2};
+    Nvn::InFlight reuse{.seq = 3};
+    const Nvn::ViewKey view{.format = source.host.format, .type = VK_IMAGE_VIEW_TYPE_2D,
+                            .aspect = VK_IMAGE_ASPECT_COLOR_BIT, .levels = 1, .layers = 1};
+
+    auto* a = resources.GetScratch(source, 0, first);
+    REQUIRE(a);
+    const u64 a_serial = a->texture->serial;
+    const u64 a_bytes = a->storage->image.GetMemoryBlock().size;
+    REQUIRE(a_bytes > 0);
+    REQUIRE(resources.GetView(*a->texture, view) != VK_NULL_HANDLE);
+
+    auto* b = resources.GetScratch(source, 1, second);
+    REQUIRE(b);
+    const u64 b_serial = b->texture->serial;
+    const u64 b_bytes = b->storage->image.GetMemoryBlock().size;
+    REQUIRE(resources.GetView(*b->texture, view) != VK_NULL_HANDLE);
+    CHECK(resources.scratch_image_bytes.load() == a_bytes + b_bytes);
+
+    auto* reused = resources.GetScratch(source, 0, reuse);
+    REQUIRE(reused);
+    CHECK(reused->texture->serial == a_serial);
+    CHECK(resources.GetScratch(source, 0, reuse) == reused);
+    CHECK(reuse.keepalive.size() == 1);
+    first.keepalive.clear();
+    CHECK(resources.TrimScratchImages(0) == 0);
+    CHECK(resources.texture_views.size() == 2);
+
+    second.keepalive.clear();
+    reuse.keepalive.clear();
+    CHECK(resources.TrimScratchImages(a_bytes) == b_bytes);
+    CHECK(resources.texture_views.contains(a_serial));
+    CHECK_FALSE(resources.texture_views.contains(b_serial));
+    CHECK(resources.scratch_image_bytes.load() == a_bytes);
+    CHECK(resources.scratch_image_evictions.load() == 1);
+
+    impl.storage_cache_budget = a_bytes * 16;
+    Nvn::InFlight row_flight{.seq = 4};
+    auto* row = resources.GetRetypedScratch(
+        source, 200, Nvn::DrawResources::RetypeTarget::Row, row_flight);
+    REQUIRE(row);
+    CHECK(row->storage->type == VK_IMAGE_TYPE_1D);
+    const u64 row_bytes = row->bytes;
+    REQUIRE(row_bytes > 0);
+    CHECK(resources.scratch_image_bytes.load() == row_bytes);
+    CHECK(resources.scratch_image_evictions.load() == 2);
+    CHECK_FALSE(resources.texture_views.contains(a_serial));
+    impl.storage_cache_budget = 0;
+    impl.TrimStorageCache(true);
+    CHECK(resources.scratch_image_bytes.load() == row_bytes);
+    row_flight.keepalive.clear();
+    impl.TrimStorageCache(true);
+    CHECK(resources.scratch_image_bytes.load() == 0);
+    CHECK(resources.scratch_images.empty());
+}
+
 TEST_CASE("NVN present keeps the previous picture until the new source has pixels",
           "[nvn][present-filter]") {
     auto vulkan = MakeHeadlessVulkan();
@@ -2553,6 +3243,68 @@ TEST_CASE("NVN completed bulk uploads reuse staging without keeping the old byte
     CHECK(rig.context.Stats().staging_chunks_reused == 1);
 }
 
+TEST_CASE("NVN reuses the spare capacity in a larger staging buffer in the same submission",
+          "[nvn][staging-reuse]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    Rig rig(*vulkan, false);
+    constexpr u64 POOL = 3;
+    constexpr u64 POOL_VA = 0x3000'0000;
+    constexpr u32 WIDTH = 2048;
+    constexpr u32 STRIDE = WIDTH * 4;
+    constexpr u64 POOL_SIZE = 25_MiB;
+    u8* const bytes = rig.memory.Add(POOL_VA, POOL_SIZE);
+    rig.context.CreatePool({.serial = POOL, .guest_address = POOL_VA, .size = POOL_SIZE,
+                            .flags = POOL_CPU_CACHED});
+    const auto create = [&](u64 serial, u64 offset, u32 height, u8 channel) {
+        std::memset(bytes + offset, channel, u64{STRIDE} * height);
+        auto desc = MakeTexture(serial, POOL, offset, NVN_FORMAT_RGBA8, WIDTH, height);
+        desc.flags = Nvn::TexFlag::Linear;
+        desc.stride = STRIDE;
+        rig.context.CreateTexture(desc);
+    };
+    create(10, 0, 1792, 0x37);       // 14 MiB
+    create(11, 14_MiB, 1152, 0x59); // 9 MiB
+    create(12, 23_MiB, 256, 0x9C);  // 2 MiB
+
+    REQUIRE(rig.Read(10, 1, 1) == std::vector<u8>(4, 0x37));
+    const auto before = rig.context.Stats();
+    std::vector<u64> list;
+    Push(list, VC::Op::CopyTextureToBuffer, CopyToBuffer(Rig::BUFFER_POOL_VA, 11, 1, 1));
+    Push(list, VC::Op::CopyTextureToBuffer, CopyToBuffer(Rig::BUFFER_POOL_VA + 16, 12, 1, 1));
+    Run(rig.context, rig.seq, std::move(list));
+    const auto after = rig.context.Stats();
+    CHECK(std::ranges::equal(std::span{rig.readback, 4}, std::vector<u8>(4, 0x59)));
+    CHECK(std::ranges::equal(std::span{rig.readback + 16, 4}, std::vector<u8>(4, 0x9C)));
+    CHECK(after.upload_bytes - before.upload_bytes == 11_MiB);
+    CHECK(after.staging_chunks_reused == before.staging_chunks_reused + 1);
+    CHECK(after.staging_chunks_allocated == before.staging_chunks_allocated);
+}
+
+TEST_CASE("NVN trims cached large staging buffers before the ordinary upload chunks",
+          "[nvn][staging-reuse]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    Nvn::Context::Impl impl(*vulkan->device, vulkan->submit_mutex, nullptr,
+                           {.background_backing = false});
+    std::array buffers{impl.AcquireStaging(54_MiB), impl.AcquireStaging(56_MiB),
+                       impl.AcquireStaging(8_MiB)};
+    const VkBuffer recent = *buffers[1];
+    const VkBuffer ordinary = *buffers[2];
+    impl.RecycleStaging(buffers);
+    auto reused = impl.AcquireStaging(48_MiB);
+    REQUIRE(*reused == recent);
+    std::array returned{std::move(reused), impl.AcquireStaging(32_MiB)};
+    impl.RecycleStaging(returned);
+    CHECK(impl.TrimCachedStaging(64_MiB) == 88_MiB);
+    CHECK(*impl.AcquireStaging(8_MiB) == ordinary);
+    CHECK(impl.TrimCachedStaging(1) == 0);
+}
+
 TEST_CASE("NVN window filters change actual presented pixels on every title and colour format",
           "[nvn][present-filter]") {
     auto vulkan = MakeHeadlessVulkan();
@@ -2608,6 +3360,15 @@ TEST_CASE("NVN window filters change actual presented pixels on every title and 
         const auto filtered = capture(filter);
         CHECK(filtered != bilinear);
         CHECK(filtered.size() == bilinear.size());
+        if (filter == ScalingFilter::Bicubic && format == VK_FORMAT_R8G8B8A8_UNORM) {
+            // Catmull-Rom reference around the red ramp's 252-to-3 transition in the
+            // 28x20 crop scaled to 79x56. Includes both overshoot and undershoot.
+            REQUIRE(filtered.size() >= (28 * 79 + 75 + 1) * 4);
+            CHECK(Close(filtered[(28 * 79 + 70) * 4], 255, 3));
+            CHECK(Close(filtered[(28 * 79 + 72) * 4], 215, 3));
+            CHECK(Close(filtered[(28 * 79 + 74) * 4], 18, 3));
+            CHECK(Close(filtered[(28 * 79 + 75) * 4], 0, 3));
+        }
         // Re-selecting a cached filter must keep producing the same pixels.
         CHECK(capture(filter) == filtered);
     }
@@ -2765,7 +3526,8 @@ TEST_CASE("MKW window filters process a saved gameplay image at display resoluti
     REQUIRE(Common::DiagRequest::WriteTextFile(directory / "metrics.csv", csv));
 }
 
-TEST_CASE("MKW buffer lookup cache follows pool replacement and virtual remaps", "[nvn][mkw]") {
+TEST_CASE("NVN buffer lookup follows pool replacement and virtual remaps for any title",
+          "[nvn][memory][pool_lookup]") {
     auto vulkan = MakeHeadlessVulkan();
     if (!vulkan) {
         SKIP("no Vulkan device");
@@ -2773,24 +3535,51 @@ TEST_CASE("MKW buffer lookup cache follows pool replacement and virtual remaps",
     auto impl =
         std::make_unique<Nvn::Context::Impl>(*vulkan->device, vulkan->submit_mutex, nullptr,
                                              Nvn::ContextOptions{.background_backing = false});
-    impl->mario_kart_world = GENERATE(false, true);
+    const u64 title_id = GENERATE(0x01000000a1b2c000ULL, 0x01000000d3e4f000ULL);
+    CAPTURE(title_id);
+    Nvn::Command title = Nvn::CmdSetTitle{title_id};
+    impl->Dispatch(title);
+    CHECK_FALSE(impl->mario_kart_world);
+    Nvn::Pool* pool = nullptr;
+    u64 offset = 0;
+    REQUIRE_FALSE(impl->ResolveBuffer(0, 0, pool, offset));
     impl->CreatePoolNow({.serial = 1, .guest_address = 0x10000, .size = 0x10000});
     impl->CreatePoolNow({.serial = 2, .guest_address = 0x30000, .size = 0x10000});
     impl->CreatePoolNow(
         {.serial = 3, .guest_address = 0x50000, .size = 0x10000, .flags = POOL_VIRTUAL});
+    ++impl->stats.presents;
     const auto resolve = [&](u64 address, u64 size, u64 serial, u64 expected_offset) {
-        Nvn::Pool* pool = nullptr;
-        u64 offset = ~u64{0};
+        pool = nullptr;
+        offset = ~u64{0};
         REQUIRE(impl->ResolveBuffer(address, size, pool, offset));
+        REQUIRE(pool != nullptr);
         REQUIRE(pool->serial == serial);
         REQUIRE(offset == expected_offset);
     };
     resolve(0x10120, 64, 1, 0x120);
     resolve(0x10120, 64, 1, 0x120);
-    CHECK(impl->mkw_resolve_hits == 1u);
+    const char* physical_cache = std::getenv("EDEN_NX2_NVN_PHYSICAL_RESOLVE_CACHE");
+    const bool use_physical_cache = physical_cache && physical_cache[0] == '1';
+    CHECK(impl->physical_resolve_hits == (use_physical_cache ? 1u : 0u));
+    CHECK(impl->exact_buffer_resolve_hits == (use_physical_cache ? 0u : 1u));
+    const char* flat_index = std::getenv("EDEN_NX2_NVN_FLAT_POOL_INDEX");
+    CHECK(impl->flat_pool_lookups == (flat_index && flat_index[0] == '1' ? 1u : 0u));
+    resolve(0x10128, 128, 1, 0x128);
+    CHECK(impl->physical_resolve_hits == (use_physical_cache ? 2u : 0u));
     impl->CreatePoolNow({.serial = 4, .guest_address = 0x10100, .size = 0x100});
+    // The first byte selects the outer pool even if the request crosses the new pool's start.
+    resolve(0x10090, 0x100, 1, 0x90);
+    resolve(0x10098, 0x100, 1, 0x98);
     resolve(0x10120, 64, 4, 0x20);
+    ++impl->stats.presents;
+    // The nearest predecessor cannot cover 32 bytes. The containing outer pool must not hide it.
+    REQUIRE_FALSE(impl->ResolveBuffer(0x101f0, 32, pool, offset));
+    impl->CreatePoolNow({.serial = 5, .guest_address = 0x10100, .size = 0x80});
     impl->DestroyNow(4);
+    ++impl->stats.presents;
+    resolve(0x10120, 64, 5, 0x20);
+    impl->DestroyNow(5);
+    ++impl->stats.presents;
     resolve(0x10120, 64, 1, 0x120);
     impl->MapVirtualNow(3, {{0, 1, 0x200, 0x1000}});
     resolve(0x50040, 64, 1, 0x240);
@@ -2798,11 +3587,465 @@ TEST_CASE("MKW buffer lookup cache follows pool replacement and virtual remaps",
     impl->MapVirtualNow(3, {{0, 2, 0x400, 0x1000}});
     resolve(0x50040, 64, 2, 0x440);
     impl->MapVirtualNow(3, {{0, 0, 0, 0x1000}});
-    Nvn::Pool* pool = nullptr;
-    u64 offset = 0;
     REQUIRE_FALSE(impl->ResolveBuffer(0x50040, 64, pool, offset));
     REQUIRE_FALSE(impl->ResolveBuffer(0x3fff0, 32, pool, offset));
     resolve(0x3fff0, 16, 2, 0xfff0);
+
+    // Adjacent runs with the same physical serial and contiguous bytes form one buffer.
+    impl->MapVirtualNow(3, {{0, 1, 0x200, 0x100}, {0x100, 1, 0x300, 0x100}});
+    resolve(0x500f0, 32, 1, 0x2f0);
+    resolve(0x500f0, 32, 1, 0x2f0);
+    // Same guest backing address can have different pool identities. Changed serials
+    // invalidate the cached span even if underlying guest bytes are the same.
+    impl->CreatePoolNow({.serial = 6, .guest_address = 0x10000, .size = 0x10000});
+    resolve(0x10040, 32, 6, 0x40);
+    resolve(0x500f0, 32, 1, 0x2f0);
+    impl->MapVirtualNow(3, {{0x100, 6, 0x300, 0x100}});
+    REQUIRE_FALSE(impl->ResolveBuffer(0x500f0, 32, pool, offset));
+    resolve(0x50100, 32, 6, 0x300);
+    resolve(0x50100, 32, 6, 0x300);
+
+    // A delayed Destroy of the earlier serial must not erase the new direct address entry.
+    impl->DestroyNow(1);
+    resolve(0x10040, 32, 6, 0x40);
+    REQUIRE_FALSE(impl->ResolveBuffer(0x50040, 32, pool, offset));
+    impl->DestroyNow(6);
+    REQUIRE_FALSE(impl->ResolveBuffer(0x10040, 32, pool, offset));
+    REQUIRE_FALSE(impl->ResolveBuffer(0x50100, 32, pool, offset));
+    impl->CreatePoolNow({.serial = 7, .guest_address = 0x10000, .size = 0x10000});
+    resolve(0x10040, 32, 7, 0x40);
+    REQUIRE_FALSE(impl->ResolveBuffer(0x50100, 32, pool, offset));
+    impl->MapVirtualNow(3, {{0x100, 7, 0x300, 0x100}});
+    resolve(0x50100, 32, 7, 0x300);
+}
+
+TEST_CASE("NVN graphics submission waits on sparse residency and its existing timeline",
+          "[nvn][sparse]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    Nvn::Context::Impl impl(*vulkan->device, vulkan->submit_mutex, nullptr, {});
+    const bool guest_first = GENERATE(false, true);
+    CAPTURE(guest_first);
+    const auto get_proc = vulkan->dld->vkGetDeviceProcAddr;
+    auto host_signal = reinterpret_cast<PFN_vkSignalSemaphore>(
+        get_proc(impl.logical, "vkSignalSemaphore"));
+    if (!host_signal) {
+        host_signal = reinterpret_cast<PFN_vkSignalSemaphore>(
+            get_proc(impl.logical, "vkSignalSemaphoreKHR"));
+    }
+    REQUIRE(host_signal);
+    const auto& device = vulkan->device->GetLogical();
+    const VkSemaphoreTypeCreateInfo type{
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+        .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
+    };
+    const VkSemaphoreCreateInfo semaphore_ci{
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+        .pNext = &type,
+    };
+    const auto guest = device.CreateSemaphore(semaphore_ci);
+    impl.sparse_timeline = device.CreateSemaphore(semaphore_ci);
+    impl.sparse_bind_value = 3;
+    const VkSemaphore wait = *guest;
+    constexpr u64 GUEST_VALUE = 2;
+    constexpr VkPipelineStageFlags STAGE = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    const VkTimelineSemaphoreSubmitInfo timeline{
+        .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+        .waitSemaphoreValueCount = 1,
+        .pWaitSemaphoreValues = &GUEST_VALUE,
+    };
+    VkSubmitInfo submit{
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .pNext = &timeline,
+        .waitSemaphoreCount = 1,
+        .pWaitSemaphores = &wait,
+        .pWaitDstStageMask = &STAGE,
+    };
+    const auto fence = device.CreateFence({.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO});
+    {
+        std::scoped_lock lock{vulkan->submit_mutex};
+        REQUIRE(impl.SubmitGraphics({&submit, 1}, *fence) == VK_SUCCESS);
+    }
+    const auto signal = [&](VkSemaphore semaphore, u64 value) {
+        const VkSemaphoreSignalInfo info{
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO,
+            .semaphore = semaphore,
+            .value = value,
+        };
+        return host_signal(impl.logical, &info);
+    };
+    if (guest_first) {
+        CHECK(signal(*guest, GUEST_VALUE) == VK_SUCCESS);
+        CHECK(signal(*impl.sparse_timeline, 2) == VK_SUCCESS);
+        CHECK(fence.Wait(1'000'000) == VK_TIMEOUT);
+        CHECK(signal(*impl.sparse_timeline, 3) == VK_SUCCESS);
+    } else {
+        CHECK(signal(*impl.sparse_timeline, 3) == VK_SUCCESS);
+        CHECK(signal(*guest, GUEST_VALUE - 1) == VK_SUCCESS);
+        CHECK(fence.Wait(1'000'000) == VK_TIMEOUT);
+        CHECK(signal(*guest, GUEST_VALUE) == VK_SUCCESS);
+    }
+    CHECK(fence.Wait(1'000'000'000) == VK_SUCCESS);
+    CHECK(impl.sparse_wait_submitted == 3);
+    CHECK(submit.pNext == &timeline);
+    CHECK(submit.waitSemaphoreCount == 1);
+}
+
+struct ObservedSparseBind {
+    PFN_vkQueueBindSparse original;
+    VkFence fence{};
+    VkSemaphore signal{};
+    u64 signal_value{};
+    u32 calls{};
+    u32 wait_count{};
+    std::array<VkSemaphore, 2> waits{};
+    std::array<u64, 2> values{};
+};
+thread_local ObservedSparseBind* observed_sparse_bind{};
+
+VKAPI_ATTR VkResult VKAPI_CALL ObserveSparseBind(VkQueue queue, u32 count,
+                                                 const VkBindSparseInfo* binds, VkFence fence) {
+    auto& observed = *observed_sparse_bind;
+    ++observed.calls;
+    observed.fence = fence;
+    if (count == 1 && binds->pNext) {
+        const auto& bind = *binds;
+        const auto& timeline = *static_cast<const VkTimelineSemaphoreSubmitInfo*>(bind.pNext);
+        observed.wait_count = bind.waitSemaphoreCount;
+        if (bind.waitSemaphoreCount <= observed.waits.size() &&
+            bind.waitSemaphoreCount == timeline.waitSemaphoreValueCount) {
+            std::copy_n(bind.pWaitSemaphores, bind.waitSemaphoreCount, observed.waits.begin());
+            std::copy_n(timeline.pWaitSemaphoreValues, bind.waitSemaphoreCount, observed.values.begin());
+        }
+        if (bind.signalSemaphoreCount == 1 && timeline.signalSemaphoreValueCount == 1) {
+            observed.signal = *bind.pSignalSemaphores;
+            observed.signal_value = *timeline.pSignalSemaphoreValues;
+        }
+    }
+    return observed.original(queue, count, binds, fence);
+}
+
+TEST_CASE("NVN sparse binds follow the last graphics submit for neutral titles",
+          "[nvn][sparse][sparse-bind-order]") {
+    const auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan || !vulkan->device->HasTimelineSemaphore() ||
+        !vulkan->device->IsSparseResidencyImage2DSupported() ||
+        !vulkan->device->CanUseUnbackedSparseImages()) {
+        SKIP("no compatible sparse image and timeline support");
+    }
+    const bool allow_gpu_wait = GENERATE(false, true);
+    CAPTURE(allow_gpu_wait);
+    Nvn::Context::Impl impl(*vulkan->device, vulkan->submit_mutex, nullptr,
+                            {.background_backing = false, .gpu_sparse_wait = true});
+    REQUIRE_FALSE(impl.mario_kart_world);
+    impl.CreatePoolNow({.serial = 6, .guest_address = 0x7D00'0000'0000'0000ULL,
+                        .size = 64_MiB, .flags = POOL_VIRTUAL});
+    auto desc = MakeTexture(10, 6, 0, 0x01, 8192, 8192);
+    desc.flags = 0x20; // sparse
+    const auto texture = impl.BuildTexture(desc);
+    REQUIRE(texture);
+    auto& storage = *texture->storage;
+    REQUIRE(impl.EnsureImage(storage));
+    if (!storage.sparse) {
+        SKIP("no compatible sparse R8 image shape");
+    }
+
+    // Submit the preceding sparse ticket and then a graphics timeline signal on the real queue.
+    REQUIRE(impl.SubmitSparseBind({.sType = VK_STRUCTURE_TYPE_BIND_SPARSE_INFO}, {}) == VK_SUCCESS);
+    const VkSemaphore graphics = *impl.GetQueue(0).timeline;
+    constexpr u64 graphics_value = 5;
+    const VkTimelineSemaphoreSubmitInfo signal{
+        .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+        .signalSemaphoreValueCount = 1,
+        .pSignalSemaphoreValues = &graphics_value,
+    };
+    VkSubmitInfo submit{
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .pNext = &signal,
+        .signalSemaphoreCount = 1,
+        .pSignalSemaphores = &graphics,
+    };
+    {
+        std::scoped_lock lock{vulkan->submit_mutex};
+        REQUIRE(impl.SubmitGraphics({&submit, 1}) == VK_SUCCESS);
+    }
+    impl.last_submit_semaphore = graphics;
+    impl.last_submit_value = graphics_value;
+
+    auto& sparse = *storage.sparse;
+    const u64 offset = sparse.Layout().TileOffset(0);
+    sparse.Remap(offset, offset + Nvn::SPARSE_TILE_BYTES, [](u64, u64) { return true; });
+    auto& dispatch = const_cast<Vulkan::vk::DeviceDispatch&>(impl.device.GetDispatchLoader());
+    ObservedSparseBind observed{dispatch.vkQueueBindSparse};
+    observed_sparse_bind = &observed;
+    dispatch.vkQueueBindSparse = ObserveSparseBind;
+    SCOPE_EXIT {
+        dispatch.vkQueueBindSparse = observed.original;
+        observed_sparse_bind = nullptr;
+    };
+    Nvn::SparseBacking::Uploads uploads;
+    REQUIRE(sparse.Prepare(impl, storage, uploads, allow_gpu_wait));
+    REQUIRE(uploads.tiles == std::vector<u32>{0});
+    REQUIRE(observed.calls == 1);
+    REQUIRE(observed.wait_count == 2);
+    CHECK(observed.waits == std::array<VkSemaphore, 2>{graphics, *impl.sparse_timeline});
+    CHECK(observed.values == std::array<u64, 2>{graphics_value, 1});
+    if (allow_gpu_wait) {
+        CHECK(observed.fence == VK_NULL_HANDLE);
+        CHECK(observed.signal == *impl.sparse_timeline);
+        REQUIRE(observed.signal_value == 2);
+        CHECK(impl.RetireSparseBinds(2) == VK_SUCCESS);
+    } else {
+        CHECK(observed.fence != VK_NULL_HANDLE);
+        CHECK(observed.signal == VK_NULL_HANDLE);
+    }
+}
+
+TEST_CASE("NVN sparse retry preserves earlier reads in the current list",
+          "[nvn][sparse][sparse-open-segment]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan || !vulkan->device->CanUseUnbackedSparseImages() ||
+        !vulkan->device->IsSparseResidencyImage2DSupported()) {
+        SKIP("requires strict sparse residency images");
+    }
+    constexpr u64 Physical = 5;
+    constexpr u64 VirtualA = 6;
+    constexpr u64 VirtualB = 7;
+    constexpr u64 PhysicalVA = 0x3000'0000;
+    constexpr u64 TileBytes = Nvn::SPARSE_TILE_BYTES;
+    constexpr u32 Size = 256;
+    Rig rig{*vulkan, true, POOL_CPU_CACHED, {}, {}, {}, {}, {}, TileBytes, false};
+    u8* physical = rig.memory.Add(PhysicalVA, 2 * TileBytes);
+    std::memset(physical, 0x65, TileBytes);
+    std::memset(physical + TileBytes, 0xA9, TileBytes);
+    rig.context.CreatePool({.serial = Physical, .guest_address = PhysicalVA,
+                            .size = 2 * TileBytes, .flags = POOL_CPU_CACHED});
+    rig.context.CreatePool({.serial = VirtualA, .guest_address = 0x7D00'0000'0000'0000ULL,
+                            .size = 16_MiB, .flags = POOL_VIRTUAL});
+    rig.context.CreatePool({.serial = VirtualB, .guest_address = 0x7D00'0000'1000'0000ULL,
+                            .size = 16_MiB, .flags = POOL_VIRTUAL});
+    auto a = MakeTexture(10, VirtualA, 0, 0x01, 4096, 2048);
+    auto b = MakeTexture(11, VirtualB, 0, 0x01, 4096, 2048);
+    a.flags = b.flags = 0x20;
+    rig.context.CreateTexture(a);
+    rig.context.CreateTexture(b);
+    const auto copy = [&](std::vector<u64>& list, u64 tex, u64 dst) {
+        Push(list, VC::Op::CopyTextureToBuffer,
+             CopyToBuffer(Rig::BUFFER_POOL_VA + dst, tex, Size, Size));
+    };
+    rig.context.MapVirtual(VirtualB, {{0, Physical, TileBytes, TileBytes}});
+    std::vector<u64> setup;
+    copy(setup, 11, 0);
+    Run(rig.context, rig.seq, std::move(setup));
+    REQUIRE(rig.context.Stats().virtual_sparse_binds == 1);
+    REQUIRE(std::all_of(rig.readback, rig.readback + TileBytes,
+                        [](u8 value) { return value == 0xA9; }));
+
+    // A's map cannot be fulfilled until B is actually prepared and unbound.
+    rig.context.MapVirtual(VirtualA, {{0, Physical, 0, TileBytes}});
+    rig.context.MapVirtual(VirtualB, {{0, 0, 0, TileBytes}});
+    std::vector<u64> list;
+    copy(list, 10, 0);
+    copy(list, 11, TileBytes);
+    copy(list, 10, 2 * TileBytes);
+    Run(rig.context, rig.seq, std::move(list));
+    const auto stats = rig.context.Stats();
+    CAPTURE(stats.virtual_sparse_binds, stats.uploads, rig.readback[0],
+            rig.readback[TileBytes], rig.readback[2 * TileBytes]);
+    REQUIRE(stats.virtual_sparse_binds == 3);
+    CHECK(std::all_of(rig.readback, rig.readback + TileBytes,
+                      [](u8 value) { return value == 0; }));
+    CHECK(std::all_of(rig.readback + TileBytes, rig.readback + 2 * TileBytes,
+                      [](u8 value) { return value == 0; }));
+    CHECK(std::all_of(rig.readback + 2 * TileBytes, rig.readback + 3 * TileBytes,
+                      [](u8 value) { return value == 0x65; }));
+}
+
+TEST_CASE("NVN sparse allocations use the device budget on every title",
+          "[nvn][sparse][.vram-pressure]") {
+    const char* limit = std::getenv("EDEN_NX2_VRAM_LIMIT_MIB");
+    if (!limit || std::string_view{limit} != "64") {
+        SKIP("run with EDEN_NX2_VRAM_LIMIT_MIB=64 to exercise the default budget");
+    }
+    const auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan || !vulkan->device->IsSparseResidencyImage2DSupported() ||
+        !vulkan->device->CanUseUnbackedSparseImages()) {
+        SKIP("no sparse residency images");
+    }
+    const u64 heap_limit = vulkan->device->GetMainHeapSize();
+    REQUIRE(heap_limit <= 64_MiB);
+    const bool mario_kart_world = GENERATE(false, true);
+    CAPTURE(mario_kart_world);
+    Nvn::Context::Impl impl(*vulkan->device, vulkan->submit_mutex, nullptr,
+                            {.background_backing = false});
+    impl.mario_kart_world = mario_kart_world;
+    impl.CreatePoolNow({.serial = 6, .guest_address = 0x7D00'0000'0000'0000ULL,
+                        .size = 64_MiB, .flags = POOL_VIRTUAL});
+    auto desc = MakeTexture(10, 6, 0, 0x01, 8192, 8192);
+    desc.flags = 0x20; // sparse
+    const auto texture = impl.BuildTexture(desc);
+    REQUIRE(texture);
+    REQUIRE(impl.EnsureImage(*texture->storage));
+    if (!texture->storage->sparse) {
+        SKIP("no compatible sparse R8 image shape");
+    }
+    REQUIRE(impl.sparse_pages);
+    CHECK(impl.sparse_pages->BudgetBytes() <= heap_limit);
+    CHECK(impl.sparse_pages->HasRoom());
+}
+
+TEST_CASE("NVN sparse tiles retry after another resource releases device memory",
+          "[nvn][sparse][.vram-pressure]") {
+    const char* limit = std::getenv("EDEN_NX2_VRAM_LIMIT_MIB");
+    if (!limit || std::string_view{limit} != "64") {
+        SKIP("run with EDEN_NX2_VRAM_LIMIT_MIB=64 to force an allocator failure");
+    }
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan || !vulkan->device->IsSparseResidencyImage2DSupported() ||
+        !vulkan->device->CanUseUnbackedSparseImages()) {
+        SKIP("no sparse residency images");
+    }
+    Nvn::Context::Impl impl(*vulkan->device, vulkan->submit_mutex, nullptr,
+                            {.background_backing = false, .sparse_device_budget_bytes = 16_MiB});
+    impl.CreatePoolNow({.serial = 6, .guest_address = 0x7D00'0000'0000'0000ULL,
+                        .size = 64_MiB, .flags = POOL_VIRTUAL});
+    auto desc = MakeTexture(10, 6, 0, 0x01, 8192, 8192);
+    desc.flags = 0x20; // sparse
+    const auto texture = impl.BuildTexture(desc);
+    REQUIRE(texture);
+    auto& storage = *texture->storage;
+    REQUIRE(impl.EnsureImage(storage));
+    if (!storage.sparse) {
+        SKIP("no compatible sparse R8 image shape");
+    }
+
+    const auto image_requirements =
+        impl.device.GetLogical().GetImageMemoryRequirements(*storage.image);
+    auto pressure_buffer = impl.CreateHostBuffer(12_MiB, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                                 Vulkan::MemoryUsage::DeviceLocal,
+                                                 Vulkan::AllocationKind::PoolBuffer);
+    REQUIRE(pressure_buffer);
+    const u32 memory_type = pressure_buffer.Location().memory_type;
+    const auto properties = impl.device.GetPhysical().GetMemoryProperties().memoryProperties;
+    REQUIRE((properties.memoryTypes[memory_type].propertyFlags &
+             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0);
+    REQUIRE((image_requirements.memoryTypeBits & (1u << memory_type)) != 0);
+
+    constexpr u64 page_bytes = Nvn::SparsePagePool::PageBytes;
+    constexpr u64 block_bytes = page_bytes * Nvn::SparsePagePool::PagesPerBlock;
+    const VkMemoryRequirements block_requirements{
+        .size = block_bytes,
+        .alignment = page_bytes,
+        .memoryTypeBits = image_requirements.memoryTypeBits,
+    };
+    std::vector<VmaAllocation> pressure_blocks;
+    SCOPE_EXIT {
+        for (auto block : pressure_blocks) {
+            impl.allocator->FreeSparseMemory(block);
+        }
+    };
+    // The range bound also keeps the test small if a driver ignores the simulated cap.
+    const size_t max_blocks = 64_MiB * properties.memoryHeapCount / block_bytes;
+    while (pressure_blocks.size() < max_blocks) {
+        VmaAllocationInfo info{};
+        const auto block = impl.allocator->AllocateSparseMemory(block_requirements, info);
+        if (!block) {
+            break;
+        }
+        pressure_blocks.push_back(block);
+    }
+    REQUIRE(pressure_blocks.size() < max_blocks);
+
+    auto& sparse = *storage.sparse;
+    const u64 offset = sparse.Layout().TileOffset(0);
+    sparse.Remap(offset, offset + page_bytes, [](u64, u64) { return true; });
+    Nvn::SparseBacking::Uploads uploads;
+    REQUIRE(sparse.Prepare(impl, storage, uploads));
+    REQUIRE(sparse.StarvedUnits() == 1);
+    CHECK(uploads.tiles.empty());
+    CHECK(impl.sparse_pages->HasRoom());
+    CHECK_FALSE(sparse.HasWork());
+
+    using Clock = std::chrono::steady_clock;
+    const u64 starved_generation = impl.sparse_pages->FreeGeneration();
+    impl.sparse_pages->WakeAllocationRetries(Clock::time_point::min());
+    CHECK(impl.sparse_pages->FreeGeneration() == starved_generation);
+    impl.sparse_pages->WakeAllocationRetries(Clock::time_point::max());
+    CHECK(impl.sparse_pages->FreeGeneration() == starved_generation + 1);
+    impl.sparse_pages->WakeAllocationRetries(Clock::time_point::max());
+    CHECK(impl.sparse_pages->FreeGeneration() == starved_generation + 1);
+    REQUIRE(sparse.HasWork());
+    REQUIRE(sparse.Prepare(impl, storage, uploads));
+    CHECK(sparse.StarvedUnits() == 1);
+    CHECK_FALSE(sparse.HasWork());
+
+    const u64 free_generation = impl.sparse_pages->FreeGeneration();
+    pressure_buffer.reset();
+    CHECK(impl.sparse_pages->FreeGeneration() == free_generation);
+    REQUIRE(sparse.HasWork());
+    REQUIRE(sparse.Prepare(impl, storage, uploads));
+    CHECK(sparse.StarvedUnits() == 0);
+    CHECK(uploads.tiles == std::vector<u32>{0});
+    CHECK(sparse.BoundBytes() == page_bytes);
+    CHECK_FALSE(sparse.HasWork());
+}
+
+TEST_CASE("SparsePagePool reuses compatible memory types and releases only empty blocks",
+          "[nvn][sparse][memory]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    const auto memory = vulkan->device->GetPhysical().GetMemoryProperties().memoryProperties;
+    u32 allowed = 0;
+    for (u32 type = 0; type < memory.memoryTypeCount; ++type) {
+        if (memory.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
+            allowed = 1u << type;
+            break;
+        }
+    }
+    REQUIRE(allowed != 0);
+    Nvn::Context::Impl impl(*vulkan->device, vulkan->submit_mutex, nullptr,
+                            {.background_backing = false});
+    using PagePool = Nvn::SparsePagePool;
+    constexpr u64 BLOCK_BYTES = PagePool::PageBytes * PagePool::PagesPerBlock;
+    PagePool pool(*impl.allocator, BLOCK_BYTES * 2);
+    std::array<u32, PagePool::PagesPerBlock> pages{};
+    pages[0] = pool.Allocate(allowed);
+    REQUIRE(pages[0] != PagePool::NoPage);
+    for (size_t i = 1; i < pages.size(); ++i) {
+        pages[i] = pool.Allocate(~0u);
+        REQUIRE(pages[i] != PagePool::NoPage);
+    }
+    CHECK(pool.ReservedBytes() == BLOCK_BYTES);
+
+    const u32 active = pool.Allocate(allowed);
+    REQUIRE(active != PagePool::NoPage);
+    const auto location = pool.Get(active);
+    for (const u32 page : pages) {
+        pool.Free(page);
+    }
+    CHECK(pool.TrimUnusedBlocks() == 0);
+    CHECK(pool.TrimUnusedBlocks(0) == BLOCK_BYTES);
+    CHECK(pool.ReservedBytes() == BLOCK_BYTES);
+    CHECK(pool.UsedBytes() == PagePool::PageBytes);
+    CHECK(pool.Get(active).memory == location.memory);
+    CHECK(pool.Get(active).offset == location.offset);
+
+    const u32 next = pool.Allocate(~0u);
+    REQUIRE(next != PagePool::NoPage);
+    CHECK(pool.Get(next).memory == location.memory);
+    CHECK(pool.Get(next).offset == location.offset + PagePool::PageBytes);
+    pool.Free(active);
+    pool.Free(next);
+    CHECK(pool.TrimUnusedBlocks(0) == BLOCK_BYTES);
+    CHECK(pool.ReservedBytes() == 0);
+    const u32 refill = pool.Allocate(allowed);
+    REQUIRE(refill != PagePool::NoPage);
+    CHECK(refill == pages[0]);
+    pool.Free(refill);
 }
 
 TEST_CASE("SparsePagePool tracks stale shared pages, IsShared, and full-budget key hits",
@@ -3134,6 +4377,12 @@ TEST_CASE("nvn memory: initial texture upload arms lazy tracked pages for later 
         CHECK(tracked.armed_pages.contains((TEX_POOL_VA >> 12) + page));
     }
 
+    const u64 full_checks = context.Stats().cpu_checks;
+    for (u32 i = 0; i < 3; ++i) {
+        REQUIRE(read_back(READ_POOL_VA) == initial_texels);
+    }
+    CHECK(context.Stats().cpu_checks == full_checks);
+
     // Mutate only page 2 directly as the guest CPU would, then issue NotifyCpuWrite without
     // forcing a full rehash so detection relies on the initial upload having armed page 2.
     const std::vector<u8> updated_texels = Gradient(SIZE, SIZE, 2);
@@ -3211,9 +4460,6 @@ TEST_CASE("nvn memory: vectorized alias transfer preserves bytes across power-of
     if (!vulkan) {
         SKIP("no Vulkan device");
     }
-    if (!Nvn::AliasTransferGpu::Supported(*vulkan->device)) {
-        SKIP("no alias transfer shader on this device");
-    }
     struct FormatCase {
         s32 format;
         PixelFormat pixel;
@@ -3256,23 +4502,28 @@ TEST_CASE("nvn memory: vectorized alias transfer preserves bytes across power-of
     src_storage.layout = Nvn::ComputeTextureLayout(src_storage.desc);
 
     std::vector<u8> pool_bytes(src_linear.size() * 2 + 0x10000, 0x5A);
-    if (tc.linear) {
-        std::memcpy(pool_bytes.data(), src_linear.data(), src_linear.size());
-    } else {
-        const std::vector<u8> swz = SwizzleLevel0(src_storage, src_linear, tc.bpp, SRC_W, SRC_H);
-        std::memcpy(pool_bytes.data(), swz.data(), swz.size());
-    }
+    const auto pack_source = [&] {
+        if (tc.linear) {
+            std::memcpy(pool_bytes.data(), src_linear.data(), src_linear.size());
+        } else {
+            const auto tiled = SwizzleLevel0(src_storage, src_linear, tc.bpp, SRC_W, SRC_H);
+            std::memcpy(pool_bytes.data(), tiled.data(), tiled.size());
+        }
+    };
+    pack_source();
     std::memcpy(rig.texture_bytes, pool_bytes.data(), (std::min)(pool_bytes.size(), size_t{4_MiB}));
 
     rig.context.CreateTexture(src_desc);
     rig.context.CreateTexture(dst_desc);
 
-    // Trigger GPU write on source via a 1-row partial CopyBufferToTexture so ResolveOverlaps runs
-    // TransferOverlapBytes from GPU-owned `src` to `dst`.
-    std::vector<u8> scratch_src(SRC_W * tc.bpp);
-    std::memcpy(scratch_src.data(), src_linear.data(), scratch_src.size());
+    // Change one row through a GPU upload, then read the newer bytes through the aliased texture.
+    const size_t row_bytes = SRC_W * tc.bpp;
+    for (u8& byte : std::span{src_linear}.first(row_bytes)) {
+        byte ^= 0xFF;
+    }
     u8* staging = rig.memory.Pointer(Rig::BUFFER_POOL_VA + 0x20000);
-    std::memcpy(staging, scratch_src.data(), scratch_src.size());
+    std::memcpy(staging, src_linear.data(), row_bytes);
+    pack_source();
     VC::CopyBufferTexturePayload upload{};
     upload.buffer = Rig::BUFFER_POOL_VA + 0x20000;
     upload.texture = {.serial = 10, .level = 0, .layer = 0};
@@ -3455,8 +4706,9 @@ TEST_CASE("nvn memory: deferred LOAD_OP_CLEAR executes clear-only pass and sciss
     Rig rig{*vulkan, true};
     rig.context.CreateTexture(MakeTexture(50, Rig::TEXTURE_POOL, 0, NVN_FORMAT_RGBA8, 64, 64));
 
-    const auto push_set_rt0 = [](std::vector<u64>& list, u64 serial) {
-        const VC::RenderTargetRef color{.texture = {.serial = serial, .level = 0, .layer = 0}};
+    const auto push_set_rt0 = [](std::vector<u64>& list, u64 serial, VC::TextureViewDesc view = {}) {
+        const VC::RenderTargetRef color{.texture = {.serial = serial, .level = 0, .layer = 0},
+                                        .view = view};
         const VC::SetRenderTargetsPayload p{.color_count = 1, .has_depth = 0};
         const size_t total_bytes = sizeof(VC::RecordHeader) + sizeof(p) + sizeof(color);
         const size_t words = (total_bytes + 7) / 8;
@@ -3530,6 +4782,43 @@ TEST_CASE("nvn memory: deferred LOAD_OP_CLEAR executes clear-only pass and sciss
         REQUIRE(blue[px * 4 + 2] == 255);
         REQUIRE(blue[px * 4 + 3] == 255);
     }
+
+    // Partial clears keep a pass open. An equivalent view and an unused temporary target do not
+    // end it, while changing targets for an actual clear still ends it.
+    rig.context.CreateTexture(
+        MakeTexture(51, Rig::TEXTURE_POOL, 256_KiB, NVN_FORMAT_RGBA8, 64, 64));
+    std::vector<u64> rebind;
+    push_set_rt0(rebind, 50);
+    push_scissor(rebind, 0, 0, 32, 64);
+    push_clear_color(rebind, 1.0f, 0.0f, 0.0f, 1.0f);
+    push_set_rt0(rebind, 50, {.set_levels = 1, .set_swizzle = 1, .nlevels = 1,
+                            .swizzle = {1, 2, 3, 4}});
+    push_set_rt0(rebind, 51);
+    push_scissor(rebind, 0, 0, 32, 64);
+    push_set_rt0(rebind, 50);
+    push_clear_color(rebind, 0.0f, 1.0f, 0.0f, 1.0f);
+    push_set_rt0(rebind, 51);
+    push_clear_color(rebind, 1.0f, 1.0f, 0.0f, 1.0f);
+    push_set_rt0(rebind, 50);
+    Run(rig.context, rig.seq, std::move(rebind));
+
+    std::vector<VC::SinkStat> rows;
+    rig.context.CollectStats(rows);
+    const auto count = [&](std::string_view reason) -> u64 {
+        const auto it = std::ranges::find(rows, reason, &VC::SinkStat::reason);
+        return it == rows.end() ? 0 : it->count;
+    };
+    CHECK(count("set_render_targets: overwritten before use") == 1);
+    CHECK(count("render_pass_break: SetRenderTargets") == 2);
+    const auto green_and_blue = rig.Read(50, 64, 64);
+    CHECK(std::equal(green_and_blue.begin(), green_and_blue.begin() + 4,
+                     std::array<u8, 4>{0, 255, 0, 255}.begin()));
+    CHECK(std::equal(green_and_blue.begin() + 32 * 4, green_and_blue.begin() + 33 * 4,
+                     std::array<u8, 4>{0, 0, 255, 255}.begin()));
+    const auto yellow = rig.Read(51, 64, 64);
+    CHECK(std::equal(yellow.begin(), yellow.begin() + 4,
+                     std::array<u8, 4>{255, 255, 0, 255}.begin()));
+    CHECK(rig.context.Stats().ops_failed == 0);
 }
 
 TEST_CASE("nvn memory: multi-source ResolveOverlaps prunes dead writers and batches "
@@ -3731,11 +5020,29 @@ TEST_CASE("nvn memory: Compressible CpuNoAccess pool defers VkBuffer backing unt
         REQUIRE(pool->pending.load());
         REQUIRE(pool->backing == Nvn::Pool::Backing::None);
         REQUIRE(impl.pool_bytes.load() == 0);
+        Nvn::Pool* resolved = nullptr;
+        u64 offset = 0;
+        REQUIRE(impl.ResolveBuffer(pool->address + 64, 32, resolved, offset));
+        REQUIRE(resolved == pool.get());
+        REQUIRE(offset == 64);
+        const u64 backing_generation = impl.pool_generation.load();
+        const u64 address_generation = impl.pool_address_generation;
+        const u64 hits = impl.exact_buffer_resolve_hits;
+        const u64 physical_hits = impl.physical_resolve_hits;
 
-        impl.EnsureBacking(*pool);
+        REQUIRE(impl.EnsureBacking(*pool));
         REQUIRE_FALSE(pool->pending.load());
         REQUIRE(pool->backing == Nvn::Pool::Backing::DeviceLocal);
         REQUIRE(impl.pool_bytes.load() == POOL_BYTES);
+        CHECK(impl.pool_generation.load() > backing_generation);
+        CHECK(impl.pool_address_generation == address_generation);
+        REQUIRE(impl.ResolveBuffer(pool->address + 64, 32, resolved, offset));
+        REQUIRE(resolved == pool.get());
+        REQUIRE(offset == 64);
+        const char* physical_cache = std::getenv("EDEN_NX2_NVN_PHYSICAL_RESOLVE_CACHE");
+        const bool use_physical_cache = physical_cache && physical_cache[0] == '1';
+        CHECK(impl.physical_resolve_hits - physical_hits == (use_physical_cache ? 1u : 0u));
+        CHECK(impl.exact_buffer_resolve_hits - hits == (use_physical_cache ? 0u : 1u));
     }
 
     SECTION("Large (>= 16 MiB) plain CpuNoAccess pool is deferred without host import") {
@@ -3751,10 +5058,16 @@ TEST_CASE("nvn memory: Compressible CpuNoAccess pool defers VkBuffer backing unt
                             .guest_address = 0x6000'0000,
                             .size = LARGE_BYTES,
                             .flags = Nvn::PoolFlag::CpuNoAccess});
-        const auto& raw = impl.RawGlobalMemoryTable();
-        (void)raw;
         const auto small_pool = impl.pools.at(1);
         const auto large_pool = impl.pools.at(2);
+        if (vulkan->device->IsBufferDeviceAddressSupported() &&
+            (impl.pool_usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0) {
+            // Table construction materializes only the small pool.
+            (void)impl.RawGlobalMemoryTable();
+        } else {
+            REQUIRE(small_pool->pending.load());
+            impl.EnsureBacking(*small_pool);
+        }
         REQUIRE_FALSE(small_pool->pending.load());
         REQUIRE(small_pool->backing == Nvn::Pool::Backing::DeviceLocal);
         REQUIRE(large_pool->pending.load());

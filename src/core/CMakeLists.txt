@@ -1303,6 +1303,17 @@ if (ENABLE_WEB_SERVICE)
     target_link_libraries(core PUBLIC web_service)
 endif()
 
+if (ENABLE_SCARLETNX)
+    target_sources(core PRIVATE
+        arm/scarletnx/arm_scarletnx_64.cpp
+        arm/scarletnx/arm_scarletnx_64.h
+        arm/scarletnx/scarletnx_api.h
+        arm/scarletnx/scarletnx_process.cpp
+        arm/scarletnx/scarletnx_process.h)
+    target_compile_definitions(core PRIVATE HAS_SCARLETNX=1)
+    target_link_libraries(core PRIVATE ScarletNX::recompiler)
+endif()
+
 if (HAS_NCE)
     enable_language(C ASM)
     set(CMAKE_ASM_FLAGS "${CFLAGS} -x assembler-with-cpp")

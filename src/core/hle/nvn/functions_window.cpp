@@ -25,6 +25,7 @@
 #include "core/hle/nvn/hle_runtime.h"
 #include "core/hle/nvn/present_pacing.h"
 #include "core/perf_stats.h"
+#include "video_core/nx2_spikes.h"
 
 // Window family: NVNwindow, its builder (kept in place using the NVN2 SDK layout), acquire and
 // present. The window's host textures are the NVN textures the game registered; a slot is free
@@ -313,6 +314,12 @@ void nvnWindowGetHdrDisplayMetadata(Call& c) {
     GetDisplayMetadata(c, c.args.NextPointer() + WindowHdrDisplayMetadata);
 }
 
+// ScarletNX's nvn_queue.c (GPL-3.0-or-later) takes the first N textures, or all
+// textures when the requested count is zero or outside the available range.
+u32 EffectiveActiveCount(s32 requested, u32 count) {
+    return requested > 0 ? std::min(static_cast<u32>(requested), count) : count;
+}
+
 void nvnWindowInitialize(Call& c) {
     const u64 window = c.args.NextPointer();
     const u64 builder = c.args.NextPointer();
@@ -336,6 +343,7 @@ void nvnWindowInitialize(Call& c) {
     StoreContentMetadata(c, window + WindowHdrContentMetadata, metadata);
     Runtime::WindowState state;
     state.count = used;
+    state.active_count = EffectiveActiveCount(c.Load<s32>(builder + WbActiveTextureCount), used);
     state.native_window = c.Load<u64>(builder + WbNative);
     state.color_space = c.Load<u32>(builder + WbColorSpace);
     state.present_interval = interval;
@@ -441,7 +449,29 @@ void nvnWindowGetNumTextures(Call& c) {
 }
 
 void nvnWindowSetNumActiveTextures(Call& c) {
-    static_cast<void>(c);
+    const u64 window = c.args.NextPointer();
+    const s32 requested = c.args.NextS32();
+    {
+        std::scoped_lock lock{c.runtime.window_mutex};
+        const auto it = c.runtime.windows.find(window);
+        if (it == c.runtime.windows.end()) {
+            return;
+        }
+        auto& state = it->second;
+        const u32 active_count = EffectiveActiveCount(requested, state.count);
+        if (state.active_count == active_count) {
+            return;
+        }
+        state.active_count = active_count;
+    }
+    c.runtime.WakeWaiters();
+}
+
+void nvnWindowGetNumActiveTextures(Call& c) {
+    const u64 window = c.args.NextPointer();
+    std::scoped_lock lock{c.runtime.window_mutex};
+    const auto it = c.runtime.windows.find(window);
+    c.ret.SetU32(it != c.runtime.windows.end() ? it->second.active_count : 0);
 }
 
 constexpr u64 DisplayPeriodNs = 16'666'667; // 60 Hz; a present interval counts these
@@ -453,22 +483,20 @@ u64 HostNanoseconds() {
                                 .count());
 }
 
-/// Hands out the free slot whose last present is oldest. A slot is free when the game does not
-/// hold it (acquired and not yet presented), its last present completed on the GPU and its
-/// texture left the display (the next frame replaced it). Sets the slot's acquired bit. When no
-/// slot is free yet only because of the display, `*wait_ns` receives the time until the first one.
-int TryAcquireSlot(Call& c, u64 window, u64* wait_ns) {
+/// Claims the active slot with the oldest completed present that the display has released.
+/// If only the display is holding a slot, release_ns tracks the earliest known release time.
+int TryAcquireSlot(Call& c, u64 window, u64& release_ns) {
     const u64 completed = c.rec.CompletedSeq();
     const u64 now = HostNanoseconds();
     std::scoped_lock lock{c.runtime.window_mutex};
     const auto it = c.runtime.windows.find(window);
-    if (it == c.runtime.windows.end()) {
+    if (it == c.runtime.windows.end() || it->second.active_count == 0) {
         return -2;
     }
     Runtime::WindowState& state = it->second;
     int best = -1;
     u64 best_seq = 0;
-    for (u32 slot = 0; slot < state.count; ++slot) {
+    for (u32 slot = 0; slot < state.active_count; ++slot) {
         if ((state.acquired_mask >> slot) & 1) {
             continue;
         }
@@ -476,11 +504,13 @@ int TryAcquireSlot(Call& c, u64 window, u64* wait_ns) {
         if (seq > completed) {
             continue;
         }
-        const u64 avail = state.avail_ns[slot];
+        // A one-texture window has no other slot to replace this one. The renderer
+        // has its own copy once the present completes, so use this frame's release time.
+        const u64 avail = state.active_count == 1 && state.displayed_slot == 0
+                              ? state.displayed_release_ns
+                              : state.avail_ns[slot];
         if (avail > now) {
-            if (avail != OnDisplay && wait_ns != nullptr && (*wait_ns == ~u64{0} || avail - now < *wait_ns)) {
-                *wait_ns = avail - now;
-            }
+            release_ns = std::min(release_ns, avail);
             continue;
         }
         if (best < 0 || seq < best_seq) {
@@ -497,33 +527,30 @@ int TryAcquireSlot(Call& c, u64 window, u64* wait_ns) {
 bool AcquireTexture(Call& c, u64 window, u64 index_out) {
     int slot = -1;
     while (true) {
-        u64 wait_ns = ~u64{0};
-        slot = TryAcquireSlot(c, window, &wait_ns);
+        u64 release_ns = OnDisplay;
+        slot = TryAcquireSlot(c, window, release_ns);
         if (slot != -1) {
             break;
         }
-        // Sleep until a completion frees a slot, or until the display releases one. An indefinite
-        // wait also ends when a display deadline appears (nothing notifies at that time), so the
-        // loop rearms with that deadline.
-        u64 next_wait_ns = ~u64{0};
-        bool ready;
-        {
-            ready = c.WaitUntil(
-                [&] {
-                    next_wait_ns = ~u64{0};
-                    slot = TryAcquireSlot(c, window, &next_wait_ns);
-                    return slot != -1 || (wait_ns == ~u64{0} && next_wait_ns != ~u64{0});
-                },
-                wait_ns == ~u64{0} ? std::chrono::nanoseconds{-1}
-                                   : std::chrono::nanoseconds{static_cast<s64>(wait_ns)});
-        }
+        // A completion or a change to the active slots can move the display deadline earlier.
+        const u64 now = HostNanoseconds();
+        const auto timeout = release_ns == OnDisplay
+                                 ? std::chrono::nanoseconds{-1}
+                                 : std::chrono::nanoseconds{release_ns - std::min(release_ns, now)};
+        const bool ready = c.WaitUntil(
+            [&] {
+                u64 next_release_ns = OnDisplay;
+                slot = TryAcquireSlot(c, window, next_release_ns);
+                return slot != -1 || next_release_ns < release_ns;
+            },
+            timeout);
         if (ready) {
             if (slot == -1) {
                 continue; // a display deadline appeared: wait for it
             }
             break;
         }
-        if (wait_ns == ~u64{0}) {
+        if (release_ns == OnDisplay) {
             return false; // stopped
         }
     }
@@ -716,6 +743,7 @@ void nvnQueuePresentTexture(Call& c) {
         return;
     }
     PresentPaceInputs pace;
+    bool presented_single_slot = false;
     {
         std::scoped_lock lock{c.runtime.window_mutex};
         const auto it = c.runtime.windows.find(window);
@@ -738,7 +766,12 @@ void nvnQueuePresentTexture(Call& c) {
             state.avail_ns[slot] = OnDisplay;
             state.displayed_slot = slot;
             state.last_display_ns = display;
+            state.displayed_release_ns = display + period;
+            presented_single_slot = state.active_count == 1;
         }
+    }
+    if (presented_single_slot) {
+        c.runtime.WakeWaiters();
     }
     const u64 presents = c.runtime.presents.fetch_add(1, std::memory_order_relaxed) + 1;
     if (presents <= 4 || presents % 600 == 0) {
@@ -748,15 +781,18 @@ void nvnQueuePresentTexture(Call& c) {
     // replaces: frame-locked key scripts, the census `calls_per_frame` column and the speed limiter
     // depend on them.
     Core::g_nx2_present_count.fetch_add(1, std::memory_order_relaxed);
+    const auto before_depth = std::chrono::steady_clock::now();
     WaitPresentDepth(c, present_seq);
     if (c.system != nullptr) {
         const auto entered = std::chrono::steady_clock::now();
         PacePresent(c, pace);
         const auto paced = std::chrono::steady_clock::now();
+        // The replay thread composites the frame. The guest present only waits on queue depth.
+        VideoCommon::Nx2Spikes::OnPresent(before_depth, entered, entered, paced);
         Common::FrameStats::AddStall(
             Common::FrameStats::Cause::GuestPace,
             static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(paced - entered).count()));
-        Common::FrameStats::OnPresent(entered);
+        Common::FrameStats::OnPresent(entered, present_seq);
         Common::DiagRequest::Poll(entered);
         Core::PerfStats& perf = c.system->GetPerfStats();
         perf.EndSystemFrame();
@@ -804,7 +840,7 @@ void RegisterWindowFunctions(Registry& registry) {
     NVN_HLE(registry, nvnWindowSetCrop);
     NVN_HLE(registry, nvnWindowGetCrop);
     NVN_HLE(registry, nvnWindowSetNumActiveTextures);
-    registry.Add<&nvnWindowGetNumTextures>("nvnWindowGetNumActiveTextures");
+    NVN_HLE(registry, nvnWindowGetNumActiveTextures);
     NVN_HLE(registry, nvnWindowGetNumTextures);
     NVN_HLE(registry, nvnQueueAcquireTexture);
     NVN_HLE(registry, nvnQueuePresentTexture);

@@ -35,6 +35,9 @@ std::vector<T> Enumerate(Query&& query) {
         u32 num{};
         result = query(&num, nullptr);
         if (result == VK_SUCCESS || result == VK_INCOMPLETE) {
+            if (result == VK_SUCCESS && num == 0) {
+                return {};
+            }
             out.resize(num);
             result = query(&num, out.data());
             out.resize(num);
@@ -104,8 +107,11 @@ void Proc(T& result, const DeviceDispatch& dld, const char* proc_name, VkDevice 
     result = reinterpret_cast<T>(dld.vkGetDeviceProcAddr(device, proc_name));
 }
 
-void Load(VkDevice device, DeviceDispatch& dld) noexcept {
+void Load(VkDevice device, u32 api_version, DeviceDispatch& dld) noexcept {
 #define X(name) Proc(dld.name, dld, #name, device)
+    // A loader can expose core symbols newer than the physical device's effective version.
+#define PROMOTED(name, version, suffix)                                                            \
+    Proc(dld.name, dld, api_version >= version ? #name : #name #suffix, device)
     X(vkAcquireNextImageKHR);
     X(vkAllocateCommandBuffers);
     X(vkAllocateDescriptorSets);
@@ -137,8 +143,8 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkCmdDrawIndexed);
     X(vkCmdDrawIndirect);
     X(vkCmdDrawIndexedIndirect);
-    X(vkCmdDrawIndirectCount);
-    X(vkCmdDrawIndexedIndirectCount);
+    PROMOTED(vkCmdDrawIndirectCount, VK_API_VERSION_1_2, KHR);
+    PROMOTED(vkCmdDrawIndexedIndirectCount, VK_API_VERSION_1_2, KHR);
     X(vkCmdDrawIndirectByteCountEXT);
     X(vkCmdDrawMeshTasksEXT);
     X(vkCmdDrawMeshTasksIndirectEXT);
@@ -150,7 +156,7 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkCmdEndDebugUtilsLabelEXT);
     X(vkCmdFillBuffer);
     X(vkCmdPipelineBarrier);
-    X(vkCmdPipelineBarrier2);
+    PROMOTED(vkCmdPipelineBarrier2, VK_API_VERSION_1_3, KHR);
     X(vkCmdPushConstants);
     X(vkCmdPushDescriptorSetKHR);
     X(vkCmdPushDescriptorSetWithTemplateKHR);
@@ -166,31 +172,34 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkCmdSetViewport);
     X(vkCmdWaitEvents);
     X(vkCmdWriteTimestamp);
-    X(vkCmdBindVertexBuffers2EXT);
-    X(vkCmdSetCullModeEXT);
-    X(vkCmdSetDepthBoundsTestEnableEXT);
-    X(vkCmdSetDepthCompareOpEXT);
-    X(vkCmdSetDepthTestEnableEXT);
-    X(vkCmdSetDepthWriteEnableEXT);
-    X(vkCmdSetPrimitiveRestartEnableEXT);
-    X(vkCmdSetRasterizerDiscardEnableEXT);
+    PROMOTED(vkCmdBindVertexBuffers2, VK_API_VERSION_1_3, EXT);
+    PROMOTED(vkCmdSetCullMode, VK_API_VERSION_1_3, EXT);
+    PROMOTED(vkCmdSetDepthBoundsTestEnable, VK_API_VERSION_1_3, EXT);
+    PROMOTED(vkCmdSetDepthCompareOp, VK_API_VERSION_1_3, EXT);
+    PROMOTED(vkCmdSetDepthTestEnable, VK_API_VERSION_1_3, EXT);
+    PROMOTED(vkCmdSetDepthWriteEnable, VK_API_VERSION_1_3, EXT);
+    PROMOTED(vkCmdSetPrimitiveRestartEnable, VK_API_VERSION_1_3, EXT);
+#ifdef VK_EXT_primitive_restart_index
+    X(vkCmdSetPrimitiveRestartIndexEXT);
+#endif
+    PROMOTED(vkCmdSetRasterizerDiscardEnable, VK_API_VERSION_1_3, EXT);
     X(vkCmdSetAlphaToCoverageEnableEXT);
     X(vkCmdSetAlphaToOneEnableEXT);
     X(vkCmdSetConservativeRasterizationModeEXT);
     X(vkCmdSetLineRasterizationModeEXT);
     X(vkCmdSetLineStippleEnableEXT);
-    X(vkCmdSetDepthBiasEnableEXT);
+    PROMOTED(vkCmdSetDepthBiasEnable, VK_API_VERSION_1_3, EXT);
     X(vkCmdSetLogicOpEnableEXT);
     X(vkCmdSetDepthClampEnableEXT);
-    X(vkCmdSetFrontFaceEXT);
+    PROMOTED(vkCmdSetFrontFace, VK_API_VERSION_1_3, EXT);
     X(vkCmdSetLogicOpEXT);
     X(vkCmdSetPatchControlPointsEXT);
     X(vkCmdSetPolygonModeEXT);
     X(vkCmdSetProvokingVertexModeEXT);
     X(vkCmdSetLineWidth);
-    X(vkCmdSetPrimitiveTopologyEXT);
-    X(vkCmdSetStencilOpEXT);
-    X(vkCmdSetStencilTestEnableEXT);
+    PROMOTED(vkCmdSetPrimitiveTopology, VK_API_VERSION_1_3, EXT);
+    PROMOTED(vkCmdSetStencilOp, VK_API_VERSION_1_3, EXT);
+    PROMOTED(vkCmdSetStencilTestEnable, VK_API_VERSION_1_3, EXT);
     X(vkCmdSetVertexInputEXT);
     X(vkCmdSetColorWriteMaskEXT);
     X(vkCmdSetColorWriteEnableEXT);
@@ -211,11 +220,12 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkCreateGraphicsPipelines);
     X(vkCreateImage);
     X(vkCreateImageView);
+    X(vkCreatePipelineBinariesKHR);
     X(vkCreatePipelineCache);
     X(vkCreatePipelineLayout);
     X(vkCreateQueryPool);
     X(vkCreateRenderPass);
-    X(vkCreateRenderPass2);
+    PROMOTED(vkCreateRenderPass2, VK_API_VERSION_1_2, KHR);
     X(vkCreateSampler);
     X(vkCreateSemaphore);
     X(vkCreateShaderModule);
@@ -233,6 +243,7 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkDestroyImage);
     X(vkDestroyImageView);
     X(vkDestroyPipeline);
+    X(vkDestroyPipelineBinaryKHR);
     X(vkDestroyPipelineCache);
     X(vkDestroyPipelineLayout);
     X(vkDestroyQueryPool);
@@ -252,7 +263,9 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkGetFenceStatus);
     X(vkGetImageMemoryRequirements);
     X(vkGetImageSparseMemoryRequirements);
+    X(vkGetPipelineBinaryDataKHR);
     X(vkGetPipelineCacheData);
+    X(vkGetPipelineKeyKHR);
     X(vkGetMemoryFdKHR);
 #ifdef _WIN32
     X(vkGetMemoryWin32HandleKHR);
@@ -260,19 +273,20 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkGetQueryPoolResults);
     X(vkGetPipelineExecutablePropertiesKHR);
     X(vkGetPipelineExecutableStatisticsKHR);
-    X(vkGetSemaphoreCounterValue);
+    PROMOTED(vkGetSemaphoreCounterValue, VK_API_VERSION_1_2, KHR);
     X(vkMapMemory);
     X(vkQueueBindSparse);
     X(vkQueueSubmit);
-    X(vkQueueSubmit2);
+    PROMOTED(vkQueueSubmit2, VK_API_VERSION_1_3, KHR);
+    X(vkReleaseCapturedPipelineDataKHR);
     X(vkResetFences);
-    X(vkResetQueryPool);
+    PROMOTED(vkResetQueryPool, VK_API_VERSION_1_2, EXT);
     X(vkSetDebugUtilsObjectNameEXT);
     X(vkSetDebugUtilsObjectTagEXT);
     X(vkUnmapMemory);
     X(vkUpdateDescriptorSetWithTemplate);
     X(vkUpdateDescriptorSets);
-    X(vkGetBufferDeviceAddress);
+    PROMOTED(vkGetBufferDeviceAddress, VK_API_VERSION_1_2, KHR);
     X(vkGetMemoryHostPointerPropertiesEXT);
     X(vkGetDescriptorSetLayoutSizeEXT);
     X(vkGetDescriptorSetLayoutBindingOffsetEXT);
@@ -280,36 +294,9 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkCmdBindDescriptorBuffersEXT);
     X(vkCmdSetDescriptorBufferOffsetsEXT);
     X(vkWaitForFences);
-    X(vkWaitSemaphores);
+    PROMOTED(vkWaitSemaphores, VK_API_VERSION_1_2, KHR);
 
-    // Support for timeline semaphores is mandatory in Vulkan 1.2
-    if (!dld.vkGetSemaphoreCounterValue) {
-        Proc(dld.vkGetSemaphoreCounterValue, dld, "vkGetSemaphoreCounterValueKHR", device);
-        Proc(dld.vkWaitSemaphores, dld, "vkWaitSemaphoresKHR", device);
-    }
-
-    // Support for host query reset is mandatory in Vulkan 1.2
-    if (!dld.vkResetQueryPool) {
-        Proc(dld.vkResetQueryPool, dld, "vkResetQueryPoolEXT", device);
-    }
-
-    // Support for draw indirect with count is optional in Vulkan 1.2
-    if (!dld.vkCmdDrawIndirectCount) {
-        Proc(dld.vkCmdDrawIndirectCount, dld, "vkCmdDrawIndirectCountKHR", device);
-        Proc(dld.vkCmdDrawIndexedIndirectCount, dld, "vkCmdDrawIndexedIndirectCountKHR", device);
-    }
-
-    // Synchronization2 is core in Vulkan 1.3, otherwise requires VK_KHR_synchronization2
-    if (!dld.vkCmdPipelineBarrier2) {
-        Proc(dld.vkCmdPipelineBarrier2, dld, "vkCmdPipelineBarrier2KHR", device);
-    }
-    if (!dld.vkQueueSubmit2) {
-        Proc(dld.vkQueueSubmit2, dld, "vkQueueSubmit2KHR", device);
-    }
-
-    if (!dld.vkCreateRenderPass2) {
-        Proc(dld.vkCreateRenderPass2, dld, "vkCreateRenderPass2KHR", device);
-    }
+#undef PROMOTED
 #undef X
 }
 
@@ -349,12 +336,14 @@ bool Load(VkInstance instance, InstanceDispatch& dld) noexcept {
     X(vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR);
     X(vkGetPhysicalDeviceFeatures2);
     X(vkGetPhysicalDeviceFormatProperties2);
+    X(vkGetPhysicalDeviceImageFormatProperties2);
     X(vkGetPhysicalDeviceProperties2);
     X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR);
     X(vkGetPhysicalDeviceSurfaceFormatsKHR);
     X(vkGetPhysicalDeviceSurfacePresentModesKHR);
     X(vkGetPhysicalDeviceSurfaceSupportKHR);
     X(vkGetPhysicalDeviceToolProperties);
+    X(vkGetPhysicalDeviceToolPropertiesEXT);
     X(vkGetSwapchainImagesKHR);
     X(vkQueuePresentKHR);
 
@@ -490,11 +479,9 @@ VkResult Free(VkDevice device, VkCommandPool handle, Span<VkCommandBuffer> buffe
 
 Instance Instance::Create(u32 version, Span<const char*> layers, Span<const char*> extensions,
                           InstanceDispatch& dispatch) {
-#ifdef __APPLE__
-    constexpr VkFlags ci_flags{VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR};
-#else
-    constexpr VkFlags ci_flags{};
-#endif
+    const bool enumerate_portability = std::ranges::any_of(extensions, [](std::string_view name) {
+        return name == VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
+    });
     // DO NOT TOUCH, breaks RNDA3!!
 	// Don't know why, but gloom + yellow line glitch appears
     const VkApplicationInfo application_info{
@@ -504,12 +491,13 @@ Instance Instance::Create(u32 version, Span<const char*> layers, Span<const char
         .applicationVersion = VK_MAKE_VERSION(1, 3, 0),
         .pEngineName = "yuzu Emulator",
         .engineVersion = VK_MAKE_VERSION(1, 3, 0),
-        .apiVersion = VK_API_VERSION_1_3,
+        .apiVersion = ApplicationApiVersion,
     };
     const VkInstanceCreateInfo ci{
         .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
         .pNext = nullptr,
-        .flags = ci_flags,
+        .flags = enumerate_portability ? VkInstanceCreateFlags{VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR}
+                                       : 0,
         .pApplicationInfo = &application_info,
         .enabledLayerCount = layers.size(),
         .ppEnabledLayerNames = layers.data(),
@@ -556,6 +544,9 @@ void Image::SetObjectNameEXT(const char* name) const {
 void Image::Release() const noexcept {
     if (handle) {
         vmaDestroyImage(allocator, handle, allocation);
+        if (device_memory_releases) {
+            device_memory_releases->fetch_add(1, std::memory_order_release);
+        }
     }
 }
 
@@ -578,10 +569,20 @@ void Buffer::Flush() const {
     }
 }
 
-void Buffer::Invalidate() const {
+void Buffer::Readback::Flush() const {
     if (!is_coherent) {
-        vmaInvalidateAllocation(allocator, allocation, 0, VK_WHOLE_SIZE);
+        Check(vmaFlushAllocation(allocator, allocation, 0, VK_WHOLE_SIZE));
     }
+}
+
+void Buffer::Readback::Invalidate() const {
+    if (!is_coherent) {
+        Check(vmaInvalidateAllocation(allocator, allocation, 0, VK_WHOLE_SIZE));
+    }
+}
+
+void Buffer::Invalidate() const {
+    HostReadback().Invalidate();
 }
 
 void Buffer::SetObjectNameEXT(const char* name) const {
@@ -591,6 +592,9 @@ void Buffer::SetObjectNameEXT(const char* name) const {
 void Buffer::Release() const noexcept {
     if (handle) {
         vmaDestroyBuffer(allocator, handle, allocation);
+        if (device_memory_releases) {
+            device_memory_releases->fetch_add(1, std::memory_order_release);
+        }
     }
 }
 
@@ -709,7 +713,8 @@ void Semaphore::SetObjectNameEXT(const char* name) const {
     SetObjectName(dld, owner, handle, VK_OBJECT_TYPE_SEMAPHORE, name);
 }
 
-Device Device::Create(VkPhysicalDevice physical_device, Span<VkDeviceQueueCreateInfo> queues_ci,
+Device Device::Create(VkPhysicalDevice physical_device, u32 api_version,
+                      Span<VkDeviceQueueCreateInfo> queues_ci,
                       Span<const char*> enabled_extensions, const void* next,
                       DeviceDispatch& dispatch) {
     const VkDeviceCreateInfo ci{
@@ -726,7 +731,7 @@ Device Device::Create(VkPhysicalDevice physical_device, Span<VkDeviceQueueCreate
     };
     VkDevice device;
     Check(dispatch.vkCreateDevice(physical_device, &ci, nullptr, &device));
-    Load(device, dispatch);
+    Load(device, api_version, dispatch);
     return Device(device, dispatch);
 }
 
@@ -1012,6 +1017,14 @@ VkFormatProperties3 PhysicalDevice::GetFormatProperties3(VkFormat format) const 
     return properties3;
 }
 
+VkResult PhysicalDevice::GetImageFormatProperties2(const VkPhysicalDeviceImageFormatInfo2& info,
+                                                  VkImageFormatProperties2& properties) const noexcept {
+    if (!dld->vkGetPhysicalDeviceImageFormatProperties2) {
+        return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    }
+    return dld->vkGetPhysicalDeviceImageFormatProperties2(physical_device, &info, &properties);
+}
+
 std::vector<VkExtensionProperties> PhysicalDevice::EnumerateDeviceExtensionProperties() const {
     u32 num;
     dld->vkEnumerateDeviceExtensionProperties(physical_device, nullptr, &num, nullptr);
@@ -1028,16 +1041,24 @@ std::vector<VkQueueFamilyProperties> PhysicalDevice::GetQueueFamilyProperties() 
     return properties;
 }
 
-std::vector<VkPhysicalDeviceToolProperties> PhysicalDevice::GetPhysicalDeviceToolProperties()
-    const {
-    u32 num = 0;
-    if (!dld->vkGetPhysicalDeviceToolProperties) {
+std::vector<VkPhysicalDeviceToolProperties> PhysicalDevice::GetPhysicalDeviceToolProperties(
+    u32 api_version) const {
+    const auto query = api_version >= VK_API_VERSION_1_3
+                           ? dld->vkGetPhysicalDeviceToolProperties
+                           : dld->vkGetPhysicalDeviceToolPropertiesEXT;
+    if (!query) {
         return {};
     }
-    dld->vkGetPhysicalDeviceToolProperties(physical_device, &num, nullptr);
-    std::vector<VkPhysicalDeviceToolProperties> properties(num);
-    dld->vkGetPhysicalDeviceToolProperties(physical_device, &num, properties.data());
-    return properties;
+    return Enumerate<VkPhysicalDeviceToolProperties>(
+        [&](u32* count, VkPhysicalDeviceToolProperties* out) {
+            if (out) {
+                for (u32 i = 0; i < *count; ++i) {
+                    out[i].sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TOOL_PROPERTIES;
+                    out[i].pNext = nullptr;
+                }
+            }
+            return query(physical_device, count, out);
+        });
 }
 
 std::vector<VkCooperativeMatrixPropertiesKHR> PhysicalDevice::GetCooperativeMatrixPropertiesKHR()

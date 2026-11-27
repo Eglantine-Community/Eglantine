@@ -35,6 +35,7 @@
 #include "shader_recompiler/backend/bindings.h"
 #include "video_core/native_tensor_programs.h"
 #include "video_core/pipeline_cache_files.h"
+#include "video_core/renderer_vulkan/nvn/nvn_debug.h"
 #include "video_core/renderer_vulkan/nvn/nvn_pipeline_cache.h"
 #include "video_core/renderer_vulkan/nvn/nvn_pipeline_disk.h"
 #include "video_core/renderer_vulkan/nvn/nvn_pipeline_state.h"
@@ -53,6 +54,16 @@ constexpr size_t MAX_CACHE_FILES = 6;
 /// preload (GPL path): the newest ones, so a long-lived cache file cannot queue minutes of work.
 constexpr size_t MAX_WARMED_SHADER_SETS = 1024;
 constexpr const char* VK_CACHE_FILE_NAME = VideoCommon::NVN_DRIVER_CACHE_FILE_NAME.data();
+
+struct GraphicsLayoutCapacity {
+    VkPhysicalDeviceLimits limits{};
+    u32 max_set_descriptors{};
+    u32 max_push_descriptors{};
+};
+
+/// Extra layout-only bindings, or no capacity class for this descriptor shape and device.
+[[nodiscard]] std::optional<u32> FragmentSamplerPadding(
+    std::span<const VkDescriptorSetLayoutBinding> bindings, const GraphicsLayoutCapacity& caps);
 
 /// Graphics stages in pipeline order as NVNshaderStage indices (task, mesh, VS, TCS, TES, GS,
 /// FS): the order BuildDescriptorLayout and the shared Bindings are fed in.
@@ -196,12 +207,21 @@ struct StageArtifact {
     std::shared_ptr<const std::vector<u32>> constants;
 };
 
+struct PreloadVariant {
+    enum class State { Pending, Built, Failed };
+
+    std::array<StageArtifact, GRAPHICS_STAGE_COUNT> stages;
+    State state{State::Pending}; ///< guarded by PendingKey::mutex
+};
+
 struct PendingKey {
     // Set before publishing the key under pipeline_mutex.
     bool speculative{};
     std::mutex mutex;
     std::condition_variable cv;
     std::atomic<int> outstanding{0};
+    /// Only the loader appends, before it publishes loader_queued.
+    std::vector<std::shared_ptr<PreloadVariant>> preload_variants;
 };
 
 inline VC::NvnShaderPools& ThreadPools() {
@@ -246,15 +266,16 @@ public:
         idle.notify_all();
     }
 
-    void Post(std::function<void()> job) {
+    bool Post(std::function<void()> job) {
         {
             std::scoped_lock lock{mutex};
             if (state == State::Disabled || stop) {
-                return;
+                return false;
             }
             queue.push_back(std::move(job));
         }
         cv.notify_one();
+        return true;
     }
 
     void Flush() {
@@ -317,10 +338,12 @@ struct PipelineCache::Impl {
     std::shared_ptr<GraphicsPipeline> GetGraphics(const GraphicsRequest& request, bool* not_ready,
                                                   u64& key_hash,
                                                   const std::function<void(u64)>& look_ahead = {},
-                                                  std::optional<u64> prefetch_skip = {});
+                                                  std::optional<u64> prefetch_skip = {},
+                                                  const std::function<void()>& before_wait = {});
     std::shared_ptr<ComputePipeline> GetCompute(const ComputeRequest& request, bool* not_ready,
                                                 const std::function<void(u64)>& look_ahead = {},
-                                                std::optional<u64> prefetch_skip = {});
+                                                std::optional<u64> prefetch_skip = {},
+                                                const std::function<void()>& before_wait = {});
     VkRenderPass GetRenderPass(const RenderPassKey& key, bool read_only_depth = false,
                                u16 clear_mask = 0);
     void Flush();
@@ -378,7 +401,7 @@ struct PipelineCache::Impl {
     /// `push_stages`: the stages of the push-constant range (PipelineBase::push_constant_stages).
     std::shared_ptr<const SharedPipelineLayout> CreateLayoutObjects(
         const VC::DescriptorLayout& descriptors, bool is_compute, VkShaderStageFlags push_stages,
-        const EmulatedMeshArtifact* emulated_mesh = nullptr);
+        const EmulatedMeshArtifact* emulated_mesh = nullptr, bool allow_capacity = true);
     VC::DescriptorLayout MergeLayouts(std::span<const StageArtifact* const> stages);
     struct ShaderSet;
     /// Without `gpl_set` the pipeline is compiled whole from modules made for the call. With it
@@ -390,23 +413,24 @@ struct PipelineCache::Impl {
         const GraphicsFixedState& state, const RenderPassKey& targets,
         const std::array<const StageArtifact*, GRAPHICS_STAGE_COUNT>& stages,
         const std::shared_ptr<ShaderSet>& gpl_set = {}, bool warm_parts = false,
-        const EmulatedMeshArtifact* emulated_mesh = nullptr);
+        const EmulatedMeshArtifact* emulated_mesh = nullptr, bool allow_capacity = true);
     const MeshEmulationHelpers* GetMeshEmulationHelpers();
     std::shared_ptr<ComputePipeline> AssembleCompute(const StageArtifact& stage,
-                                                     const VC::ComputeDriverLayout& layout);
+                                                     const VC::ComputeDriverLayout& layout,
+                                                     bool save_binary = true);
     void FillStages(PipelineBase& pipeline, std::span<const StageArtifact* const> stages);
 
     // --- VK_EXT_graphics_pipeline_library path (nvn_pipeline_gpl.cpp) -------------------------
-    /// The translated stages of one TranslationKey for one set of texture answers, and the
-    /// Vulkan objects its shader library parts are compiled from (made by the first pipeline
-    /// that links from it). Every pipeline built from these stages shares the set; its address
-    /// stands for the pipeline layout in the library keys (GraphicsPipelineLibraryCache), so a
-    /// set lives as long as the cache.
+    struct SharedShaderModule {
+        std::shared_ptr<const Disk::ShaderRecord> record;
+        std::once_flag created;
+        vk::ShaderModule handle;
+    };
+    /// The translated stages for one set of texture answers and their shared Vulkan modules.
     struct ShaderSet {
         TranslateOutput translated;
-        std::once_flag created; ///< `modules` and `layout` exist once it is set
-        std::array<vk::ShaderModule, GRAPHICS_STAGE_COUNT> modules; ///< by NVNshaderStage
-        std::shared_ptr<const SharedPipelineLayout> layout; ///< layout the shader parts are compiled with
+        std::once_flag created; ///< `modules` exist once it is set
+        std::array<std::shared_ptr<SharedShaderModule>, GRAPHICS_STAGE_COUNT> modules;
         /// True when `oracle` still answers every texture query of the stages as it did.
         [[nodiscard]] bool QueriesMatch(const TextureOracle& oracle) const;
     };
@@ -484,14 +508,25 @@ struct PipelineCache::Impl {
     };
     /// Creates the set's shader modules and library layout once. Throws vk::Exception when the
     /// driver fails (the next pipeline of the set tries again).
-    void CreateShaderSetObjects(ShaderSet& set, const VC::DescriptorLayout& descriptors,
-                                VkShaderStageFlags push_stages);
+    std::shared_ptr<SharedShaderModule> GetShaderModule(
+        const std::shared_ptr<const Disk::ShaderRecord>& record);
+    void CreateShaderSetModules(ShaderSet& set);
     /// Queues the whole compile of a fast-linked pipeline on the optimize workers; the result is
     /// published in `GraphicsPipeline::optimized_handle`.
     void QueueOptimize(std::shared_ptr<GraphicsPipeline> pipeline, std::shared_ptr<ShaderSet> set,
                        const GraphicsFixedState& state, const RenderPassKey& targets);
     void DeferOptimize(std::shared_ptr<GraphicsPipeline> pipeline, std::shared_ptr<ShaderSet> set,
                        const GraphicsFixedState& state, const RenderPassKey& targets);
+    /// Marks a cache miss that replay must finish before it can continue.
+    struct RequiredLookup {
+        explicit RequiredLookup(Impl* impl_);
+        ~RequiredLookup();
+        RequiredLookup(const RequiredLookup&) = delete;
+        RequiredLookup& operator=(const RequiredLookup&) = delete;
+
+        Impl* impl;
+    };
+    bool WaitToOptimize();
     void NoteGraphicsUsed(GraphicsPipeline& pipeline);
     void OnPresent();
     void PrepareProgram(const std::array<StageProgram, STAGE_COUNT>& stages,
@@ -502,6 +537,7 @@ struct PipelineCache::Impl {
     void LogRuntimeCompile(const GraphicsKey& key, bool had_variants);
     std::shared_ptr<GraphicsPipeline> CompileGraphics(const GraphicsRequest& request,
                                                       const GraphicsKey& key, bool had_variants,
+                                                      Debug::PipelineTrace trace,
                                                       bool speculative = false);
     std::shared_ptr<ComputePipeline> CompileCompute(const ComputeRequest& request,
                                                     const ComputeKey& key, bool had_variants,
@@ -518,6 +554,7 @@ struct PipelineCache::Impl {
         std::array<OwnedProgram, GRAPHICS_STAGE_COUNT> programs;
         std::unique_ptr<TextureOracle> oracle;
         GraphicsKey key;
+        Debug::PipelineTrace trace;
         bool had_variants{};
         bool speculative{};
         std::shared_ptr<PendingKey> pending;
@@ -576,20 +613,38 @@ struct PipelineCache::Impl {
     void PostComputePipeline(const StageArtifact& stage, const ComputeKey& key,
                              const ComputePipeline& pipeline);
     void PostBytes(std::vector<u8> bytes);
+    struct DriverCacheUse {
+        explicit DriverCacheUse(Impl& owner);
+        ~DriverCacheUse();
+        DriverCacheUse(const DriverCacheUse&) = delete;
+        DriverCacheUse& operator=(const DriverCacheUse&) = delete;
+
+        Impl* const impl;
+    };
+    [[nodiscard]] bool DriverCacheIdle();
     void MaybeWriteVkCache();
     void WriteVkCache();
-    std::vector<u8> ReadVkCacheBlob() const;
+    std::vector<u8> ReadVkCacheBlob();
+    void InitPipelineBinaries();
+    std::unique_ptr<GraphicsPipelineLibraryCache> MakeLibraryCache();
+    vk::Pipeline CreateComputeBinary(VkComputePipelineCreateInfo ci, u64 hash, bool save_binary);
+    vk::Pipeline CreateGraphicsLibraryBinary(VkGraphicsPipelineCreateInfo ci);
     void RunLoader(std::stop_token stop);
     /// Counts one handled cached record and reports Build done / total (rate limited, always on
     /// the last one).
     void NotePreloadStep();
+    template <typename PendingMap, typename PipelineMap, typename Key, typename Build>
+    void QueuePreload(PendingMap& pending_map, PipelineMap& pipelines, const Key& key,
+                      std::shared_ptr<PreloadVariant> variant, Build build);
     void PreloadGraphics(
         const Disk::GraphicsPipelineRecord& record,
         const std::unordered_map<Disk::ContentId, StageArtifact, Disk::ContentIdHash>& shaders);
     void PreloadCompute(
         const Disk::ComputePipelineRecord& record,
         const std::unordered_map<Disk::ContentId, StageArtifact, Disk::ContentIdHash>& shaders);
-    void WaitPending(const std::shared_ptr<PendingKey>& pending);
+    /// Called after WaitLoaderQueued() has published the disk variants. Returns true if replay
+    /// ran queued work while resolving the key.
+    bool WaitPending(const std::shared_ptr<PendingKey>& pending, const TextureOracle& oracle);
     /// Blocks while the loader is still registering the cached pipelines as pending (false
     /// without waiting when it is done or there is no loader): a draw that misses before that
     /// would compile a pipeline the preload is about to deliver.
@@ -607,13 +662,15 @@ struct PipelineCache::Impl {
     VertexInputMode vertex_input_mode{VertexInputMode::Static};
     DynamicStateCaps dynamic_caps{};
     bool must_emulate_scaled_formats{};
-    /// How the title's compute programs lower their matrix multiplies (decided once, part of the
-    /// translation key).
-    VideoCommon::NativeTensorLowering tensor_lowering{VideoCommon::NativeTensorLowering::None};
     Shader::HostTranslateInfo host_info;
     Disk::Header disk_header;
     std::filesystem::path disk_path;
     std::filesystem::path vk_cache_path;
+    std::filesystem::path compute_binary_directory;
+    std::filesystem::path graphics_binary_directory;
+    VkPipelineBinaryKeyKHR pipeline_binary_device_key{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR,
+    };
     vk::PipelineCache vk_cache;
     std::atomic<u64> shader_generation{};
 
@@ -672,6 +729,8 @@ struct PipelineCache::Impl {
 
     std::mutex layout_cache_mutex;
     std::map<std::vector<u32>, std::shared_ptr<const SharedPipelineLayout>> layout_cache;
+    std::optional<GraphicsLayoutCapacity> graphics_layout_capacity;
+    std::map<std::vector<u32>, std::shared_ptr<const PipelineLayoutHandles>> capacity_layout_cache;
     std::mutex mesh_helpers_mutex;
     std::unique_ptr<MeshEmulationHelpers> mesh_helpers;
     bool mesh_helpers_failed{};
@@ -682,20 +741,26 @@ struct PipelineCache::Impl {
         graphics;
     std::unordered_map<ComputeKey, std::vector<std::shared_ptr<ComputePipeline>>, ComputeKeyHash>
         compute;
+    u32 unused_compute_prefetches{}; ///< protected by pipeline_mutex
     std::unordered_map<GraphicsKey, std::shared_ptr<PendingKey>, GraphicsKeyHash, GraphicsKeyEqual>
         pending_graphics;
     std::unordered_map<ComputeKey, std::shared_ptr<PendingKey>, ComputeKeyHash> pending_compute;
     /// Keys whose asynchronous compile produced no pipeline (guarded by pipeline_mutex).
     std::unordered_set<GraphicsKey, GraphicsKeyHash, GraphicsKeyEqual> failed_graphics;
     std::unordered_set<ComputeKey, ComputeKeyHash> failed_compute;
-    u32 unused_compute_prefetches{}; ///< Protected by pipeline_mutex.
 
     std::mutex written_mutex;
     std::unordered_set<Disk::ContentId, Disk::ContentIdHash> written_shaders;
     std::unordered_set<Disk::ContentId, Disk::ContentIdHash> written_pipelines;
     Disk::Appender appender; ///< touched by the writer thread only (and the loader before Ready)
+    /// Blob size and checksum, initialized before compilation and updated by the writer only.
+    std::optional<std::pair<u64, u32>> saved_driver_cache;
     std::atomic<u64> new_since_vk_write{};
     std::atomic<s64> last_vk_write_ticks{};
+    std::atomic<bool> vk_write_pending{};
+    std::mutex vk_cache_work_mutex;
+    size_t vk_cache_users{}; ///< Guarded by vk_cache_work_mutex
+    std::chrono::steady_clock::time_point last_vk_cache_use{}; ///< Guarded by vk_cache_work_mutex
 
     std::atomic<bool> stopping{};
     std::mutex loader_mutex;
@@ -723,11 +788,15 @@ struct PipelineCache::Impl {
     std::mutex async_mutex;
     std::condition_variable async_cv;
     u64 async_outstanding{}; ///< jobs queued and not finished (guarded by async_mutex)
+    size_t required_lookups{}; ///< replay lookups on cache misses (guarded by async_mutex)
+    std::chrono::steady_clock::time_point last_pipeline_ready{}; ///< guarded by async_mutex
 
     // GPL path (null / empty unless options.graphics_pipeline_library and the device allows it).
     std::unique_ptr<GraphicsPipelineLibraryCache> library_cache;
     /// GPL pipelines declare the DynamicFixedState states dynamic (EDS and EDS2 present).
     bool gpl_dynamic_fixed{};
+    std::mutex shader_module_mutex;
+    std::unordered_multimap<u64, std::shared_ptr<SharedShaderModule>> shader_modules;
     std::mutex translation_mutex;
     std::unordered_map<TranslationKey, std::vector<std::shared_ptr<ShaderSet>>, TranslationKeyHash,
                        TranslationKeyEqual>
@@ -742,6 +811,7 @@ struct PipelineCache::Impl {
     std::atomic<u64> stat_gpl_reused{};
     std::atomic<u64> stat_gpl_whole{};
     std::atomic<u64> stat_gpl_optimized{};
+    std::atomic<u64> stat_gpl_optimize_waits{};
     std::atomic<u64> stat_gpl_warmed{}; ///< shader sets whose parts the preload compiled
     std::atomic<u64> stat_gpl_optimize_failed{};
     std::atomic<u64> stat_gpl_optimize_ns{};

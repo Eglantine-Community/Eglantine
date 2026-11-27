@@ -895,7 +895,8 @@ public:
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
             .pNext = nullptr,
             .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT |
+                             VK_ACCESS_HOST_READ_BIT,
         };
         scheduler.RequestOutsideRenderPassOperationContext();
         scheduler.Record([](vk::CommandBuffer cmdbuf) {
@@ -923,6 +924,7 @@ public:
             pending_flush_sets.pop_front();
         }
 
+        staging_ref.Invalidate();
         size_t offset_base = staging_ref.offset;
         for (auto q : flushed_queries) {
             auto* query = GetQuery(q);
@@ -1425,15 +1427,14 @@ void QueryCacheRuntime::EndHostConditionalRendering() {
     impl->hcr_offset = 0;
 }
 
-void QueryCacheRuntime::PauseHostConditionalRendering() {
-    if (!impl->hcr_is_set) {
-        return;
+bool QueryCacheRuntime::PauseHostConditionalRendering() {
+    if (!impl->hcr_is_set || !impl->is_hcr_running) {
+        return false;
     }
-    if (impl->is_hcr_running) {
-        impl->scheduler.Record(
-            [](vk::CommandBuffer cmdbuf) { cmdbuf.EndConditionalRenderingEXT(); });
-    }
+    impl->scheduler.Record(
+        [](vk::CommandBuffer cmdbuf) { cmdbuf.EndConditionalRenderingEXT(); });
     impl->is_hcr_running = false;
+    return true;
 }
 
 void QueryCacheRuntime::ResumeHostConditionalRendering() {

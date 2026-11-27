@@ -33,7 +33,9 @@
 #include "common/thread.h"
 #include "common/thread_worker.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "shader_recompiler/exception.h"
+#include "shader_recompiler/frontend/ampere/instruction.h"
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
 #include "shader_recompiler/program_header.h"
 #include "video_core/nvn/state_layouts.h"
@@ -107,7 +109,7 @@ bool StoresGlobalMemory(const GraphicsRequest& request) noexcept {
     return false;
 }
 
-bool PipelineBase::QueriesMatch(const TextureOracle& oracle) const {
+static bool QueriesMatch(std::span<const TextureQuery> queries, const TextureOracle& oracle) {
     for (const TextureQuery& query : queries) {
         const TextureInfo now = oracle.Query(query.stage, query.record);
         if (now.type != query.info.type || now.format != query.info.format ||
@@ -116,6 +118,10 @@ bool PipelineBase::QueriesMatch(const TextureOracle& oracle) const {
         }
     }
     return true;
+}
+
+bool PipelineBase::QueriesMatch(const TextureOracle& oracle) const {
+    return Nvn::QueriesMatch(queries, oracle);
 }
 
 namespace {
@@ -202,8 +208,17 @@ std::string MeshLimitExceeded(const Device& device, const Shader::IR::Program& p
 /// sizes the mesh program's payload input).
 u64 HashRuntime(u32 nvn_stage, const Shader::RuntimeInfo& info,
                 const Shader::Backend::Bindings& bindings, u64 extra,
-                const std::array<u32, 3>& mesh_registers) {
+                const std::array<u32, 3>& mesh_registers, const Shader::Profile& stage_profile,
+                const std::array<u32, 3>& guest_size) {
     ByteBuffer buf;
+    if (nvn_stage == STAGE_COMPUTE) {
+        for (const u32 dim : guest_size) {
+            buf.Add(dim);
+        }
+        buf.Add(stage_profile.compute_warp_local_id_from_subgroup);
+        buf.Add(stage_profile.compute_warp_subgroup_size);
+        buf.Add(stage_profile.compute_warp_flatten_workgroup);
+    }
     buf.Add(extra);
     buf.Add(nvn_stage);
     if (nvn_stage == STAGE_TASK || nvn_stage == STAGE_MESH) {
@@ -249,6 +264,7 @@ u64 HashRuntime(u32 nvn_stage, const Shader::RuntimeInfo& info,
         buf.Add(static_cast<u8>(type));
     }
     buf.Add(info.dual_source_blend);
+    buf.Add(info.warp_scratch_memory_limit);
     if (info.mesh_as_compute) {
         buf.Add(info.mesh_as_compute);
         buf.Add(info.mesh_output_binding);
@@ -268,6 +284,9 @@ u64 HashProfile(const Shader::Profile& profile, const Shader::HostTranslateInfo&
     buf.Add(profile.support_int16);
     buf.Add(profile.support_int64);
     buf.Add(profile.support_float_controls);
+    buf.Add(profile.native_float16_controls.available);
+    buf.Add(profile.native_float16_controls.round_float64);
+    buf.Add(profile.native_float16_controls.preserve_denorm_float64);
     buf.Add(profile.support_native_ndc);
     buf.Add(profile.support_scaled_attributes);
     buf.Add(profile.support_multi_viewport);
@@ -276,9 +295,16 @@ u64 HashProfile(const Shader::Profile& profile, const Shader::HostTranslateInfo&
     buf.Add(profile.support_demote_to_helper_invocation);
     buf.Add(profile.support_typeless_image_loads);
     buf.Add(profile.supported_subgroup_stages);
-    if (profile.has_broken_spirv_fragment_shuffle) {
-        buf.Add(profile.has_broken_spirv_fragment_shuffle); // only when set: other keys unchanged
-    }
+    buf.Add(profile.support_vote);
+    buf.Add(profile.support_ballot);
+    buf.Add(profile.support_shuffle);
+    buf.Add(profile.support_quad_shuffles);
+    buf.Add(profile.support_quad_shuffles_all_stages);
+    buf.Add(profile.support_shuffle_relative);
+    buf.Add(profile.warp_size_potentially_larger_than_guest);
+    buf.Add(profile.has_broken_spirv_subgroup_mask_vector_extract_dynamic);
+    buf.Add(profile.has_broken_spirv_subgroup_shuffle);
+    buf.Add(profile.has_broken_spirv_fragment_shuffle);
     buf.Add(profile.max_subgroup_size);
     buf.Add(profile.min_ssbo_alignment);
     buf.Add(profile.max_user_clip_distances);
@@ -297,8 +323,17 @@ u64 HashProfile(const Shader::Profile& profile, const Shader::HostTranslateInfo&
     buf.Add(host.max_descriptor_set_samplers);
     buf.Add(host.max_descriptor_set_uniform_buffers);
     buf.Add(host.max_descriptor_set_storage_buffers);
+    // Keep the previous key when the per-stage limit cannot constrain translation.
+    if (host.max_per_stage_descriptor_storage_buffers <
+        (std::min<size_t>)(Shader::Info::MAX_SSBOS, host.max_descriptor_set_storage_buffers)) {
+        buf.Add(host.max_per_stage_descriptor_storage_buffers);
+    }
     buf.Add(host.max_descriptor_set_sampled_images);
     buf.Add(host.max_descriptor_set_storage_images);
+    if (!profile.UsesTypedUniformBuffers()) {
+        // Encode the packed UBO layout without changing keys for the existing typed layout.
+        buf.Add(true);
+    }
     return buf.Hash();
 }
 
@@ -415,12 +450,14 @@ void PipelineCache::Impl::LogCounts() const {
         LOG_INFO(Render_Vulkan,
                  "[nvn] pipeline libraries: {} fast links ({} from parts compiled already), {} "
                  "built from earlier translations, {} compiled whole; {} optimized compiles "
-                 "swapped in ({} failed, {} over 50 ms, {} ms in total, background); {} program "
+                 "swapped in ({} failed, {} over 50 ms, {} ms in total, background); {} "
+                 "optimizations waited for pipeline activity to settle; {} program "
                  "stages lowered at creation; {} shader sets of the disk cache warmed",
                  stat_gpl_fast_links.load(), stat_gpl_cached_links.load(), stat_gpl_reused.load(),
                  stat_gpl_whole.load(), stat_gpl_optimized.load(),
                  stat_gpl_optimize_failed.load(), stat_gpl_optimize_slow.load(),
-                 stat_gpl_optimize_ns.load() / 1'000'000, stat_prepared.load(),
+                 stat_gpl_optimize_ns.load() / 1'000'000, stat_gpl_optimize_waits.load(),
+                 stat_prepared.load(),
                  stat_gpl_warmed.load());
     }
 }
@@ -489,18 +526,6 @@ PipelineCache::Impl::Impl(const Device& device_, PipelineCacheOptions options_)
                             ? VertexInputMode::Dynamic
                             : VertexInputMode::Static;
     must_emulate_scaled_formats = device.MustEmulateScaledFormats();
-    // The titles whose own tensor programs are lowered, as the emulated GPU picks them
-    // (KeplerCompute::EmulatesNativeTensorPrograms); the compact form needs compute pipelines
-    // created 32 threads wide.
-    tensor_lowering = VideoCommon::NativeTensorLoweringFor(
-        Settings::GetCurrentProgramID(),
-        device.IsExtSubgroupSizeControlSupported() &&
-            device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT));
-    if (tensor_lowering != VideoCommon::NativeTensorLowering::None) {
-        LOG_INFO(Render_Vulkan, "[nvn] tensor programs: lowered ({} form)",
-                 tensor_lowering == VideoCommon::NativeTensorLowering::Compact ? "compact"
-                                                                               : "full");
-    }
     if (options.dedup_dynamic_state) {
         dynamic_caps.fixed = device.IsExtExtendedDynamicStateSupported() &&
                              device.IsExtExtendedDynamicState2Supported();
@@ -533,7 +558,24 @@ PipelineCache::Impl::Impl(const Device& device_, PipelineCacheOptions options_)
     if (options.raw_miss_reporting && profile.support_raw_global_memory) {
         switches.raw_coverage = true;
     }
-    switches.tensor_lowering = static_cast<u8>(tensor_lowering);
+    const u32 width = (std::max)(GuestWarpSize, device.GetMaxSubgroupSize());
+    const auto tensor_mode = device.NativeTensorComputeSupport({width, 1, 1});
+    ByteBuffer compute_limits;
+    compute_limits.Add(disk_header.profile_hash);
+    for (const auto width : device.DefaultComputeSubgroupRange()) {
+        compute_limits.Add(width);
+    }
+    compute_limits.Add(device.SupportsFullComputeSubgroups());
+    compute_limits.Add(device.MaxComputeInvocationsWithGuestWarp());
+    compute_limits.Add(props.limits.maxComputeWorkGroupInvocations);
+    for (u32 limit : props.limits.maxComputeWorkGroupSize) {
+        compute_limits.Add(limit);
+    }
+    compute_limits.Add(props.limits.maxComputeSharedMemorySize);
+    disk_header.profile_hash = compute_limits.Hash();
+    switches.tensor_lowering = static_cast<u8>(tensor_mode);
+    switches.tensor_full_fallback = tensor_mode == VideoCommon::NativeTensorLowering::Compact ||
+                                    tensor_mode == VideoCommon::NativeTensorLowering::Full;
     disk_header.translation_key = Disk::MakeTranslationKey({
         .epoch = epoch,
         .switches_hash = HashTranslationSwitches(switches),
@@ -557,6 +599,7 @@ PipelineCache::Impl::Impl(const Device& device_, PipelineCacheOptions options_)
         }
     }
     if (disk) {
+        InitPipelineBinaries();
         disk_path = options.directory / Disk::FileNameForKey(disk_header.translation_key);
         LOG_INFO(Render_Vulkan, "[nvn] pipeline cache file {} for {}", disk_path.filename().string(),
                  disk_header.translation_key);
@@ -582,9 +625,12 @@ PipelineCache::Impl::Impl(const Device& device_, PipelineCacheOptions options_)
     try {
         vk_cache = create_cache(blob);
     } catch (const vk::Exception&) {
+        saved_driver_cache.reset();
         vk_cache = create_cache({});
     }
-    last_vk_write_ticks = std::chrono::steady_clock::now().time_since_epoch().count();
+    if (!Debug::Get().quiet_driver_cache) {
+        last_vk_write_ticks = std::chrono::steady_clock::now().time_since_epoch().count();
+    }
 
     if (!disk) {
         writer.SetState(DiskWriter::State::Disabled);
@@ -602,7 +648,13 @@ PipelineCache::Impl::Impl(const Device& device_, PipelineCacheOptions options_)
         // Run-time compiles block draws that cannot be skipped by the preload, so they run at
         // normal priority on their own threads (the preload workers are a background queue).
         const s64 hw = static_cast<s64>(std::thread::hardware_concurrency());
-        size_t threads = static_cast<size_t>(std::clamp<s64>(hw / 3, 2, 4));
+        size_t threads = static_cast<size_t>(std::clamp<s64>(
+            options.graphics_pipeline_library && device.IsExtGraphicsPipelineLibrarySupported()
+                ? hw / 4
+                : hw / 3,
+            2,
+            options.graphics_pipeline_library && device.IsExtGraphicsPipelineLibrarySupported() ? 3
+                                                                                                : 4));
         if (const u32 forced = Debug::Get().async_workers; forced != 0) {
             threads = forced; // EDEN_NX2_NVN_ASYNC_WORKERS: worker-count experiments
         }
@@ -616,7 +668,20 @@ PipelineCache::Impl::Impl(const Device& device_, PipelineCacheOptions options_)
         prepare_workers.reset(new Common::ThreadWorker(prepare_threads, "NvnProgramPrepare", {},
                                                        Common::ThreadPlacement::Background));
         if (device.IsExtGraphicsPipelineLibrarySupported()) {
-            library_cache = std::make_unique<GraphicsPipelineLibraryCache>(device);
+            library_cache = MakeLibraryCache();
+            if (Debug::Get().gpl_layout_capacity) {
+                VkPhysicalDeviceMaintenance3Properties maintenance{
+                    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES,
+                };
+                VkPhysicalDeviceProperties2 properties{
+                    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+                    .pNext = &maintenance,
+                };
+                device.GetPhysical().GetProperties2(properties);
+                graphics_layout_capacity = GraphicsLayoutCapacity{
+                    properties.properties.limits, maintenance.maxPerSetDescriptors,
+                    CanUsePush(0) ? device.MaxPushDescriptors() : 0};
+            }
             gpl_dynamic_fixed = device.IsExtExtendedDynamicStateSupported() &&
                                 device.IsExtExtendedDynamicState2Supported();
             constexpr size_t optimize_threads = 1;
@@ -701,16 +766,15 @@ void PipelineCache::Impl::ClearShaders() {
     auto fresh_cache = device.GetLogical().CreatePipelineCache({
         .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
     });
-    auto fresh_libraries =
-        library_cache ? std::make_unique<GraphicsPipelineLibraryCache>(device) : nullptr;
+    auto fresh_libraries = library_cache ? MakeLibraryCache() : nullptr;
     const auto before = Stats();
     {
         std::scoped_lock lock{pipeline_mutex};
         graphics.clear();
         compute.clear();
+        unused_compute_prefetches = 0;
         failed_graphics.clear();
         failed_compute.clear();
-        unused_compute_prefetches = 0;
     }
     {
         std::scoped_lock lock{translation_mutex};
@@ -721,6 +785,10 @@ void PipelineCache::Impl::ClearShaders() {
         deferred_optimizes.clear();
     }
     library_cache = std::move(fresh_libraries);
+    {
+        std::scoped_lock lock{shader_module_mutex};
+        shader_modules.clear();
+    }
     {
         std::scoped_lock lock{lowered_mutex};
         lowered.clear();
@@ -759,6 +827,7 @@ PipelineCacheStats PipelineCache::Impl::Stats() const {
     stats.gpl_translations_reused = stat_gpl_reused;
     stats.gpl_whole = stat_gpl_whole;
     stats.gpl_optimized = stat_gpl_optimized;
+    stats.gpl_optimize_waits = stat_gpl_optimize_waits;
     stats.gpl_shader_sets_warmed = stat_gpl_warmed;
     stats.programs_prepared = stat_prepared;
     {
@@ -799,15 +868,29 @@ LoweredEntry PipelineCache::Impl::GetLowered(const StageProgram& program, u32 nv
     }
     LoweredEntry entry;
     try {
+        auto tensor_mode = VideoCommon::NativeTensorLowering::None;
+        if (nvn_stage == STAGE_COMPUTE) {
+            std::string error;
+            if (const auto control = VC::ParseControl(*program.control, error)) {
+                tensor_mode = device.NativeTensorComputeSupport(control->thread_group);
+            }
+        }
         entry.program = VC::PrepareNvnProgram(
             VC::NvnProgramBinary{
                 static_cast<VC::ShaderStage>(nvn_stage),
                 std::span<const u8>{program.control->data(), program.control->size()},
                 std::span<const u8>{program.code->data(), program.code->size()}},
-            // No cooperative matrix lowering in Eglantine: a game's own DLSS network is lowered
-            // for the titles NativeTensorLoweringFor names, otherwise rejected and replaced by the
-            // replay (nvn_upscale.cpp).
-            tensor_lowering);
+            tensor_mode);
+        if (const char* requested = std::getenv("EDEN_NX2_TENSOR");
+            nvn_stage == STAGE_COMPUTE && tensor_mode == VideoCommon::NativeTensorLowering::None &&
+            requested && Shader::Ampere::ParseTensorMode(requested) != Shader::Ampere::TensorMode::Stub &&
+            entry.program && entry.program->error.empty() && Shader::Ampere::HasHmma(entry.program->native)) {
+            // A diagnostic override can enable frontend translation even when this local size
+            // cannot run HMMA. Only the stub avoids the unavailable physical warp operations.
+            auto failed = std::make_shared<VC::LoweredNvnProgram>();
+            failed->error = "lower: explicit HMMA mode needs a supported physical subgroup";
+            entry.program = std::move(failed);
+        }
     } catch (const std::exception& e) {
         auto failed = std::make_shared<VC::LoweredNvnProgram>();
         failed->error = std::string{"exception: "} + e.what();
@@ -1075,23 +1158,33 @@ bool PipelineCache::Impl::Translate(const TranslateInput& in, TranslateOutput& o
     std::array<std::shared_ptr<Disk::ShaderRecord>, STAGE_COUNT> records;
     Shader::Profile guest_warp_profile = translation_profile;
     guest_warp_profile.max_subgroup_size = GuestWarpSize;
-    if (translation_profile.support_vote) {
-        guest_warp_profile.warp_size_potentially_larger_than_guest = false;
-    }
+    guest_warp_profile.warp_size_potentially_larger_than_guest = false;
     for (const u32 stage : order) {
         const StageProgram& source = *in.programs[stage];
         Shader::IR::Program& program = programs[stage];
         const bool emulated_mesh_stage = emulate_mesh && (stage == STAGE_TASK || stage == STAGE_MESH);
         const bool compute_stage = is_compute || emulated_mesh_stage;
-        const bool mesh_uses_guest_warp = emulated_mesh_stage && program.info.UsesWarpOps();
-        const auto workgroup_size = emulated_mesh_stage
+        const bool workgroup_hmma = is_compute && lowered_programs[stage].program->tensor_lowering ==
+                                                     VideoCommon::NativeTensorLowering::Workgroup;
+        auto workgroup_size = emulated_mesh_stage
                                         ? std::array<u32, 3>{program.workgroup_size[0], 1, 1}
                                         : program.workgroup_size;
-        const bool fixed_guest_warp =
-            mesh_uses_guest_warp && device.CanRequireGuestWarpForCompute(workgroup_size);
-        const auto& stage_profile = fixed_guest_warp ? guest_warp_profile : translation_profile;
+        const bool uses_native_warp = is_compute
+                                          ? program.info.UsesWarpCollectives() && !workgroup_hmma &&
+                                                !program.HasScalarWarp()
+                                          : emulated_mesh_stage && program.info.UsesWarpOps();
+        auto stage_profile = emulated_mesh_stage && uses_native_warp &&
+                                     device.CanRequireGuestWarpForCompute(workgroup_size)
+                                 ? guest_warp_profile
+                                 : translation_profile;
+        const bool workgroup_warp = is_compute && uses_native_warp &&
+            !ConfigureNativeComputeWarp(device, program, stage_profile, workgroup_size);
+        const bool requires_guest_warp = uses_native_warp && !workgroup_warp;
         Shader::RuntimeInfo runtime_info =
             MakeRuntimeInfo(stage, program, previous, in.translation, has_geometry);
+        if (workgroup_hmma || workgroup_warp) {
+            runtime_info.warp_scratch_memory_limit = device.GetMaxComputeSharedMemorySize();
+        }
         if (emulate_mesh) {
             if (emulated_mesh_stage) {
                 runtime_info.mesh_as_compute = true;
@@ -1121,9 +1214,18 @@ bool PipelineCache::Impl::Translate(const TranslateInput& in, TranslateOutput& o
         std::vector<u32> spirv;
         u64 runtime_hash{};
         try {
+            if (workgroup_warp) {
+                const auto limits = device.GetPhysical().GetProperties().limits;
+                if (!VideoCommon::ValidTensorWorkgroup(program.workgroup_size,
+                                                      limits.maxComputeWorkGroupSize,
+                                                      limits.maxComputeWorkGroupInvocations)) {
+                    throw Shader::NotImplementedException("Guest warp scratch has an invalid local size");
+                }
+            }
             ConvertLegacyToGeneric(program, runtime_info);
             runtime_hash =
-                HashRuntime(stage, runtime_info, bindings, in.extra_key, mesh_registers);
+                HashRuntime(stage, runtime_info, bindings, in.extra_key, mesh_registers,
+                            stage_profile, program.workgroup_size);
             if (ShaderLog::Enabled()) {
                 // What the emitter consumes (kept also when the emit below rejects the stage).
                 // A failed dump only loses the text: it must not reach the catches below.
@@ -1207,10 +1309,7 @@ bool PipelineCache::Impl::Translate(const TranslateInput& in, TranslateOutput& o
             record->workgroup_size = workgroup_size;
             record->shared_memory_size = program.shared_memory_size;
         }
-        record->layout.requires_guest_warp =
-            mesh_uses_guest_warp ||
-            (is_compute && tensor_lowering == VideoCommon::NativeTensorLowering::Compact &&
-             program.info.UsesWarpOps());
+        record->layout.requires_guest_warp = requires_guest_warp;
         record->spirv = std::move(spirv);
         records[stage] = std::move(record);
     }
@@ -1267,9 +1366,33 @@ bool PipelineCache::Impl::Translate(const TranslateInput& in, TranslateOutput& o
 // lookups and compilation
 // ================================================================================================
 
-void PipelineCache::Impl::WaitPending(const std::shared_ptr<PendingKey>& pending) {
+bool PipelineCache::Impl::WaitPending(const std::shared_ptr<PendingKey>& pending,
+                                      const TextureOracle& oracle) {
+    if (!pending->preload_variants.empty()) {
+        bool assisted = false;
+        for (const auto& variant : pending->preload_variants) {
+            // Keys omit the texture queries. Only run or wait for a compatible disk variant.
+            if (!std::ranges::all_of(variant->stages, [&](const StageArtifact& stage) {
+                    return !stage.record || QueriesMatch(stage.record->queries, oracle);
+                })) {
+                continue;
+            }
+            assisted |= workers->TryRunOne(variant.get());
+            std::unique_lock lock{pending->mutex};
+            pending->cv.wait(lock, [&] { return variant->state != PreloadVariant::State::Pending; });
+            if (variant->state == PreloadVariant::State::Built) {
+                break;
+            }
+        }
+        return assisted;
+    }
+    // A required pipeline that is still queued can compile here without waiting for a worker.
+    if (async_workers && async_workers->TryRunOne(pending.get())) {
+        return true;
+    }
     std::unique_lock lock{pending->mutex};
     pending->cv.wait(lock, [&] { return pending->outstanding.load() == 0; });
+    return false;
 }
 
 bool PipelineCache::Impl::WaitLoaderQueued() {
@@ -1315,9 +1438,15 @@ void PipelineCache::Impl::NoteNotReady(std::string_view what, std::span<const u6
 }
 
 bool PipelineCache::Impl::AsyncQueued(size_t limit) {
-    std::scoped_lock lock{async_mutex};
-    if (limit != 0 && async_outstanding >= limit) {
-        return false;
+    {
+        std::scoped_lock lock{async_mutex};
+        if (limit != 0 && async_outstanding >= limit) {
+            return false;
+        }
+        ++async_outstanding;
+        if (async_outstanding > stat_async_peak.load()) {
+            stat_async_peak = async_outstanding;
+        }
     }
     if (options.shader_notify != nullptr) {
         options.shader_notify->MarkShaderBuilding();
@@ -1325,10 +1454,6 @@ bool PipelineCache::Impl::AsyncQueued(size_t limit) {
     const u64 now = static_cast<u64>(std::chrono::steady_clock::now().time_since_epoch().count());
     u64 expected = 0;
     stat_async_first_ticks.compare_exchange_strong(expected, now);
-    ++async_outstanding;
-    if (async_outstanding > stat_async_peak.load()) {
-        stat_async_peak = async_outstanding;
-    }
     return true;
 }
 
@@ -1336,10 +1461,12 @@ void PipelineCache::Impl::AsyncDone() {
     if (options.shader_notify != nullptr) {
         options.shader_notify->MarkShaderComplete();
     }
-    stat_async_last_ticks = static_cast<u64>(std::chrono::steady_clock::now().time_since_epoch().count());
+    const auto now = std::chrono::steady_clock::now();
+    stat_async_last_ticks = static_cast<u64>(now.time_since_epoch().count());
     {
         std::scoped_lock lock{async_mutex};
         --async_outstanding;
+        last_pipeline_ready = (std::max)(last_pipeline_ready, now);
     }
     async_cv.notify_all();
 }
@@ -1363,7 +1490,8 @@ void PipelineCache::Impl::RunAsyncGraphics(AsyncGraphicsJob& job) {
     std::shared_ptr<GraphicsPipeline> pipeline;
     if (!stopping.load()) {
         try {
-            pipeline = CompileGraphics(job.request, job.key, job.had_variants, job.speculative);
+            pipeline =
+                CompileGraphics(job.request, job.key, job.had_variants, job.trace, job.speculative);
         } catch (const std::exception& e) {
             ++stat_failures;
             NoteRow(fmt::format("pipeline: async compile failed: {}", FirstLine(e.what())));
@@ -1376,18 +1504,34 @@ void PipelineCache::Impl::RunAsyncGraphics(AsyncGraphicsJob& job) {
             std::scoped_lock lock{pipeline_mutex};
             failed_graphics.insert(job.key);
         }
+    } else {
+        job.trace.Event("cancelled", "stopping");
     }
     // The pipeline (or the failed mark) is visible before the key stops being pending.
     ReleasePending(pending_graphics, job.key, job.pending);
     AsyncDone();
 }
 
+void GraphicsPipeline::TraceFirstBind() const noexcept {
+    if (trace_first_bind.exchange(false, std::memory_order_relaxed)) {
+        Debug::PipelineTrace{trace_key, trace_job, "draw"}.Event("first_bind");
+    }
+}
+
 std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::GetGraphics(const GraphicsRequest& source,
     bool* not_ready, u64& key_hash, const std::function<void(u64)>& look_ahead,
-    std::optional<u64> prefetch_skip) {
+    std::optional<u64> prefetch_skip, const std::function<void()>& before_wait) {
     if (not_ready != nullptr) {
         *not_ready = false;
     }
+    // The dynamic blend key can strip the operation from the live request.
+    if (!device.SupportsLogicOp() && UsesColorLogicOp(source.state, source.targets)) {
+        NoteIssue("pipeline: NVN color logic operation requires Vulkan logicOp");
+        return nullptr;
+    }
+    using Clock = std::chrono::steady_clock;
+    const bool trace_enabled = Debug::Get().pipeline_trace;
+    const auto lookup_start = trace_enabled ? Clock::now() : Clock::time_point{};
     // The state words carry guest garbage in the bits no field covers: key on the canonical form
     // (the same form the disk records hold) and create the pipeline from it. In Dynamic mode that
     // form holds the vertex type classes instead of the vertex layout.
@@ -1430,13 +1574,9 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::GetGraphics(const Graphic
                      !loader_queued.load(std::memory_order_acquire))) {
         return nullptr;
     }
-    if (prefetch) {
-        // Bound speculative work so a later frame cannot build up a backlog behind it.
-        std::scoped_lock lock{async_mutex};
-        if (async_outstanding >= async_worker_count) {
-            return nullptr;
-        }
-    }
+    // Allow one batch to queue behind running compiles. Frozen oracles can hold copies of many
+    // uniform buffers, and a future required draw may wait on one of these keys.
+    const size_t queue_limit = async_worker_count * (prefetch ? 1 : 2);
 
     // A draw that may be skipped (`not_ready`) with asynchronous shaders on is compiled on the
     // workers, the GPL path included: translating, compiling the library parts and linking all
@@ -1486,19 +1626,64 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::GetGraphics(const Graphic
     };
     if (auto hit = search()) {
         if (!prefetch) {
+            if (trace_enabled && !hit->trace_demand_seen) {
+                hit->trace_demand_seen = true;
+                Debug::BeginPipelineTrace(key.hash, "draw").Event(
+                    "demand", "cache_hit", lookup_start, hit->TraceJob());
+            }
             NoteGraphicsUsed(*hit);
         }
         return hit;
     }
+    Debug::PipelineTrace trace;
+    if (trace_enabled && (!prefetch || !pending)) {
+        trace = Debug::BeginPipelineTrace(key.hash, prefetch ? "prefetch" : "draw");
+        trace.Event(prefetch ? "prefetch" : "demand", "cache_miss", lookup_start);
+    }
+    const auto note_result = [&](std::shared_ptr<GraphicsPipeline> result, const char* detail) {
+        if (trace.job != 0) {
+            if (result) {
+                result->trace_demand_seen = true;
+            }
+            trace.Event("resolved", result ? detail : "failed", {}, result ? result->TraceJob() : 0);
+        }
+        return result;
+    };
+    const auto report_not_ready = [&] {
+        if (!prefetch) {
+            *not_ready = true;
+            NoteNotReady("draw", key.hashes);
+        }
+    };
+    bool scanned_ahead = false;
+    const auto scan_ahead = [&] {
+        if (scanned_ahead || failed || !options.prefetch_graphics || !look_ahead) {
+            return;
+        }
+        const bool workers_busy = [&] {
+            std::scoped_lock lock{async_mutex};
+            return async_outstanding >= async_worker_count;
+        }();
+        if (workers_busy) {
+            trace.Event("lookahead_skipped", "workers_busy");
+            return;
+        }
+        scanned_ahead = true;
+        trace.Event("lookahead");
+        try {
+            look_ahead(key_hash);
+        } catch (const std::exception& error) {
+            NoteIssue(fmt::format("pipeline: graphics lookahead failed: {}", FirstLine(error.what())));
+        }
+    };
     if (async) {
         if (!preload_registered || pending) {
-            if (!prefetch) {
-                *not_ready = true;
-                NoteNotReady("draw", key.hashes);
-            }
+            trace.Event("deferred", pending ? "pending_key" : "loader_registering");
+            report_not_ready();
             return nullptr;
         }
         if (failed) {
+            trace.Event("rejected", "failed_key");
             if (!prefetch) {
                 NoteRow("pipeline: draw skipped, the pipeline was rejected earlier");
             }
@@ -1510,6 +1695,16 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::GetGraphics(const Graphic
             }
         };
         if (AnyStageRejected(key.hashes)) {
+            trace.Event("rejected", "failed_stage");
+            return nullptr;
+        }
+        const bool queue_full = [&] {
+            std::scoped_lock lock{async_mutex};
+            return async_outstanding >= queue_limit;
+        }();
+        if (queue_full) {
+            trace.Event("deferred", "queue_full");
+            report_not_ready();
             return nullptr;
         }
         u32 stage_mask = 0;
@@ -1521,14 +1716,21 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::GetGraphics(const Graphic
         std::unique_ptr<TextureOracle> frozen = oracle.Freeze(stage_mask);
         if (!frozen) {
             if (prefetch) {
+                trace.Event("deferred", "oracle");
                 return nullptr;
             }
             // An oracle that cannot be copied cannot be used by a worker: compile here.
-            auto result = CompileGraphics(request, key, had_variants);
+            const RequiredLookup required{this};
+            if (before_wait) {
+                before_wait();
+            }
+            auto compile_trace = trace;
+            compile_trace.source = "sync_oracle";
+            auto result = CompileGraphics(request, key, had_variants, compile_trace);
             if (result) {
                 NoteGraphicsUsed(*result);
             }
-            return result;
+            return note_result(std::move(result), "sync_oracle");
         }
         auto job = std::make_shared<AsyncGraphicsJob>();
         job->request.state = request.state;
@@ -1550,75 +1752,85 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::GetGraphics(const Graphic
         job->oracle = std::move(frozen);
         job->request.oracle = job->oracle.get();
         job->key = key;
+        job->trace = trace;
+        job->trace.source = prefetch ? "prefetch" : "async";
         job->had_variants = had_variants;
         job->speculative = prefetch;
         job->pending = claim;
-        AsyncQueued();
+        if (!AsyncQueued(queue_limit)) {
+            trace.Event("deferred", "queue_full");
+            report_not_ready();
+            return nullptr;
+        }
+        const auto queued = trace_enabled ? Clock::now() : Clock::time_point{};
         try {
-            async_workers->QueueWork([this, job] { RunAsyncGraphics(*job); });
+            async_workers->QueueWork([this, job] { RunAsyncGraphics(*job); }, claim.get());
         } catch (...) {
+            job->trace.Event("cancelled", "enqueue_failed");
             AsyncDone();
             throw;
         }
+        job->trace.Event("queued", "", queued);
         claim.reset();
         ++stat_async_queued;
         if (prefetch) {
             ++stat_prefetch_queued;
-        }
-        if (!prefetch) {
-            *not_ready = true;
-            NoteNotReady("draw", key.hashes);
+        } else {
+            if (!had_variants) {
+                scan_ahead();
+            }
+            report_not_ready();
         }
         return nullptr;
     }
+    const bool required_miss = !failed && (!before_wait || !AnyStageRejected(key.hashes));
+    const RequiredLookup required{required_miss ? this : nullptr};
+    if (before_wait && required_miss) {
+        before_wait();
+    }
     // A miss while the loader is still registering the cached pipelines: wait for it, then
     // look again (the key may be about to be delivered).
-    if (const auto wait_start = std::chrono::steady_clock::now(); WaitLoaderQueued()) {
+    if (const auto wait_start = Clock::now(); WaitLoaderQueued()) {
+        const auto wait_end = trace_enabled ? Clock::now() : Clock::time_point{};
+        trace.Event("wait_start", "loader_registration", wait_start);
+        trace.Event("wait_end", "loader_registration", wait_end);
         NoteWait(wait_start);
         if (auto hit = search()) {
             NoteGraphicsUsed(*hit);
-            return hit;
+            return note_result(std::move(hit), "loader_registration");
         }
     }
-    bool scanned_ahead = false;
-    const auto scan_ahead = [&] {
-        if (scanned_ahead || failed || !options.prefetch_graphics || !look_ahead) {
-            return;
-        }
-        {
-            std::scoped_lock lock{async_mutex};
-            if (async_outstanding >= async_worker_count) {
-                return;
-            }
-        }
-        scanned_ahead = true;
-        try {
-            look_ahead(key_hash);
-        } catch (const std::exception& error) {
-            NoteIssue(fmt::format("pipeline: graphics lookahead failed: {}", FirstLine(error.what())));
-        }
-    };
     if (pending) {
         // Keep the other workers busy while replay waits for this speculative build.
         if (pending->speculative) {
             scan_ahead();
         }
-        const auto wait_start = std::chrono::steady_clock::now();
-        WaitPending(pending);
+        const char* const reason = pending->speculative ? "prefetch" : "pending_key";
+        const auto wait_start = Clock::now();
+        const bool assisted = WaitPending(pending, oracle);
+        const auto wait_end = trace_enabled ? Clock::now() : Clock::time_point{};
+        trace.Event("wait_start", reason, wait_start);
+        if (assisted) {
+            trace.Event("wait_assisted", reason, wait_end);
+        }
+        trace.Event("wait_end", reason, wait_end);
         NoteWait(wait_start);
         if (auto hit = search()) {
             NoteGraphicsUsed(*hit);
-            return hit;
+            return note_result(std::move(hit), reason);
         }
     }
     if (failed) {
+        trace.Event("rejected", "failed_key");
         NoteRow("pipeline: draw skipped, the pipeline was rejected earlier");
         return nullptr;
     }
     if (!had_variants) {
         scan_ahead();
     }
-    auto result = CompileGraphics(request, key, had_variants);
+    auto compile_trace = trace;
+    compile_trace.source = "sync";
+    auto result = CompileGraphics(request, key, had_variants, compile_trace);
     if (!result && gpl) {
         // Not built again for every later draw of the key (the asynchronous path does the same).
         std::scoped_lock lock{pipeline_mutex};
@@ -1627,7 +1839,7 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::GetGraphics(const Graphic
     if (result) {
         NoteGraphicsUsed(*result);
     }
-    return result;
+    return note_result(std::move(result), "sync");
 }
 
 void PipelineCache::Impl::LogRuntimeCompile(const GraphicsKey& key, bool had_variants) {
@@ -1662,8 +1874,16 @@ void PipelineCache::Impl::LogRuntimeCompile(const GraphicsKey& key, bool had_var
 }
 
 std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::CompileGraphics(
-    const GraphicsRequest& request, const GraphicsKey& key, bool had_variants, bool speculative) {
+    const GraphicsRequest& request, const GraphicsKey& key, bool had_variants,
+    Debug::PipelineTrace trace, bool speculative) {
     const auto start = std::chrono::steady_clock::now();
+    trace.Event("compile_start", "", start);
+    bool published = false;
+    SCOPE_EXIT {
+        if (!published) {
+            trace.Event("compile_failed");
+        }
+    };
     CompileFailureNote failure{*this, key.hash};
     if (AnyStageRejected(key.hashes)) {
         return nullptr;
@@ -1743,6 +1963,7 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::CompileGraphics(
         failure.ir = gpl_set ? gpl_set->translated.ir : std::move(fresh.ir);
         return nullptr;
     }
+    std::chrono::steady_clock::time_point ready;
     {
         std::scoped_lock lock{pipeline_mutex};
         auto& variants = graphics[key];
@@ -1759,8 +1980,16 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::CompileGraphics(
                            static_cast<u32>(variants.size()));
         }
         pipeline->prefetched_unused = speculative;
+        if (trace.job != 0) {
+            pipeline->SetTraceIdentity(trace.key, trace.job);
+        }
         variants.push_back(pipeline);
+        if (trace.job != 0) {
+            ready = std::chrono::steady_clock::now();
+        }
     }
+    published = true;
+    trace.Event("ready", "", ready);
     failure.armed = false;
     ++stat_compiled;
     if (had_variants) {
@@ -1797,8 +2026,9 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::CompileGraphics(
             record.emulated_mesh = std::move(fresh.mesh_emulation);
         }
         PostGraphicsRecord(record);
-        ++new_since_vk_write;
-        MaybeWriteVkCache();
+        if (!Debug::Get().quiet_driver_cache) {
+            MaybeWriteVkCache();
+        }
     }
     return pipeline;
 }
@@ -1829,7 +2059,7 @@ constexpr u32 MAX_UNUSED_COMPUTE_PREFETCHES = 16;
 
 std::shared_ptr<ComputePipeline> PipelineCache::Impl::GetCompute(
     const ComputeRequest& request, bool* not_ready, const std::function<void(u64)>& look_ahead,
-    std::optional<u64> prefetch_skip) {
+    std::optional<u64> prefetch_skip, const std::function<void()>& before_wait) {
     if (not_ready != nullptr) {
         *not_ready = false;
     }
@@ -1852,7 +2082,7 @@ std::shared_ptr<ComputePipeline> PipelineCache::Impl::GetCompute(
                      (before_binding && ShaderLog::Enabled()))) {
         return nullptr;
     }
-    // An unused program should not delay work found by command lookahead.
+    // Program registration can name unused shaders. Keep room for lookahead of actual commands.
     const size_t queue_limit = before_binding ? 1 : async_worker_count;
     if (prefetch) {
         std::scoped_lock lock{async_mutex};
@@ -1890,9 +2120,7 @@ std::shared_ptr<ComputePipeline> PipelineCache::Impl::GetCompute(
                     hit->stages[STAGE_COMPUTE].program_constants,
                 };
                 lock.unlock();
-                if (DiskEnabled()) {
-                    PostComputePipeline(stage, key, *hit);
-                }
+                PostComputePipeline(stage, key, *hit);
                 return hit;
             }
             had_variants = !it->second.empty();
@@ -1949,6 +2177,10 @@ std::shared_ptr<ComputePipeline> PipelineCache::Impl::GetCompute(
             if (prefetch) {
                 return nullptr;
             }
+            const RequiredLookup required{this};
+            if (before_wait) {
+                before_wait();
+            }
             return CompileCompute(request, key, had_variants, false);
         }
         auto job = std::make_shared<AsyncComputeJob>();
@@ -1971,7 +2203,7 @@ std::shared_ptr<ComputePipeline> PipelineCache::Impl::GetCompute(
             return nullptr;
         }
         try {
-            async_workers->QueueWork([this, job] { RunAsyncCompute(*job); });
+            async_workers->QueueWork([this, job] { RunAsyncCompute(*job); }, claim.get());
         } catch (...) {
             AsyncDone();
             throw;
@@ -1986,6 +2218,12 @@ std::shared_ptr<ComputePipeline> PipelineCache::Impl::GetCompute(
             NoteNotReady("dispatch", hashes);
         }
         return nullptr;
+    }
+    const u64 hashes[1]{key.hash};
+    const bool required_miss = !before_wait || !AnyStageRejected(hashes);
+    const RequiredLookup required{required_miss ? this : nullptr};
+    if (before_wait && required_miss) {
+        before_wait();
     }
     if (const auto wait_start = std::chrono::steady_clock::now(); WaitLoaderQueued()) {
         NoteWait(wait_start);
@@ -2017,7 +2255,7 @@ std::shared_ptr<ComputePipeline> PipelineCache::Impl::GetCompute(
             scan_ahead();
         }
         const auto wait_start = std::chrono::steady_clock::now();
-        WaitPending(pending);
+        WaitPending(pending, oracle);
         NoteWait(wait_start);
         if (auto hit = search()) {
             return hit;
@@ -2046,8 +2284,6 @@ std::shared_ptr<ComputePipeline> PipelineCache::Impl::CompileCompute(const Compu
         return nullptr;
     }
     TranslateInput input;
-    const bool before_binding = speculative && request.oracle == nullptr;
-    input.speculative = before_binding;
     input.programs[STAGE_COMPUTE] = &request.program;
     input.oracle = request.oracle != nullptr ? request.oracle : &DEFAULT_ORACLE;
     input.environment = &request.environment;
@@ -2060,13 +2296,14 @@ std::shared_ptr<ComputePipeline> PipelineCache::Impl::CompileCompute(const Compu
         return nullptr;
     }
     const StageArtifact& stage = translated.stages[STAGE_COMPUTE];
+    const bool before_binding = speculative && request.oracle == nullptr;
     if (before_binding && !stage.record->queries.empty()) {
         // Handles can also come from uniform buffers and the handle bank.
         failure.armed = false;
         return nullptr;
     }
     const auto create_start = std::chrono::steady_clock::now();
-    auto pipeline = AssembleCompute(stage, translated.compute_layout);
+    auto pipeline = AssembleCompute(stage, translated.compute_layout, !before_binding);
     const auto create_end = std::chrono::steady_clock::now();
     if (!pipeline) {
         failure.ir = std::move(translated.ir);
@@ -2108,7 +2345,9 @@ std::shared_ptr<ComputePipeline> PipelineCache::Impl::CompileCompute(const Compu
                     create_end - create_start);
     if (!before_binding && DiskEnabled()) {
         PostComputePipeline(stage, key, *pipeline);
-        MaybeWriteVkCache();
+        if (!Debug::Get().quiet_driver_cache) {
+            MaybeWriteVkCache();
+        }
     }
     return pipeline;
 }
@@ -2129,11 +2368,12 @@ void PipelineCache::PrefetchGraphics(const GraphicsRequest& request, u64 current
 }
 
 std::shared_ptr<GraphicsPipeline> PipelineCache::GetGraphics(const GraphicsRequest& request,
-    bool* not_ready, const std::function<void(u64)>& look_ahead) {
+    bool* not_ready, const std::function<void(u64)>& look_ahead,
+    const std::function<void()>& before_wait) {
     const auto begin = Common::FrameStats::Enabled() ? std::chrono::steady_clock::now()
                                                      : std::chrono::steady_clock::time_point{};
     u64 key_hash{};
-    auto result = impl->GetGraphics(request, not_ready, key_hash, look_ahead);
+    auto result = impl->GetGraphics(request, not_ready, key_hash, look_ahead, {}, before_wait);
     if (Common::FrameStats::Enabled()) {
         const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::steady_clock::now() - begin)
@@ -2153,10 +2393,11 @@ void PipelineCache::PrefetchCompute(const ComputeRequest& request, u64 skip_hash
 }
 
 std::shared_ptr<ComputePipeline> PipelineCache::GetCompute(
-    const ComputeRequest& request, bool* not_ready, const std::function<void(u64)>& look_ahead) {
+    const ComputeRequest& request, bool* not_ready, const std::function<void(u64)>& look_ahead,
+    const std::function<void()>& before_wait) {
     const auto begin = Common::FrameStats::Enabled() ? std::chrono::steady_clock::now()
                                                      : std::chrono::steady_clock::time_point{};
-    auto result = impl->GetCompute(request, not_ready, look_ahead);
+    auto result = impl->GetCompute(request, not_ready, look_ahead, {}, before_wait);
     if (Common::FrameStats::Enabled()) {
         const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::steady_clock::now() - begin)

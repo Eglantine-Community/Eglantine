@@ -162,6 +162,33 @@ private:
 /// (nvn_debug.h). Registered when a replay context exists (the NVN HLE is on).
 void RegisterDiagRequests() {
     using Common::DiagRequest::Request;
+    Common::DiagRequest::Register("nvn-frame", [](const Request& request) {
+        Debug::RequestDump(0, 0, request.Directory());
+        LOG_INFO(Render_Vulkan, "[diag] nvn-frame: logging draws and targets of the next frame");
+    });
+    Common::DiagRequest::Register("nvn-survey", [](const Request& request) {
+        const Debug::Survey::Limits limits{
+            .left = request.NumberArg(0, 1001),
+            .top = request.NumberArg(1, 1001),
+            .right = request.NumberArg(2, 0),
+            .bottom = request.NumberArg(3, 0),
+            .min_width = request.NumberArg(4, 640),
+            .min_height = request.NumberArg(5, 360),
+            .first_pass = request.NumberArg(6, 1),
+            .max_passes = request.NumberArg(7, 96),
+            .max_bytes = u64{request.NumberArg(8, 32)} << 20,
+        };
+        if (request.args.size() < 4 || request.args.size() > 9 || !limits.Valid()) {
+            LOG_WARNING(Render_Vulkan,
+                        "[diag] nvn-survey: use left top right bottom [min_width min_height "
+                        "first_pass max_passes max_MiB]; coordinates 0..1000, ROI <= 10%, "
+                        "at most 128 passes and 64 MiB");
+            return;
+        }
+        Debug::RequestSurvey(limits, request.Directory());
+        LOG_INFO(Render_Vulkan, "[diag] nvn-survey: armed one frame into {}",
+                 request.Directory().string());
+    });
     Common::DiagRequest::Register("nvn-pass", [](const Request& request) {
         const u32 pass = request.NumberArg(0, 0);
         if (pass == 0) {
@@ -211,7 +238,7 @@ Context::Impl::Impl(const Device& device_, std::mutex& submit_mutex_,
         options.allow_host_import = false;
     }
     vma = device.CreateThreadSafeAllocator();
-    allocator = std::make_unique<MemoryAllocator>(device, vma);
+    allocator = std::make_unique<MemoryAllocator>(device, vma, &device_memory_releases);
     vma_device_strict = options.vma_device_strict.value_or(Debug::Get().try_vma_device_strict);
     allocator->TrackSpills(&spills, vma_device_strict);
     if (vma_device_strict) {
@@ -261,14 +288,31 @@ Context::Impl::Impl(const Device& device_, std::mutex& submit_mutex_,
     trim_legacy = options.storage_trim_legacy.value_or(Debug::Get().trim_legacy);
     barrier_merge =
         BarrierMergeMask(options.barrier_merge.value_or(Debug::Get().try_barrier_merge));
-    astc_gpu_enabled = AstcGpuDecoder::Supported(device);
+    const bool transcode_astc = !device.IsOptimalAstcSupported();
+    astc_gpu_enabled = transcode_astc && AstcGpuDecoder::Supported(device);
     if (astc_gpu_enabled) {
         astc_decoder_future = std::async(std::launch::async, [this] {
             Common::SetCurrentThreadName("NvnAstcInit");
             return std::make_unique<AstcGpuDecoder>(device);
         });
     }
-    if (!device.IsOptimalAstcSupported()) {
+    const char* sparse_bc3 = std::getenv("EDEN_NX2_NVN_SPARSE_ASTC_BC3");
+    if (astc_gpu_enabled && options.sparse_astc_bc3.value_or(sparse_bc3 && sparse_bc3[0] == '1') &&
+        AstcBc3::Supported(device)) {
+        sparse_astc_bc3_future = std::async(std::launch::async, [this] {
+            Common::SetCurrentThreadName("NvnAstcBc3Init");
+            const auto start = std::chrono::steady_clock::now();
+            auto transcoder = std::make_unique<AstcBc3>(device);
+            const auto elapsed = std::chrono::steady_clock::now() - start;
+            LOG_INFO(Render_Vulkan, "[nvn] fused sparse ASTC to BC3 pipeline ready in {:.1f} ms",
+                     std::chrono::duration<double, std::milli>(elapsed).count());
+            return transcoder;
+        });
+        if (options.sparse_astc_bc3.value_or(false)) {
+            sparse_astc_bc3_future.wait();
+        }
+    }
+    if (transcode_astc) {
         // Read past the override renderer_vulkan.cpp sets for MaxwellToVK (Uncompressed: the
         // replay's stand-ins start as RGBA8 and become BC per storage, ToBcStandin).
         const AstcStandin chosen = ChooseAstcStandin(
@@ -322,16 +366,21 @@ Context::Impl::Impl(const Device& device_, std::mutex& submit_mutex_,
             return std::make_unique<UntileGpu>(device);
         });
     }
-    if (AliasTransferGpu::Supported(device)) {
-        alias_gpu_future = std::async(std::launch::async, [this] {
-            Common::SetCurrentThreadName("NvnAliasInit");
-            return std::make_unique<AliasTransferGpu>(device);
-        });
-    }
+    alias_gpu_future = std::async(std::launch::async, [this] {
+        Common::SetCurrentThreadName("NvnAliasInit");
+        return std::make_unique<AliasTransferGpu>(device);
+    });
     if (present_target) {
         present_target->Attach(*allocator);
     }
     queue = device.GetGraphicsQueue();
+    const char* sparse_wait = std::getenv("EDEN_NX2_NVN_GPU_SPARSE_WAIT");
+    gpu_sparse_wait = options.gpu_sparse_wait.value_or(sparse_wait && sparse_wait[0] == '1');
+    const char* sparse_buffers = std::getenv("EDEN_NX2_NVN_SPARSE_BUFFER_MIRRORS");
+    sparse_buffer_mirrors = device.IsSparseResidencyBufferSupported() &&
+                            device.HasTimelineSemaphore() &&
+                            options.sparse_buffer_mirrors.value_or(sparse_buffers &&
+                                                                   sparse_buffers[0] == '1');
     command_pool = device.GetLogical().CreateCommandPool({
         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
         .pNext = nullptr,
@@ -402,6 +451,19 @@ AstcGpuDecoder* Context::Impl::AstcDecoder() {
         }
     }
     return astc_decoder.get();
+}
+
+AstcBc3* Context::Impl::SparseAstcBc3() {
+    if (sparse_astc_bc3_future.valid() && sparse_astc_bc3_future.wait_for(std::chrono::seconds(0)) ==
+                                            std::future_status::ready) {
+        try {
+            sparse_astc_bc3 = sparse_astc_bc3_future.get();
+        } catch (const std::exception& exception) {
+            LOG_WARNING(Render_Vulkan, "[nvn] fused sparse ASTC to BC3 unavailable: {}",
+                        exception.what());
+        }
+    }
+    return sparse_astc_bc3.get();
 }
 
 BcGpuEncoder* Context::Impl::BcEncoder() {
@@ -551,6 +613,15 @@ void Context::Impl::CompleteBcTimes(const BcUploadTimes& times) {
                                             VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
         return;
     }
+    const u32 stage_queries = times.next_stage_query - BcUploadTimes::FIRST_STAGE_QUERY;
+    std::vector<u64> stage_ticks(stage_queries);
+    if (stage_queries != 0 &&
+        device.GetLogical().GetQueryResults(*times.pool, BcUploadTimes::FIRST_STAGE_QUERY,
+                                            stage_queries, stage_ticks.size() * sizeof(u64),
+                                            stage_ticks.data(), sizeof(u64),
+                                            VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
+        stage_ticks.clear();
+    }
     for (size_t i = 0; i < times.uploads.size(); ++i) {
         const BcUploadTimes::Upload& upload = times.uploads[i];
         const u64 elapsed = (ticks[2 * i + 1] - ticks[2 * i]) & bc_timestamp_mask;
@@ -567,6 +638,25 @@ void Context::Impl::CompleteBcTimes(const BcUploadTimes& times) {
                      "(ASTC decode or texel copy and encode)",
                      upload.kind, upload.width, upload.height, upload.layers, upload.levels,
                      upload.format, upload.bytes >> 20, static_cast<double>(ns) / 1e6);
+        }
+        if (upload.stage_query_count != 0 && !stage_ticks.empty()) {
+            std::array<u64, BcUploadTimes::QUERIES_PER_BATCH> stage_elapsed{};
+            const size_t first = upload.first_stage_query - BcUploadTimes::FIRST_STAGE_QUERY;
+            u64 previous = ticks[2 * i];
+            for (size_t j = 0; j < upload.stage_query_count; ++j) {
+                const u64 current = stage_ticks[first + j];
+                stage_elapsed[j % stage_elapsed.size()] += (current - previous) & bc_timestamp_mask;
+                previous = current;
+            }
+            const auto to_ms = [this](u64 count) {
+                return static_cast<double>(count) * bc_timestamp_period / 1e6;
+            };
+            LOG_INFO(Render_Vulkan,
+                     "[nvn] {} stand-in stages {}x{}x{} lv {} fmt {:#x}: {} batches, GPU "
+                     "prepare and fill {:.2f} ms, encode {:.2f} ms, copy {:.2f} ms",
+                     upload.kind, upload.width, upload.height, upload.layers, upload.levels,
+                     upload.format, upload.stage_query_count / BcUploadTimes::QUERIES_PER_BATCH,
+                     to_ms(stage_elapsed[0]), to_ms(stage_elapsed[1]), to_ms(stage_elapsed[2]));
         }
     }
 }
@@ -680,6 +770,9 @@ Context::Impl::~Impl() {
     if (astc_decoder_future.valid()) {
         astc_decoder_future.wait();
     }
+    if (sparse_astc_bc3_future.valid()) {
+        sparse_astc_bc3_future.wait();
+    }
     if (untile_gpu_future.valid()) {
         untile_gpu_future.wait();
     }
@@ -703,8 +796,36 @@ Context::Impl::~Impl() {
     if (loss_report_thread.joinable()) {
         loss_report_thread.join();
     }
-    LOG_INFO(Render_Vulkan, "[nvn] early submits: {} extra command buffer submissions over {} submissions",
-             stats.early_submits.load(), stats.submissions.load());
+    LOG_INFO(Render_Vulkan,
+             "[nvn] early submits: {} extra command buffer submissions over {} submissions, "
+             "{} before pipeline waits",
+             stats.early_submits.load(), stats.submissions.load(), stats.pipeline_wait_submits.load());
+    if (draw_resources != nullptr) {
+        const DrawCounters& dc = draw_resources->counters;
+        std::string break_summary;
+        for (u32 cause = 0; cause < static_cast<u32>(BreakCause::Count); ++cause) {
+            const u64 count = dc.break_causes[cause].load(std::memory_order_relaxed);
+            if (count != 0) {
+                if (!break_summary.empty()) {
+                    break_summary += ", ";
+                }
+                break_summary +=
+                    fmt::format("{}={}", BreakCauseName(static_cast<BreakCause>(cause)), count);
+            }
+        }
+        LOG_INFO(Render_Vulkan,
+                 "[nvn] draw summary: draws={} skipped={} skipped_async={} mesh_draws={} "
+                 "mesh_skipped={} feedback={} (depth={} color={}) pass_breaks={} [{}]",
+                 dc.draws.load(std::memory_order_relaxed),
+                 dc.draws_skipped.load(std::memory_order_relaxed),
+                 dc.draws_skipped_async.load(std::memory_order_relaxed),
+                 stats.mesh_task_draws.load(std::memory_order_relaxed),
+                 dc.mesh_draws_skipped.load(std::memory_order_relaxed),
+                 dc.feedback_copies.load(std::memory_order_relaxed),
+                 dc.feedback_depth.load(std::memory_order_relaxed),
+                 dc.feedback_color.load(std::memory_order_relaxed),
+                 dc.pass_breaks.load(std::memory_order_relaxed), break_summary);
+    }
     // The raw coverage diagnostic's run summary; the GPU is idle, so the last, unfinished
     // window's misses can be counted. The rings go before the allocator they came from.
     if (raw_coverage) {
@@ -722,6 +843,12 @@ Context::Impl::~Impl() {
     if (present_target) {
         present_target->Detach();
     }
+    for (auto& bind : pending_sparse_binds) {
+        for (const u32 page : bind.old_pages) {
+            sparse_pages->Free(page);
+        }
+    }
+    pending_sparse_binds.clear();
     retired.clear();
     commands.clear();
     inflight.clear();
@@ -733,6 +860,7 @@ Context::Impl::~Impl() {
     ClearRecycledImages();
     textures.clear();
     target_aliases.clear();
+    flat_pool_index.clear();
     pools_by_address.clear();
     pools.clear();
     // Every storage that held a page is gone: the pool frees its blocks through the allocator,
@@ -828,7 +956,7 @@ void Context::Impl::ReplayMain() {
         {
             replay_stage.store("idle", std::memory_order_relaxed);
             std::unique_lock lock{state_mutex};
-            if (streams_waiting) {
+            if (streams_waiting || !pending_sparse_binds.empty()) {
                 // A wait nobody satisfies would hold its queue forever: look again.
                 work_cv.wait_for(lock, std::chrono::milliseconds(250),
                                  [this] { return stopping || !commands.empty(); });
@@ -841,6 +969,7 @@ void Context::Impl::ReplayMain() {
             if (commands.empty()) {
                 lock.unlock();
                 PumpStreams(true);
+                RetireSparseBinds();
                 continue;
             }
             command = std::move(commands.front());
@@ -901,20 +1030,6 @@ void Context::Impl::Dispatch(Command& command) {
         }
         void operator()(CmdSetTitle& c) const {
             impl.mario_kart_world = c.title_id == Settings::MarioKartWorldProgramId;
-            if (impl.mario_kart_world) {
-                LOG_INFO(Render_Vulkan,
-                         "[nvn] Mario Kart World: sparse CPU writes use physical-pool lookup; "
-                         "exact buffer lookup cache and lazy raw mirror invalidation active");
-            }
-            impl.mkw_coalesce_early_submit =
-                c.title_id != 0 && std::getenv("EDEN_NX2_NVN_EARLY_SUBMIT_US") == nullptr &&
-                std::getenv("EDEN_NX2_NVN_EARLY_FIRST_US") == nullptr &&
-                std::getenv("EDEN_NX2_NVN_EARLY_PASS_US") == nullptr;
-            if (impl.mkw_coalesce_early_submit && impl.options.early_submit) {
-                LOG_INFO(Render_Vulkan, "[nvn] title {:#018x}: early submit coalesced; live "
-                                        "passes, shadows, and queued GPU work avoid extra splits",
-                         c.title_id);
-            }
             if (c.title_id != 0) {
                 if (!impl.options.barrier_merge &&
                     std::getenv("EDEN_NX2_TRY_BARRIER_MERGE") == nullptr) {
@@ -1358,7 +1473,7 @@ vk::Buffer Context::Impl::AcquireStaging(u64 size) {
                 return std::move(buffer);
             }
         }
-    } else if (size > STAGING_CHUNK && size <= (u64{128} << 20)) {
+    } else if (size > STAGING_CHUNK && size <= LARGE_STAGING_CACHE_BYTES) {
         std::scoped_lock lock{staging_cache_mutex};
         size_t best = large_staging_cache.size();
         u64 best_size = ~u64{0};
@@ -1378,8 +1493,56 @@ vk::Buffer Context::Impl::AcquireStaging(u64 size) {
         }
     }
     // GPU untile and ASTC decode can read the staged GOBs directly.
-    return CreateHostBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                            MemoryUsage::Upload, AllocationKind::Staging);
+    auto buffer =
+        CreateHostBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                         MemoryUsage::Upload, AllocationKind::Staging);
+    if (buffer) {
+        stats.staging_chunks_allocated.fetch_add(1, std::memory_order_relaxed);
+    }
+    return buffer;
+}
+
+void Context::Impl::RecycleStaging(std::span<vk::Buffer> buffers) {
+    std::scoped_lock lock{staging_cache_mutex};
+    auto free = staging_cache.begin();
+    for (auto& buffer : buffers) {
+        if (!buffer) {
+            continue;
+        }
+        const u64 bytes = buffer.Mapped().size();
+        if (bytes == STAGING_CHUNK) {
+            free = std::find_if(free, staging_cache.end(), [](const auto& slot) { return !slot; });
+            if (free != staging_cache.end()) {
+                *free++ = std::move(buffer);
+            }
+        } else if (bytes > STAGING_CHUNK && bytes <= LARGE_STAGING_CACHE_BYTES) {
+            // Keep the most recently used sizes that fit alongside this one.
+            const u64 remaining = LARGE_STAGING_CACHE_BYTES - bytes;
+            auto& [recent, older] = large_staging_cache;
+            if (recent && recent.Mapped().size() <= remaining) {
+                older = std::move(recent);
+            } else if (older && older.Mapped().size() > remaining) {
+                older.reset();
+            }
+            recent = std::move(buffer);
+        }
+    }
+}
+
+u64 Context::Impl::TrimCachedStaging(u64 bytes_to_release) {
+    std::scoped_lock lock{staging_cache_mutex};
+    u64 released = 0;
+    const auto trim = [&](auto& slots) {
+        for (auto it = slots.rbegin(); it != slots.rend() && released < bytes_to_release; ++it) {
+            if (*it) {
+                released += it->Mapped().size();
+                it->reset();
+            }
+        }
+    };
+    trim(large_staging_cache);
+    trim(staging_cache);
+    return released;
 }
 
 vk::Buffer Context::Impl::AcquireDownload(u64 size) {
@@ -1584,36 +1747,7 @@ void Context::Impl::CompleteMain() {
         }
         if (gpu_complete && !flight->staging.empty() &&
             !device_lost.load(std::memory_order_acquire)) {
-            std::scoped_lock lock{staging_cache_mutex};
-            auto free = staging_cache.begin();
-            for (auto& buffer : flight->staging) {
-                const u64 buf_size = buffer.Mapped().size();
-                if (buf_size == STAGING_CHUNK) {
-                    free = std::find_if(free, staging_cache.end(),
-                                        [](const auto& slot) { return !slot; });
-                    if (free != staging_cache.end()) {
-                        *free++ = std::move(buffer);
-                    }
-                } else if (buf_size > STAGING_CHUNK && buf_size <= (u64{128} << 20)) {
-                    size_t target = large_staging_cache.size();
-                    u64 smallest = ~u64{0};
-                    for (size_t i = 0; i < large_staging_cache.size(); ++i) {
-                        if (!large_staging_cache[i]) {
-                            target = i;
-                            break;
-                        }
-                        const u64 cur_size = large_staging_cache[i].Mapped().size();
-                        if (cur_size < smallest) {
-                            smallest = cur_size;
-                            target = i;
-                        }
-                    }
-                    if (target < large_staging_cache.size() &&
-                        (!large_staging_cache[target] || buf_size > smallest)) {
-                        large_staging_cache[target] = std::move(buffer);
-                    }
-                }
-            }
+            RecycleStaging(flight->staging);
         }
         flight->staging.clear();
         if (!flight->arena.empty()) {
@@ -1870,6 +2004,7 @@ ContextStats Context::Stats() const {
         .mirror_pages_hashed = s.mirror_pages_hashed.load(relaxed),
         .mirror_pages_trusted = s.mirror_pages_trusted.load(relaxed),
         .staging_chunks_reused = s.staging_chunks_reused.load(relaxed),
+        .staging_chunks_allocated = s.staging_chunks_allocated.load(relaxed),
         .mirror_pages_gpu_owned = s.mirror_pages_gpu_owned.load(relaxed),
         .vram_mirrors = s.vram_mirrors.load(relaxed),
         .vram_mirror_refused = s.vram_mirror_refused.load(relaxed),
@@ -1921,11 +2056,15 @@ ContextStats Context::Stats() const {
         .virtual_maps = s.virtual_maps.load(relaxed),
         .virtual_unresolved = s.virtual_unresolved.load(relaxed),
         .virtual_sparse_binds = s.virtual_sparse_binds.load(relaxed),
+        .virtual_sparse_queued_batches = s.virtual_sparse_queued_batches.load(relaxed),
+        .sparse_buffer_bound_bytes = s.sparse_buffer_bound_bytes.load(relaxed),
+        .sparse_buffer_mirrors = s.sparse_buffer_mirrors.load(relaxed),
         .sparse_write_pool_checks = s.sparse_write_pool_checks.load(relaxed),
         .texels_flushed = s.texels_flushed.load(relaxed),
         .ops_unsupported = s.ops_unsupported.load(relaxed),
         .ops_failed = s.ops_failed.load(relaxed),
         .submissions = s.submissions.load(relaxed),
+        .pipeline_wait_submits = s.pipeline_wait_submits.load(relaxed),
         .presents = s.presents.load(relaxed),
         .held_back_submissions = s.held_back_submissions.load(relaxed),
         .parked_timeouts = s.parked_timeouts.load(relaxed),
@@ -1935,6 +2074,7 @@ ContextStats Context::Stats() const {
         .waits_unsatisfied = s.waits_unsatisfied.load(relaxed),
     };
     stats.device_lost = impl->device_lost.load(relaxed) ? 1 : 0;
+    stats.sparse_astc_bc3_tiles = s.sparse_astc_bc3_tiles.load(relaxed);
     stats.dropped_after_device_loss = s.dropped_after_device_loss.load(relaxed);
     stats.indirect_draws = s.indirect_draws.load(relaxed);
     stats.indirect_counted_draws = s.indirect_counted_draws.load(relaxed);
@@ -2236,6 +2376,9 @@ std::string Context::DescribeMemory() const {
                         impl->import_chunks_live.load(std::memory_order_relaxed),
                         mib(impl->import_chunks_live_bytes.load(std::memory_order_relaxed)));
     if (impl->draw_resources) {
+        text += fmt::format("; feedback scratch {} MiB",
+                            mib(impl->draw_resources->scratch_image_bytes.load(
+                                std::memory_order_relaxed)));
         std::scoped_lock lock{impl->draw_resources->cache_mutex};
         if (const auto& cache = impl->draw_resources->cache_instance) {
             const PipelineCacheStats p = cache->Stats();
@@ -2292,11 +2435,13 @@ std::string Context::DescribeState() const {
             private_bytes = counters.PrivateUsage;
         }
 #endif
-        text += fmt::format(" commit_MB={} device(usage/budget/slack)_MB={}/{}/{} sparse_pages_MB={}",
-                            private_bytes >> 20, impl->device.GetDeviceMemoryUsage() >> 20,
-                            impl->device.GetDeviceMemoryBudget() >> 20,
-                            impl->device.GetDeviceMemorySlack() >> 20,
-                            impl->sparse_pages ? impl->sparse_pages->UsedBytes() >> 20 : 0);
+        const auto memory = impl->device.GetDeviceMemoryBudgetSnapshot();
+        text += fmt::format(" commit_MB={} device(usage/budget/slack)_MB={}/{}/{} sparse_pages_MB={}"
+                            " sparse_queued_batches={}",
+                            private_bytes >> 20, memory.usage >> 20, memory.budget >> 20,
+                            memory.slack >> 20,
+                            impl->sparse_pages ? impl->sparse_pages->UsedBytes() >> 20 : 0,
+                            impl->stats.virtual_sparse_queued_batches.load());
     }
     text += " cmd(n/ms):";
     for (size_t i = 0; i < std::size(names); ++i) {
@@ -2324,8 +2469,9 @@ std::string Context::DescribeState() const {
             " mirror(uploads/copies/MiB/clean/pages_hashed/pages_trusted)={}/{}/{}/{}/{}/{}",
             c.mirror_uploads, c.mirror_upload_runs, c.mirror_upload_bytes >> 20,
             c.mirror_ranges_clean, c.mirror_pages_hashed, c.mirror_pages_trusted);
-        text += fmt::format(" mirror_gpu_owned_pages={} staging_chunks_reused={}",
-                            c.mirror_pages_gpu_owned, c.staging_chunks_reused);
+        text += fmt::format(" mirror_gpu_owned_pages={} staging_chunks_reused={} staging_chunks_allocated={}",
+                            c.mirror_pages_gpu_owned, c.staging_chunks_reused,
+                            c.staging_chunks_allocated);
         if (impl->draw_resources) {
             const DrawCounters& draw = impl->draw_resources->counters;
             const auto breaks = [&](BreakCause cause) {
@@ -2333,9 +2479,12 @@ std::string Context::DescribeState() const {
             };
             text += fmt::format(
                 " pass_breaks(total/mirror/indirect_mirror)={}/{}/{} presents={}"
+                " target_bindings(total/unchanged/overwritten)={}/{}/{}"
                 " counter_breaks(report/reset/report_read/condition)={}/{}/{}/{}",
                 draw.pass_breaks.load(), breaks(BreakCause::MirrorUpload),
-                breaks(BreakCause::IndirectUpload), c.presents, breaks(BreakCause::ReportCounter),
+                breaks(BreakCause::IndirectUpload), c.presents, draw.render_targets_ops.load(),
+                draw.render_targets_same.load(), draw.render_targets_overwritten.load(),
+                breaks(BreakCause::ReportCounter),
                 breaks(BreakCause::ResetCounter), breaks(BreakCause::ReportRead),
                 breaks(BreakCause::RenderCondition));
         }
@@ -2465,6 +2614,7 @@ void Context::CollectStats(std::vector<VideoCommon::Nvn::SinkStat>& out) const {
     out.push_back({"mirror guest pages trusted (no write tracked)", s.mirror_pages_trusted});
     out.push_back({"mirror guest pages not hashed (pending GPU writes)", s.mirror_pages_gpu_owned});
     out.push_back({"staging chunks reused", s.staging_chunks_reused});
+    out.push_back({"staging chunks allocated", s.staging_chunks_allocated});
     out.push_back({"pool mirrors (VRAM copies of imported pools)", s.vram_mirrors});
     out.push_back({"pool mirrors: refused (budget, allocation, no CPU write tracking)",
                    s.vram_mirror_refused});
@@ -2556,6 +2706,7 @@ void Context::CollectStats(std::vector<VideoCommon::Nvn::SinkStat>& out) const {
     out.push_back({"graphics pipeline state reuses", s.pipeline_state_reuses});
     out.push_back({"ops_unsupported", s.ops_unsupported});
     out.push_back({"ops_failed", s.ops_failed});
+    out.push_back({"fused sparse ASTC to BC3 tiles", s.sparse_astc_bc3_tiles});
     out.push_back({"device_lost", s.device_lost});
     out.push_back({"dropped_after_device_loss", s.dropped_after_device_loss});
     out.push_back({"held_back_submissions", s.held_back_submissions});
@@ -2623,12 +2774,20 @@ void Context::CollectStats(std::vector<VideoCommon::Nvn::SinkStat>& out) const {
             }
         }
         out.push_back({"feedback_copy", draw.feedback_copies.load()});
+        out.push_back({"feedback_copy: mip copy regions", draw.feedback_mip_regions.load()});
+        out.push_back({"feedback_copy: mip regions reused", draw.feedback_mip_regions_reused.load()});
+        out.push_back({"feedback scratch: bytes cached",
+                       impl->draw_resources->scratch_image_bytes.load(std::memory_order_relaxed)});
+        out.push_back({"feedback scratch: evictions",
+                       impl->draw_resources->scratch_image_evictions.load(std::memory_order_relaxed)});
         out.push_back({"feedback_copy: depth/stencil target", draw.feedback_depth.load()});
         out.push_back({"feedback_copy: color target", draw.feedback_color.load()});
         out.push_back({"feedback_copy: target already copied since SetRenderTargets",
                        draw.feedback_repeat.load()});
         out.push_back({"set_render_targets", draw.render_targets_ops.load()});
         out.push_back({"set_render_targets: unchanged (pass kept)", draw.render_targets_same.load()});
+        out.push_back({"set_render_targets: overwritten before use",
+                       draw.render_targets_overwritten.load()});
         out.push_back({"barriers kept in a pass without shader writes", draw.barriers_kept.load()});
         out.push_back({"game barriers outside a pass without a wait for earlier work (no "
                        "ORDER_PRIMITIVES/ORDER_INDIRECT_DATA; EDEN_NX2_TRY_DISPATCH_ORDER)",
@@ -2706,6 +2865,11 @@ bool Context::Impl::VisitPendingPoolWrites(u64 begin, u64 end, Visitor&& visit) 
             continue;
         }
         for (const u32 index : it->second) {
+            // A write can appear in every block it covers. Visit it in the first block it
+            // shares with the requested range.
+            if (block != first && (pending_pool_writes[index].begin >> PENDING_BLOCK_SHIFT) != block) {
+                continue;
+            }
             if (visit(index)) {
                 return true;
             }
@@ -2764,13 +2928,22 @@ void Context::Impl::RemovePendingPoolWrite(u32 index) {
     ++pending_dead;
 }
 
-void Context::Impl::RemovePendingPoolWritesWithin(u64 begin, u64 end) {
+void Context::Impl::SupersedePendingPoolWrites(u64 begin, u64 end,
+                                               bool invalidate_inline_overlaps) {
+    if (pending_pool_writes.size() == pending_dead || end <= begin) {
+        return;
+    }
     thread_local std::vector<u32> contained;
     contained.clear();
     VisitPendingPoolWrites(begin, end, [&](u32 index) {
-        const PendingPoolWrite& write = pending_pool_writes[index];
+        PendingPoolWrite& write = pending_pool_writes[index];
         if (write.begin >= begin && write.end <= end) {
             contained.push_back(index);
+        } else if (invalidate_inline_overlaps && !write.inline_bytes.empty() &&
+                   write.begin < end && begin < write.end) {
+            // Keep the range pending, but the GPU write makes its inline bytes unsafe to overlay.
+            write.inline_bytes = {};
+            --pending_inline;
         }
         return false;
     });
@@ -2858,7 +3031,7 @@ void Context::Impl::NoteFlushedInlinePoolWrite(u64 address, const u8* data, u64 
     }
     PrunePendingPoolWrites();
     const u64 end = address + size;
-    RemovePendingPoolWritesWithin(address, end);
+    SupersedePendingPoolWrites(address, end, false);
     CollapsePendingPoolWrites();
     PushPendingPoolWrite(
         {address, end, seq, std::vector<u8>(data, data + static_cast<size_t>(size))});
@@ -2870,17 +3043,7 @@ void Context::Impl::NoteNonInlinePoolWrite(u64 address, u64 size, u64 seq) {
     }
     PrunePendingPoolWrites();
     const u64 end = address + size;
-    RemovePendingPoolWritesWithin(address, end);
-    if (pending_inline != 0) {
-        VisitPendingPoolWrites(address, end, [&](u32 index) {
-            PendingPoolWrite& write = pending_pool_writes[index];
-            if (!write.inline_bytes.empty() && write.begin < end && address < write.end) {
-                write.inline_bytes = {};
-                --pending_inline;
-            }
-            return false;
-        });
-    }
+    SupersedePendingPoolWrites(address, end, true);
     if (!pending_pool_writes.empty()) {
         // (settled above: the last entry is a live write)
         PendingPoolWrite& last = pending_pool_writes.back();
@@ -2971,8 +3134,6 @@ void Context::Impl::ApplyPendingInlineWrites(u64 base_address, u8* dst, u64 size
         return false;
     });
     std::ranges::sort(overlapping);
-    const auto repeated = std::ranges::unique(overlapping);
-    overlapping.erase(repeated.begin(), repeated.end());
     for (const u32 index : overlapping) {
         const PendingPoolWrite& write = pending_pool_writes[index];
         const u64 lo = (std::max)(write.begin, base_address);

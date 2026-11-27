@@ -509,7 +509,8 @@ template <u32 GOB_EXTENT>
     return num_slices;
 }
 
-void SwizzlePitchLinearImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr,
+template <typename Memory>
+void SwizzlePitchLinearImage(Memory& gpu_memory, GPUVAddr gpu_addr,
                              const ImageInfo& info, const BufferImageCopy& copy,
                              std::span<const u8> memory) {
     ASSERT(copy.image_offset.z == 0);
@@ -518,20 +519,42 @@ void SwizzlePitchLinearImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr
     ASSERT(copy.image_subresource.base_layer == 0);
     ASSERT(copy.image_subresource.num_layers == 1);
 
-    const u32 bytes_per_block = BytesPerBlock(info.format);
-    const u32 row_length = copy.image_extent.width * bytes_per_block;
-    const u32 guest_offset_x = copy.image_offset.x * bytes_per_block;
+    const Extent2D block = DefaultBlockSize(info.format);
+    const size_t bytes_per_block = BytesPerBlock(info.format);
+    const size_t rows = Common::DivCeil(copy.image_extent.height, block.height);
+    const size_t row_length =
+        Common::DivCeil(copy.image_extent.width, block.width) * bytes_per_block;
+    ASSERT(copy.image_offset.x >= 0 && copy.image_offset.y >= 0);
+    const u32 x = static_cast<u32>(copy.image_offset.x);
+    const u32 y = static_cast<u32>(copy.image_offset.y);
+    ASSERT(x % block.width == 0 && y % block.height == 0);
+    const size_t guest_offset_x = (x / block.width) * bytes_per_block;
+    const size_t guest_offset_y = (y / block.height) * size_t{info.pitch};
+    const size_t host_pitch = copy.buffer_row_length != 0
+                                  ? Common::DivCeil(copy.buffer_row_length, block.width) *
+                                        bytes_per_block
+                                  : row_length;
+    if (rows == 0 || row_length == 0) {
+        return;
+    }
+    ASSERT(copy.buffer_offset + (rows - 1) * host_pitch + row_length <= memory.size_bytes());
+    const u8* const source = memory.data() + copy.buffer_offset;
+    const GPUVAddr destination = gpu_addr + guest_offset_y + guest_offset_x;
 
-    for (u32 line = 0; line < copy.image_extent.height; ++line) {
-        const u32 host_offset_y = line * info.pitch;
-        const u32 guest_offset_y = (copy.image_offset.y + line) * info.pitch;
-        const u32 guest_offset = guest_offset_x + guest_offset_y;
-        gpu_memory.WriteBlockUnsafe(gpu_addr + guest_offset, memory.data() + host_offset_y,
+    if (guest_offset_x == 0 && row_length == info.pitch && row_length == host_pitch) {
+        gpu_memory.WriteBlockUnsafe(destination, source, row_length * rows);
+        return;
+    }
+
+    for (size_t line = 0; line < rows; ++line) {
+        gpu_memory.WriteBlockUnsafe(destination + line * size_t{info.pitch},
+                                    source + line * host_pitch,
                                     row_length);
     }
 }
 
-void SwizzleBlockLinearImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr,
+template <typename Memory>
+void SwizzleBlockLinearImage(Memory& gpu_memory, GPUVAddr gpu_addr,
                              const ImageInfo& info, const BufferImageCopy& copy,
                              std::span<const u8> input, Common::ScratchBuffer<u8>& tmp_buffer) {
     const Extent3D size = info.size;
@@ -566,8 +589,7 @@ void SwizzleBlockLinearImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr
     for (s32 layer = 0; layer < info.resources.layers; ++layer) {
         const std::span<const u8> src = input.subspan(host_offset);
         {
-            Tegra::Memory::GpuGuestMemoryScoped<u8,
-                                                Tegra::Memory::GuestMemoryFlags::UnsafeReadWrite>
+            Core::Memory::GuestMemoryScoped<Memory, u8, Core::Memory::GuestMemoryFlags::UnsafeReadWrite>
                 dst(gpu_memory, gpu_addr + guest_offset, subresource_size, &tmp_buffer);
 
             SwizzleTexture(dst, src, bytes_per_block, num_tiles.width, num_tiles.height,
@@ -579,6 +601,73 @@ void SwizzleBlockLinearImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr
     }
     ASSERT(host_offset - copy.buffer_offset == copy.buffer_size);
 }
+
+template <typename Memory>
+void SwizzleImageToMemory(Memory& memory, u64 address, const ImageInfo& info,
+                          std::span<const BufferImageCopy> copies, std::span<const u8> source,
+                          Common::ScratchBuffer<u8>& tmp_buffer) {
+    const bool is_pitch_linear = info.type == ImageType::Linear;
+    for (const BufferImageCopy& copy : copies) {
+        if (is_pitch_linear) {
+            SwizzlePitchLinearImage(memory, address, info, copy, source);
+        } else {
+            SwizzleBlockLinearImage(memory, address, info, copy, source, tmp_buffer);
+        }
+    }
+}
+
+class MappedImageMemory {
+public:
+    MappedImageMemory(Tegra::MaxwellDeviceMemoryManager& memory_,
+                      std::span<const ImageMapView* const> ranges_)
+        : memory{memory_}, ranges{ranges_} {}
+
+    u8* GetSpan(GPUVAddr address, size_t size) {
+        const auto range = FindRange(address);
+        if (range == ranges.end() || address < (*range)->gpu_addr ||
+            address + size > (*range)->gpu_addr + (*range)->size) {
+            return nullptr;
+        }
+        return memory.GetSpan((*range)->cpu_addr + address - (*range)->gpu_addr, size);
+    }
+
+    void ReadBlockUnsafe(GPUVAddr address, u8* destination, size_t size) {
+        std::memset(destination, 0, size);
+        ForEachRange(address, size, [&](DAddr mapped, size_t offset, size_t count) {
+            memory.ReadBlockUnsafe(mapped, destination + offset, count);
+        });
+    }
+
+    void WriteBlockUnsafe(GPUVAddr address, const u8* source, size_t size) {
+        ForEachRange(address, size, [&](DAddr mapped, size_t offset, size_t count) {
+            memory.WriteBlockUnsafe(mapped, source + offset, count);
+        });
+    }
+
+    static constexpr bool HAS_FLUSH_INVALIDATION = false;
+
+private:
+    std::span<const ImageMapView* const>::iterator FindRange(GPUVAddr address) {
+        return std::ranges::upper_bound(ranges, address, {}, [](const ImageMapView* range) {
+            return range->gpu_addr + range->size;
+        });
+    }
+
+    template <typename Func>
+    void ForEachRange(GPUVAddr address, size_t size, Func&& func) {
+        const GPUVAddr end = address + size;
+        for (auto range = FindRange(address); range != ranges.end() && (*range)->gpu_addr < end;
+             ++range) {
+            const auto& map = **range;
+            const GPUVAddr begin = (std::max)(address, map.gpu_addr);
+            const GPUVAddr count = (std::min)(end, map.gpu_addr + map.size) - begin;
+            func(map.cpu_addr + begin - map.gpu_addr, begin - address, count);
+        }
+    }
+
+    Tegra::MaxwellDeviceMemoryManager& memory;
+    std::span<const ImageMapView* const> ranges;
+};
 
 } // Anonymous namespace
 
@@ -1413,12 +1502,14 @@ boost::container::small_vector<BufferImageCopy, 16> FullDownloadCopies(const Ima
     const Extent3D size = info.size;
     const u32 bytes_per_block = BytesPerBlock(info.format);
     if (info.type == ImageType::Linear) {
+        const Extent2D block = DefaultBlockSize(info.format);
+        const u32 block_rows = Common::DivCeil(size.height, block.height);
         ASSERT(info.pitch % bytes_per_block == 0);
         return {{
             .buffer_offset = 0,
-            .buffer_size = static_cast<size_t>(info.pitch) * size.height,
-            .buffer_row_length = info.pitch / bytes_per_block,
-            .buffer_image_height = size.height,
+            .buffer_size = static_cast<size_t>(info.pitch) * block_rows,
+            .buffer_row_length = info.pitch / bytes_per_block * block.width,
+            .buffer_image_height = block_rows * block.height,
             .image_subresource =
                 {
                     .base_level = 0,
@@ -1508,14 +1599,21 @@ boost::container::small_vector<SwizzleParameters, 16> FullUploadSwizzles(const I
 void SwizzleImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
                   std::span<const BufferImageCopy> copies, std::span<const u8> memory,
                   Common::ScratchBuffer<u8>& tmp_buffer) {
-    const bool is_pitch_linear = info.type == ImageType::Linear;
-    for (const BufferImageCopy& copy : copies) {
-        if (is_pitch_linear) {
-            SwizzlePitchLinearImage(gpu_memory, gpu_addr, info, copy, memory);
-        } else {
-            SwizzleBlockLinearImage(gpu_memory, gpu_addr, info, copy, memory, tmp_buffer);
-        }
-    }
+    SwizzleImageToMemory(gpu_memory, gpu_addr, info, copies, memory, tmp_buffer);
+}
+
+void SwizzleImage(Tegra::MaxwellDeviceMemoryManager& device_memory, DAddr device_addr,
+                  const ImageInfo& info, std::span<const BufferImageCopy> copies,
+                  std::span<const u8> memory, Common::ScratchBuffer<u8>& tmp_buffer) {
+    SwizzleImageToMemory(device_memory, device_addr, info, copies, memory, tmp_buffer);
+}
+
+void SwizzleImage(Tegra::MaxwellDeviceMemoryManager& device_memory, GPUVAddr gpu_addr,
+                  std::span<const ImageMapView* const> ranges, const ImageInfo& info,
+                  std::span<const BufferImageCopy> copies, std::span<const u8> memory,
+                  Common::ScratchBuffer<u8>& tmp_buffer) {
+    MappedImageMemory backing{device_memory, ranges};
+    SwizzleImageToMemory(backing, gpu_addr, info, copies, memory, tmp_buffer);
 }
 
 bool IsBlockLinearSizeCompatible(const ImageInfo& lhs, const ImageInfo& rhs, u32 lhs_level,

@@ -154,6 +154,7 @@ std::vector<u32> Emit(Translated& translated) {
     // definitions, which only exist with descriptor aliasing (every desktop profile has it).
     Shader::Profile profile = MakeReferenceProfile();
     profile.support_descriptor_aliasing = true;
+    profile.support_uniform_buffer_standard_layout = true;
     return Shader::Backend::SPIRV::EmitSPIRV(profile, translated.program);
 }
 

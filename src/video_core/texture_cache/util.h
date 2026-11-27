@@ -18,6 +18,7 @@
 #include "common/common_types.h"
 #include "common/scratch_buffer.h"
 
+#include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/image_base.h"
 #include "video_core/texture_cache/types.h"
@@ -143,6 +144,15 @@ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8
     const ImageInfo& info);
 
 void SwizzleImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const ImageInfo& info,
+                  std::span<const BufferImageCopy> copies, std::span<const u8> memory,
+                  Common::ScratchBuffer<u8>& tmp_buffer);
+
+void SwizzleImage(Tegra::MaxwellDeviceMemoryManager& device_memory, DAddr device_addr,
+                  const ImageInfo& info, std::span<const BufferImageCopy> copies,
+                  std::span<const u8> memory, Common::ScratchBuffer<u8>& tmp_buffer);
+
+void SwizzleImage(Tegra::MaxwellDeviceMemoryManager& device_memory, GPUVAddr gpu_addr,
+                  std::span<const ImageMapView* const> ranges, const ImageInfo& info,
                   std::span<const BufferImageCopy> copies, std::span<const u8> memory,
                   Common::ScratchBuffer<u8>& tmp_buffer);
 

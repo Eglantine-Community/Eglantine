@@ -136,6 +136,9 @@ struct RuntimeInfo {
     u32 mesh_task_offsets_binding{~0U};
     u32 mesh_task_args_binding{~0U};
     u32 mesh_task_payload_stride{}; ///< payload buffer words per task workgroup
+
+    /// Shared memory budget for workgroup-backed warp operations. Zero selects native subgroup lowering.
+    u32 warp_scratch_memory_limit{};
 };
 
 } // namespace Shader

@@ -8,12 +8,17 @@
 // render conditions) is reused through `DrawContext::PrepareDraw`. The indirect mesh-task draws
 // (vkCmdDrawMeshTasksIndirect[Count]EXT) are here too.
 
+#include <array>
 #include <cstring>
+#include <limits>
 #include <algorithm>
 #include <string>
 
 #include <fmt/format.h>
 
+#include "video_core/host_shaders/vulkan_uint16_comp_spv.h"
+#include "video_core/host_shaders/vulkan_uint8_comp_spv.h"
+#include "video_core/renderer_vulkan/index_restart.h"
 #include "video_core/renderer_vulkan/nvn/nvn_draw.h"
 #include "video_core/renderer_vulkan/nvn/nvn_quad_indirect.h"
 
@@ -98,6 +103,144 @@ bool ResolveArguments(DrawContext& context, DrawHost& host, const IndirectCall& 
 }
 
 } // Anonymous namespace
+
+VkPipeline DrawResources::IndexWidenPipeline(VkIndexType source_type) {
+    const size_t variant = source_type == VK_INDEX_TYPE_UINT8_EXT ? 0 : 1;
+    auto& pipeline = index_widen_pipelines[variant];
+    if (pipeline || index_widen_failed[variant]) {
+        return pipeline ? *pipeline : VK_NULL_HANDLE;
+    }
+    try {
+        const vk::Device& device = impl.device.GetLogical();
+        if (!index_widen_layout) {
+            const std::array<VkDescriptorSetLayoutBinding, 2> bindings{{
+                {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+            }};
+            index_widen_set_layout = device.CreateDescriptorSetLayout({
+                .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                .bindingCount = static_cast<u32>(bindings.size()),
+                .pBindings = bindings.data(),
+            });
+            const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, 2 * sizeof(u32)};
+            index_widen_layout = device.CreatePipelineLayout({
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                .setLayoutCount = 1,
+                .pSetLayouts = index_widen_set_layout.address(),
+                .pushConstantRangeCount = 1,
+                .pPushConstantRanges = &push,
+            });
+        }
+        const auto code = source_type == VK_INDEX_TYPE_UINT8_EXT
+                              ? std::span<const u32>{VULKAN_UINT8_COMP_SPV}
+                              : std::span<const u32>{VULKAN_UINT16_COMP_SPV};
+        const auto module = device.CreateShaderModule({
+            .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+            .codeSize = code.size_bytes(),
+            .pCode = code.data(),
+        });
+        pipeline = device.CreateComputePipeline({
+            .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            .stage{
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                .module = *module,
+                .pName = "main",
+            },
+            .layout = *index_widen_layout,
+            .basePipelineIndex = -1,
+        }, VK_NULL_HANDLE);
+    } catch (const vk::Exception&) {
+        index_widen_failed[variant] = true;
+    }
+    return pipeline ? *pipeline : VK_NULL_HANDLE;
+}
+
+BufferRef DrawContext::WidenIndices(const BufferRef& source, VkIndexType source_type,
+                                    u64 source_bytes, std::optional<u32> restart_marker) {
+    constexpr u32 WORKGROUP_SIZE = 128;
+    const u64 element_size = source_type == VK_INDEX_TYPE_UINT8_EXT ? 1 : 2;
+    const u64 count = source_bytes / element_size;
+    if (!source.buffer || source_bytes > source.range || count == 0 ||
+        count > (std::numeric_limits<u32>::max)()) {
+        return {};
+    }
+
+    const auto size = GetIndexWideningSize(source_type, static_cast<u32>(count));
+    const u64 alignment = (std::max<u64>)(impl.device.GetStorageBufferAlignment(), sizeof(u32));
+    const u64 input_size = (size.input_bytes + 3) & ~u64{3};
+    const u64 output_size = size.output_words * sizeof(u32);
+    const u64 max_range = impl.device.GetMaxStorageBufferRange();
+    if (input_size > max_range || output_size > max_range) {
+        return {};
+    }
+    const VkPipeline pipeline = resources.IndexWidenPipeline(source_type);
+    if (pipeline == VK_NULL_HANDLE) {
+        return {};
+    }
+
+    BufferRef input = source;
+    if (source.offset % alignment != 0 || input_size > source.range) {
+        input = AllocArena(input_size, alignment, nullptr);
+        host->HostFlushBarrier();
+        if (input_size != size.input_bytes) {
+            const u64 last_word = input.offset + input_size - sizeof(u32);
+            host->HostCmd().FillBuffer(input.buffer, last_word, sizeof(u32), 0);
+            const VkBufferMemoryBarrier fill_before_copy{
+                .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .buffer = input.buffer,
+                .offset = last_word,
+                .size = sizeof(u32),
+            };
+            host->HostCmd().PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, fill_before_copy);
+        }
+        const VkBufferCopy copy{source.offset, input.offset, size.input_bytes};
+        host->HostCmd().CopyBuffer(source.buffer, input.buffer, copy);
+        host->HostMarkTransferWritten();
+    }
+
+    const BufferRef output = AllocArena(output_size, (std::max<u64>)(alignment, 8), nullptr);
+    const VkDescriptorSet set = AllocateSet(*resources.index_widen_set_layout);
+    if (!set) {
+        return {};
+    }
+    const std::array<VkDescriptorBufferInfo, 2> buffers{{
+        {input.buffer, input.offset, input_size},
+        {output.buffer, output.offset, output_size},
+    }};
+    std::array<VkWriteDescriptorSet, 2> writes{};
+    for (u32 index = 0; index < writes.size(); ++index) {
+        writes[index] = {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = set,
+            .dstBinding = index,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pBufferInfo = &buffers[index],
+        };
+    }
+    impl.dld.vkUpdateDescriptorSets(impl.logical, static_cast<u32>(writes.size()), writes.data(),
+                                    0, nullptr);
+    host->HostFlushBarrier();
+    vk::CommandBuffer cmd = host->HostCmd();
+    const auto layout = *resources.index_widen_layout;
+    const std::array push{static_cast<u32>(count),
+                          restart_marker.value_or(std::numeric_limits<u32>::max())};
+    cmd.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    cmd.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, std::span{&set, 1}, {});
+    cmd.PushConstants(layout, VK_SHADER_STAGE_COMPUTE_BIT, push);
+    const u32 groups = static_cast<u32>((std::min<u64>)(
+        (size.work_items + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE,
+        impl.device.GetMaxComputeWorkGroupCount()[0]));
+    cmd.Dispatch(groups, 1, 1);
+    host->HostMarkWritten();
+    return output;
+}
 
 /// Everything an indirect draw needs recorded OUTSIDE a render pass, before conditional rendering
 /// and the draw's own pass: a refresh of mirrored argument/count/index ranges, and the end of a
@@ -270,12 +413,6 @@ void DrawContext::DrawIndexedIndirect(const VC::DrawIndexedPayload& p) {
     BufferRef count;
     u64 args_size = 0;
     if (!ResolveArguments(*this, *host, call, args, count, args_size)) {
-        return;
-    }
-    if (p.index_type == 0 && !impl.device.IsExtIndexTypeUint8Supported()) {
-        impl.stats.indirect_unsupported.fetch_add(1, std::memory_order_relaxed);
-        host->HostUnsupported(call.op, "8-bit indices need VK_EXT_index_type_uint8 (an indirect "
-                                       "draw cannot widen them on the CPU)");
         return;
     }
     // The index range an indirect draw can reach is not known: everything from the base address

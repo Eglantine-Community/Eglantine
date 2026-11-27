@@ -10,6 +10,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <exception>
 #include <limits>
 #include <memory>
@@ -32,6 +33,9 @@ VK_DEFINE_HANDLE(VmaAllocator)
 VK_DEFINE_HANDLE(VmaAllocation)
 
 namespace Vulkan::vk {
+
+// Keep device-level version checks within the Vulkan version requested by the application.
+inline constexpr u32 ApplicationApiVersion = VK_API_VERSION_1_3;
 
 /**
  * Span for Vulkan arrays.
@@ -185,11 +189,13 @@ struct InstanceDispatch {
     PFN_vkGetPhysicalDeviceFeatures2 vkGetPhysicalDeviceFeatures2{};
     PFN_vkGetPhysicalDeviceFormatProperties vkGetPhysicalDeviceFormatProperties{};
     PFN_vkGetPhysicalDeviceFormatProperties2 vkGetPhysicalDeviceFormatProperties2{};
+    PFN_vkGetPhysicalDeviceImageFormatProperties2 vkGetPhysicalDeviceImageFormatProperties2{};
     PFN_vkGetPhysicalDeviceMemoryProperties vkGetPhysicalDeviceMemoryProperties{};
     PFN_vkGetPhysicalDeviceMemoryProperties2 vkGetPhysicalDeviceMemoryProperties2{};
     PFN_vkGetPhysicalDeviceProperties vkGetPhysicalDeviceProperties{};
     PFN_vkGetPhysicalDeviceProperties2 vkGetPhysicalDeviceProperties2{};
     PFN_vkGetPhysicalDeviceToolProperties vkGetPhysicalDeviceToolProperties{};
+    PFN_vkGetPhysicalDeviceToolPropertiesEXT vkGetPhysicalDeviceToolPropertiesEXT{};
     PFN_vkGetPhysicalDeviceQueueFamilyProperties vkGetPhysicalDeviceQueueFamilyProperties{};
     PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR vkGetPhysicalDeviceSurfaceCapabilitiesKHR{};
     PFN_vkGetPhysicalDeviceSurfaceFormatsKHR vkGetPhysicalDeviceSurfaceFormatsKHR{};
@@ -218,7 +224,7 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkCmdBindPipeline vkCmdBindPipeline{};
     PFN_vkCmdBindTransformFeedbackBuffersEXT vkCmdBindTransformFeedbackBuffersEXT{};
     PFN_vkCmdBindVertexBuffers vkCmdBindVertexBuffers{};
-    PFN_vkCmdBindVertexBuffers2EXT vkCmdBindVertexBuffers2EXT{};
+    PFN_vkCmdBindVertexBuffers2 vkCmdBindVertexBuffers2{};
     PFN_vkCmdBlitImage vkCmdBlitImage{};
     PFN_vkCmdClearAttachments vkCmdClearAttachments{};
     PFN_vkCmdClearColorImage vkCmdClearColorImage{};
@@ -253,38 +259,41 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkCmdResetQueryPool vkCmdResetQueryPool{};
     PFN_vkCmdResolveImage vkCmdResolveImage{};
     PFN_vkCmdSetBlendConstants vkCmdSetBlendConstants{};
-    PFN_vkCmdSetCullModeEXT vkCmdSetCullModeEXT{};
+    PFN_vkCmdSetCullMode vkCmdSetCullMode{};
     PFN_vkCmdSetDepthBias vkCmdSetDepthBias{};
     PFN_vkCmdSetDepthBias2EXT vkCmdSetDepthBias2EXT{};
     PFN_vkCmdSetDepthBounds vkCmdSetDepthBounds{};
-    PFN_vkCmdSetDepthBoundsTestEnableEXT vkCmdSetDepthBoundsTestEnableEXT{};
-    PFN_vkCmdSetDepthCompareOpEXT vkCmdSetDepthCompareOpEXT{};
-    PFN_vkCmdSetDepthTestEnableEXT vkCmdSetDepthTestEnableEXT{};
-    PFN_vkCmdSetDepthWriteEnableEXT vkCmdSetDepthWriteEnableEXT{};
-    PFN_vkCmdSetPrimitiveRestartEnableEXT vkCmdSetPrimitiveRestartEnableEXT{};
-    PFN_vkCmdSetRasterizerDiscardEnableEXT vkCmdSetRasterizerDiscardEnableEXT{};
+    PFN_vkCmdSetDepthBoundsTestEnable vkCmdSetDepthBoundsTestEnable{};
+    PFN_vkCmdSetDepthCompareOp vkCmdSetDepthCompareOp{};
+    PFN_vkCmdSetDepthTestEnable vkCmdSetDepthTestEnable{};
+    PFN_vkCmdSetDepthWriteEnable vkCmdSetDepthWriteEnable{};
+    PFN_vkCmdSetPrimitiveRestartEnable vkCmdSetPrimitiveRestartEnable{};
+#ifdef VK_EXT_primitive_restart_index
+    PFN_vkCmdSetPrimitiveRestartIndexEXT vkCmdSetPrimitiveRestartIndexEXT{};
+#endif
+    PFN_vkCmdSetRasterizerDiscardEnable vkCmdSetRasterizerDiscardEnable{};
     PFN_vkCmdSetAlphaToCoverageEnableEXT vkCmdSetAlphaToCoverageEnableEXT{};
     PFN_vkCmdSetAlphaToOneEnableEXT vkCmdSetAlphaToOneEnableEXT{};
     PFN_vkCmdSetConservativeRasterizationModeEXT vkCmdSetConservativeRasterizationModeEXT{};
     PFN_vkCmdSetLineRasterizationModeEXT vkCmdSetLineRasterizationModeEXT{};
     PFN_vkCmdSetLineStippleEnableEXT vkCmdSetLineStippleEnableEXT{};
     PFN_vkCmdSetLineStippleEXT vkCmdSetLineStippleEXT{};
-    PFN_vkCmdSetDepthBiasEnableEXT vkCmdSetDepthBiasEnableEXT{};
+    PFN_vkCmdSetDepthBiasEnable vkCmdSetDepthBiasEnable{};
     PFN_vkCmdSetLogicOpEnableEXT vkCmdSetLogicOpEnableEXT{};
     PFN_vkCmdSetDepthClampEnableEXT vkCmdSetDepthClampEnableEXT{};
     PFN_vkCmdSetEvent vkCmdSetEvent{};
-    PFN_vkCmdSetFrontFaceEXT vkCmdSetFrontFaceEXT{};
+    PFN_vkCmdSetFrontFace vkCmdSetFrontFace{};
     PFN_vkCmdSetPatchControlPointsEXT vkCmdSetPatchControlPointsEXT{};
     PFN_vkCmdSetPolygonModeEXT vkCmdSetPolygonModeEXT{};
     PFN_vkCmdSetProvokingVertexModeEXT vkCmdSetProvokingVertexModeEXT{};
     PFN_vkCmdSetLogicOpEXT vkCmdSetLogicOpEXT{};
     PFN_vkCmdSetLineWidth vkCmdSetLineWidth{};
-    PFN_vkCmdSetPrimitiveTopologyEXT vkCmdSetPrimitiveTopologyEXT{};
+    PFN_vkCmdSetPrimitiveTopology vkCmdSetPrimitiveTopology{};
     PFN_vkCmdSetScissor vkCmdSetScissor{};
     PFN_vkCmdSetStencilCompareMask vkCmdSetStencilCompareMask{};
-    PFN_vkCmdSetStencilOpEXT vkCmdSetStencilOpEXT{};
+    PFN_vkCmdSetStencilOp vkCmdSetStencilOp{};
     PFN_vkCmdSetStencilReference vkCmdSetStencilReference{};
-    PFN_vkCmdSetStencilTestEnableEXT vkCmdSetStencilTestEnableEXT{};
+    PFN_vkCmdSetStencilTestEnable vkCmdSetStencilTestEnable{};
     PFN_vkCmdSetStencilWriteMask vkCmdSetStencilWriteMask{};
     PFN_vkCmdSetVertexInputEXT vkCmdSetVertexInputEXT{};
     PFN_vkCmdSetViewport vkCmdSetViewport{};
@@ -307,6 +316,7 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkCreateGraphicsPipelines vkCreateGraphicsPipelines{};
     PFN_vkCreateImage vkCreateImage{};
     PFN_vkCreateImageView vkCreateImageView{};
+    PFN_vkCreatePipelineBinariesKHR vkCreatePipelineBinariesKHR{};
     PFN_vkCreatePipelineCache vkCreatePipelineCache{};
     PFN_vkCreatePipelineLayout vkCreatePipelineLayout{};
     PFN_vkCreateQueryPool vkCreateQueryPool{};
@@ -329,6 +339,7 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkDestroyImage vkDestroyImage{};
     PFN_vkDestroyImageView vkDestroyImageView{};
     PFN_vkDestroyPipeline vkDestroyPipeline{};
+    PFN_vkDestroyPipelineBinaryKHR vkDestroyPipelineBinaryKHR{};
     PFN_vkDestroyPipelineCache vkDestroyPipelineCache{};
     PFN_vkDestroyPipelineLayout vkDestroyPipelineLayout{};
     PFN_vkDestroyQueryPool vkDestroyQueryPool{};
@@ -348,7 +359,9 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkGetFenceStatus vkGetFenceStatus{};
     PFN_vkGetImageMemoryRequirements vkGetImageMemoryRequirements{};
     PFN_vkGetImageSparseMemoryRequirements vkGetImageSparseMemoryRequirements{};
+    PFN_vkGetPipelineBinaryDataKHR vkGetPipelineBinaryDataKHR{};
     PFN_vkGetPipelineCacheData vkGetPipelineCacheData{};
+    PFN_vkGetPipelineKeyKHR vkGetPipelineKeyKHR{};
     PFN_vkGetMemoryFdKHR vkGetMemoryFdKHR{};
 #ifdef _WIN32
     PFN_vkGetMemoryWin32HandleKHR vkGetMemoryWin32HandleKHR{};
@@ -361,6 +374,7 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkQueueBindSparse vkQueueBindSparse{};
     PFN_vkQueueSubmit vkQueueSubmit{};
     PFN_vkQueueSubmit2 vkQueueSubmit2{};
+    PFN_vkReleaseCapturedPipelineDataKHR vkReleaseCapturedPipelineDataKHR{};
     PFN_vkResetFences vkResetFences{};
     PFN_vkResetQueryPool vkResetQueryPool{};
     PFN_vkSetDebugUtilsObjectNameEXT vkSetDebugUtilsObjectNameEXT{};
@@ -698,9 +712,10 @@ class Image {
 public:
     explicit Image(VkImage handle_, VkImageUsageFlags usage_, VkDevice owner_,
                    VmaAllocator allocator_, VmaAllocation allocation_,
-                   const DeviceDispatch& dld_) noexcept
+                   const DeviceDispatch& dld_,
+                   std::atomic<u64>* device_memory_releases_ = nullptr) noexcept
         : handle{handle_}, usage{usage_}, owner{owner_}, allocator{allocator_},
-          allocation{allocation_}, dld{&dld_} {}
+          allocation{allocation_}, dld{&dld_}, device_memory_releases{device_memory_releases_} {}
     Image() = default;
 
     /// True for an image created without memory (an unbacked sparse image).
@@ -713,7 +728,8 @@ public:
 
     Image(Image&& rhs) noexcept
         : handle{std::exchange(rhs.handle, VkImage{})}, usage{rhs.usage}, owner{rhs.owner},
-          allocator{rhs.allocator}, allocation{rhs.allocation}, dld{rhs.dld} {}
+          allocator{rhs.allocator}, allocation{rhs.allocation}, dld{rhs.dld},
+          device_memory_releases{rhs.device_memory_releases} {}
 
     Image& operator=(Image&& rhs) noexcept {
         Release();
@@ -723,6 +739,7 @@ public:
         allocator = rhs.allocator;
         allocation = rhs.allocation;
         dld = rhs.dld;
+        device_memory_releases = rhs.device_memory_releases;
         return *this;
     }
 
@@ -767,6 +784,7 @@ private:
     VmaAllocator allocator = nullptr;
     VmaAllocation allocation = nullptr;
     const DeviceDispatch* dld = nullptr;
+    std::atomic<u64>* device_memory_releases{};
 };
 
 struct MemoryLocation {
@@ -777,12 +795,28 @@ struct MemoryLocation {
 
 class Buffer {
 public:
+    // Non-owning allocation identity, stable across moves of the owning Buffer. Its owner must
+    // remain alive, and GPU writes must have completed, until the host has consumed the data.
+    struct Readback {
+        VmaAllocator allocator{};
+        VmaAllocation allocation{};
+        bool is_coherent{true};
+
+        void Invalidate() const;
+        void Flush() const;
+    };
+
+    Readback HostReadback() const noexcept {
+        return {allocator, allocation, is_coherent};
+    }
+
     explicit Buffer(VkBuffer handle_, VkDevice owner_, VmaAllocator allocator_,
                     VmaAllocation allocation_, std::span<u8> mapped_, bool is_coherent_,
-                    MemoryLocation location_, const DeviceDispatch& dld_) noexcept
+                    MemoryLocation location_, const DeviceDispatch& dld_,
+                    std::atomic<u64>* device_memory_releases_ = nullptr) noexcept
         : handle{handle_}, owner{owner_}, allocator{allocator_},
           allocation{allocation_}, mapped{mapped_}, location{location_},
-          is_coherent{is_coherent_}, dld{&dld_} {}
+          is_coherent{is_coherent_}, dld{&dld_}, device_memory_releases{device_memory_releases_} {}
     Buffer() = default;
 
     Buffer(const Buffer&) = delete;
@@ -791,7 +825,8 @@ public:
     Buffer(Buffer&& rhs) noexcept
         : handle{std::exchange(rhs.handle, VkBuffer{})}, owner{rhs.owner}, allocator{rhs.allocator},
           allocation{rhs.allocation}, mapped{rhs.mapped}, location{rhs.location},
-          is_coherent{rhs.is_coherent}, dld{rhs.dld} {}
+          is_coherent{rhs.is_coherent}, dld{rhs.dld},
+          device_memory_releases{rhs.device_memory_releases} {}
 
     Buffer& operator=(Buffer&& rhs) noexcept {
         Release();
@@ -803,6 +838,7 @@ public:
         location = rhs.location;
         is_coherent = rhs.is_coherent;
         dld = rhs.dld;
+        device_memory_releases = rhs.device_memory_releases;
         return *this;
     }
 
@@ -863,6 +899,7 @@ private:
     MemoryLocation location{};
     bool is_coherent = false;
     const DeviceDispatch* dld = nullptr;
+    std::atomic<u64>* device_memory_releases{};
 };
 
 class Queue {
@@ -1074,7 +1111,7 @@ class Device : public Handle<VkDevice, NoOwner, DeviceDispatch> {
     using Handle<VkDevice, NoOwner, DeviceDispatch>::Handle;
 
 public:
-    [[nodiscard]] static Device Create(VkPhysicalDevice physical_device,
+    [[nodiscard]] static Device Create(VkPhysicalDevice physical_device, u32 api_version,
                                        Span<VkDeviceQueueCreateInfo> queues_ci,
                                        Span<const char*> enabled_extensions, const void* next,
                                        DeviceDispatch& dispatch);
@@ -1227,11 +1264,14 @@ public:
 
     VkFormatProperties3 GetFormatProperties3(VkFormat) const noexcept;
 
+    VkResult GetImageFormatProperties2(const VkPhysicalDeviceImageFormatInfo2& info,
+                                       VkImageFormatProperties2& properties) const noexcept;
+
     std::vector<VkExtensionProperties> EnumerateDeviceExtensionProperties() const;
 
     std::vector<VkQueueFamilyProperties> GetQueueFamilyProperties() const;
 
-    std::vector<VkPhysicalDeviceToolProperties> GetPhysicalDeviceToolProperties() const;
+    std::vector<VkPhysicalDeviceToolProperties> GetPhysicalDeviceToolProperties(u32 api_version) const;
 
     /// Matrix shapes and types of VK_KHR_cooperative_matrix; empty when the driver lacks it.
     std::vector<VkCooperativeMatrixPropertiesKHR> GetCooperativeMatrixPropertiesKHR() const;
@@ -1666,36 +1706,42 @@ public:
     void BindVertexBuffers2EXT(u32 first_binding, u32 binding_count, const VkBuffer* buffers,
                                const VkDeviceSize* offsets, const VkDeviceSize* sizes,
                                const VkDeviceSize* strides) const noexcept {
-        dld->vkCmdBindVertexBuffers2EXT(handle, first_binding, binding_count, buffers, offsets,
+        dld->vkCmdBindVertexBuffers2(handle, first_binding, binding_count, buffers, offsets,
                                         sizes, strides);
     }
 
     void SetCullModeEXT(VkCullModeFlags cull_mode) const noexcept {
-        dld->vkCmdSetCullModeEXT(handle, cull_mode);
+        dld->vkCmdSetCullMode(handle, cull_mode);
     }
 
     void SetDepthBoundsTestEnableEXT(bool enable) const noexcept {
-        dld->vkCmdSetDepthBoundsTestEnableEXT(handle, enable ? VK_TRUE : VK_FALSE);
+        dld->vkCmdSetDepthBoundsTestEnable(handle, enable ? VK_TRUE : VK_FALSE);
     }
 
     void SetDepthCompareOpEXT(VkCompareOp compare_op) const noexcept {
-        dld->vkCmdSetDepthCompareOpEXT(handle, compare_op);
+        dld->vkCmdSetDepthCompareOp(handle, compare_op);
     }
 
     void SetDepthTestEnableEXT(bool enable) const noexcept {
-        dld->vkCmdSetDepthTestEnableEXT(handle, enable ? VK_TRUE : VK_FALSE);
+        dld->vkCmdSetDepthTestEnable(handle, enable ? VK_TRUE : VK_FALSE);
     }
 
     void SetDepthWriteEnableEXT(bool enable) const noexcept {
-        dld->vkCmdSetDepthWriteEnableEXT(handle, enable ? VK_TRUE : VK_FALSE);
+        dld->vkCmdSetDepthWriteEnable(handle, enable ? VK_TRUE : VK_FALSE);
     }
 
     void SetPrimitiveRestartEnableEXT(bool enable) const noexcept {
-        dld->vkCmdSetPrimitiveRestartEnableEXT(handle, enable ? VK_TRUE : VK_FALSE);
+        dld->vkCmdSetPrimitiveRestartEnable(handle, enable ? VK_TRUE : VK_FALSE);
+    }
+
+    void SetPrimitiveRestartIndexEXT([[maybe_unused]] u32 index) const noexcept {
+#ifdef VK_EXT_primitive_restart_index
+        dld->vkCmdSetPrimitiveRestartIndexEXT(handle, index);
+#endif
     }
 
     void SetRasterizerDiscardEnableEXT(bool enable) const noexcept {
-        dld->vkCmdSetRasterizerDiscardEnableEXT(handle, enable ? VK_TRUE : VK_FALSE);
+        dld->vkCmdSetRasterizerDiscardEnable(handle, enable ? VK_TRUE : VK_FALSE);
     }
 
     void SetConservativeRasterizationModeEXT(VkConservativeRasterizationModeEXT mode) const noexcept
@@ -1719,7 +1765,7 @@ public:
     }
 
     void SetDepthBiasEnableEXT(bool enable) const noexcept {
-        dld->vkCmdSetDepthBiasEnableEXT(handle, enable ? VK_TRUE : VK_FALSE);
+        dld->vkCmdSetDepthBiasEnable(handle, enable ? VK_TRUE : VK_FALSE);
     }
 
     void SetLogicOpEnableEXT(bool enable) const noexcept {
@@ -1739,7 +1785,7 @@ public:
     }
 
     void SetFrontFaceEXT(VkFrontFace front_face) const noexcept {
-        dld->vkCmdSetFrontFaceEXT(handle, front_face);
+        dld->vkCmdSetFrontFace(handle, front_face);
     }
 
     void SetLogicOpEXT(VkLogicOp logic_op) const noexcept {
@@ -1780,16 +1826,16 @@ public:
     }
 
     void SetPrimitiveTopologyEXT(VkPrimitiveTopology primitive_topology) const noexcept {
-        dld->vkCmdSetPrimitiveTopologyEXT(handle, primitive_topology);
+        dld->vkCmdSetPrimitiveTopology(handle, primitive_topology);
     }
 
     void SetStencilOpEXT(VkStencilFaceFlags face_mask, VkStencilOp fail_op, VkStencilOp pass_op,
                          VkStencilOp depth_fail_op, VkCompareOp compare_op) const noexcept {
-        dld->vkCmdSetStencilOpEXT(handle, face_mask, fail_op, pass_op, depth_fail_op, compare_op);
+        dld->vkCmdSetStencilOp(handle, face_mask, fail_op, pass_op, depth_fail_op, compare_op);
     }
 
     void SetStencilTestEnableEXT(bool enable) const noexcept {
-        dld->vkCmdSetStencilTestEnableEXT(handle, enable ? VK_TRUE : VK_FALSE);
+        dld->vkCmdSetStencilTestEnable(handle, enable ? VK_TRUE : VK_FALSE);
     }
 
     void SetVertexInputEXT(

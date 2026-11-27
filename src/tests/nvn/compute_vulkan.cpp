@@ -12,12 +12,15 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
 #include <span>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <utility>
@@ -29,14 +32,18 @@
 #include "common/diag_request.h"
 #include "common/game_presets.h"
 #include "common/literals.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
+#include "tests/temp_path.h"
 #include "video_core/nvn/guest_memory.h"
 #include "video_core/nvn/record.h"
 #include "video_core/nvn/shader/nvn_program_map.h"
 #include "video_core/nvn/sink.h"
+#include "video_core/nvn/state_layouts.h"
 #include "video_core/renderer_vulkan/nvn/nvn_bc_encode.h"
 #include "video_core/renderer_vulkan/nvn/nvn_context.h"
 #include "video_core/renderer_vulkan/nvn/nvn_counters.h"
+#include "video_core/renderer_vulkan/nvn/nvn_format.h"
 #include "video_core/renderer_vulkan/nvn/nvn_pipeline_cache.h"
 #include "video_core/renderer_vulkan/nvn/nvn_sparse_layout.h"
 #include "video_core/renderer_vulkan/nvn/nvn_texture_layout.h"
@@ -136,6 +143,16 @@ public:
     std::shared_ptr<const std::atomic<u64>> WriteEpoch(u64 id) override {
         return trackers.at(id - 1).epoch;
     }
+    bool TrackWriteNotification(u64 id, std::shared_ptr<std::atomic<u64>> word, u64 mask) override {
+        if (!write_notifications) {
+            return false;
+        }
+        Tracker& tracker = trackers.at(id - 1);
+        tracker.notification = std::move(word);
+        tracker.notification_mask = mask;
+        ++notification_subscriptions;
+        return true;
+    }
     bool AnyWritten(u64 id, u64 va, u64 size) override {
         const Tracker& t = trackers.at(id - 1);
         for (u64 page = va >> 12; page < (va + size + 0xFFF) >> 12; ++page) {
@@ -152,17 +169,24 @@ public:
             for (u64 page = va >> 12; page < (va + size + 0xFFF) >> 12; ++page) {
                 if (t.armed.contains(page) && t.dirty.insert(page).second) {
                     t.epoch->fetch_add(1, std::memory_order_release);
+                    if (t.notification) {
+                        t.notification->fetch_or(t.notification_mask, std::memory_order_release);
+                    }
                 }
             }
         }
     }
     bool tracking{true};
+    bool write_notifications{false};
+    size_t notification_subscriptions{};
 
 private:
     struct Tracker {
         std::set<u64> armed;
         std::set<u64> dirty;
         std::shared_ptr<std::atomic<u64>> epoch{std::make_shared<std::atomic<u64>>(0)};
+        std::shared_ptr<std::atomic<u64>> notification;
+        u64 notification_mask{};
     };
     std::vector<Tracker> trackers;
 
@@ -377,7 +401,7 @@ std::array<Inst, 8> FillProgram(u32 storage_entry_offset) {
              MulImm(5, 0, 4), Add(2, 2, 5), AddImm(6, 0, 100), Stg(2, 6), Exit}};
 }
 
-void RunFill(HeadlessVulkan& vulkan, bool allow_import, bool indirect) {
+void RunFill(HeadlessVulkan& vulkan, bool allow_import, bool indirect, u64 cache_title = 0) {
     FakeMemory memory;
     u8* data = memory.Add(POOL_VA, 64_KiB);
     std::memset(data, 0xCD, 64_KiB);
@@ -389,6 +413,9 @@ void RunFill(HeadlessVulkan& vulkan, bool allow_import, bool indirect) {
 
     Vulkan::Nvn::Context context(*vulkan.device, vulkan.submit_mutex, nullptr,
                                  {.allow_host_import = allow_import});
+    if (cache_title != 0) {
+        context.SetTitleId(cache_title);
+    }
     context.SetGuestMemory(&memory);
     context.CreatePool({.serial = 1, .guest_address = POOL_VA, .size = 64_KiB,
                         .flags = POOL_CPU_CACHED});
@@ -432,6 +459,84 @@ void RunFill(HeadlessVulkan& vulkan, bool allow_import, bool indirect) {
     REQUIRE(skipped == 0);
 }
 
+class ScopedNvnCacheDirectory {
+public:
+    explicit ScopedNvnCacheDirectory(const std::filesystem::path& path) {
+        if (const char* old = std::getenv(variable)) {
+            saved = old;
+        }
+#ifdef _WIN32
+        REQUIRE(_putenv_s(variable, path.string().c_str()) == 0);
+#else
+        REQUIRE(setenv(variable, path.string().c_str(), 1) == 0);
+#endif
+    }
+
+    ~ScopedNvnCacheDirectory() {
+#ifdef _WIN32
+        _putenv_s(variable, saved ? saved->c_str() : "");
+#else
+        if (saved) {
+            setenv(variable, saved->c_str(), 1);
+        } else {
+            unsetenv(variable);
+        }
+#endif
+    }
+
+private:
+    static constexpr const char* variable = "EDEN_NX2_NVN_CACHE_DIR";
+    std::optional<std::string> saved;
+};
+
+struct CacheInitialData {
+    PFN_vkCreatePipelineCache create;
+    std::atomic<bool> restored{};
+    static inline CacheInitialData* active{};
+
+    static VKAPI_ATTR VkResult VKAPI_CALL Create(VkDevice device,
+        const VkPipelineCacheCreateInfo* info, const VkAllocationCallbacks* allocator,
+        VkPipelineCache* cache) {
+        const VkResult result = active->create(device, info, allocator, cache);
+        if (result == VK_SUCCESS && info->initialDataSize != 0) {
+            active->restored = true;
+        }
+        return result;
+    }
+};
+
+struct ComputeBinaryCalls {
+    PFN_vkCreateComputePipelines create;
+    std::atomic<u32> captures{};
+    std::atomic<u32> restores{};
+    static inline ComputeBinaryCalls* active{};
+
+    static VKAPI_ATTR VkResult VKAPI_CALL Create(
+        VkDevice device, VkPipelineCache cache, u32 count,
+        const VkComputePipelineCreateInfo* infos, const VkAllocationCallbacks* allocator,
+        VkPipeline* pipelines) {
+        auto& calls = *active;
+        for (u32 i = 0; i < count; ++i) {
+            for (auto* next = static_cast<const VkBaseInStructure*>(infos[i].pNext); next;
+                 next = next->pNext) {
+                if (next->sType == VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR) {
+                    const auto* flags =
+                        reinterpret_cast<const VkPipelineCreateFlags2CreateInfoKHR*>(next);
+                    if ((flags->flags & VK_PIPELINE_CREATE_2_CAPTURE_DATA_BIT_KHR) != 0) {
+                        ++calls.captures;
+                    }
+                } else if (next->sType == VK_STRUCTURE_TYPE_PIPELINE_BINARY_INFO_KHR) {
+                    const auto* binary = reinterpret_cast<const VkPipelineBinaryInfoKHR*>(next);
+                    if (binary->binaryCount != 0) {
+                        ++calls.restores;
+                    }
+                }
+            }
+        }
+        return calls.create(device, cache, count, infos, allocator, pipelines);
+    }
+};
+
 } // namespace
 
 TEST_CASE("NVN compute: a dispatch runs its groups against a bound storage buffer",
@@ -446,6 +551,110 @@ TEST_CASE("NVN compute: a dispatch runs its groups against a bound storage buffe
     SECTION("direct, mirror") {
         RunFill(*vulkan, false, false);
     }
+}
+
+TEST_CASE("NVN driver cache restores compute output independently of title", "[nvn][driver_cache]") {
+    const u64 title = GENERATE(u64{0x1234}, Settings::MarioKartWorldProgramId);
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    Tests::TempDir directory{"nvn-driver-cache"};
+    ScopedNvnCacheDirectory isolated{directory.Path()};
+    const bool disk = Settings::values.use_disk_shader_cache.GetValue();
+    const bool driver = Settings::values.use_vulkan_driver_pipeline_cache.GetValue();
+    const bool refresh = Settings::values.nvn_shader_refresh.GetValue();
+    SCOPE_EXIT {
+        Settings::values.use_disk_shader_cache.SetValue(disk);
+        Settings::values.use_vulkan_driver_pipeline_cache.SetValue(driver);
+        Settings::values.nvn_shader_refresh.SetValue(refresh);
+    };
+    Settings::values.use_disk_shader_cache.SetValue(true);
+    Settings::values.use_vulkan_driver_pipeline_cache.SetValue(true);
+    Settings::values.nvn_shader_refresh.SetValue(false);
+
+    auto& dispatch = const_cast<Vulkan::vk::DeviceDispatch&>(vulkan->device->GetDispatchLoader());
+    CacheInitialData calls{dispatch.vkCreatePipelineCache};
+    CacheInitialData::active = &calls;
+    dispatch.vkCreatePipelineCache = &CacheInitialData::Create;
+    SCOPE_EXIT {
+        dispatch.vkCreatePipelineCache = calls.create;
+        CacheInitialData::active = nullptr;
+    };
+    CAPTURE(title);
+    RunFill(*vulkan, false, false, title);
+    REQUIRE_FALSE(calls.restored.load());
+    REQUIRE(std::filesystem::is_regular_file(directory.Path() / "nvn_pipelines.vkcache"));
+    RunFill(*vulkan, false, false, title);
+    CHECK(calls.restored.load());
+}
+
+TEST_CASE("NVN compute binaries preserve storage writes after reload and corruption",
+          "[nvn][compute][compute-binary]") {
+    const char* const enabled = std::getenv("EDEN_NX2_NVN_COMPUTE_BINARIES");
+    if (!enabled || std::string_view{enabled}.empty() || std::string_view{enabled} == "0") {
+        SKIP("set EDEN_NX2_NVN_COMPUTE_BINARIES=1 before launching the tests");
+    }
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan || !vulkan->device->IsKhrPipelineBinarySupported()) {
+        SKIP("no Vulkan device with pipeline binary support");
+    }
+
+    Tests::TempDir directory{"nvn-compute-binary"};
+    ScopedNvnCacheDirectory isolated{directory.Path()};
+    const bool disk_cache = Settings::values.use_disk_shader_cache.GetValue();
+    const bool driver_cache = Settings::values.use_vulkan_driver_pipeline_cache.GetValue();
+    SCOPE_EXIT {
+        Settings::values.use_disk_shader_cache.SetValue(disk_cache);
+        Settings::values.use_vulkan_driver_pipeline_cache.SetValue(driver_cache);
+    };
+    Settings::values.use_disk_shader_cache.SetValue(true);
+    Settings::values.use_vulkan_driver_pipeline_cache.SetValue(false);
+
+    auto& dispatch = const_cast<Vulkan::vk::DeviceDispatch&>(vulkan->device->GetDispatchLoader());
+    ComputeBinaryCalls calls{dispatch.vkCreateComputePipelines};
+    ComputeBinaryCalls::active = &calls;
+    dispatch.vkCreateComputePipelines = &ComputeBinaryCalls::Create;
+    SCOPE_EXIT {
+        dispatch.vkCreateComputePipelines = calls.create;
+        ComputeBinaryCalls::active = nullptr;
+    };
+
+    RunFill(*vulkan, false, false, true);
+    REQUIRE(calls.captures.load() == 1);
+    REQUIRE(calls.restores.load() == 0);
+    const auto binaries = directory.Path() / "compute-binaries-v1";
+    REQUIRE(std::filesystem::is_directory(binaries));
+    std::filesystem::path entry;
+    for (const auto& candidate : std::filesystem::directory_iterator{binaries}) {
+        if (candidate.path().extension() == ".bin") {
+            REQUIRE(entry.empty());
+            entry = candidate.path();
+        }
+    }
+    REQUIRE_FALSE(entry.empty());
+    REQUIRE(std::filesystem::file_size(entry) > 1);
+
+    RunFill(*vulkan, false, false, true);
+    REQUIRE(calls.captures.load() == 1);
+    REQUIRE(calls.restores.load() == 1);
+
+    {
+        std::fstream file(entry, std::ios::binary | std::ios::in | std::ios::out);
+        file.seekg(-1, std::ios::end);
+        const auto tail = file.get();
+        REQUIRE(tail != std::char_traits<char>::eof());
+        file.seekp(-1, std::ios::end);
+        file.put(static_cast<char>(tail ^ 1));
+        REQUIRE(file.good());
+    }
+    RunFill(*vulkan, false, false, true);
+    REQUIRE(calls.captures.load() == 2);
+    REQUIRE(calls.restores.load() == 1);
+
+    RunFill(*vulkan, false, false, true);
+    REQUIRE(calls.captures.load() == 2);
+    REQUIRE(calls.restores.load() == 2);
 }
 
 TEST_CASE("NVN compute: an indirect dispatch reads its group counts from memory",
@@ -730,6 +939,35 @@ void Dispatch(std::vector<u64>& list, u64 program, u64 address, u64 size, u32 gr
 
 } // namespace
 
+TEST_CASE("NVN submits earlier buffer writes before compiling a compute pipeline",
+          "[nvn][compute][pipeline-lookahead]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    const bool early_submit = GENERATE(false, true);
+    ShadowRig rig(*vulkan, {.allow_host_import = false, .early_submit = early_submit});
+    constexpr u64 SOURCE = POOL_VA + 0x1000;
+    constexpr u64 DESTINATION = POOL_VA + 0x2000;
+
+    for (u32 submission : {1u, 2u}) {
+        std::vector<u64> list;
+        Push(list, VC::Op::ClearBuffer,
+             VC::ClearBufferPayload{.address = SOURCE, .size = 4096, .value = submission});
+        BindCompute2(list, PROGRAM_COPY, SOURCE, DESTINATION, 4096);
+        Push(list, VC::Op::Dispatch, VC::DispatchPayload{.x = 4, .y = 1, .z = 1});
+        rig.Run(submission, std::move(list));
+
+        const auto stats = rig.context.Stats();
+        CHECK(stats.pipeline_wait_submits == (early_submit ? 1 : 0));
+        CHECK(stats.ops_failed == 0);
+        CHECK(stats.ops_unsupported == 0);
+        for (u32 i = 0; i < 4; ++i) {
+            CHECK(WordAt(rig.data, DESTINATION - POOL_VA + i * sizeof(u32)) == submission + 1);
+        }
+    }
+}
+
 TEST_CASE("NVN storage shadow: dispatches over one range share a shadow and write it back once",
           "[nvn][compute]") {
     auto vulkan = MakeHeadlessVulkan();
@@ -819,6 +1057,30 @@ TEST_CASE("NVN storage shadow: a partly overlapping range is not served from the
         CHECK(stats.shadow_flush_conflict == 1);
         CHECK(stats.shadow_flush_segment == 1);
     }
+}
+
+TEST_CASE("NVN compute: inline updates and storage writes share an aligned buffer range",
+          "[nvn][compute]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    ShadowRig rig(*vulkan);
+    std::vector<u64> list;
+    const std::array<u32, 4> update{10, 11, 12, 13};
+    Push(list, VC::Op::UpdateUniformBuffer,
+         VC::UpdateUniformBufferPayload{STORAGE_VA + 8, sizeof(update)},
+         {reinterpret_cast<const u8*>(update.data()), sizeof(update)});
+    Dispatch(list, PROGRAM, STORAGE_VA + 16, 3 * sizeof(u32), 3);
+    rig.Run(1, std::move(list));
+
+    const std::array<u32, 8> expected{0xCDCDCDCD, 0xCDCDCDCD, 10, 11, 100, 101, 102, 0xCDCDCDCD};
+    for (u32 i = 0; i < expected.size(); ++i) {
+        INFO("word " << i);
+        CHECK(WordAt(rig.data, STORAGE_VA - POOL_VA + i * sizeof(u32)) == expected[i]);
+    }
+    CHECK(rig.context.Stats().ops_failed == 0);
+    CHECK(rig.context.Stats().ops_unsupported == 0);
 }
 
 TEST_CASE("NVN storage shadow: guest writes between submissions reach the next shadow",
@@ -1112,10 +1374,14 @@ TEST_CASE("MKW graphics lookahead preserves live attachments across passes and l
          VC::BindBuffersPayload{.stage = 0, .first = 0, .count = 1},
          {reinterpret_cast<const u8*>(&range), sizeof(range)});
     draw(first);
+    constexpr u64 sync = 100;
+    Push(first, VC::Op::FenceSync, VC::FenceSyncPayload{.sync_serial = sync});
     PushEnd(first);
-    auto submission = MakeSubmission(1, std::move(first), {VERTEX_PROGRAM, 10, 11, 1, 2});
+    auto submission = MakeSubmission(1, std::move(first), {VERTEX_PROGRAM, 10, 11, 1, 2, sync});
 
     auto& next = submission.lists.emplace_back();
+    Push(next, VC::Op::SignalEvent,
+         VC::SignalEventPayload{.event_address = POOL_VA + 0x3000, .value = 1});
     bind_target(next, 11);
     Push(next, VC::Op::ClearColor,
          VC::ClearColorPayload{.index = 0, .mask = 0xF, .is_integer = 1, .color = {0x1234}});
@@ -1900,7 +2166,10 @@ TEST_CASE("NVN compute prefetch before binding keeps only texture-independent pi
     CHECK(cache.Stats().compute_pipelines == (sampled ? 0 : 1));
     CHECK(cache.Stats().rejected_shaders == 0);
 
-    REQUIRE(cache.GetCompute(request));
+    u32 blocking_misses = 0;
+    const auto pipeline = cache.GetCompute(request, nullptr, {}, [&] { ++blocking_misses; });
+    REQUIRE(pipeline);
+    CHECK(blocking_misses == (sampled ? 1 : 0));
     CHECK(cache.Stats().prefetch_used == (sampled ? 0 : 1));
     CHECK(cache.Stats().compiled_at_runtime == 1);
 }
@@ -2136,10 +2405,13 @@ TEST_CASE("MKW BC3: sparse atlas sampling and streaming copies preserve residenc
         u32 width;
         u32 layers;
         u32 levels;
+        bool map_tail;
     };
-    const auto shape = GENERATE(Shape{8192, 68, 14}, Shape{16384, 1, 15}, Shape{8192, 1, 1});
+    const auto shape =
+        GENERATE(Shape{8192, 68, 14, false}, Shape{16384, 1, 15, false},
+                 Shape{8192, 1, 1, false}, Shape{4096, 2, 13, true});
     INFO("atlas " << shape.width << "x" << shape.width << "x" << shape.layers << ", levels "
-                  << shape.levels);
+                  << shape.levels << ", explicit tail mapping " << shape.map_tail);
     constexpr u64 VIRTUAL_VA = 0x7D00'0000'0000'0000ULL;
     constexpr u64 TILE = 64_KiB;
     FakeMemory memory;
@@ -2156,7 +2428,8 @@ TEST_CASE("MKW BC3: sparse atlas sampling and streaming copies preserve residenc
     fill(0, 2_MiB, 0x8000);
     Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr, {});
     context.SetGuestMemory(&memory);
-    context.SetTitleId(Settings::MarioKartWorldProgramId);
+    context.SetTitleId(shape.map_tail ? Settings::OcarinaOfTimeProgramId
+                                      : Settings::MarioKartWorldProgramId);
     context.CreatePool(
         {.serial = 1, .guest_address = POOL_VA, .size = 64_KiB, .flags = POOL_CPU_CACHED});
     context.CreatePool(
@@ -2195,6 +2468,14 @@ TEST_CASE("MKW BC3: sparse atlas sampling and streaming copies preserve residenc
     const u64 tile_offset = layout->TileOffset(id);
     const u64 last_layer_tile = tile_offset + (shape.layers - 1) * layout->layer_size;
     context.MapVirtual(3, {{tile_offset, 2, 0, TILE}, {last_layer_tile, 2, 0, TILE}});
+    if (shape.map_tail) {
+        constexpr u64 PHYSICAL_TAIL = 512_KiB;
+        REQUIRE(layout->HasTail());
+        REQUIRE(layout->TailSize() <= 512_KiB);
+        fill(PHYSICAL_TAIL, layout->TailSize(), 0);
+        const u64 guest_tail = layout->tail_offset + (shape.layers - 1) * layout->layer_size;
+        context.MapVirtual(3, {{guest_tail, 2, PHYSICAL_TAIL, layout->TailSize()}});
+    }
     const auto view = [&](u64 serial, u32 layer, u32 mip, bool srgb) {
         VC::TextureDesc desc = atlas;
         desc.serial = serial;
@@ -2299,7 +2580,7 @@ TEST_CASE("MKW BC3: sparse atlas sampling and streaming copies preserve residenc
         CHECK(coarse_samples[1] == 0.0f);
         CHECK(coarse_samples[2] == 0.0f);
         CHECK(coarse_samples[3] == 0.0f);
-        // Re-visiting an unmapped coarse mip must retain the new GPU texels.
+        // Re-visiting a coarse mip must retain the new GPU texels.
         CHECK(run({}, 52) == coarse_samples);
         view(53, shape.layers - 1, shape.levels - 1, false);
         partial.dst.level = shape.levels - 1;
@@ -2314,7 +2595,12 @@ TEST_CASE("MKW BC3: sparse atlas sampling and streaming copies preserve residenc
     check(11, 0.5f);
     check(12, 0.5f);   // full array layer range, including the final layer
     check(13, 0.214f); // first sRGB alias sees the same BC bits
-    const u64 tile_binds = shape.layers > 1 ? 4 : 2;
+    // Each BC3 block is 16 bytes for 4x4 texels. The mapped guest tile is full-sized
+    // and the runtime binds one region for every 64 KiB host sparse block.
+    const u64 tile_bytes = u64{layout->tile_width / 4} * (layout->tile_height / 4) * 16;
+    REQUIRE(tile_bytes % Nvn::SPARSE_TILE_BYTES == 0);
+    const u64 tile_binds = (last_layer_tile == tile_offset ? 1 : 2) *
+                           (tile_bytes / Nvn::SPARSE_TILE_BYTES);
     if (layout->HasTail()) {
         CHECK(context.Stats().virtual_sparse_binds > tile_binds);
     } else {
@@ -2432,6 +2718,109 @@ u64 StatRow(const Vulkan::Nvn::Context& context, std::string_view reason) {
 
 } // namespace
 
+TEST_CASE("NVN feedback copies only the attachment mip changed since the last snapshot",
+          "[nvn][compute][feedback-mips]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    FakeMemory memory;
+    u8* data = memory.Add(POOL_VA, 64_KiB);
+    std::memset(data, 0xCD, 64_KiB);
+    memory.Add(TEXTURE_POOL_VA, 1_MiB);
+    Vulkan::Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr,
+                                 {.early_submit = false, .try_storage_vram = false});
+    context.SetGuestMemory(&memory);
+    context.CreatePool({.serial = 1, .guest_address = POOL_VA, .size = 64_KiB,
+                        .flags = POOL_CPU_CACHED});
+    context.CreatePool({.serial = 2, .guest_address = TEXTURE_POOL_VA, .size = 1_MiB,
+                        .flags = 1 /* CPU_NO_ACCESS */});
+    constexpr u32 LEVELS = 4;
+    context.CreateTexture({.target = 1, .format = 0x0A, .width = 16, .height = 16,
+                           .depth = 1, .levels = LEVELS, .serial = 10, .pool_serial = 2});
+    VC::SamplerDesc sampler{};
+    sampler.wrap_s = sampler.wrap_t = sampler.wrap_r = 7; // clamp-to-edge
+    sampler.serial = 20;
+    context.CreateSampler(sampler);
+
+    // TEX.LZ samples the red channel of the whole view at mip 0 using graphics handle slot 0
+    // (c2[0x20]). The vertex stores the result through the graphics storage entry c0[0x110].
+    constexpr Inst sample{{0x04047b60, 0x30800803, 0x049e01ff, 0x000f4800}};
+    const std::array vertex{AddImm(4, 255, 0x3f000000), AddImm(3, 255, 0x3f000000), sample,
+                            MovC0(6, 0x110), MovC0(7, 0x114), Stg(6, 4), Exit};
+    context.CreateProgram(MakeVertexProgram(VERTEX_PROGRAM, vertex));
+
+    std::vector<u64> list;
+    Push(list, VC::Op::SetRasterizerDiscard, VC::EnablePayload{.enable = 1});
+    Push(list, VC::Op::BindProgram,
+         VC::BindProgramPayload{.program_serial = VERTEX_PROGRAM, .stages = 1u << 0});
+    const u64 handle = 1 | (u64{1} << 20);
+    Push(list, VC::Op::BindTextures, VC::BindHandlesPayload{.stage = 0, .first = 0, .count = 1},
+         {reinterpret_cast<const u8*>(&handle), sizeof(handle)});
+    const auto target = [&](u32 level) {
+        const VC::RenderTargetRef ref{.texture = {.serial = 10, .level = level, .layer = 0}};
+        Push(list, VC::Op::SetRenderTargets, VC::SetRenderTargetsPayload{1, 0},
+             {reinterpret_cast<const u8*>(&ref), sizeof(ref)});
+    };
+    const auto clear = [&](float red) {
+        Push(list, VC::Op::ClearColor,
+             VC::ClearColorPayload{.index = 0, .mask = 0xF, .color = {std::bit_cast<u32>(red)}});
+    };
+    const auto draw = [&](u32 output) {
+        const VC::BufferRange range{POOL_VA + output, 16};
+        Push(list, VC::Op::BindStorageBuffers,
+             VC::BindBuffersPayload{.stage = 0, .first = 0, .count = 1},
+             {reinterpret_cast<const u8*>(&range), sizeof(range)});
+        Push(list, VC::Op::Draw, VC::DrawPayload{.mode = 0, .count = 1, .instance_count = 1});
+    };
+    target(0);
+    clear(0.25f);
+    draw(0x2000);
+    clear(0.75f);
+    target(1);
+    draw(0x2010);
+    clear(0.50f);
+    target(2);
+    draw(0x2020);
+
+    const auto submit = [&](u64 seq) {
+        PushEnd(list);
+        VC::Submission submission =
+            MakeSubmission(seq, std::exchange(list, {}), {VERTEX_PROGRAM, 10, 20, 1, 2});
+        submission.texture_pool_snapshot =
+            VC::IdSnapshot{std::make_shared<const std::vector<u64>>(std::vector<u64>{0, 10})};
+        submission.sampler_pool_snapshot =
+            VC::IdSnapshot{std::make_shared<const std::vector<u64>>(std::vector<u64>{0, 20})};
+        context.Submit(std::move(submission));
+        REQUIRE(context.Wait(seq, 20s));
+    };
+    submit(1);
+    REQUIRE(context.Stats().ops_failed == 0);
+    CHECK(context.Stats().ops_unsupported == 0);
+    CHECK(WordAt(data, 0x2000) == std::bit_cast<u32>(0.25f));
+    CHECK(WordAt(data, 0x2010) == std::bit_cast<u32>(0.75f));
+    CHECK(WordAt(data, 0x2020) == std::bit_cast<u32>(0.75f));
+    CHECK(StatRow(context, "feedback_copy") == 3);
+    CHECK(StatRow(context, "feedback_copy: mip copy regions") == LEVELS + 2);
+    CHECK(StatRow(context, "feedback_copy: mip regions reused") == 2 * (LEVELS - 1));
+
+    // An image operation outside the attachment path invalidates the snapshot.
+    target(3);
+    Push(list, VC::Op::ClearTexture,
+         VC::ClearTexturePayload{.texture = {.serial = 10, .level = 0, .layer = 0},
+                                 .region = {0, 0, 0, 16, 16, 1},
+                                 .layer_count = 1,
+                                 .color = {std::bit_cast<u32>(0.125f)}},
+         {}, 0xF);
+    draw(0x2030);
+    submit(2);
+    CHECK(context.Stats().ops_failed == 0);
+    CHECK(context.Stats().ops_unsupported == 0);
+    CHECK(WordAt(data, 0x2030) == std::bit_cast<u32>(0.125f));
+    CHECK(StatRow(context, "feedback_copy: mip copy regions") == 2 * LEVELS + 2);
+    CHECK(StatRow(context, "feedback_copy: mip regions reused") == 2 * (LEVELS - 1));
+}
+
 TEST_CASE("NVN occlusion: SAMPLES_PASSED reports and resets keep the render pass open",
           "[nvn][compute]") {
     auto vulkan = MakeHeadlessVulkan();
@@ -2468,8 +2857,8 @@ TEST_CASE("NVN occlusion: SAMPLES_PASSED reports and resets keep the render pass
             target.pool_serial = 2;
             target.pool_offset = 0;
             context.CreateTexture(target);
-            // Draws without fragments (rasterizer discard): they count 0 samples, but every one
-            // is a counted draw of the open pass.
+            // These shaders give all three vertices the same position. The degenerate triangle
+            // contributes no samples, but still exercises query recording for every draw.
             const std::array<Inst, 1> nothing{{Exit}};
             const auto store = StoreProgram(0, 0x1337);
             context.CreateProgram(MakeVertexProgram(VERTEX_PROGRAM, nothing));
@@ -2480,7 +2869,6 @@ TEST_CASE("NVN occlusion: SAMPLES_PASSED reports and resets keep the render pass
             const VC::RenderTargetRef color{.texture = {.serial = 10, .level = 0, .layer = 0}};
             Push(list, VC::Op::SetRenderTargets, VC::SetRenderTargetsPayload{1, 0},
                  {reinterpret_cast<const u8*>(&color), sizeof(color)});
-            Push(list, VC::Op::SetRasterizerDiscard, VC::EnablePayload{.enable = 1});
             Push(list, VC::Op::BindProgram,
                  VC::BindProgramPayload{.program_serial = VERTEX_PROGRAM, .stages = 1u << 0});
             const auto draw = [&] {
@@ -3237,10 +3625,15 @@ TEST_CASE("NVN draw: without render targets a draw rasterizes over NVN's no-targ
     if (!vulkan) {
         SKIP("no Vulkan device");
     }
+    const bool in_pass = GENERATE(false, true);
+    if (in_pass && !vulkan->device->IsHostQueryResetSupported()) {
+        SKIP("in-pass queries require host query reset");
+    }
     FakeMemory memory;
     u8* data = memory.Add(POOL_VA, 64_KiB);
     std::memset(data, 0xCD, 64_KiB);
-    Vulkan::Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr, {});
+    Vulkan::Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr,
+                                 {.in_pass_queries = in_pass});
     context.SetGuestMemory(&memory);
     context.CreatePool({.serial = 1, .guest_address = POOL_VA, .size = 64_KiB,
                         .flags = POOL_CPU_CACHED});
@@ -3267,7 +3660,21 @@ TEST_CASE("NVN draw: without render targets a draw rasterizes over NVN's no-targ
     Push(list, VC::Op::BindProgram,
          VC::BindProgramPayload{.program_serial = VERTEX_PROGRAM, .stages = 1u << 0});
     Push(list, VC::Op::ResetCounter, VC::ResetCounterPayload{.counter_type = SAMPLES_PASSED});
-    Push(list, VC::Op::Draw, VC::DrawPayload{.mode = 0, .first = 0, .count = 1, .instance_count = 1});
+    const auto draw = [&] {
+        Push(list, VC::Op::Draw, VC::DrawPayload{.mode = 0, .count = 1, .instance_count = 1});
+    };
+    draw();
+    u32 expected_samples = 1;
+    u64 expected_passes = 1;
+    SECTION("only a rasterizing draw") {}
+    SECTION("a discard draw between two rasterizing draws") {
+        Push(list, VC::Op::SetRasterizerDiscard, VC::EnablePayload{.enable = 1});
+        draw();
+        Push(list, VC::Op::SetRasterizerDiscard, VC::EnablePayload{.enable = 0});
+        draw();
+        expected_samples = 2;
+        expected_passes = in_pass ? 1 : 3;
+    }
     Push(list, VC::Op::ReportCounter,
          VC::ReportCounterPayload{.address = POOL_VA + REPORTS, .counter_type = SAMPLES_PASSED});
     PushEnd(list);
@@ -3277,9 +3684,168 @@ TEST_CASE("NVN draw: without render targets a draw rasterizes over NVN's no-targ
     const Vulkan::Nvn::ContextStats stats = context.Stats();
     CHECK(stats.ops_failed == 0);
     CHECK(stats.ops_unsupported == 0);
-    CHECK(StatRow(context, "render_pass_begins") == 1);
-    CHECK(WordAt(data, REPORTS) == 1);
+    CHECK(StatRow(context, "render_pass_begins") == expected_passes);
+    CHECK(WordAt(data, REPORTS) == expected_samples);
     CHECK(WordAt(data, REPORTS + 4) == 0);
+}
+
+TEST_CASE("NVN draw: depth feedback copies only when direct sampling is disabled or unsafe",
+          "[nvn][compute][pass_state]") {
+    const auto resolution =
+        GENERATE(Settings::ResolutionSetup::Res1X, Settings::ResolutionSetup::Res3_4X);
+    const auto saved_resolution = Settings::values.resolution_info;
+    SCOPE_EXIT { Settings::values.resolution_info = saved_resolution; };
+    Settings::TranslateResolutionInfo(resolution, Settings::values.resolution_info);
+    const bool requested_scaling = Settings::values.resolution_info.active;
+    const u32 size = requested_scaling ? 384 : 64;
+    const u64 texture_pool_size = requested_scaling ? 6_MiB : 1_MiB;
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan || vulkan->device->ApiVersion() < VK_API_VERSION_1_3) {
+        SKIP("requires Vulkan 1.3");
+    }
+    constexpr s32 depth_format = 0x34; // D32_FLOAT
+    constexpr s32 color_format = 0x25; // A8B8G8R8_UNORM
+    constexpr VkFormatFeatureFlags blit_features =
+        VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+    const auto can_blit = [&](s32 format) {
+        const auto host = Vulkan::Nvn::ResolveHostFormat(*vulkan->device, format);
+        REQUIRE(host);
+        return vulkan->device->IsFormatSupported(host->format, blit_features,
+                                                  Vulkan::FormatType::Optimal);
+    };
+    // The scaled twin transfers in both directions. A missing blit feature keeps all the
+    // attachments at native size, but the requested-scaling case still exercises all four draws.
+    const bool expects_scaled_passes =
+        requested_scaling && can_blit(depth_format) && can_blit(color_format);
+
+    FakeMemory memory;
+    u8* data = memory.Add(POOL_VA, 64_KiB);
+    std::memset(data, 0xCD, 64_KiB);
+    memory.Add(TEXTURE_POOL_VA, texture_pool_size);
+    Vulkan::Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr, {});
+    context.SetGuestMemory(&memory);
+    context.SetDeviceModes(0, 1); // zero-to-one clip depth
+    context.CreatePool({.serial = 1, .guest_address = POOL_VA, .size = 64_KiB,
+                        .flags = POOL_CPU_CACHED});
+    context.CreatePool({.serial = 2, .guest_address = TEXTURE_POOL_VA, .size = texture_pool_size,
+                        .flags = 1 /* CPU_NO_ACCESS */});
+    context.CreateTexture({.target = 1, .format = depth_format, .width = size, .height = size,
+                           .depth = 1, .levels = 1, .serial = 10, .pool_serial = 2});
+    if (requested_scaling) {
+        context.CreateTexture({.target = 1, .format = color_format, .width = size, .height = size,
+                               .depth = 1, .levels = 1, .serial = 11, .pool_serial = 2,
+                               .pool_offset = 2_MiB});
+        context.CreateTexture({.target = 1, .format = color_format, .width = size, .height = size,
+                               .depth = 1, .levels = 2, .serial = 12, .pool_serial = 2,
+                               .pool_offset = 4_MiB});
+    }
+    context.CreateSampler({.wrap_s = 7, .wrap_t = 7, .wrap_r = 7, .serial = 20});
+
+    // Set position.z to the depth sampled from combined handle 0. The point only passes the
+    // EQUAL depth test if that sample saw the value last cleared into the attachment.
+    constexpr Inst TexDepth{{0x04027b60, 0x30800803, 0x049e01ff, 0x000f4800}};
+    constexpr Inst AstPosition{{0xff007322, 0x00007000, 0x00000cff, 0x000fe200}};
+    constexpr u32 ONE_64TH = 0x3c800000;
+    constexpr u32 HALF = 0x3f000000;
+    constexpr u32 ONE = 0x3f800000;
+    const std::array<Inst, 8> point{{
+        AddImm(0, 255, ONE_64TH), AddImm(1, 255, ONE_64TH), AddImm(3, 255, HALF),
+        AddImm(4, 255, HALF), TexDepth, AddImm(3, 255, ONE), AstPosition, Exit,
+    }};
+    context.CreateProgram(MakeVertexProgram(VERTEX_PROGRAM, point));
+
+    std::vector<u64> list;
+    const auto set_targets = [&](u64 color) {
+        const std::array<VC::RenderTargetRef, 2> targets{{
+            {.texture = {.serial = color}}, {.texture = {.serial = 10}},
+        }};
+        const auto attachments = std::span{targets}.subspan(requested_scaling ? 0 : 1);
+        Push(list, VC::Op::SetRenderTargets, VC::SetRenderTargetsPayload{requested_scaling ? 1u : 0u, 1},
+             {reinterpret_cast<const u8*>(attachments.data()), attachments.size_bytes()});
+    };
+    set_targets(11);
+    const VC::ViewportRect viewport{0, 0, static_cast<f32>(size), static_cast<f32>(size)};
+    Push(list, VC::Op::SetViewports, VC::SetViewportsPayload{.first = 0, .count = 1},
+         {reinterpret_cast<const u8*>(&viewport), sizeof(viewport)});
+    Push(list, VC::Op::SetPointSize, VC::F32Payload{.value = 1.0f});
+    using DS = VC::DepthStencilState;
+    const auto bind_depth = [&](bool write) {
+        const u64 state =
+            DS::WithDepthWriteEnable(DS::WithDepthFunc(DS::WithDepthTestEnable(0, 1), 3), write);
+        Push(list, VC::Op::BindState,
+             VC::BindStatePayload{static_cast<u32>(VC::StateKind::DepthStencil), sizeof(state)},
+             {reinterpret_cast<const u8*>(&state), sizeof(state)});
+    };
+    bind_depth(false);
+    Push(list, VC::Op::BindProgram,
+         VC::BindProgramPayload{.program_serial = VERTEX_PROGRAM, .stages = 1u << 0});
+    const u64 handle = 1u | (1u << 20);
+    Push(list, VC::Op::BindTextures, VC::BindHandlesPayload{.stage = 0, .first = 0, .count = 1},
+         {reinterpret_cast<const u8*>(&handle), sizeof(handle)});
+    if (requested_scaling) {
+        // Fill the depth image before testing direct sampling, allocating twins when supported.
+        Push(list, VC::Op::ClearDepthStencil,
+             VC::ClearDepthStencilPayload{.depth = 0.125f, .depth_mask = 1});
+        Push(list, VC::Op::Barrier, VC::BarrierPayload{.bits = 0x11});
+    }
+    Push(list, VC::Op::ResetCounter, VC::ResetCounterPayload{.counter_type = SAMPLES_PASSED});
+    for (const float value : {0.25f, 0.75f}) {
+        Push(list, VC::Op::ClearDepthStencil,
+             VC::ClearDepthStencilPayload{.depth = value, .depth_mask = 1});
+        Push(list, VC::Op::Barrier, VC::BarrierPayload{.bits = 0x11});
+        Push(list, VC::Op::Draw, VC::DrawPayload{.mode = 0, .count = 1, .instance_count = 1});
+    }
+    // The same shader still samples the cleared depth, but now the draw can write depth too.
+    bind_depth(true);
+    Push(list, VC::Op::Draw, VC::DrawPayload{.mode = 0, .count = 1, .instance_count = 1});
+    if (requested_scaling) {
+        // The mipmapped color target keeps this clear at the native size. The next draw samples
+        // the new depth and depth-tests against it, scaling when the formats support blits.
+        set_targets(12);
+        Push(list, VC::Op::ClearDepthStencil,
+             VC::ClearDepthStencilPayload{.depth = 0.5f, .depth_mask = 1});
+        Push(list, VC::Op::Barrier, VC::BarrierPayload{.bits = 0x11});
+        set_targets(11);
+        Push(list, VC::Op::Draw, VC::DrawPayload{.mode = 0, .count = 1, .instance_count = 1});
+    }
+    Push(list, VC::Op::ReportCounter,
+         VC::ReportCounterPayload{.address = POOL_VA, .counter_type = SAMPLES_PASSED});
+    PushEnd(list);
+    std::vector<u64> retained{VERTEX_PROGRAM, 10, 20, 1, 2};
+    if (requested_scaling) {
+        retained.push_back(11);
+        retained.push_back(12);
+    }
+    auto submission = MakeSubmission(1, std::move(list), std::move(retained));
+    submission.texture_pool_snapshot =
+        VC::IdSnapshot{std::make_shared<const std::vector<u64>>(std::vector<u64>{0, 10})};
+    submission.sampler_pool_snapshot =
+        VC::IdSnapshot{std::make_shared<const std::vector<u64>>(std::vector<u64>{0, 20})};
+    context.Submit(std::move(submission));
+    REQUIRE(context.Wait(1, 60s));
+
+    CHECK(context.Stats().ops_failed == 0);
+    CHECK(context.Stats().ops_unsupported == 0);
+    CHECK(WordAt(data, 0) == (requested_scaling ? 4 : 3));
+    const char* read_only_depth = std::getenv("EDEN_NX2_NVN_READ_ONLY_DEPTH");
+    const char* scaled_read_only_depth = std::getenv("EDEN_NX2_NVN_SCALED_READ_ONLY_DEPTH");
+    const bool direct = (!read_only_depth || read_only_depth[0] != '0') &&
+                        (!expects_scaled_passes ||
+                         (scaled_read_only_depth && scaled_read_only_depth[0] == '1'));
+    const u64 copies = direct ? 1 : 2;
+    CHECK(StatRow(context, "feedback_copy: depth/stencil target") ==
+          copies + (requested_scaling ? 1 : 0));
+    if (requested_scaling) {
+        const u64 scaled_passes =
+            StatRow(context, "resolution scale: passes drawn at the scaled size");
+        if (expects_scaled_passes) {
+            CHECK(scaled_passes > 0);
+        } else {
+            CHECK(scaled_passes == 0);
+            CHECK(StatRow(context, "resolution scale: passes that stayed guest size (an attachment "
+                                   "is not eligible)") > 0);
+        }
+    }
 }
 
 TEST_CASE("NVN draw: unchanged dynamic state survives a masked clear",
@@ -3427,45 +3993,63 @@ TEST_CASE("Shader refresh retains queued compute pipelines until GPU completion"
     CHECK(context.Stats().ops_unsupported == 0);
 }
 
-TEST_CASE("NVN draw: with asynchronous shaders only the draws the emulated path may skip are "
-          "skipped while their pipeline compiles",
-          "[nvn][compute]") {
-    // vk_pipeline_cache.cpp CanSkipDraw / BuiltPipeline: a depth-less draw of <= 6 elements (a
-    // fullscreen texture-building pass such as OoT's sky_bake_inscatter slices) and a draw that
-    // stores to memory wait for their pipeline; a depth-less draw of 7 elements is skipped.
+TEST_CASE("NVN draw: a cold pipeline must contribute to its current frame",
+          "[nvn][compute][pipeline-required-draw]") {
     auto vulkan = MakeHeadlessVulkan();
     if (!vulkan) {
         SKIP("no Vulkan device");
     }
     struct RestoreSetting {
         bool previous = Settings::values.use_asynchronous_shaders.GetValue();
+        bool disk_cache = Settings::values.use_disk_shader_cache.GetValue();
         ~RestoreSetting() {
             Settings::values.use_asynchronous_shaders.SetValue(previous);
+            Settings::values.use_disk_shader_cache.SetValue(disk_cache);
         }
     } restore;
     Settings::values.use_asynchronous_shaders.SetValue(true);
+    Settings::values.use_disk_shader_cache.SetValue(false);
+    const bool title_with_old_protection = GENERATE(false, true);
+    CAPTURE(title_with_old_protection);
 
     FakeMemory memory;
     u8* data = memory.Add(POOL_VA, 64_KiB);
     std::memset(data, 0xCD, 64_KiB);
+    memory.Add(TEXTURE_POOL_VA, 1_MiB);
     Vulkan::Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr, {});
+    context.SetTitleId(title_with_old_protection ? Settings::MarioKartWorldProgramId : 0x1234);
     context.SetGuestMemory(&memory);
     context.CreatePool({.serial = 1, .guest_address = POOL_VA, .size = 64_KiB,
                         .flags = POOL_CPU_CACHED});
+    context.CreatePool({.serial = 2, .guest_address = TEXTURE_POOL_VA, .size = 1_MiB,
+                        .flags = 1 /* CPU_NO_ACCESS */});
+    context.CreateTexture({.target = 1, .format = 0x25, .width = 64, .height = 64, .depth = 1,
+                           .levels = 1, .serial = 10, .pool_serial = 2});
     //   AST.128 a[0x70], R0 (position x, y, z, w)
     constexpr Inst AstPosition{{0xff007322, 0x00007000, 0x00000cff, 0x000fe200}};
     constexpr u32 ONE_64TH = 0x3c800000;
     constexpr u32 ONE = 0x3f800000;
-    // Points at the centre of pixel (32, 32) of a 64 x 64 viewport; the second program differs
-    // in its depth only, so it is a pipeline of its own.
+    // Points at the centre of pixel (32, 32) of a 64 x 64 viewport. Changing depth gives each
+    // draw a distinct program and a cold pipeline lookup.
     const auto point = [&](u32 z) {
         return std::array<Inst, 6>{{AddImm(0, 255, ONE_64TH), AddImm(1, 255, ONE_64TH),
                                     AddImm(2, 255, z), AddImm(3, 255, ONE), AstPosition, Exit}};
     };
-    const auto small = point(0);
-    const auto large = point(0x3e800000);
-    context.CreateProgram(MakeVertexProgram(VERTEX_PROGRAM, small));
-    context.CreateProgram(MakeVertexProgram(VERTEX_PROGRAM + 1, large));
+    context.CreateProgram(MakeVertexProgram(VERTEX_PROGRAM, point(0)));
+    context.CreateProgram(MakeVertexProgram(VERTEX_PROGRAM + 1, point(0x3e800000)));
+    constexpr u64 COLOR_PROGRAM = VERTEX_PROGRAM + 3;
+    VC::ProgramDesc color_program = MakeVertexProgram(COLOR_PROGRAM, point(0x3f000000));
+    constexpr std::array<Inst, 5> FRAGMENT{
+        AddImm(0, 255, ONE), AddImm(1, 255, 0), AddImm(2, 255, 0), AddImm(3, 255, ONE), Exit,
+    };
+    VC::ProgramDesc fragment = MakeVertexProgram(COLOR_PROGRAM, FRAGMENT);
+    fragment.control[0][0x56] = 1; // fragment
+    Put32(fragment.code[0], 0, 5u << 10); // SPH type: fragment
+    Put32(fragment.code[0], 0x48, 0xF);   // SPH output mask: C0 RGBA from R0-R3
+    color_program.control[1] = std::move(fragment.control[0]);
+    color_program.code[1] = std::move(fragment.code[0]);
+    color_program.stage_mask |= 1u << 1;
+    context.CreateProgram(std::move(color_program));
     // Every vertex stores 0x1337 at word 0 of storage buffer 0; the header says so.
     const auto store = StoreProgram(0, 0x1337);
     VC::ProgramDesc storing = MakeVertexProgram(VERTEX_PROGRAM + 2, store);
@@ -3485,44 +4069,80 @@ TEST_CASE("NVN draw: with asynchronous shaders only the draws the emulated path 
     constexpr u64 REPORTS = 0x2000;
     constexpr u64 STORAGE = 0x4000;
     u64 seq = 0;
-    /// One submission: `count` points of `program` (its samples reported at REPORTS + 16 * seq).
-    const auto draw = [&](u64 program, u32 count, bool discard) {
+    const auto draw = [&](u64 program, u32 count, bool count_samples, bool discard = false) {
         ++seq;
         std::vector<u64> list;
-        Push(list, VC::Op::SetRenderTargets, VC::SetRenderTargetsPayload{0, 0}, {});
+        const VC::RenderTargetRef target{.texture = {.serial = 10, .level = 0, .layer = 0}};
+        Push(list, VC::Op::SetRenderTargets, VC::SetRenderTargetsPayload{1, 0},
+             {reinterpret_cast<const u8*>(&target), sizeof(target)});
+        Push(list, VC::Op::ClearColor, VC::ClearColorPayload{.index = 0, .mask = 0xF});
         const VC::ViewportRect viewport{0.0f, 0.0f, 64.0f, 64.0f};
         Push(list, VC::Op::SetViewports, VC::SetViewportsPayload{.first = 0, .count = 1},
              {reinterpret_cast<const u8*>(&viewport), sizeof(viewport)});
         Push(list, VC::Op::SetPointSize, VC::F32Payload{.value = 1.0f});
         Push(list, VC::Op::SetRasterizerDiscard, VC::EnablePayload{.enable = discard ? 1u : 0u});
         Push(list, VC::Op::BindProgram,
-             VC::BindProgramPayload{.program_serial = program, .stages = 1u << 0});
+             VC::BindProgramPayload{.program_serial = program,
+                                    .stages = program == COLOR_PROGRAM ? 3u : 1u});
         const VC::BufferRange range{POOL_VA + STORAGE, 4096};
         Push(list, VC::Op::BindStorageBuffers,
              VC::BindBuffersPayload{.stage = 0, .first = 0, .count = 1},
              {reinterpret_cast<const u8*>(&range), sizeof(range)});
-        Push(list, VC::Op::ResetCounter, VC::ResetCounterPayload{.counter_type = SAMPLES_PASSED});
+        if (count_samples) {
+            Push(list, VC::Op::ResetCounter,
+                 VC::ResetCounterPayload{.counter_type = SAMPLES_PASSED});
+        }
         Push(list, VC::Op::Draw,
-             VC::DrawPayload{.mode = 0, .first = 0, .count = count, .instance_count = 1});
-        Push(list, VC::Op::ReportCounter,
-             VC::ReportCounterPayload{.address = POOL_VA + REPORTS + 16 * seq,
-                                      .counter_type = SAMPLES_PASSED});
+             VC::DrawPayload{.mode = discard ? 4u : 0u, .count = count, .instance_count = 1});
+        if (count_samples) {
+            Push(list, VC::Op::ReportCounter,
+                 VC::ReportCounterPayload{.address = POOL_VA + REPORTS + 16 * seq,
+                                          .counter_type = SAMPLES_PASSED});
+        }
+        if (program == COLOR_PROGRAM) {
+            Push(list, VC::Op::CopyTextureToBuffer,
+                 VC::CopyBufferTexturePayload{.buffer = POOL_VA + 0x8000,
+                                              .texture = {.serial = 10},
+                                              .region = {0, 0, 0, 64, 64, 1}});
+        }
         PushEnd(list);
-        context.Submit(MakeSubmission(seq, std::move(list), {program, 1}));
-        REQUIRE(context.Wait(seq, 60s));
+        context.Submit(MakeSubmission(seq, std::move(list), {program, 10, 1, 2}));
+        const bool completed = context.Wait(seq, 10s);
+        if (!completed) {
+            UNSCOPED_INFO(context.DescribeState());
+        }
+        REQUIRE(completed);
         return WordAt(data, REPORTS + 16 * seq);
     };
 
-    // A 1-vertex depth-less draw waits for its pipeline: drawn on its first use.
-    CHECK(draw(VERTEX_PROGRAM, 1, false) == 1);
+    for (u32 frame = 0; frame < 4; ++frame) {
+        draw(VERTEX_PROGRAM, 1, false);
+        context.Present({.seq = ++seq, .queue = 0});
+    }
     CHECK(row("draw skipped awaiting async pipeline") == 0);
-    // A 7-vertex depth-less draw may pop in later: skipped on its first use.
-    CHECK(draw(VERTEX_PROGRAM + 1, 7, false) == 0);
-    CHECK(row("draw skipped awaiting async pipeline") == 1);
-    // A draw that stores to memory waits whatever its size.
-    draw(VERTEX_PROGRAM + 2, 7, true);
-    CHECK(WordAt(data, STORAGE) == 0x1337);
-    CHECK(row("draw skipped awaiting async pipeline") == 1);
+    SECTION("the draw contributes to an occlusion query") {
+        CHECK(draw(VERTEX_PROGRAM + 1, 7, true) == 7);
+        CHECK(row("draw skipped awaiting async pipeline") == 0);
+    }
+    SECTION("the shader writes guest memory") {
+        draw(VERTEX_PROGRAM + 2, 7, false, true);
+        CHECK(WordAt(data, STORAGE) == 0x1337);
+        CHECK(row("draw skipped awaiting async pipeline") == 0);
+    }
+    SECTION("the draw contributes color after a clear with no query or memory store") {
+        draw(COLOR_PROGRAM, 7, false);
+        u32 painted = 0;
+        u32 clear = 0;
+        for (u32 i = 0; i < 64 * 64; ++i) {
+            const u8* p = data + 0x8000 + i * 4;
+            const std::array<u8, 4> pixel{p[0], p[1], p[2], p[3]};
+            painted += pixel == std::array<u8, 4>{255, 0, 0, 255};
+            clear += pixel == std::array<u8, 4>{};
+        }
+        CHECK(painted == 1);
+        CHECK(clear == 64 * 64 - 1);
+        CHECK(row("draw skipped awaiting async pipeline") == 0);
+    }
     const Vulkan::Nvn::ContextStats stats = context.Stats();
     CHECK(stats.ops_failed == 0);
     CHECK(stats.ops_unsupported == 0);
@@ -3629,6 +4249,110 @@ TEST_CASE("NVN mirror pool: only the guest pages that changed are copied again",
     REQUIRE(stats.mirror_upload_runs == 4);
     REQUIRE(stats.mirror_pages_trusted == 0);
     REQUIRE(stats.ops_failed == 0);
+}
+
+TEST_CASE("NVN sparse buffer mirrors preserve aliased storage through full backing",
+          "[nvn][compute][mirror][sparse]") {
+    const bool enable_sparse = GENERATE(false, true);
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    const bool expect_sparse = enable_sparse && vulkan->device->IsSparseResidencyBufferSupported() &&
+                               vulkan->device->HasTimelineSemaphore();
+    INFO("sparse enabled: " << enable_sparse << ", expected: " << expect_sparse);
+
+    constexpr u64 POOL_SIZE = 16_MiB;
+    constexpr u64 FIRST_VA = 0x7d00'0000'0000'0000;
+    constexpr u64 SECOND_VA = FIRST_VA + POOL_SIZE;
+    constexpr u64 OUTPUT_VA = POOL_VA + POOL_SIZE;
+    constexpr u64 SOURCE = 1_MiB + sizeof(u32);
+    constexpr u64 DESTINATION = 4_MiB + sizeof(u32);
+    constexpr u64 FAR = 12_MiB;
+    constexpr u64 BIND_SIZE = 4096;
+    constexpr u32 GROUPS = 4;
+    constexpr u32 GUARD = 0xcdcdcdcdu;
+    constexpr u32 FAR_VALUE = 0x12345678;
+
+    FakeMemory memory;
+    u8* const data = memory.Add(POOL_VA, POOL_SIZE);
+    u8* const output = memory.Add(OUTPUT_VA, 4096);
+    std::memset(data, 0xcd, POOL_SIZE);
+    const std::array<u32, GROUPS> initial{21, 43, 65, 87};
+    std::memcpy(data + SOURCE, initial.data(), sizeof(initial));
+    std::memcpy(data + FAR, &FAR_VALUE, sizeof(FAR_VALUE));
+
+    Vulkan::Nvn::ContextOptions options{
+        .allow_host_import = false, .background_backing = false, .early_submit = false};
+    options.sparse_buffer_mirrors = enable_sparse;
+    Vulkan::Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr, options);
+    context.SetGuestMemory(&memory);
+    // CPU_CACHED | GPU_NO_ACCESS | COMPRESSIBLE | PHYSICAL
+    context.CreatePool({.serial = 1, .guest_address = POOL_VA, .size = POOL_SIZE, .flags = 0x18c});
+    context.CreatePool({.serial = 2, .guest_address = FIRST_VA, .size = POOL_SIZE, .flags = 0x200});
+    context.CreatePool({.serial = 3, .guest_address = SECOND_VA, .size = POOL_SIZE, .flags = 0x200});
+    context.CreatePool(
+        {.serial = 4, .guest_address = OUTPUT_VA, .size = 4096, .flags = POOL_CPU_CACHED});
+    context.MapVirtual(2, {{0, 1, 0, POOL_SIZE}});
+    context.MapVirtual(3, {{0, 1, 0, POOL_SIZE}});
+    context.CreateProgram(MakeProgram(PROGRAM, AddProgram(), {.uniform = 1, .storage = 1}));
+    context.CreateProgram(
+        MakeProgram(PROGRAM_COPY, CopyPlusOneProgram(), {.uniform = 1, .storage = 2}));
+
+    std::vector<u64> dispatches;
+    Dispatch(dispatches, PROGRAM, FIRST_VA + SOURCE, BIND_SIZE, GROUPS);
+    // ORDER_INDIRECT_DATA | INVALIDATE_SHADER
+    Push(dispatches, VC::Op::Barrier, VC::BarrierPayload{.bits = 0x28});
+    BindCompute2(dispatches, PROGRAM_COPY, SECOND_VA + SOURCE, FIRST_VA + DESTINATION, BIND_SIZE);
+    Push(dispatches, VC::Op::Dispatch, VC::DispatchPayload{.x = GROUPS, .y = 1, .z = 1});
+    PushEnd(dispatches);
+    context.Submit(MakeSubmission(1, std::move(dispatches), {1, 2, 3, PROGRAM, PROGRAM_COPY}));
+    REQUIRE(context.Wait(1, 60s));
+
+    for (u32 i = 0; i < GROUPS; ++i) {
+        CHECK(WordAt(data, SOURCE + i * sizeof(u32)) == initial[i] + 100);
+        CHECK(WordAt(data, DESTINATION + i * sizeof(u32)) == initial[i] + 101);
+    }
+    CHECK(WordAt(data, SOURCE - sizeof(u32)) == GUARD);
+    CHECK(WordAt(data, DESTINATION + GROUPS * sizeof(u32)) == GUARD);
+    const auto partial = context.Stats();
+    CHECK(partial.sparse_buffer_mirrors == (expect_sparse ? 1u : 0u));
+    if (expect_sparse) {
+        CHECK(partial.sparse_buffer_bound_bytes > 0);
+        CHECK(partial.sparse_buffer_bound_bytes < POOL_SIZE);
+    } else {
+        CHECK(partial.sparse_buffer_bound_bytes == 0);
+    }
+
+    constexpr u32 UPDATED = 300;
+    memory.CpuWrite(POOL_VA + SOURCE, &UPDATED, sizeof(UPDATED));
+    std::vector<u64> copies;
+    Dispatch(copies, PROGRAM, FIRST_VA + SOURCE, BIND_SIZE, 1);
+    // The distant copy completes the backing. The second copy still sees the in-flight write.
+    Push(copies, VC::Op::CopyBufferToBuffer,
+         VC::CopyBufferToBufferPayload{
+             .src = SECOND_VA + FAR, .dst = OUTPUT_VA, .size = sizeof(u32)});
+    Push(copies, VC::Op::CopyBufferToBuffer,
+         VC::CopyBufferToBufferPayload{
+             .src = SECOND_VA + SOURCE, .dst = OUTPUT_VA + sizeof(u32), .size = sizeof(u32)});
+    PushEnd(copies);
+    context.Submit(MakeSubmission(2, std::move(copies), {1, 2, 3, 4, PROGRAM}));
+    REQUIRE(context.Wait(2, 60s));
+
+    CHECK(WordAt(output, 0) == FAR_VALUE);
+    CHECK(WordAt(output, sizeof(u32)) == UPDATED + 100);
+    CHECK(WordAt(data, SOURCE) == UPDATED + 100);
+    CHECK(WordAt(data, SOURCE + sizeof(u32)) == initial[1] + 100);
+    CHECK(WordAt(data, SOURCE - sizeof(u32)) == GUARD);
+    const auto full = context.Stats();
+    CHECK(full.sparse_buffer_mirrors == partial.sparse_buffer_mirrors);
+    if (expect_sparse) {
+        CHECK(full.sparse_buffer_bound_bytes >= POOL_SIZE);
+    } else {
+        CHECK(full.sparse_buffer_bound_bytes == 0);
+    }
+    CHECK(full.ops_failed == 0);
+    CHECK(full.ops_unsupported == 0);
 }
 
 TEST_CASE("NVN mirror pool: pending GPU pages skip hashes without losing later CPU changes",
@@ -3868,7 +4592,8 @@ TEST_CASE("NVN mirror pool: a pool over two host runs is mirrored and a range ac
         std::memcpy(word_at(i), &value, sizeof(value));
     }
     rig.Start(2 * RUN);
-    rig.Run(POOL_VA + START, GROUPS, 4096);
+    // The range ends at the last word. Aligning the descriptor base must also extend its size.
+    rig.Run(POOL_VA + START, GROUPS, GROUPS * sizeof(u32));
 
     const Vulkan::Nvn::ContextStats stats = rig.context.Stats();
     REQUIRE(stats.pools_imported == 0);
@@ -4415,9 +5140,8 @@ u64 CovBinds(const Vulkan::Nvn::ContextStats& stats, VtxCov reason) {
     return stats.vtxcov_binds[static_cast<size_t>(reason)];
 }
 
-/// One submission of one pass: a draw of 3 points from page 2 of the vertex pool (bound before
-/// the pass), the same SetRenderTargets again (the pass goes on, the staging scan stopped there)
-/// and a draw of 3 points from page 0, bound only then. Returns the SAMPLES_PASSED of both.
+/// One pass across two command lists. The staging scan sees the first draw from page 2, and the
+/// second list binds page 0 and draws inside the same pass. Returns the SAMPLES_PASSED of both.
 u32 DrawInPass(VertexMirrorRig& rig) {
     ++rig.seq;
     std::vector<u64> list;
@@ -4432,14 +5156,16 @@ u32 DrawInPass(VertexMirrorRig& rig) {
     VertexMirrorRig::BindVertexBuffer(list, 0x2000);
     Push(list, VC::Op::ResetCounter, VC::ResetCounterPayload{.counter_type = SAMPLES_PASSED});
     Push(list, VC::Op::Draw, VC::DrawPayload{.mode = 0, .first = 0, .count = 3, .instance_count = 1});
-    Push(list, VC::Op::SetRenderTargets, VC::SetRenderTargetsPayload{0, 0}, {});
-    VertexMirrorRig::BindVertexBuffer(list, 0);
-    Push(list, VC::Op::Draw, VC::DrawPayload{.mode = 0, .first = 0, .count = 3, .instance_count = 1});
-    const u64 report_offset = 0x2000 + 16 * rig.seq;
-    Push(list, VC::Op::ReportCounter,
-         VC::ReportCounterPayload{.address = POOL_VA + report_offset, .counter_type = SAMPLES_PASSED});
     PushEnd(list);
-    rig.context.Submit(MakeSubmission(rig.seq, std::move(list), {PROGRAM_ATTRIBUTE, 1, 2}));
+    auto submission = MakeSubmission(rig.seq, std::move(list), {PROGRAM_ATTRIBUTE, 1, 2});
+    auto& tail = submission.lists.emplace_back();
+    VertexMirrorRig::BindVertexBuffer(tail, 0);
+    Push(tail, VC::Op::Draw, VC::DrawPayload{.mode = 0, .first = 0, .count = 3, .instance_count = 1});
+    const u64 report_offset = 0x2000 + 16 * rig.seq;
+    Push(tail, VC::Op::ReportCounter,
+         VC::ReportCounterPayload{.address = POOL_VA + report_offset, .counter_type = SAMPLES_PASSED});
+    PushEnd(tail);
+    rig.context.Submit(std::move(submission));
     REQUIRE(rig.context.Wait(rig.seq, 60s));
     return WordAt(rig.report, report_offset);
 }
@@ -4473,7 +5199,7 @@ TEST_CASE("NVN vertex coverage: a stream bound inside an open pass is counted, a
             CHECK(delta(VtxCov::Device) == 2);
         } else {
             CHECK(delta(VtxCov::FewDraws) == 1);
-            CHECK(delta(VtxCov::NotScannedTargets) == 1);
+            CHECK(delta(VtxCov::NotScannedEnd) == 1);
         }
         CHECK(delta(VtxCov::MirrorBind) == 0);
         CHECK(after.ops_failed == 0);
@@ -4481,6 +5207,7 @@ TEST_CASE("NVN vertex coverage: a stream bound inside an open pass is counted, a
     for (const bool inpass : {false, true}) {
         INFO("inpass " << inpass);
         VertexMirrorRig rig(*vulkan, true, false, inpass ? Vulkan::Nvn::VTXCOV_INPASS : 0u);
+        rig.memory.write_notifications = inpass;
         for (u32 i = 0; i < 3; ++i) {
             rig.SetVertex(i, F32_ONE_64TH);               // page 0: on the screen
             rig.SetVertex(0x2000 / 4 + i, F32_FIVE);      // page 2: off the screen
@@ -4502,7 +5229,7 @@ TEST_CASE("NVN vertex coverage: a stream bound inside an open pass is counted, a
             return CovBinds(after, reason) - CovBinds(before, reason);
         };
         CHECK(delta(VtxCov::Mirror) == 1); // page 2, through the pass's scan
-        CHECK(delta(VtxCov::NotScannedTargets) == (inpass ? 0u : 1u));
+        CHECK(delta(VtxCov::NotScannedEnd) == (inpass ? 0u : 1u));
         CHECK(delta(VtxCov::MirrorBind) == (inpass ? 1u : 0u));
         CHECK(after.ops_failed == 0);
 
@@ -4579,13 +5306,19 @@ TEST_CASE("NVN vertex coverage: TRY_VTXCOV_BIGPOOL mirrors a pool over the stora
 
 TEST_CASE("NVN uniform mirror: the first copy is the pages the bindings use, not the pool",
           "[nvn][compute][mirror]") {
+    const bool write_notifications = GENERATE(false, true);
+    const auto previous_path = Settings::values.graphics_path.GetValue();
+    SCOPE_EXIT { Settings::values.graphics_path.SetValue(previous_path); };
+    Settings::values.graphics_path.SetValue(Settings::GraphicsPath::Hle);
     auto vulkan = MakeHeadlessVulkan();
     if (!vulkan) {
         SKIP("no Vulkan device");
     }
     VertexMirrorRig rig(*vulkan, false, true);
+    rig.memory.write_notifications = write_notifications;
     constexpr u64 UNIFORM = 0x5000; // page 5 of a 64 KiB pool
     const u32 on_screen = F32_ONE_64TH;
+    rig.SetVertex(0, on_screen);
     std::memcpy(rig.vertex + UNIFORM, &on_screen, sizeof(on_screen));
     const auto binds = [&](std::vector<u64>& list) {
         VertexMirrorRig::BindUniform(list, UNIFORM, 256);
@@ -4599,6 +5332,7 @@ TEST_CASE("NVN uniform mirror: the first copy is the pages the bindings use, not
     REQUIRE(stats.ops_failed == 0);
     CHECK(stats.vram_mirrors == 1);
     CHECK(stats.vram_copy_in_bytes == 4096); // one page, not the 64 KiB pool
+    CHECK(rig.memory.notification_subscriptions == (write_notifications ? 1U : 0U));
 
     // A page nobody binds changes: nothing is copied for it, at any pass begin.
     const u32 elsewhere = 0x12345678;
@@ -4608,6 +5342,9 @@ TEST_CASE("NVN uniform mirror: the first copy is the pages the bindings use, not
 
     // The bound page changes: it is copied in again before the next pass reads it, and only it.
     rig.CpuSetVertex(UNIFORM, F32_FIVE);
+    // This pass does not bind the uniform. Its begin still drains the pending write.
+    REQUIRE(rig.Draw(PROGRAM_ATTRIBUTE, 1, 1, VertexMirrorRig::BindVertices) == 1);
+    CHECK(rig.context.Stats().vram_copy_in_bytes == 2 * 4096);
     REQUIRE(rig.Draw(PROGRAM_UNIFORM, 1, 2, binds) == 0);
     CHECK(rig.context.Stats().vram_copy_in_bytes == 2 * 4096);
     rig.CpuSetVertex(UNIFORM, F32_ONE_64TH);
@@ -4780,6 +5517,40 @@ TEST_CASE("NVN inline uniform: flushed inline update plus later partial update s
 
     CHECK(rig.context.Stats().ops_failed == 0);
     CHECK(rig.context.Stats().ops_unsupported == 0);
+}
+
+TEST_CASE("NVN inline uniform: reusing pending staging preserves draws between updates",
+          "[nvn][compute][inline]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    constexpr u64 UBO_OFFSET = 0x5000;
+    constexpr u64 UBO_VA = VERTEX_POOL_VA + UBO_OFFSET;
+    constexpr VC::DrawPayload DRAW_POINT{.mode = 0, .first = 0, .count = 1, .instance_count = 1};
+    VertexMirrorRig rig(*vulkan, false, false, 0, std::nullopt, POOL_CPU_CACHED, false);
+    rig.CpuSetVertex(UBO_OFFSET, F32_FIVE);
+    rig.CpuSetVertex(UBO_OFFSET + 0x10, F32_FIVE);
+
+    std::vector<u64> list;
+    VertexMirrorRig::PushTargetSetup(list, PROGRAM_UNIFORM_XY, UBO_OFFSET, 256);
+    Push(list, VC::Op::ResetCounter, VC::ResetCounterPayload{.counter_type = SAMPLES_PASSED});
+    Push(list, VC::Op::Draw, DRAW_POINT); // Open the pass with the point offscreen.
+    VertexMirrorRig::PushInlineU32(list, UBO_VA, F32_ONE_64TH);
+    VertexMirrorRig::PushInlineU32(list, UBO_VA + 0x10, F32_ONE_64TH);
+    Push(list, VC::Op::Draw, DRAW_POINT); // This draw must retain the visible point.
+    VertexMirrorRig::PushInlineU32(list, UBO_VA, F32_FIVE);
+    Push(list, VC::Op::Draw, DRAW_POINT);
+    CHECK(rig.SubmitAndCount(list) == 1);
+    CHECK(rig.context.Stats().ops_failed == 0);
+    CHECK(rig.context.Stats().ops_unsupported == 0);
+    std::vector<VC::SinkStat> rows;
+    rig.context.CollectStats(rows);
+    const auto superseded = std::ranges::find(
+        rows, "inline_uniform_updates: rewritten whole by a later one (no copy)",
+        &VC::SinkStat::reason);
+    REQUIRE(superseded != rows.end());
+    CHECK(superseded->count == 1);
 }
 
 TEST_CASE("NVN inline uniform: DeviceLocal UBO pool sees prior GPU write plus inline update",
@@ -5094,20 +5865,65 @@ TEST_CASE("NVN compute: lazy storage upgrade and write-only GPU-only overwrite",
     }
 }
 
+namespace {
+
+struct BindlessSwitch2Scope {
+    const bool previous = Settings::CurrentProgramIsSwitch2();
+    const Settings::GraphicsPath previous_path = Settings::values.graphics_path.GetValue();
+    BindlessSwitch2Scope() {
+        Settings::SetCurrentProgramIsSwitch2(true);
+        Settings::values.graphics_path.SetValue(Settings::GraphicsPath::Hle);
+    }
+    ~BindlessSwitch2Scope() {
+        Settings::values.graphics_path.SetValue(previous_path);
+        Settings::SetCurrentProgramIsSwitch2(previous);
+    }
+};
+
+VC::ProgramDesc MakeBindlessSampleProgram(u32 coord_bits = 0x3f000000) {
+    // The runtime lane-indexed handle load keeps TEX.B bindless.
+    constexpr Inst TexBLz2D{{0x04087361, 0x28000006, 0x008e01ff, Sched}};
+    const std::array instructions{
+        AddImm(4, 255, coord_bits),
+        AddImm(5, 255, coord_bits),
+        S2R(0, 0x00 /* SR_LANEID */),
+        MulImm(1, 0, 4),
+        MovC0(2, 0x110),
+        MovC0(3, 0x114),
+        Add(2, 2, 1),
+        Ldg(6, 2),
+        TexBLz2D,
+        MovC0(2, 0x110),
+        MovC0(3, 0x114),
+        AddImm(2, 2, 0x100),
+        Stg(2, 8),
+        Exit,
+    };
+    VC::ProgramDesc vert_desc = MakeVertexProgram(VERTEX_PROGRAM, instructions);
+    vert_desc.code[0][2] |= 0x01; // SPH word 0 bit 16: DoesGlobalStore
+    return vert_desc;
+}
+
+void AppendBindlessSampleDraw(std::vector<u64>& list) {
+    Push(list, VC::Op::SetRenderTargets, VC::SetRenderTargetsPayload{0, 0}, {});
+    Push(list, VC::Op::SetDepthClamp, VC::EnablePayload{.enable = 0});
+    Push(list, VC::Op::SetSampleMask, VC::U32Payload{.value = 0xFFFFFFFFu});
+    Push(list, VC::Op::SetRasterizerDiscard, VC::EnablePayload{.enable = 1});
+    Push(list, VC::Op::BindProgram,
+         VC::BindProgramPayload{.program_serial = VERTEX_PROGRAM, .stages = 1u << 0});
+    const VC::BufferRange storage_range{POOL_VA, 0x200};
+    Push(list, VC::Op::BindStorageBuffers,
+         VC::BindBuffersPayload{.stage = 0, .first = 0, .count = 1},
+         {reinterpret_cast<const u8*>(&storage_range), sizeof(storage_range)});
+    Push(list, VC::Op::Draw,
+         VC::DrawPayload{.mode = 0, .first = 0, .count = 1, .instance_count = 1});
+}
+
+} // namespace
+
 TEST_CASE("NVN bindless: layout-only BindlessPrepare skips dead transient alias transfers",
           "[nvn][compute][alias]") {
-    struct Switch2Scope {
-        const bool previous = Settings::CurrentProgramIsSwitch2();
-        const Settings::GraphicsPath previous_path = Settings::values.graphics_path.GetValue();
-        Switch2Scope() {
-            Settings::SetCurrentProgramIsSwitch2(true);
-            Settings::values.graphics_path.SetValue(Settings::GraphicsPath::Hle);
-        }
-        ~Switch2Scope() {
-            Settings::values.graphics_path.SetValue(previous_path);
-            Settings::SetCurrentProgramIsSwitch2(previous);
-        }
-    } const switch2_scope;
+    const BindlessSwitch2Scope switch2_scope;
     auto vulkan = MakeHeadlessVulkan();
     if (!vulkan || !vulkan->device->IsBindlessTableSupported()) {
         SKIP("no Vulkan device with bindless texture table");
@@ -5169,28 +5985,7 @@ TEST_CASE("NVN bindless: layout-only BindlessPrepare skips dead transient alias 
         std::memcpy(data + lane * sizeof(u32), &bindless_handle, sizeof(u32));
     }
 
-    // Vertex shader with runtime lane-indexed handle load so ShaderPass emits bindless TEX.B.
-    constexpr Inst TexBLz2D{{0x04087361, 0x28000006, 0x008e01ff, Sched}};
-    const std::array<Inst, 13> bindless_vert{{
-        AddImm(4, 255, 0x3f000000),
-        AddImm(5, 255, 0x3f000000),
-        S2R(0, 0x00 /* SR_LANEID */),
-        MulImm(1, 0, 4),
-        MovC0(2, 0x110),
-        MovC0(3, 0x114),
-        Add(2, 2, 1),
-        Ldg(6, 2),
-        TexBLz2D,
-        MovC0(2, 0x110),
-        MovC0(3, 0x114),
-        AddImm(2, 2, 0x100),
-        Stg(2, 8),
-    }};
-    std::vector<Inst> program_insns(bindless_vert.begin(), bindless_vert.end());
-    program_insns.push_back(Exit);
-    VC::ProgramDesc vert_desc = MakeVertexProgram(VERTEX_PROGRAM, program_insns);
-    vert_desc.code[0][2] |= 0x01; // SPH word 0 bit 16: DoesGlobalStore
-    context.CreateProgram(std::move(vert_desc));
+    context.CreateProgram(MakeBindlessSampleProgram());
 
     const auto make_clear = [](u64 serial, float r, float g, float b, float a) {
         VC::ClearTexturePayload clear{};
@@ -5206,18 +6001,7 @@ TEST_CASE("NVN bindless: layout-only BindlessPrepare skips dead transient alias 
     Push(list1, VC::Op::ClearTexture, make_clear(10, 0.0f, 0.0f, 0.0f, 1.0f), {}, 0xF);
     Push(list1, VC::Op::ClearTexture, make_clear(11, 0.25f, 0.5f, 0.75f, 1.0f), {}, 0xF);
     Push(list1, VC::Op::ClearTexture, make_clear(12, 1.0f, 0.0f, 0.0f, 1.0f), {}, 0xF);
-    Push(list1, VC::Op::SetRenderTargets, VC::SetRenderTargetsPayload{0, 0}, {});
-    Push(list1, VC::Op::SetDepthClamp, VC::EnablePayload{.enable = 0});
-    Push(list1, VC::Op::SetSampleMask, VC::U32Payload{.value = 0xFFFFFFFFu});
-    Push(list1, VC::Op::SetRasterizerDiscard, VC::EnablePayload{.enable = 1});
-    Push(list1, VC::Op::BindProgram,
-         VC::BindProgramPayload{.program_serial = VERTEX_PROGRAM, .stages = 1u << 0});
-    const VC::BufferRange storage_range{POOL_VA, 0x200};
-    Push(list1, VC::Op::BindStorageBuffers,
-         VC::BindBuffersPayload{.stage = 0, .first = 0, .count = 1},
-         {reinterpret_cast<const u8*>(&storage_range), sizeof(storage_range)});
-    Push(list1, VC::Op::Draw,
-         VC::DrawPayload{.mode = 0, .first = 0, .count = 1, .instance_count = 1});
+    AppendBindlessSampleDraw(list1);
     PushEnd(list1);
 
     VC::Submission sub1 = MakeSubmission(1, std::move(list1), {VERTEX_PROGRAM, 10, 11, 12, 20, 1, 2});
@@ -5261,18 +6045,7 @@ TEST_CASE("NVN bindless: layout-only BindlessPrepare skips dead transient alias 
 
 TEST_CASE("NVN bindless: dirty sync tracks storage readiness, format upgrade, and erasure",
           "[nvn][compute][alias]") {
-    struct Switch2Scope {
-        const bool previous = Settings::CurrentProgramIsSwitch2();
-        const Settings::GraphicsPath previous_path = Settings::values.graphics_path.GetValue();
-        Switch2Scope() {
-            Settings::SetCurrentProgramIsSwitch2(true);
-            Settings::values.graphics_path.SetValue(Settings::GraphicsPath::Hle);
-        }
-        ~Switch2Scope() {
-            Settings::values.graphics_path.SetValue(previous_path);
-            Settings::SetCurrentProgramIsSwitch2(previous);
-        }
-    } const switch2_scope;
+    const BindlessSwitch2Scope switch2_scope;
     auto vulkan = MakeHeadlessVulkan();
     if (!vulkan || !vulkan->device->IsBindlessTableSupported()) {
         SKIP("no Vulkan device with bindless texture table");
@@ -5326,42 +6099,8 @@ TEST_CASE("NVN bindless: dirty sync tracks storage readiness, format upgrade, an
         std::memcpy(data + lane * sizeof(u32), &bindless_handle, sizeof(u32));
     }
 
-    constexpr Inst TexBLz2D{{0x04087361, 0x28000006, 0x008e01ff, Sched}};
-    const std::array<Inst, 13> bindless_vert{{
-        AddImm(4, 255, 0x3f000000),
-        AddImm(5, 255, 0x3f000000),
-        S2R(0, 0x00 /* SR_LANEID */),
-        MulImm(1, 0, 4),
-        MovC0(2, 0x110),
-        MovC0(3, 0x114),
-        Add(2, 2, 1),
-        Ldg(6, 2),
-        TexBLz2D,
-        MovC0(2, 0x110),
-        MovC0(3, 0x114),
-        AddImm(2, 2, 0x100),
-        Stg(2, 8),
-    }};
-    std::vector<Inst> program_insns(bindless_vert.begin(), bindless_vert.end());
-    program_insns.push_back(Exit);
-    VC::ProgramDesc vert_desc = MakeVertexProgram(VERTEX_PROGRAM, program_insns);
-    vert_desc.code[0][2] |= 0x01; // SPH word 0 bit 16: DoesGlobalStore
-    context.CreateProgram(std::move(vert_desc));
+    context.CreateProgram(MakeBindlessSampleProgram());
 
-    const auto append_draw = [&](std::vector<u64>& list) {
-        Push(list, VC::Op::SetRenderTargets, VC::SetRenderTargetsPayload{0, 0}, {});
-        Push(list, VC::Op::SetDepthClamp, VC::EnablePayload{.enable = 0});
-        Push(list, VC::Op::SetSampleMask, VC::U32Payload{.value = 0xFFFFFFFFu});
-        Push(list, VC::Op::SetRasterizerDiscard, VC::EnablePayload{.enable = 1});
-        Push(list, VC::Op::BindProgram,
-             VC::BindProgramPayload{.program_serial = VERTEX_PROGRAM, .stages = 1u << 0});
-        const VC::BufferRange storage_range{POOL_VA, 0x200};
-        Push(list, VC::Op::BindStorageBuffers,
-             VC::BindBuffersPayload{.stage = 0, .first = 0, .count = 1},
-             {reinterpret_cast<const u8*>(&storage_range), sizeof(storage_range)});
-        Push(list, VC::Op::Draw,
-             VC::DrawPayload{.mode = 0, .first = 0, .count = 1, .instance_count = 1});
-    };
     const auto make_clear = [](u64 serial, float r, float g, float b, float a) {
         VC::ClearTexturePayload clear{};
         clear.texture = {.serial = serial, .level = 0, .layer = 0};
@@ -5377,7 +6116,7 @@ TEST_CASE("NVN bindless: dirty sync tracks storage readiness, format upgrade, an
 
     // 1. Registered before the storage has data: reads the black stand-in (0.0f).
     std::vector<u64> list1;
-    append_draw(list1);
+    AppendBindlessSampleDraw(list1);
     PushEnd(list1);
     VC::Submission sub1 = MakeSubmission(1, std::move(list1), {VERTEX_PROGRAM, 10, 20, 1, 2});
     sub1.texture_pool_snapshot = VC::IdSnapshot{snap1};
@@ -5388,9 +6127,9 @@ TEST_CASE("NVN bindless: dirty sync tracks storage readiness, format upgrade, an
 
     // 2. Reuses the exact same snapshot: storage becomes ready mid-submission via ClearTexture.
     std::vector<u64> list2;
-    append_draw(list2);
+    AppendBindlessSampleDraw(list2);
     Push(list2, VC::Op::ClearTexture, make_clear(10, 1.0f, 0.0f, 0.0f, 1.0f), {}, 0xF);
-    append_draw(list2);
+    AppendBindlessSampleDraw(list2);
     PushEnd(list2);
     VC::Submission sub2 = MakeSubmission(2, std::move(list2), {VERTEX_PROGRAM, 10, 20, 1, 2});
     sub2.texture_pool_snapshot = VC::IdSnapshot{snap1};
@@ -5409,7 +6148,7 @@ TEST_CASE("NVN bindless: dirty sync tracks storage readiness, format upgrade, an
     const auto snap2 = std::make_shared<const std::vector<u64>>(std::vector<u64>{0, 12});
     std::vector<u64> list3;
     Push(list3, VC::Op::ClearTexture, make_clear(10, 0.5f, 0.0f, 0.0f, 1.0f), {}, 0xF);
-    append_draw(list3);
+    AppendBindlessSampleDraw(list3);
     PushEnd(list3);
     VC::Submission sub3 = MakeSubmission(3, std::move(list3), {VERTEX_PROGRAM, 10, 12, 20, 1, 2});
     sub3.texture_pool_snapshot = VC::IdSnapshot{snap2};
@@ -5428,7 +6167,7 @@ TEST_CASE("NVN bindless: dirty sync tracks storage readiness, format upgrade, an
     const auto snap3 = std::make_shared<const std::vector<u64>>(std::vector<u64>{0, 11});
     std::vector<u64> list4;
     Push(list4, VC::Op::ClearTexture, make_clear(11, 0.25f, 0.5f, 0.75f, 1.0f), {}, 0xF);
-    append_draw(list4);
+    AppendBindlessSampleDraw(list4);
     PushEnd(list4);
     VC::Submission sub4 = MakeSubmission(4, std::move(list4), {VERTEX_PROGRAM, 11, 20, 1, 2});
     sub4.texture_pool_snapshot = VC::IdSnapshot{snap3};
@@ -5443,7 +6182,7 @@ TEST_CASE("NVN bindless: dirty sync tracks storage readiness, format upgrade, an
     // 5. Destroy registered serial while snapshot still names it -> falls back to stand-in.
     context.Destroy(11);
     std::vector<u64> list5;
-    append_draw(list5);
+    AppendBindlessSampleDraw(list5);
     PushEnd(list5);
     VC::Submission sub5 = MakeSubmission(5, std::move(list5), {VERTEX_PROGRAM, 20, 1, 2});
     sub5.texture_pool_snapshot = VC::IdSnapshot{snap3};
@@ -5453,6 +6192,121 @@ TEST_CASE("NVN bindless: dirty sync tracks storage readiness, format upgrade, an
     CHECK(WordAt(data, 0x100) == 0u);
 
     const Vulkan::Nvn::ContextStats stats = context.Stats();
+    CHECK(stats.ops_failed == 0);
+    CHECK(stats.ops_unsupported == 0);
+}
+
+TEST_CASE("NVN bindless: a starved sparse tile recovers after another image releases its page",
+          "[nvn][sparse][bindless]") {
+    const BindlessSwitch2Scope switch2_scope;
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan || !vulkan->device->IsBindlessTableSupported() ||
+        !vulkan->device->IsSparseResidencyImageSupported(VK_IMAGE_TYPE_2D) ||
+        !vulkan->device->CanUseUnbackedSparseImages()) {
+        SKIP("no Vulkan device with sparse residency and bindless textures");
+    }
+
+    constexpr u64 BUFFER_POOL = 1;
+    constexpr u64 PHYSICAL_POOL = 2;
+    constexpr u64 VIRTUAL_POOL = 3;
+    constexpr u64 PHYSICAL_VA = 0x6000'0000;
+    constexpr u64 VIRTUAL_VA = 0x7D00'0000'0000'0000ULL;
+    constexpr u64 TILE_BYTES = 64_KiB;
+    constexpr u64 TEXTURE_BYTES = 64_MiB;
+    constexpr u64 PAGE_OWNER = 10;
+    constexpr u64 SAMPLED_TEXTURE = 11;
+    constexpr u64 SAMPLER = 20;
+
+    FakeMemory memory;
+    u8* const data = memory.Add(POOL_VA, 2 * TILE_BYTES);
+    std::memset(data, 0xCD, TILE_BYTES);
+    u8* const physical = memory.Add(PHYSICAL_VA, 2 * TILE_BYTES);
+    // Every texel in each tile has the same value, including in the guest's tiled layout.
+    std::memset(physical, 0x5A, TILE_BYTES);
+    std::memset(physical + TILE_BYTES, 0xFF, TILE_BYTES);
+
+    Vulkan::Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr,
+                                 {.sparse_device_budget_bytes = TILE_BYTES});
+    context.SetGuestMemory(&memory);
+    context.CreatePool({.serial = BUFFER_POOL, .guest_address = POOL_VA, .size = 2 * TILE_BYTES,
+                        .flags = POOL_CPU_CACHED});
+    context.CreatePool({.serial = PHYSICAL_POOL, .guest_address = PHYSICAL_VA,
+                        .size = 2 * TILE_BYTES, .flags = POOL_CPU_CACHED});
+    context.CreatePool({.serial = VIRTUAL_POOL, .guest_address = VIRTUAL_VA,
+                        .size = 2 * TEXTURE_BYTES, .flags = 0x200 /* VIRTUAL */});
+    VC::TextureDesc texture{};
+    texture.target = 1;
+    texture.format = 0x01; // R8 UNORM
+    texture.width = 8192;
+    texture.height = 8192;
+    texture.depth = 1;
+    texture.levels = 1;
+    texture.flags = 0x20; // SPARSE
+    texture.serial = PAGE_OWNER;
+    texture.pool_serial = VIRTUAL_POOL;
+    context.CreateTexture(texture);
+    texture.serial = SAMPLED_TEXTURE;
+    texture.pool_offset = TEXTURE_BYTES;
+    context.CreateTexture(texture);
+    context.MapVirtual(VIRTUAL_POOL, {{0, PHYSICAL_POOL, 0, TILE_BYTES},
+                                      {TEXTURE_BYTES, PHYSICAL_POOL, TILE_BYTES, TILE_BYTES}});
+
+    VC::SamplerDesc sampler{};
+    sampler.wrap_s = 7;
+    sampler.wrap_t = 7;
+    sampler.wrap_r = 7;
+    sampler.serial = SAMPLER;
+    context.CreateSampler(sampler);
+    context.CreateProgram(MakeBindlessSampleProgram(0x3b800000)); // 1/256, inside the first tile
+
+    constexpr u32 handle = 1u | (1u << 20); // texture and sampler slot 1
+    for (u32 lane = 0; lane < 64; ++lane) {
+        std::memcpy(data + lane * sizeof(handle), &handle, sizeof(handle));
+    }
+    const VC::IdSnapshot textures{std::make_shared<const std::vector<u64>>(
+        std::vector<u64>{0, SAMPLED_TEXTURE})};
+    const VC::IdSnapshot samplers{std::make_shared<const std::vector<u64>>(
+        std::vector<u64>{0, SAMPLER})};
+
+    u64 seq = 0;
+    const auto read_tile = [&](u64 serial) {
+        VC::CopyBufferTexturePayload copy{};
+        copy.buffer = POOL_VA + TILE_BYTES;
+        copy.texture = {.serial = serial};
+        copy.region = {0, 0, 0, 256, 256, 1};
+        std::vector<u64> list;
+        Push(list, VC::Op::CopyTextureToBuffer, copy);
+        PushEnd(list);
+        context.Submit(MakeSubmission(++seq, std::move(list), {BUFFER_POOL, serial}));
+        REQUIRE(context.Wait(seq, 60s));
+        return data[TILE_BYTES];
+    };
+    const auto sample = [&] {
+        std::vector<u64> list;
+        AppendBindlessSampleDraw(list);
+        PushEnd(list);
+        auto submission = MakeSubmission(++seq, std::move(list),
+                                         {BUFFER_POOL, VERTEX_PROGRAM, SAMPLED_TEXTURE, SAMPLER});
+        submission.texture_pool_snapshot = textures;
+        submission.sampler_pool_snapshot = samplers;
+        context.Submit(std::move(submission));
+        REQUIRE(context.Wait(seq, 60s));
+        return WordAt(data, 0x100);
+    };
+
+    REQUIRE(read_tile(PAGE_OWNER) == 0x5A);
+    REQUIRE(context.Stats().virtual_sparse_binds == 1);
+    // Create the sampled image while the quota is full. All later uses of it are bindless.
+    REQUIRE(read_tile(SAMPLED_TEXTURE) == 0);
+    REQUIRE(sample() == 0);
+    REQUIRE(context.Stats().virtual_sparse_binds == 1);
+
+    context.MapVirtual(VIRTUAL_POOL, {{0, 0, 0, TILE_BYTES}});
+    REQUIRE(read_tile(PAGE_OWNER) == 0);
+    REQUIRE(context.Stats().virtual_sparse_binds == 2);
+    CHECK(sample() == 0x3f800000u);
+    const auto stats = context.Stats();
+    CHECK(stats.virtual_sparse_binds == 3);
     CHECK(stats.ops_failed == 0);
     CHECK(stats.ops_unsupported == 0);
 }
@@ -5584,4 +6438,130 @@ TEST_CASE("nvn compute: raw global memory demand-promotes mirror pools without h
     CHECK(stats.pools_mirrored == 3u);
     CHECK(stats.ops_failed == 0);
     CHECK(stats.ops_unsupported == 0);
+}
+
+TEST_CASE("NVN indexed quads restart splits strips and lists", "[nvn][quad-restart]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    const bool list_restart =
+        vulkan->device->SupportsPrimitiveRestart(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+    CAPTURE(list_restart);
+    VertexMirrorRig rig{*vulkan, false, false};
+    const std::array<Inst, 6> vertex{
+        {AldAttribute(0, 0x80), AldAttribute(1, 0x84), AddImm(2, 255, 0),
+         AddImm(3, 255, F32_ONE), AstPositionWord, Exit}};
+    rig.context.CreateProgram(MakeVertexProgram(VERTEX_PROGRAM, vertex));
+
+    constexpr u8 marker = 254;
+    constexpr u8 first_corner = 255; // The fixed u8 restart value is a vertex with this custom marker.
+    constexpr s32 base_vertex = 1;
+    const auto place = [&](u32 index, s32 x, s32 y) {
+        const std::array<f32, 2> xy{static_cast<f32>(x) / 32.0f - 1.0f,
+                                    static_cast<f32>(y) / 32.0f - 1.0f};
+        std::memcpy(rig.vertex + (index + base_vertex) * sizeof(xy), xy.data(), sizeof(xy));
+    };
+    place(first_corner, 8, 8);
+    place(1, 8, 16);
+    place(2, 16, 8);
+    place(3, 16, 16);
+    place(4, 24, 8);
+    place(5, 24, 16);
+    place(6, 32, 32);
+    place(7, 32, 42);
+    place(8, 44, 32);
+    place(9, 44, 42);
+    place(10, 56, 32);
+    place(11, 56, 42);
+
+    // The two areas (8x8 and 12x10) are disjoint and each covers exactly that many pixels.
+    constexpr std::array<u8, 17> list{
+        marker, first_corner, 1, 3, 2, 4, 5, marker, marker, 6, 7, 9, 8, 10, 11, marker, 1};
+    constexpr std::array<u8, 18> strip{
+        marker, first_corner, 1, 2, 3, 4, 5, 6, marker, marker, 6, 7, 8, 9, 10, 11, 1, marker};
+    constexpr std::array<u16, 12> list_triangles{
+        first_corner, 1, 3, first_corner, 3, 2, 6, 7, 9, 6, 9, 8};
+    constexpr std::array<u16, 24> strip_triangles{
+        first_corner, 1, 3, first_corner, 3, 2, 2, 3, 5, 2, 5, 4,
+        6, 7, 9, 6, 9, 8, 8, 9, 11, 8, 11, 10};
+    constexpr u64 INDEX_OFFSET = 0x4000;
+    constexpr u64 TRIANGLE_OFFSET = 0x5000;
+    constexpr u64 GPU_INDEX_VA = TEXTURE_POOL_VA;
+    constexpr u64 GPU_INDEX_POOL = 3;
+    constexpr u32 RG32F = 0x16;
+    const auto bytes = [](const auto& v) -> std::span<const u8> {
+        return {reinterpret_cast<const u8*>(&v), sizeof(v)};
+    };
+    const auto draw = [&](u32 mode, u32 index_type, u32 count, u64 offset, bool restart, u32 cull,
+                          bool gpu_source) {
+        std::vector<u64> commands;
+        u64 index_address = POOL_VA + offset;
+        if (gpu_source) {
+            Push(commands, VC::Op::CopyBufferToBuffer,
+                 VC::CopyBufferToBufferPayload{.src = index_address, .dst = GPU_INDEX_VA,
+                                               .size = (count + 3u) & ~3u});
+            index_address = GPU_INDEX_VA;
+        }
+        Push(commands, VC::Op::SetRenderTargets, VC::SetRenderTargetsPayload{0, 0}, {});
+        const VC::ViewportRect viewport{0.0f, 0.0f, 64.0f, 64.0f};
+        Push(commands, VC::Op::SetViewports, VC::SetViewportsPayload{.first = 0, .count = 1},
+             bytes(viewport));
+        Push(commands, VC::Op::BindProgram,
+             VC::BindProgramPayload{.program_serial = VERTEX_PROGRAM, .stages = 1u << 0});
+        Push(commands, VC::Op::BindVertexAttribs, VC::BindVertexAttribsPayload{.first = 0, .count = 1},
+             bytes(RG32F));
+        const VC::VertexStreamState stream{.stride = 8, .divisor = 0};
+        Push(commands, VC::Op::BindVertexStreams, VC::BindVertexStreamsPayload{.first = 0, .count = 1},
+             bytes(stream));
+        VertexMirrorRig::BindVertexBuffer(commands, 0);
+        const u32 polygon = VC::PolygonState::WithCullFace(VC::PolygonState::Defaults(), cull);
+        Push(commands, VC::Op::BindState,
+             VC::BindStatePayload{.kind = static_cast<u32>(VC::StateKind::Polygon),
+                                  .size = sizeof(polygon)}, bytes(polygon));
+        Push(commands, VC::Op::SetPrimitiveRestart, VC::SetPrimitiveRestartPayload{restart, marker});
+        Push(commands, VC::Op::ResetCounter, VC::ResetCounterPayload{.counter_type = SAMPLES_PASSED});
+        Push(commands, VC::Op::DrawIndexed,
+             VC::DrawIndexedPayload{.mode = mode, .index_type = index_type, .count = count,
+                                    .base_vertex = base_vertex, .instance_count = 1,
+                                    .index_address = index_address});
+        if (gpu_source) {
+            return rig.SubmitAndCount(commands, {VERTEX_PROGRAM, 1, 2, GPU_INDEX_POOL});
+        }
+        return rig.SubmitAndCount(commands, {VERTEX_PROGRAM, 1, 2});
+    };
+    const auto check = [&](u32 mode, const auto& indices, const auto& reference, u32 coverage,
+                           bool gpu_source) {
+        CAPTURE(mode, gpu_source);
+        // Begin the first complete primitive just before the GPU's 256-index scan boundary.
+        std::vector<u8> stream(gpu_source ? 253 : 0, marker);
+        stream.insert(stream.end(), indices.begin(), indices.end());
+        rig.memory.CpuWrite(POOL_VA + INDEX_OFFSET, stream.data(), stream.size());
+        rig.memory.CpuWrite(POOL_VA + TRIANGLE_OFFSET, reference.data(), sizeof(reference));
+        std::array<u32, 3> counts{};
+        for (const u32 cull : {VC::STATE_FACE_NONE, VC::STATE_FACE_FRONT, VC::STATE_FACE_BACK}) {
+            CAPTURE(cull);
+            counts[cull] =
+                draw(4, 1, static_cast<u32>(reference.size()), TRIANGLE_OFFSET, false, cull, false);
+            CHECK(draw(mode, 0, static_cast<u32>(stream.size()), INDEX_OFFSET, true, cull,
+                       gpu_source) == counts[cull]);
+        }
+        CHECK(counts[VC::STATE_FACE_NONE] == coverage);
+        CHECK((counts[VC::STATE_FACE_FRONT] == 0 || counts[VC::STATE_FACE_BACK] == 0));
+        CHECK(counts[VC::STATE_FACE_FRONT] + counts[VC::STATE_FACE_BACK] == coverage);
+        CHECK(rig.context.Stats().ops_failed == 0);
+        CHECK(rig.context.Stats().ops_unsupported == 0);
+    };
+    SECTION("CPU-readable source") {
+        check(7, list, list_triangles, 184, false);
+        check(8, strip, strip_triangles, 368, false);
+    }
+    SECTION("source written by a GPU transfer in the same submission") {
+        // The bytes the CPU sees are all zero. Only the replay's GPU copy populates the indices.
+        std::memset(rig.memory.Add(GPU_INDEX_VA, 64_KiB), 0, 64_KiB);
+        rig.context.CreatePool({.serial = GPU_INDEX_POOL, .guest_address = GPU_INDEX_VA,
+                                .size = 64_KiB, .flags = 1 /* CPU_NO_ACCESS */});
+        check(7, list, list_triangles, 184, true);
+        check(8, strip, strip_triangles, 368, true);
+    }
 }

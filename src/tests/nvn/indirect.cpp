@@ -374,6 +374,15 @@ private:
             .preserveAttachmentCount = 0,
             .pPreserveAttachments = nullptr,
         };
+        // Each pass discards this attachment, but its layout transition still writes it.
+        const VkSubpassDependency reuse_attachment{
+            .srcSubpass = VK_SUBPASS_EXTERNAL,
+            .dstSubpass = 0,
+            .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        };
         render_pass = logical.CreateRenderPass({
             .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
             .pNext = nullptr,
@@ -382,8 +391,8 @@ private:
             .pAttachments = &attachment,
             .subpassCount = 1,
             .pSubpasses = &subpass,
-            .dependencyCount = 0,
-            .pDependencies = nullptr,
+            .dependencyCount = 1,
+            .pDependencies = &reuse_attachment,
         });
         const VkImageView attachment_view = *view;
         framebuffer = logical.CreateFramebuffer({
@@ -878,6 +887,63 @@ TEST_CASE("NVN indirect: a render condition compares the 64-bit counters of a re
             }
         } else {
             CHECK(samples == 0);
+        }
+    }
+}
+
+TEST_CASE("NVN timestamp completion reads across query blocks with an unavailable slot",
+          "[nvn][timestamps]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    const auto families = vulkan->device->GetPhysical().GetQueueFamilyProperties();
+    if (families.at(vulkan->device->GetGraphicsFamily()).timestampValidBits == 0) {
+        SKIP("the graphics queue has no timestamps");
+    }
+    EngineRig rig{*vulkan, false};
+    CounterFlight flight;
+    constexpr u32 REPORTS = CounterEngine::BLOCK_QUERIES + 2;
+    constexpr u32 MISSING_SLOT = CounterEngine::BLOCK_QUERIES - 1;
+    constexpr u64 CLOCK_STEP = 1'000'000;
+    constexpr u64 COUNTER = 0xABABABABABABABAB;
+    constexpr u64 REPORT_BYTES = 2 * sizeof(u64);
+    std::vector<u8> reports(REPORTS * REPORT_BYTES, 0xAB);
+    rig.Immediate([&](Vulkan::vk::CommandBuffer cmd) {
+        for (u32 index = 0; index < REPORTS; ++index) {
+            rig.engine->WriteTimestamp(cmd, flight, false,
+                                       {.host = reports.data() + index * REPORT_BYTES});
+        }
+    });
+    REQUIRE(flight.blocks.size() == 2);
+    const bool can_reset = vulkan->device->IsHostQueryResetSupported();
+    if (can_reset) {
+        const auto query = flight.timestamps[MISSING_SLOT].query;
+        vulkan->device->GetLogical().ResetQueryPool(*flight.blocks[query.block].timestamp,
+                                                    query.slot, 1);
+    }
+
+    u64 clock_reads = 0;
+    VC::SetTimestampModeOverride(VC::TimestampMode::Real);
+    Settings::SetCurrentProgramIsSwitch2(true);
+    VC::SetGuestClockSource([&] { return GUEST_EPOCH_SHIFT + clock_reads++ * CLOCK_STEP; });
+    SCOPE_EXIT {
+        VC::SetTimestampModeOverride(std::nullopt);
+        VC::SetGuestClockSource({});
+        Settings::SetCurrentProgramIsSwitch2(false);
+    };
+    rig.engine->Complete(flight, nullptr);
+    CHECK(clock_reads == REPORTS);
+    for (u32 index = 0; index < REPORTS; ++index) {
+        CAPTURE(index);
+        const u64 offset = index * REPORT_BYTES;
+        const u64 now = GUEST_EPOCH_SHIFT + index * CLOCK_STEP;
+        CHECK(Get<u64>(reports.data(), offset) == COUNTER);
+        const u64 timestamp = Get<u64>(reports.data(), offset + sizeof(u64));
+        CHECK(timestamp >= GUEST_EPOCH_SHIFT);
+        CHECK(timestamp <= now);
+        if (index == 0 || (can_reset && index == MISSING_SLOT)) {
+            CHECK(timestamp == now);
         }
     }
 }

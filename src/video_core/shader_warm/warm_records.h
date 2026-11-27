@@ -21,7 +21,7 @@ namespace VideoCommon::ShaderWarm {
 
 /// Precache files use the Vulkan pipeline cache version: the emulator loads one only when it
 /// matches, so the two must move together (vk_pipeline_cache.cpp checks it).
-constexpr u32 WarmCacheVersion = 36;
+constexpr u32 WarmCacheVersion = 38;
 
 /// What the builder finds in the game files, recorded in the precache's count file. A file built by
 /// an older builder is rebuilt at boot (RefreshWarmFiles). 2: Mario Kart World's .esetb effects.
@@ -38,8 +38,8 @@ struct LoweredCode {
 };
 
 /// Captures and validates one extracted compute program as the runtime does for a dispatch and
-/// packs it with PackNativeAmpereCode (a zero shader header). Matrix multiply programs, configured
-/// per title at runtime, are not converted. Returns the error text when the program fails validation.
+/// packs it with PackNativeAmpereCode (a zero shader header). Automatic tensor translation uses
+/// the runtime workgroup and backend capabilities. Returns the validation error on failure.
 std::optional<std::string> LowerProgram(std::span<const u8> program, LoweredCode& out);
 
 /// The pipeline cache key hash of laid out code (NativeShaderHash).

@@ -250,6 +250,7 @@ add_library(video_core STATIC
     renderer_vulkan/nvn/nvn_bc_encode.h
     renderer_vulkan/nvn/nvn_barrier_track.h
     renderer_vulkan/nvn/nvn_compute.cpp
+    renderer_vulkan/nvn/nvn_compute_descriptors.h
     renderer_vulkan/nvn/nvn_condition_prefetch.h
     renderer_vulkan/nvn/nvn_context.cpp
     renderer_vulkan/nvn/nvn_context.h
@@ -269,6 +270,7 @@ add_library(video_core STATIC
     renderer_vulkan/nvn/nvn_bindless.cpp
     renderer_vulkan/nvn/nvn_draw_descriptors.cpp
     renderer_vulkan/nvn/nvn_draw_indirect.cpp
+    renderer_vulkan/nvn/nvn_quad_indexed.cpp
     renderer_vulkan/nvn/nvn_draw_log.cpp
     renderer_vulkan/nvn/nvn_draw_mesh.cpp
     renderer_vulkan/nvn/nvn_draw_plan.h
@@ -306,6 +308,7 @@ add_library(video_core STATIC
     renderer_vulkan/nvn/nvn_pipeline_state.cpp
     renderer_vulkan/nvn/nvn_pipeline_state.h
     renderer_vulkan/nvn/nvn_pipeline_vk.cpp
+    renderer_vulkan/nvn/nvn_pipeline_binary.cpp
     ${NVN_TRANSLATION_EPOCH_SOURCE}
     renderer_vulkan/nvn/nvn_pool_mirror.cpp
     renderer_vulkan/nvn/nvn_pool_mirror.h
@@ -341,6 +344,7 @@ add_library(video_core STATIC
     renderer_vulkan/pipeline_cache_dir.cpp
     renderer_vulkan/pipeline_cache_dir.h
     renderer_vulkan/pipeline_helper.h
+    renderer_vulkan/index_restart.h
     renderer_vulkan/pipeline_optimization.h
     renderer_vulkan/pipeline_statistics.cpp
     renderer_vulkan/pipeline_statistics.h
@@ -355,6 +359,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_command_pool.h
     renderer_vulkan/vk_compute_pass.cpp
     renderer_vulkan/vk_compute_pass.h
+    renderer_vulkan/vk_indexed_quad.cpp
+    renderer_vulkan/vk_indexed_quad.h
     renderer_vulkan/vk_fsr3_upscaler.cpp
     renderer_vulkan/vk_fsr3_upscaler.h
     renderer_vulkan/vk_dlss_network_probe.cpp
@@ -659,6 +665,8 @@ target_include_directories(video_core PRIVATE ${HOST_SHADERS_INCLUDE})
 target_link_libraries(video_core PRIVATE sirit::sirit)
 
 # Header-only stuff needed by all dependent targets
+# The SDK exposes VK_KHR_portability_subset in its provisional header.
+set_property(SOURCE vulkan_common/vulkan_device.cpp APPEND PROPERTY COMPILE_DEFINITIONS VK_ENABLE_BETA_EXTENSIONS)
 target_link_libraries(video_core PUBLIC Vulkan::Headers Vulkan::UtilityHeaders GPUOpen::VulkanMemoryAllocator)
 
 if (ENABLE_NSIGHT_AFTERMATH)

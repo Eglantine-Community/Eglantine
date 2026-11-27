@@ -77,7 +77,7 @@ TextureDesc WindowTextureDesc() {
 }
 
 /// Creates a window of `count` textures through the HLE bodies.
-void MakeWindow(Rig& rig, u32 count) {
+void MakeWindow(Rig& rig, u32 count, s32 active_count = 0) {
     REQUIRE(rig.recorder.MemoryPoolInitialize(POOL, Rig::STORAGE, Rig::STORAGE_SIZE, 0));
     REQUIRE(rig.Call("nvnQueueInitialize", {Rig::I(QUEUE), Rig::I(BUILDER)}) == 1);
     std::vector<u64> textures;
@@ -90,6 +90,7 @@ void MakeWindow(Rig& rig, u32 count) {
     rig.Call("nvnWindowBuilderSetDefaults", {Rig::I(BUILDER)});
     rig.Call("nvnWindowBuilderSetTextures",
              {Rig::I(BUILDER), Rig::I(count), Rig::I(Rig::SCRATCH)});
+    rig.Call("nvnWindowBuilderSetNumActiveTextures", {Rig::I(BUILDER), Rig::I(active_count)});
     REQUIRE(rig.Call("nvnWindowInitialize", {Rig::I(WINDOW), Rig::I(BUILDER)}) == 1);
 }
 
@@ -506,6 +507,74 @@ TEST_CASE("nvn hle window: acquire hands out free slots, present frees them on c
     rig.sink.Complete(rig.sink.presents[0].seq);
     acquirer.join();
     CHECK(acquired.load() == 0); // slot 1 is still on display
+}
+
+TEST_CASE("nvn hle window: only active slots can be acquired", "[nvn]") {
+    WaitProbe probe;
+    probe.infinite_limit = std::chrono::milliseconds{20};
+    Rig rig;
+    probe.Install(rig);
+    MakeWindow(rig, 3, 2);
+    const u64 index = Rig::SCRATCH + 0x100;
+    const auto acquire = [&] {
+        return rig.Call("nvnWindowAcquireTexture", {Rig::I(WINDOW), Rig::I(0), Rig::I(index)});
+    };
+    CHECK(rig.Call("nvnWindowGetNumTextures", {Rig::I(WINDOW)}) == 3);
+    CHECK(rig.Call("nvnWindowGetNumActiveTextures", {Rig::I(WINDOW)}) == 2);
+    for (s32 slot : {0, 1}) {
+        REQUIRE(acquire() == 0);
+        CHECK(rig.memory.Get<s32>(index) == slot);
+    }
+    CHECK(acquire() != 0);
+
+    // A slot already acquired can still be presented after it becomes inactive.
+    rig.Call("nvnWindowSetNumActiveTextures", {Rig::I(WINDOW), Rig::I(1)});
+    CHECK(rig.Call("nvnWindowGetNumActiveTextures", {Rig::I(WINDOW)}) == 1);
+    rig.Call("nvnQueuePresentTexture", {Rig::I(QUEUE), Rig::I(WINDOW), Rig::I(1)});
+    REQUIRE(rig.sink.presents.size() == 1);
+    CHECK(rig.sink.presents.front().window_slot == 1);
+    for (s32 requested : {0, -1, 3, 4}) {
+        rig.Call("nvnWindowSetNumActiveTextures", {Rig::I(WINDOW), Rig::I(requested)});
+        CHECK(rig.Call("nvnWindowGetNumActiveTextures", {Rig::I(WINDOW)}) == 3);
+    }
+    REQUIRE(acquire() == 0);
+    CHECK(rig.memory.Get<s32>(index) == 2);
+}
+
+TEST_CASE("nvn hle window: a single active slot can be presented repeatedly", "[nvn]") {
+    ScopedEnv configured{"EDEN_NX2_MAX_FRAMES_IN_FLIGHT", "0"};
+    WaitProbe probe;
+    probe.infinite_limit = std::chrono::seconds{1};
+    Rig rig;
+    probe.Install(rig);
+    MakeWindow(rig, 2);
+    rig.Call("nvnWindowSetPresentInterval", {Rig::I(WINDOW), Rig::I(0)});
+    const u64 index = Rig::SCRATCH + 0x100;
+    const auto acquire = [&] {
+        return rig.Call("nvnWindowAcquireTexture", {Rig::I(WINDOW), Rig::I(0), Rig::I(index)});
+    };
+    const auto present = [&] {
+        rig.Call("nvnQueuePresentTexture", {Rig::I(QUEUE), Rig::I(WINDOW), Rig::I(0)});
+    };
+    REQUIRE(acquire() == 0);
+    REQUIRE(rig.memory.Get<s32>(index) == 0);
+    present();
+    REQUIRE(rig.sink.presents.size() == 1);
+    rig.Call("nvnWindowSetNumActiveTextures", {Rig::I(WINDOW), Rig::I(1)});
+
+    std::atomic<bool> acquired{false};
+    std::thread acquirer{[&] { acquired = acquire() == 0; }};
+    CHECK(probe.AwaitWaiting());
+    CHECK_FALSE(acquired.load());
+    rig.sink.Complete(rig.sink.presents.back().seq);
+    acquirer.join();
+    REQUIRE(acquired.load());
+    REQUIRE(rig.memory.Get<s32>(index) == 0);
+    present();
+    REQUIRE(rig.sink.presents.size() == 2);
+    rig.sink.Complete(rig.sink.presents.back().seq);
+    REQUIRE(acquire() == 0);
+    CHECK(rig.memory.Get<s32>(index) == 0);
 }
 
 TEST_CASE("nvn hle window: the default frame queue limit waits for the previous present",

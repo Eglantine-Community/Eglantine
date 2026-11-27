@@ -141,7 +141,8 @@ namespace Vulkan {
 
         /// Allocates from `allocator_` instead of the device's shared one (which is externally
         /// synchronized). Used by VTX-HLE's replay, which must not race the render thread.
-        explicit MemoryAllocator(const Device &device_, VmaAllocator allocator_);
+        explicit MemoryAllocator(const Device &device_, VmaAllocator allocator_,
+                                 std::atomic<u64>* device_memory_releases_ = nullptr);
 
         ~MemoryAllocator();
 
@@ -169,9 +170,9 @@ namespace Vulkan {
             return CreateImage(ci, dedicated, transient, kind);
         }
 
-        /// A sparse resident image with nothing bound (reads return zero, writes are dropped), or
-        /// a null image when the device can't make one.
-        /// aliased: its sparse blocks may share memory (VK_IMAGE_CREATE_SPARSE_ALIASED_BIT).
+        /// Create an initially unbound sparse image, or return null if the path is unavailable.
+        /// Non-aliased use requires strict nonresident behavior. Aliased callers must initialize
+        /// and bind any regions that need defined values on devices without that guarantee.
         vk::Image CreateUnbackedImage(const VkImageCreateInfo &ci, bool aliased = false) const;
 
         /// Device memory to bind to part of a sparse resource. Null when there is none left.
@@ -183,8 +184,16 @@ namespace Vulkan {
 
         VmaAllocation AllocateSparseMemory(const VkMemoryRequirements &requirements,
                                            VkDeviceMemory &memory, VkDeviceSize &offset) const;
+        VmaAllocation AllocateSparseMemory(const VkMemoryRequirements& requirements,
+                                           VmaAllocationInfo& info) const;
 
         void FreeSparseMemory(VmaAllocation allocation) const;
+
+        [[nodiscard]] u64 DeviceMemoryReleaseGeneration() const noexcept {
+            return device_memory_releases
+                       ? device_memory_releases->load(std::memory_order_acquire)
+                       : 0;
+        }
 
         /// Counts the images that did not fit the device memory budget (made anyway, in host
         /// memory or with nothing bound): the texture cache collects harder when it grows.
@@ -231,6 +240,8 @@ namespace Vulkan {
 
         const Device &device;                              ///< Device handle.
         VmaAllocator allocator;                           ///< VMA allocator.
+        // Owned by the NVN context, which releases its resources before destroying the allocator.
+        std::atomic<u64>* const device_memory_releases;
         const VkPhysicalDeviceMemoryProperties properties; ///< Physical device memory properties.
         VkDeviceSize buffer_image_granularity;            ///< Adjacent buffer/image granularity
         u32 valid_memory_types{~0u};

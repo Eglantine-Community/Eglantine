@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "video_core/renderer_vulkan/nvn/nvn_compute_descriptors.h"
 #include "video_core/renderer_vulkan/nvn/nvn_format.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -45,18 +46,18 @@ enum class BcBlocks : u32 {
 /// Compresses RGBA8 texels to BC1, BC3, BC4 or BC5 blocks on the GPU (the emulated path's
 /// `bc_encoder.comp`, the shader its `BcEncoderPass` runs), or to BC7 (`bc7_encoder.comp`, ported
 /// from DirectXTex), for ASTC stand-ins held as BC (`HostFormat::bc_standin`). The replay records
-/// the dispatches into its own command buffers with push descriptors, as `AstcGpuDecoder` does.
+/// the dispatches into its own command buffers, as `AstcGpuDecoder` does.
 class BcGpuEncoder {
 public:
     /// Format of the storage views the encoder reads (and the ASTC decoder writes).
-    static constexpr VkFormat SOURCE_FORMAT = VK_FORMAT_A8B8G8R8_UNORM_PACK32;
+    // Matches the Rgba8 storage image declared by the compute shaders.
+    static constexpr VkFormat SOURCE_FORMAT = VK_FORMAT_R8G8B8A8_UNORM;
 
-    /// True when the device can run the encoder (push descriptors, a storable RGBA8 format) and
+    /// True when the device can run the encoder (a storable RGBA8 format) and
     /// sample and copy into BC1/BC3 images.
     [[nodiscard]] static bool Supported(const Device& device);
 
-    /// True when, beyond Supported, the device can sample and copy into BC7 images and push the
-    /// BC7 encoder's three descriptors.
+    /// True when, beyond Supported, the device can sample and copy into BC7 images.
     [[nodiscard]] static bool SupportsBc7(const Device& device);
 
     /// True when, beyond Supported, the device can sample and copy into BC4 and BC5 images.
@@ -73,20 +74,24 @@ public:
     /// `blocks` row-major, layer after layer, from the start of `output` (`output_size` bytes).
     /// `refine`: refined colour endpoints for the BC1/BC3 colour blocks (the stand-ins of the
     /// smart selection; never more error per block than without).
-    void Record(vk::CommandBuffer cmd, VkImageView source, u32 width, u32 height, u32 layers,
-                BcBlocks blocks, bool refine, VkBuffer output, u64 output_size) const;
+    [[nodiscard]] bool Record(vk::CommandBuffer cmd, VkImageView source, u32 width, u32 height,
+                              u32 layers, BcBlocks blocks, bool refine, VkBuffer output,
+                              u64 output_size, const AllocateComputeSet& allocate_set) const;
 
     /// Record for BC7 blocks: the passes `quality` asks for (BC7_QUALITY_MAX), the best mode of
     /// each block kept in `modes` (8 bytes per block, BcScratch::modes) between them.
-    void RecordBc7(vk::CommandBuffer cmd, VkImageView source, u32 width, u32 height, u32 layers,
-                   u32 quality, VkBuffer modes, u64 modes_size, VkBuffer output,
-                   u64 output_size) const;
+    [[nodiscard]] bool RecordBc7(vk::CommandBuffer cmd, VkImageView source, u32 width, u32 height,
+                                 u32 layers, u32 quality, VkBuffer modes, u64 modes_size,
+                                 VkBuffer output, u64 output_size,
+                                 const AllocateComputeSet& allocate_set) const;
 
     /// Decode a partial compressed copy and its unchanged destination neighbors into scratch.
-    void RecordCopy(vk::CommandBuffer cmd, VkImageView source, VkImageView destination,
-                    VkImageView scratch, std::array<s32, 2> source_origin,
-                    std::array<s32, 2> destination_origin, std::array<s32, 2> block_origin,
-                    std::array<s32, 2> copy_size, std::array<s32, 2> scratch_size, u32 layers);
+    [[nodiscard]] bool RecordCopy(vk::CommandBuffer cmd, VkImageView source, VkImageView destination,
+                                  VkImageView scratch, std::array<s32, 2> source_origin,
+                                  std::array<s32, 2> destination_origin,
+                                  std::array<s32, 2> block_origin, std::array<s32, 2> copy_size,
+                                  std::array<s32, 2> scratch_size, u32 layers,
+                                  const AllocateComputeSet& allocate_set);
 
     /// Whether the BC7 pipelines were built (RecordBc7 can be used).
     [[nodiscard]] bool HasBc7() const {
@@ -95,6 +100,7 @@ public:
 
 private:
     const Device& device;
+    const u32 max_push_descriptors;
     vk::DescriptorSetLayout set_layout;
     vk::PipelineLayout pipeline_layout;
     vk::ShaderModule module;
@@ -103,7 +109,7 @@ private:
 
     vk::DescriptorSetLayout copy_set_layout;
     vk::PipelineLayout copy_pipeline_layout;
-    vk::ShaderModule copy_module;
+    vk::Sampler copy_sampler;
     vk::Pipeline copy_pipeline;
 
     vk::DescriptorSetLayout bc7_set_layout;
@@ -136,6 +142,9 @@ struct BcScratch {
 struct BcUploadTimes {
     /// Uploads timed per submission; later ones are counted untimed.
     static constexpr u32 CAPACITY = 128;
+    static constexpr u32 FIRST_STAGE_QUERY = CAPACITY * 2;
+    static constexpr u32 STAGE_QUERY_CAPACITY = 768;
+    static constexpr u32 QUERIES_PER_BATCH = 3;
     struct Upload {
         u32 width{};
         u32 height{};
@@ -144,9 +153,12 @@ struct BcUploadTimes {
         s32 format{}; ///< NVN format of the ASTC texture
         u64 bytes{};  ///< compressed bytes copied to the destination
         const char* kind{};
+        u32 first_stage_query{};
+        u32 stage_query_count{};
     };
-    vk::QueryPool pool;          ///< 2 * CAPACITY timestamps
+    vk::QueryPool pool;
     std::vector<Upload> uploads; ///< upload i: queries 2i and 2i + 1
+    u32 next_stage_query{FIRST_STAGE_QUERY};
 };
 
 /// Uploads of stand-ins this large or larger get a log line of their own with their GPU time.

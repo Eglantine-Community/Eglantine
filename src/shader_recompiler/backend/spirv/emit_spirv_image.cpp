@@ -101,10 +101,6 @@ public:
             return;
         }
         const std::array values{offset.InstRecursive(), offset2.InstRecursive()};
-        if (!values[0]->AreAllArgsImmediates() || !values[1]->AreAllArgsImmediates()) {
-            LOG_WARNING(Shader_SPIRV, "Not all arguments in PTP are immediate, ignoring");
-            return;
-        }
         const IR::Opcode opcode{values[0]->GetOpcode()};
         if (opcode != values[1]->GetOpcode() || opcode != IR::Opcode::CompositeConstructU32x4) {
             throw LogicError("Invalid PTP arguments");
@@ -435,37 +431,6 @@ Id Emit(MethodPtrType sparse_ptr, MethodPtrType non_sparse_ptr, EmitContext& ctx
     return ctx.OpCompositeExtract(result_type, sample, 1U);
 }
 
-bool IsDynamicPtp(IR::Inst* inst, const IR::Value& offset, const IR::Value& offset2) {
-    if (offset2.IsEmpty() || offset.IsEmpty() ||
-        inst->GetAssociatedPseudoOperation(IR::Opcode::GetSparseFromOp)) {
-        return false;
-    }
-    const auto constant{[](const IR::Value& value) {
-        return value.IsImmediate() || value.InstRecursive()->AreAllArgsImmediates();
-    }};
-    return !constant(offset) || !constant(offset2);
-}
-
-// Per-tap offsets the IR could not fold to constants (ConstOffsets must be constant): one gather
-// per tap with a runtime Offset, keeping the i0,j0 texel (w) of each footprint, which is the
-// texel a per-tap gather returns for that tap.
-template <typename GatherFn>
-Id GatherDynamicPtp(EmitContext& ctx, bool is_integer, Id result_type, const IR::Value& offset,
-                    const IR::Value& offset2, GatherFn&& gather) {
-    const std::array packed{ctx.Def(offset), ctx.Def(offset2)};
-    const Id component_type{is_integer ? ctx.U32[1] : ctx.F32[1]};
-    std::array<Id, 4> texels;
-    for (u32 tap = 0; tap < 4; ++tap) {
-        const Id vector{packed[tap / 2]};
-        const u32 first{(tap % 2) * 2};
-        const Id x{ctx.OpBitcast(ctx.S32[1], ctx.OpCompositeExtract(ctx.U32[1], vector, first))};
-        const Id y{ctx.OpBitcast(ctx.S32[1], ctx.OpCompositeExtract(ctx.U32[1], vector, first + 1))};
-        const Id tap_offset{ctx.OpCompositeConstruct(ctx.S32[2], x, y)};
-        texels[tap] = ctx.OpCompositeExtract(component_type, gather(tap_offset), 3U);
-    }
-    return ctx.OpCompositeConstruct(result_type, std::span<const Id>{texels.data(), texels.size()});
-}
-
 Id IsScaled(EmitContext& ctx, const IR::Value& index, Id member_index, u32 base_index) {
     const Id push_constant_u32{ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U32[1])};
     Id bit{};
@@ -523,6 +488,167 @@ Id ImageGatherSubpixelOffset(EmitContext& ctx, const IR::TextureInstInfo& info, 
     default:
         return coords;
     }
+}
+
+bool IsConstantGatherOffset(const IR::Value& offset) {
+    return offset.IsEmpty() || offset.IsImmediate() ||
+           offset.InstRecursive()->AreAllArgsImmediates();
+}
+
+bool FitsGatherOffset(const Profile& profile, s32 offset) {
+    return offset >= profile.min_texel_gather_offset &&
+           static_cast<s64>(offset) <= profile.max_texel_gather_offset;
+}
+
+bool CanUseDynamicGatherOffset(const Profile& profile) {
+    // Maxwell and Ampere gather offsets are signed 6-bit values.
+    return profile.support_image_gather_extended && profile.min_texel_gather_offset <= -32 &&
+           profile.max_texel_gather_offset >= 31;
+}
+
+bool CanEncodeGatherOffset(const Profile& profile, const IR::Value& offset) {
+    if (offset.IsEmpty()) {
+        return true;
+    }
+    if (offset.IsImmediate()) {
+        return FitsGatherOffset(profile, static_cast<s32>(offset.U32()));
+    }
+    if (!IsConstantGatherOffset(offset)) {
+        return CanUseDynamicGatherOffset(profile);
+    }
+    const IR::Inst& vector = *offset.InstRecursive();
+    for (size_t i = 0; i < vector.NumArgs(); ++i) {
+        if (!FitsGatherOffset(profile, static_cast<s32>(vector.Arg(i).U32()))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+template <typename MethodPtr>
+Id Gather(EmitContext& ctx, IR::Inst* inst, const IR::Value& index, Id coords, Id reference,
+          const IR::Value& offset, const IR::Value& offset2, MethodPtr sparse_gather,
+          MethodPtr gather) {
+    const auto info{inst->Flags<IR::TextureInstInfo>()};
+    const bool is_integer{IsTextureInteger(ctx, info)};
+    const Id result_type{is_integer ? ctx.U32[4] : ctx.F32[4]};
+    const Id texture{Texture(ctx, info, index)};
+    if (ctx.profile.need_gather_subpixel_offset) {
+        coords = ImageGatherSubpixelOffset(ctx, info, TextureImage(ctx, info, index), coords);
+    }
+
+    const bool per_tap = !offset2.IsEmpty();
+    const bool native_offsets =
+        offset.IsEmpty() ||
+        (ctx.profile.support_image_gather_extended &&
+         (!per_tap || (IsConstantGatherOffset(offset) && IsConstantGatherOffset(offset2))));
+    const bool offsets_fit = CanEncodeGatherOffset(ctx.profile, offset) &&
+                             CanEncodeGatherOffset(ctx.profile, offset2);
+    if (native_offsets && offsets_fit) {
+        const ImageOperands operands(ctx, offset, offset2);
+        const Id result = Emit(sparse_gather, gather, ctx, inst, result_type, texture, coords,
+                               reference, operands.MaskOptional(), operands.Span());
+        return is_integer ? ctx.OpBitcast(ctx.F32[4], result) : result;
+    }
+
+    const bool array = info.type == TextureType::ColorArray2D;
+    const bool use_dynamic_offset = offsets_fit && CanUseDynamicGatherOffset(ctx.profile);
+    const auto xy = [&](Id vector, const auto& type) {
+        return ctx.OpCompositeConstruct(type[2], ctx.OpCompositeExtract(type[1], vector, 0),
+                                        ctx.OpCompositeExtract(type[1], vector, 1));
+    };
+    Id inverse_size{};
+    Id center{};
+    if (!use_dynamic_offset) {
+        if (info.type != TextureType::Color2D && info.type != TextureType::Color2DRect && !array) {
+            throw NotImplementedException("Gather offset fallback for {}", info.type);
+        }
+        const Id image = TextureImage(ctx, info, index);
+        const Id size = ctx.OpImageQuerySizeLod(ctx.U32[array ? 3 : 2], image, ctx.u32_zero_value);
+        const Id texture_size = ctx.OpConvertUToF(ctx.F32[2], array ? xy(size, ctx.U32) : size);
+        const Id one = ctx.Const(1.0f);
+        const Id ones = ctx.ConstantComposite(ctx.F32[2], one, one);
+        inverse_size = ctx.OpFDiv(ctx.F32[2], ones, texture_size);
+        // A gather always uses the image view's base level. Move to the middle
+        // of its original footprint in texel space before adding offsets.
+        // Converting back to normalized coordinates then cannot cross a texel
+        // boundary because of rounding on an exact half-texel coordinate.
+        const Id neg_half = ctx.Const(-0.5f);
+        const Id corner = ctx.OpFloor(
+            ctx.F32[2], ctx.OpFma(ctx.F32[2], array ? xy(coords, ctx.F32) : coords, texture_size,
+                                ctx.ConstantComposite(ctx.F32[2], neg_half, neg_half)));
+        center = ctx.OpFAdd(ctx.F32[2], corner, ones);
+    }
+
+    IR::Inst* const sparse = inst->GetAssociatedPseudoOperation(IR::Opcode::GetSparseFromOp);
+    const Id sparse_type{sparse ? ctx.TypeStruct(ctx.U32[1], result_type) : Id{}};
+    Id resident{};
+    const auto sample = [&](Id tap_offset) {
+        Id tap_coords = coords;
+        std::optional<spv::ImageOperandsMask> mask;
+        std::span<const Id> operands;
+        if (use_dynamic_offset) {
+            mask = spv::ImageOperandsMask::Offset;
+            operands = std::span<const Id>{&tap_offset, 1};
+        } else {
+            // Keep the original sampler's addressing and comparison behavior.
+            const Id position = ctx.OpFAdd(ctx.F32[2], center,
+                                           ctx.OpConvertSToF(ctx.F32[2], tap_offset));
+            tap_coords = ctx.OpFMul(ctx.F32[2], position, inverse_size);
+            if (array) {
+                tap_coords = ctx.OpCompositeConstruct(
+                    ctx.F32[3], ctx.OpCompositeExtract(ctx.F32[1], tap_coords, 0),
+                    ctx.OpCompositeExtract(ctx.F32[1], tap_coords, 1),
+                    ctx.OpCompositeExtract(ctx.F32[1], coords, 2));
+            }
+        }
+        if (!sparse) {
+            return Decorate(
+                ctx, inst,
+                (ctx.*gather)(result_type, texture, tap_coords, reference, mask, operands));
+        }
+        const Id result =
+            (ctx.*sparse_gather)(sparse_type, texture, tap_coords, reference, mask, operands);
+        const Id code = ctx.OpCompositeExtract(ctx.U32[1], result, 0);
+        const Id tap_resident = ctx.OpImageSparseTexelsResident(ctx.U1, code);
+        resident = Sirit::ValidId(resident) ? ctx.OpLogicalAnd(ctx.U1, resident, tap_resident)
+                                            : tap_resident;
+        Decorate(ctx, inst, result);
+        return ctx.OpCompositeExtract(result_type, result, 1);
+    };
+
+    Id result{};
+    if (per_tap) {
+        const Id component_type{is_integer ? ctx.U32[1] : ctx.F32[1]};
+        std::array<Id, 4> texels;
+        const std::array packed{offset, offset2};
+        for (u32 tap = 0; tap < texels.size(); ++tap) {
+            const IR::Value& vector = packed[tap / 2];
+            const u32 first = (tap % 2) * 2;
+            Id tap_offset;
+            if (IsConstantGatherOffset(vector)) {
+                const IR::Inst& values = *vector.InstRecursive();
+                const auto x = static_cast<s32>(values.Arg(first).U32());
+                const auto y = static_cast<s32>(values.Arg(first + 1).U32());
+                tap_offset = ctx.SConst(x, y);
+            } else {
+                const Id id = ctx.Def(vector);
+                const Id x = ctx.OpCompositeExtract(ctx.U32[1], id, first);
+                const Id y = ctx.OpCompositeExtract(ctx.U32[1], id, first + 1);
+                tap_offset = ctx.OpBitcast(ctx.S32[2], ctx.OpCompositeConstruct(ctx.U32[2], x, y));
+            }
+            // ConstOffsets selects the (i0,j0) texel at each offset, which is .w in a basic gather.
+            texels[tap] = ctx.OpCompositeExtract(component_type, sample(tap_offset), 3);
+        }
+        result = ctx.OpCompositeConstruct(result_type, texels);
+    } else {
+        result = sample(ctx.OpBitcast(ctx.S32[2], ctx.Def(offset)));
+    }
+    if (sparse) {
+        sparse->SetDefinition(resident);
+        sparse->Invalidate();
+    }
+    return is_integer ? ctx.OpBitcast(ctx.F32[4], result) : result;
 }
 
 void AddOffsetToCoordinates(EmitContext& ctx, const IR::TextureInstInfo& info, Id& coords,
@@ -735,53 +861,14 @@ Id EmitImageSampleDrefExplicitLod(EmitContext& ctx, IR::Inst* inst, const IR::Va
 Id EmitImageGather(EmitContext& ctx, IR::Inst* inst, const IR::Value& index, Id coords,
                    const IR::Value& offset, const IR::Value& offset2) {
     const auto info{inst->Flags<IR::TextureInstInfo>()};
-    const bool is_integer{IsTextureInteger(ctx, info)};
-    const Id result_type{is_integer ? ctx.U32[4] : ctx.F32[4]};
-    if (ctx.profile.need_gather_subpixel_offset) {
-        coords = ImageGatherSubpixelOffset(ctx, info, TextureImage(ctx, info, index), coords);
-    }
-    if (IsDynamicPtp(inst, offset, offset2)) {
-        const Id texture{Texture(ctx, info, index)};
-        const Id component{ctx.Const(info.gather_component)};
-        const Id color{GatherDynamicPtp(ctx, is_integer, result_type, offset, offset2, [&](Id tap_offset) {
-            return Decorate(ctx, inst,
-                            ctx.OpImageGather(result_type, texture, coords, component,
-                                              spv::ImageOperandsMask::Offset,
-                                              std::span<const Id>{&tap_offset, 1}));
-        })};
-        return is_integer ? ctx.OpBitcast(ctx.F32[4], color) : color;
-    }
-    const ImageOperands operands(ctx, offset, offset2);
-    const Id color{Emit(&EmitContext::OpImageSparseGather, &EmitContext::OpImageGather, ctx, inst,
-                        result_type, Texture(ctx, info, index), coords,
-                        ctx.Const(info.gather_component), operands.MaskOptional(),
-                        operands.Span())};
-    return is_integer ? ctx.OpBitcast(ctx.F32[4], color) : color;
+    return Gather(ctx, inst, index, coords, ctx.Const(info.gather_component), offset, offset2,
+                  &EmitContext::OpImageSparseGather, &EmitContext::OpImageGather);
 }
 
 Id EmitImageGatherDref(EmitContext& ctx, IR::Inst* inst, const IR::Value& index, Id coords,
                        const IR::Value& offset, const IR::Value& offset2, Id dref) {
-    const auto info{inst->Flags<IR::TextureInstInfo>()};
-    const bool is_integer{IsTextureInteger(ctx, info)};
-    const Id result_type{is_integer ? ctx.U32[4] : ctx.F32[4]};
-    if (ctx.profile.need_gather_subpixel_offset) {
-        coords = ImageGatherSubpixelOffset(ctx, info, TextureImage(ctx, info, index), coords);
-    }
-    if (IsDynamicPtp(inst, offset, offset2)) {
-        const Id texture{Texture(ctx, info, index)};
-        const Id color{GatherDynamicPtp(ctx, is_integer, result_type, offset, offset2, [&](Id tap_offset) {
-            return Decorate(ctx, inst,
-                            ctx.OpImageDrefGather(result_type, texture, coords, dref,
-                                                  spv::ImageOperandsMask::Offset,
-                                                  std::span<const Id>{&tap_offset, 1}));
-        })};
-        return is_integer ? ctx.OpBitcast(ctx.F32[4], color) : color;
-    }
-    const ImageOperands operands(ctx, offset, offset2);
-    const Id color{Emit(&EmitContext::OpImageSparseDrefGather, &EmitContext::OpImageDrefGather,
-                        ctx, inst, result_type, Texture(ctx, info, index), coords, dref,
-                        operands.MaskOptional(), operands.Span())};
-    return is_integer ? ctx.OpBitcast(ctx.F32[4], color) : color;
+    return Gather(ctx, inst, index, coords, dref, offset, offset2, &EmitContext::OpImageSparseDrefGather,
+                  &EmitContext::OpImageDrefGather);
 }
 
 Id EmitImageFetch(EmitContext& ctx, IR::Inst* inst, const IR::Value& index, Id coords, Id offset,

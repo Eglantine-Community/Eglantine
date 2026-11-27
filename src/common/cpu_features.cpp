@@ -298,13 +298,19 @@ s64 WallClock::GetCNTPCT() const {
 #endif
         return MultiplyAndDivide64(GetUptime(), GetGuestCNTFRQ(), NsRatio::den);
     }
-    return MultiplyHigh(GetUptime(), cntpct_rdtsc_factor.load(std::memory_order_relaxed));
+    const u64 host_ticks = Common::X64::ReadGuestCounterTsc() - base_rdtsc;
+    const u64 factor = cntpct_rdtsc_factor.load(std::memory_order_relaxed);
+    return factor != 0 ? MultiplyHigh(host_ticks, factor)
+                       : MultiplyAndDivide64(host_ticks, GetGuestCNTFRQ(), rdtsc_frequency);
 }
 
 void WallClock::SetGuestCNTFRQ(u64 frequency) {
     guest_cntfrq.store(frequency, std::memory_order_relaxed);
     if (invariant) {
-        cntpct_rdtsc_factor.store(GetFixedPoint64Factor(frequency, rdtsc_frequency),
+        // This fast reciprocal only represents ratios below one.
+        cntpct_rdtsc_factor.store(frequency < rdtsc_frequency
+                                      ? GetFixedPoint64Factor(frequency, rdtsc_frequency)
+                                      : 0,
                                   std::memory_order_relaxed);
     }
 }

@@ -8,8 +8,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
-#include <chrono>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <cstdlib>
 #include <span>
@@ -20,8 +20,8 @@
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
-#include "video_core/renderer_vulkan/vertex_repack.h"
 
+#include "video_core/renderer_vulkan/index_restart.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
@@ -51,7 +51,7 @@ VkIndexType IndexTypeFromNumElements(const Device& device, u32 num_elements) {
     return VK_INDEX_TYPE_UINT32;
 }
 
-size_t BytesPerIndex(VkIndexType index_type) {
+u32 BytesPerIndex(VkIndexType index_type) {
     switch (index_type) {
     case VK_INDEX_TYPE_UINT8_EXT:
         return 1;
@@ -192,35 +192,70 @@ VkBufferView Buffer::View(u32 offset, u32 size, VideoCore::Surface::PixelFormat 
 class QuadIndexBuffer {
 public:
     QuadIndexBuffer(const Device& device_, MemoryAllocator& memory_allocator_,
-                    Scheduler& scheduler_, StagingBufferPool& staging_pool_)
+                    Scheduler& scheduler_, StagingBufferPool& staging_pool_,
+                    VkDeviceSize max_bytes_, bool strip_)
         : device{device_}, memory_allocator{memory_allocator_}, scheduler{scheduler_},
-          staging_pool{staging_pool_} {}
+          staging_pool{staging_pool_}, max_bytes{max_bytes_}, strip{strip_} {}
 
-    virtual ~QuadIndexBuffer() = default;
-
-    void UpdateBuffer(u32 num_indices_) {
+    bool UpdateBuffer(u32 num_indices_) {
         while (!retired_buffers.empty() && scheduler.IsFree(retired_buffers.front().first)) {
             retired_buffers.erase(retired_buffers.begin());
         }
         if (num_indices_ <= num_indices) {
-            return;
+            return true;
         }
 
-        // Commands recorded so far may still use the old buffer: it stays until the GPU is past
-        // them. Waiting for the GPU here stalled the thread ~150 ms in the middle of a load.
-        if (buffer) {
-            retired_buffers.emplace_back(scheduler.CurrentTick(), std::move(buffer));
+        const u64 growth = u64{num_indices} + num_indices / 2;
+        const u32 capacity = static_cast<u32>((std::min)(u64{std::numeric_limits<u32>::max()},
+                                                         (std::max)(u64{num_indices_}, growth)));
+        if (capacity != num_indices_ && TryGrow(capacity)) {
+            return true;
         }
+        return TryGrow(num_indices_);
+    }
 
-        // Grown by at least half, so that a draw count creeping up doesn't redo this every time.
-        num_indices = (std::max)(num_indices_, num_indices + num_indices / 2);
-        index_type = IndexTypeFromNumElements(device, num_indices);
+    void BindBuffer() {
+        scheduler.Record([buffer_ = *buffer, type = index_type](vk::CommandBuffer cmdbuf) {
+            cmdbuf.BindIndexBuffer(buffer_, 0, type);
+        });
+    }
 
-        const u32 num_quads = GetQuadsNum(num_indices);
-        const u32 num_triangle_indices = num_quads * 6;
-        const u32 num_first_offset_copies = 4;
-        const size_t bytes_per_index = BytesPerIndex(index_type);
-        const size_t size_bytes = num_triangle_indices * bytes_per_index * num_first_offset_copies;
+private:
+    bool TryGrow(u32 capacity) {
+        const auto new_type = IndexTypeFromNumElements(device, capacity);
+        const u32 num_quads = strip ? (capacity - 2) / 2 : capacity / 4;
+        const u64 size = u64{num_quads} * 6 * BytesPerIndex(new_type);
+        if (size > max_bytes) {
+            return false;
+        }
+        try {
+            Upload(capacity, new_type, num_quads, static_cast<size_t>(size));
+            return true;
+        } catch (const vk::Exception& exception) {
+            if (exception.GetResult() != VK_ERROR_OUT_OF_DEVICE_MEMORY &&
+                exception.GetResult() != VK_ERROR_OUT_OF_HOST_MEMORY) {
+                throw;
+            }
+            return false;
+        }
+    }
+
+    template <typename T>
+    void WriteIndices(u8* out, u32 num_quads) const {
+        const std::array<u32, 6> order = strip ? std::array<u32, 6>{0, 1, 3, 0, 3, 2}
+                                               : std::array<u32, 6>{0, 1, 2, 0, 2, 3};
+        const u32 step = strip ? 2 : 4;
+        for (u32 quad = 0; quad < num_quads; ++quad) {
+            std::array<T, 6> indices;
+            for (size_t i = 0; i < indices.size(); ++i) {
+                indices[i] = static_cast<T>(quad * step + order[i]);
+            }
+            std::memcpy(out, indices.data(), sizeof(indices));
+            out += sizeof(indices);
+        }
+    }
+
+    void Upload(u32 capacity, VkIndexType new_type, u32 num_quads, size_t size_bytes) {
         const VkBufferCreateInfo buffer_ci = {
             .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
             .pNext = nullptr,
@@ -231,33 +266,42 @@ public:
             .queueFamilyIndexCount = 0,
             .pQueueFamilyIndices = nullptr,
         };
-        buffer = memory_allocator.CreateBuffer(buffer_ci, MemoryUsage::DeviceLocal);
+        auto next = memory_allocator.CreateBuffer(buffer_ci, MemoryUsage::DeviceLocal);
         if (device.HasDebuggingToolAttached()) {
-            buffer.SetObjectNameEXT("Quad LUT");
+            next.SetObjectNameEXT("Quad LUT");
         }
 
-        const bool host_visible = buffer.IsHostVisible();
-        const StagingBufferRef staging = [&] {
+        const bool host_visible = next.IsHostVisible();
+        StagingBufferRef staging = [&] {
             if (host_visible) {
                 return StagingBufferRef{};
             }
-            return staging_pool.Request(size_bytes, MemoryUsage::Upload);
+            return staging_pool.Request(size_bytes, MemoryUsage::Upload, true);
         }();
 
-        u8* staging_data = host_visible ? buffer.Mapped().data() : staging.mapped_span.data();
-        const size_t quad_size = bytes_per_index * 6;
-
-        for (u32 first = 0; first < num_first_offset_copies; ++first) {
-            for (u32 quad = 0; quad < num_quads; ++quad) {
-                MakeAndUpdateIndices(staging_data, quad_size, quad, first);
-                staging_data += quad_size;
+        SCOPE_EXIT {
+            if (!host_visible) {
+                staging_pool.FreeDeferred(staging);
             }
+        };
+        u8* staging_data = host_visible ? next.Mapped().data() : staging.mapped_span.data();
+        switch (new_type) {
+        case VK_INDEX_TYPE_UINT8_EXT:
+            WriteIndices<u8>(staging_data, num_quads);
+            break;
+        case VK_INDEX_TYPE_UINT16:
+            WriteIndices<u16>(staging_data, num_quads);
+            break;
+        default:
+            WriteIndices<u32>(staging_data, num_quads);
+            break;
         }
 
         if (!host_visible) {
+            staging_pool.FlushDeferredUpload(staging);
             scheduler.RequestOutsideRenderPassOperationContext();
             scheduler.Record([src_buffer = staging.buffer, src_offset = staging.offset,
-                              dst_buffer = *buffer, size_bytes](vk::CommandBuffer cmdbuf) {
+                              dst_buffer = *next, size_bytes](vk::CommandBuffer cmdbuf) {
                 const VkBufferCopy copy{
                     .srcOffset = src_offset,
                     .dstOffset = 0,
@@ -279,115 +323,27 @@ public:
                                        VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, write_barrier);
             });
         } else {
-            buffer.Flush();
+            next.Flush();
         }
+        // Publish the replacement only after allocation and upload have succeeded.
+        if (buffer) {
+            retired_buffers.emplace_back(scheduler.CurrentTick(), std::move(buffer));
+        }
+        buffer = std::move(next);
+        index_type = new_type;
+        num_indices = capacity;
     }
-
-    void BindBuffer(u32 first) {
-        const VkIndexType index_type_ = index_type;
-        const size_t sub_first_offset = static_cast<size_t>(first % 4) * GetQuadsNum(num_indices);
-        const size_t offset =
-            (sub_first_offset + GetQuadsNum(first)) * 6ULL * BytesPerIndex(index_type);
-        scheduler.Record([buffer_ = *buffer, index_type_, offset](vk::CommandBuffer cmdbuf) {
-            cmdbuf.BindIndexBuffer(buffer_, offset, index_type_);
-        });
-    }
-
-protected:
-    virtual u32 GetQuadsNum(u32 num_indices) const = 0;
-
-    virtual void MakeAndUpdateIndices(u8* staging_data, size_t quad_size, u32 quad, u32 first) = 0;
 
     const Device& device;
     MemoryAllocator& memory_allocator;
     Scheduler& scheduler;
     StagingBufferPool& staging_pool;
-
+    const VkDeviceSize max_bytes;
+    const bool strip;
     vk::Buffer buffer{};
-    std::vector<std::pair<u64, vk::Buffer>> retired_buffers; ///< GPU tick that frees each one
-    MemoryCommit memory_commit{};
+    std::vector<std::pair<u64, vk::Buffer>> retired_buffers;
     VkIndexType index_type{};
-    u32 num_indices = 0;
-};
-
-class QuadArrayIndexBuffer : public QuadIndexBuffer {
-public:
-    QuadArrayIndexBuffer(const Device& device_, MemoryAllocator& memory_allocator_,
-                         Scheduler& scheduler_, StagingBufferPool& staging_pool_)
-        : QuadIndexBuffer(device_, memory_allocator_, scheduler_, staging_pool_) {}
-
-    ~QuadArrayIndexBuffer() = default;
-
-private:
-    u32 GetQuadsNum(u32 num_indices_) const override {
-        return num_indices_ / 4;
-    }
-
-    template <typename T>
-    static std::array<T, 6> MakeIndices(u32 quad, u32 first) {
-        std::array<T, 6> indices{0, 1, 2, 0, 2, 3};
-        for (T& index : indices) {
-            index = static_cast<T>(first + index + quad * 4);
-        }
-        return indices;
-    }
-
-    void MakeAndUpdateIndices(u8* staging_data, size_t quad_size, u32 quad, u32 first) override {
-        switch (index_type) {
-        case VK_INDEX_TYPE_UINT8_EXT:
-            std::memcpy(staging_data, MakeIndices<u8>(quad, first).data(), quad_size);
-            break;
-        case VK_INDEX_TYPE_UINT16:
-            std::memcpy(staging_data, MakeIndices<u16>(quad, first).data(), quad_size);
-            break;
-        case VK_INDEX_TYPE_UINT32:
-            std::memcpy(staging_data, MakeIndices<u32>(quad, first).data(), quad_size);
-            break;
-        default:
-            ASSERT(false);
-            break;
-        }
-    }
-};
-
-class QuadStripIndexBuffer : public QuadIndexBuffer {
-public:
-    QuadStripIndexBuffer(const Device& device_, MemoryAllocator& memory_allocator_,
-                         Scheduler& scheduler_, StagingBufferPool& staging_pool_)
-        : QuadIndexBuffer(device_, memory_allocator_, scheduler_, staging_pool_) {}
-
-    ~QuadStripIndexBuffer() = default;
-
-private:
-    u32 GetQuadsNum(u32 num_indices_) const override {
-        return num_indices_ >= 4 ? (num_indices_ - 2) / 2 : 0;
-    }
-
-    template <typename T>
-    static std::array<T, 6> MakeIndices(u32 quad, u32 first) {
-        std::array<T, 6> indices{0, 3, 1, 0, 2, 3};
-        for (T& index : indices) {
-            index = static_cast<T>(first + index + quad * 2);
-        }
-        return indices;
-    }
-
-    void MakeAndUpdateIndices(u8* staging_data, size_t quad_size, u32 quad, u32 first) override {
-        switch (index_type) {
-        case VK_INDEX_TYPE_UINT8_EXT:
-            std::memcpy(staging_data, MakeIndices<u8>(quad, first).data(), quad_size);
-            break;
-        case VK_INDEX_TYPE_UINT16:
-            std::memcpy(staging_data, MakeIndices<u16>(quad, first).data(), quad_size);
-            break;
-        case VK_INDEX_TYPE_UINT32:
-            std::memcpy(staging_data, MakeIndices<u32>(quad, first).data(), quad_size);
-            break;
-        default:
-            ASSERT(false);
-            break;
-        }
-    }
+    u32 num_indices{};
 };
 
 BufferCacheRuntime::BufferCacheRuntime(const Device& device_, MemoryAllocator& memory_allocator_,
@@ -398,48 +354,80 @@ BufferCacheRuntime::BufferCacheRuntime(const Device& device_, MemoryAllocator& m
     : device{device_}, memory_allocator{memory_allocator_}, scheduler{scheduler_},
       master_semaphore{scheduler_.GetMasterSemaphore()}, staging_pool{staging_pool_},
       host_importer{device_, scheduler_.GetMasterSemaphore().HostImportWarmup()},
-      guest_descriptor_queue{guest_descriptor_queue_},
+      guest_descriptor_queue{guest_descriptor_queue_}, compute_descriptor_queue{compute_pass_descriptor_queue},
+      compute_descriptor_pool{descriptor_pool},
       quad_index_pass(device, scheduler, descriptor_pool, staging_pool,
                       compute_pass_descriptor_queue),
       multi_range_buffers(device_) {
-    const VkDriverIdKHR driver_id = device.GetDriverID();
-    const bool enable_vertex_repack = VertexRepackEnabled();
-    LOG_INFO(Render_Vulkan, "69-byte vertex layout repacking {} ({})",
-             enable_vertex_repack ? "enabled" : "disabled",
-             "portable Vulkan layout fallback");
-    static_vertex_repack =
-        StaticVertexRepackEnabled(device.GetMinVertexInputBindingStrideAlignment());
-    LOG_INFO(Render_Vulkan, "Vertex repacking without dynamic vertex input {}",
-             static_vertex_repack ? "enabled" : "disabled");
-    if (enable_vertex_repack) {
-        vertex_repack_pass = std::make_unique<VertexRepackPass>(
-            device, scheduler, descriptor_pool, staging_pool, compute_pass_descriptor_queue);
-    }
-    limit_dynamic_storage_buffers = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY ||
-                                    driver_id == VK_DRIVER_ID_ARM_PROPRIETARY;
-    if (limit_dynamic_storage_buffers) {
-        max_dynamic_storage_buffers = device.GetMaxDescriptorSetStorageBuffersDynamic();
-    }    
-    if (device.SupportsUint8Indices()) {
-        uint8_pass = std::make_unique<Uint8Pass>(device, scheduler, descriptor_pool, staging_pool,
-                                                 compute_pass_descriptor_queue);
-    }
-    quad_array_index_buffer = std::make_shared<QuadArrayIndexBuffer>(device_, memory_allocator_,
-                                                                     scheduler_, staging_pool_);
-    quad_strip_index_buffer = std::make_shared<QuadStripIndexBuffer>(device_, memory_allocator_,
-                                                                     scheduler_, staging_pool_);
+    const VkDeviceSize quad_limit = StagingAllocationLimit(device);
+    quad_array_index_buffer = std::make_shared<QuadIndexBuffer>(
+        device, memory_allocator, scheduler, staging_pool, quad_limit, false);
+    quad_strip_index_buffer = std::make_shared<QuadIndexBuffer>(
+        device, memory_allocator, scheduler, staging_pool, quad_limit, true);
 }
 
-u32 BufferCacheRuntime::SetVertexRepackLayout(const Tegra::Engines::Maxwell3D::Regs& regs,
-                                            bool dynamic_input) {
-    const u32 old_mask = vertex_repack_mask;
-    const bool input_supported = VertexRepackInputSupported(dynamic_input, static_vertex_repack);
-    vertex_repack_mask = vertex_repack_pass && input_supported ? VertexRepackMask(regs) : 0;
-    if (vertex_repack_mask != old_mask) {
-        LOG_DEBUG(Render_Vulkan, "Vertex repack selection: mask={:#x}, dynamic_input={}",
-                  vertex_repack_mask, dynamic_input);
+u32 BufferCacheRuntime::SetVertexRepackLayout(const Regs& regs, bool dynamic_input,
+                                              bool uses_vertex_input) {
+    const bool had_vertex_input = std::exchange(uses_vertex_buffers, uses_vertex_input);
+    vertex_repack_failed = false;
+    if (!uses_vertex_input) {
+        return 0;
     }
-    return old_mask ^ vertex_repack_mask;
+
+    // The output belongs to the staging pool until the current submission completes.
+    u32 dirty = std::exchange(retry_vertex_bindings, 0U);
+    const u64 tick = CurrentTick();
+    if (std::exchange(repack_tick, tick) != tick || !had_vertex_input) {
+        dirty |= repacked_bindings;
+    }
+    u32 reconsider = repack_dynamic_input == dynamic_input ? 0U : ~0U;
+    repack_dynamic_input = dynamic_input;
+    if (std::memcmp(regs.vertex_attrib_format.data(), repack_attributes.data(),
+                    sizeof(repack_attributes)) != 0) {
+        for (size_t i = 0; i < repack_attributes.size(); ++i) {
+            const auto& attr = regs.vertex_attrib_format[i];
+            auto& old = repack_attributes[i];
+            if (attr.hex != old.hex) {
+                reconsider |= (1U << attr.buffer.Value()) | (1U << old.buffer.Value());
+                old = attr;
+            }
+        }
+    }
+    for (size_t i = 0; i < repack_stream_keys.size(); ++i) {
+        const auto& stream = regs.vertex_streams[i];
+        // All supported component and packed-format alignments divide 16.
+        const u32 key = stream.stride.Value() | ((stream.address_low & 15U) << 12) |
+                        (u32{stream.IsEnabled()} << 16);
+        if (std::exchange(repack_stream_keys[i], key) != key) {
+            reconsider |= 1U << i;
+        }
+    }
+    while (reconsider != 0) {
+        const u32 binding = std::countr_zero(reconsider);
+        const u32 bit = 1U << binding;
+        reconsider &= reconsider - 1;
+        auto result = BuildVertexRepackLayout(regs, device, binding, dynamic_input);
+        const bool was_unsupported = (unsupported_repack_bindings & bit) != 0;
+        if (!result.supported && !was_unsupported) {
+            LOG_ERROR(Render_Vulkan, "Cannot represent vertex binding {} with the enabled Vulkan features", binding);
+        }
+        if (result.supported) {
+            unsupported_repack_bindings &= ~bit;
+        } else {
+            unsupported_repack_bindings |= bit;
+        }
+        if (was_unsupported != !result.supported || vertex_repack_layouts[binding] != result.layout) {
+            dirty |= bit;
+            if (result.layout) {
+                repacked_bindings |= bit;
+            } else {
+                repacked_bindings &= ~bit;
+            }
+            vertex_repack_layouts[binding] = std::move(result.layout);
+        }
+    }
+    vertex_repack_failed = unsupported_repack_bindings != 0;
+    return dirty;
 }
 
 StagingBufferRef BufferCacheRuntime::UploadStagingBuffer(size_t size) {
@@ -452,6 +440,35 @@ StagingBufferRef BufferCacheRuntime::DownloadStagingBuffer(size_t size, bool def
 
 VkFormat BufferCacheRuntime::TexelBufferFormat(VideoCore::Surface::PixelFormat format) const {
     return MaxwellToVK::SurfaceFormat(device, FormatType::Buffer, false, format).format;
+}
+
+void BufferCacheRuntime::PrepareDownloadStagingBuffer(const StagingBufferRef& ref) {
+    ASSERT(ref.usage == MemoryUsage::Download);
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record([buffer = ref.buffer](vk::CommandBuffer cmdbuf) {
+        const VkBufferMemoryBarrier barrier{
+            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer = buffer,
+            .offset = 0,
+            .size = VK_WHOLE_SIZE,
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                               barrier);
+    });
+}
+
+void BufferCacheRuntime::InvalidateDownloadStagingBuffer(const StagingBufferRef& ref) {
+    ASSERT(ref.usage == MemoryUsage::Download);
+    ref.Invalidate();
+}
+
+void BufferCacheRuntime::FlushDownloadStagingBuffer(const StagingBufferRef& ref) {
+    ASSERT(ref.usage == MemoryUsage::Download && ref.host_readable);
+    ref.readback.Flush();
 }
 
 void BufferCacheRuntime::FreeDeferredStagingBuffer(StagingBufferRef& ref) {
@@ -746,25 +763,221 @@ bool BufferCacheRuntime::BindMultiRangeStorageBuffer(u64 key, bool is_written) {
 }
 
 void BufferCacheRuntime::BindIndexBuffer(PrimitiveTopology topology, IndexFormat index_format,
-                                         u32 base_vertex, u32 num_indices, VkBuffer buffer,
-                                         u32 offset, [[maybe_unused]] u32 size) {
-    VkIndexType vk_index_type = MaxwellToVK::IndexFormat(index_format);
-    VkDeviceSize vk_offset = offset;
-    VkBuffer vk_buffer = buffer;
-    if (topology == PrimitiveTopology::Quads || topology == PrimitiveTopology::QuadStrip) {
-        vk_index_type = VK_INDEX_TYPE_UINT32;
-        std::tie(vk_buffer, vk_offset) =
-            quad_index_pass.Assemble(index_format, num_indices, base_vertex, buffer, offset,
-                                     topology == PrimitiveTopology::QuadStrip);
-    } else if (vk_index_type == VK_INDEX_TYPE_UINT8_EXT && !device.IsExtIndexTypeUint8Supported()) {
-        vk_index_type = VK_INDEX_TYPE_UINT16;
-        if (uint8_pass) {
-            std::tie(vk_buffer, vk_offset) = uint8_pass->Assemble(num_indices, buffer, offset);
-        } else if (device.GetDriverID() == VK_DRIVER_ID_QUALCOMM_PROPRIETARY) {
-            ReserveNullBuffer();
-            vk_buffer = *null_buffer;
-            vk_offset = 0;
+                                         u32 first_index, u32 num_indices, Buffer& buffer,
+                                         u32 offset, u32 size, const Regs::PrimitiveRestart& restart,
+                                         bool indirect, u32 removed_prefix) {
+    BindIndexBuffer(topology, index_format, first_index, num_indices, buffer.Handle(), offset,
+                    size, buffer.SizeBytes(), restart, indirect);
+    // Quad expansion always emits an index buffer starting at index zero.
+    if (!MaxwellToVK::UsesConvertedQuadIndices(topology)) {
+        removed_index_prefix += removed_prefix;
+    }
+}
+
+bool BufferCacheRuntime::CanGatherIndexBuffer(u64 size) {
+    if (!index_gather_limit) {
+        index_gather_limit = StagingAllocationLimit(device);
+    }
+    return size != 0 && size <= *index_gather_limit &&
+           Common::AlignUp(size, sizeof(u32)) <= *index_gather_limit;
+}
+
+void BufferCacheRuntime::BindGatheredIndexBuffer(
+    PrimitiveTopology topology, IndexFormat index_format, u32 first_index, u32 num_indices,
+    std::span<const IndexSource> sources, u32 size, const Regs::PrimitiveRestart& restart,
+    bool indirect, u32 removed_prefix) {
+    if (!CanGatherIndexBuffer(size)) {
+        RejectIndexAssembly();
+        return;
+    }
+    const VkDeviceSize padded_size = Common::AlignUp(VkDeviceSize{size}, sizeof(u32));
+
+    boost::container::small_vector<std::pair<VkBuffer, VkBufferCopy>, 8> copies;
+    VkDeviceSize copied = 0;
+    for (const auto& source : sources) {
+        if (!source.buffer || !source.buffer->Handle() || source.size == 0 ||
+            source.size > size - copied || source.offset > source.buffer->SizeBytes() ||
+            source.size > source.buffer->SizeBytes() - source.offset) {
+            RejectIndexAssembly();
+            return;
         }
+        copies.emplace_back(source.buffer->Handle(),
+                            VkBufferCopy{source.offset, copied, source.size});
+        copied += source.size;
+    }
+    if (copied != size) {
+        RejectIndexAssembly();
+        return;
+    }
+
+    StagingBufferRef scratch;
+    try {
+        scratch = staging_pool.Request(padded_size, MemoryUsage::DeviceLocal, true);
+    } catch (const vk::Exception& exception) {
+        if (exception.GetResult() != VK_ERROR_OUT_OF_DEVICE_MEMORY &&
+            exception.GetResult() != VK_ERROR_OUT_OF_HOST_MEMORY) {
+            throw;
+        }
+        RejectIndexAssembly();
+        return;
+    }
+    SCOPE_EXIT {
+        staging_pool.FreeDeferred(scratch);
+    };
+    PreCopyBarrier();
+    scheduler.Record([scratch, size, padded_size, copies = std::move(copies)](vk::CommandBuffer cmdbuf) {
+        if (size != padded_size) {
+            const VkDeviceSize last_word = scratch.offset + padded_size - sizeof(u32);
+            cmdbuf.FillBuffer(scratch.buffer, last_word, sizeof(u32), 0);
+            const VkBufferMemoryBarrier ready{
+                .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .buffer = scratch.buffer,
+                .offset = last_word,
+                .size = sizeof(u32),
+            };
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   0, ready);
+        }
+        for (const auto& [source, copy] : copies) {
+            const VkBufferCopy region{copy.srcOffset, scratch.offset + copy.dstOffset, copy.size};
+            cmdbuf.CopyBuffer(source, scratch.buffer, region);
+        }
+    });
+    PostCopyBarrier();
+    const bool quads = MaxwellToVK::UsesConvertedQuadIndices(topology);
+    BindIndexBuffer(topology, index_format, first_index, num_indices, scratch.buffer,
+                    scratch.offset, size, scratch.offset + padded_size, restart, indirect);
+    if (!quads) {
+        removed_index_prefix += removed_prefix;
+    }
+}
+
+void BufferCacheRuntime::SetDirectQuadDraw(std::optional<DirectQuadDraw> draw) {
+    if (quad_assembly) {
+        ReleaseQuadAssembly();
+    }
+    direct_quad_draw = draw;
+}
+
+void BufferCacheRuntime::ReleaseQuadAssembly() {
+    // Keep both buffers pinned through recording of DrawIndexedIndirect, even if configuring the
+    // graphics state advanced the scheduler tick between assembly and draw.
+    for (auto& ref : *quad_assembly) {
+        staging_pool.FreeDeferred(ref);
+    }
+    quad_assembly.reset();
+}
+
+void BufferCacheRuntime::BindIndexBuffer(PrimitiveTopology topology, IndexFormat index_format,
+                                         u32 first_index, u32 num_indices, VkBuffer vk_buffer,
+                                         VkDeviceSize vk_offset, u32 size, VkDeviceSize buffer_size,
+                                         const Regs::PrimitiveRestart& restart, bool indirect) {
+    VkIndexType vk_index_type = MaxwellToVK::IndexFormat(index_format);
+    if (vk_offset > buffer_size || size > buffer_size - vk_offset) {
+        RejectIndexAssembly();
+        return;
+    }
+    const bool quads = MaxwellToVK::UsesConvertedQuadIndices(topology);
+    if (quads && indirect) {
+        // The expansion changes firstIndex and indexCount in the GPU-authored arguments.
+        RejectIndexAssembly();
+        return;
+    }
+    std::optional<u32> guest_marker;
+    if (restart.enabled && !quads &&
+        device.SupportsPrimitiveRestart(MaxwellToVK::PrimitiveTopology(device, topology))) {
+        guest_marker = restart.index;
+    }
+    const auto plan = PlanIndexRestart(vk_index_type, guest_marker,
+                                       device.IsExtIndexTypeUint8Supported(),
+                                       device.SupportsCustomRestartIndex());
+    if (quads || plan.host_type != vk_index_type) {
+        std::optional<std::pair<VkBuffer, VkDeviceSize>> assembled;
+        if (quads) {
+            const u32 element_size = BytesPerIndex(vk_index_type);
+            const VkDeviceSize first_byte = VkDeviceSize{first_index} * element_size;
+            const bool strip = topology == PrimitiveTopology::QuadStrip;
+            const bool restart_in_range = restart.enabled &&
+                (element_size == 4 || restart.index < (1u << (element_size * 8)));
+            vk_index_type = VK_INDEX_TYPE_UINT32;
+            if (num_indices < 4) {
+                assembled.emplace();
+            } else if (first_byte <= size && restart_in_range && direct_quad_draw) {
+                std::array<StagingBufferRef, 2> output{};
+                try {
+                    if (!quad_restart_pass) {
+                        quad_restart_pass = std::make_unique<QuadRestartPass>(
+                            device, scheduler, compute_descriptor_pool, staging_pool);
+                    }
+                    if (quad_restart_pass->Assemble(vk_buffer, vk_offset + first_byte,
+                                                    size - first_byte, buffer_size, num_indices,
+                                                    element_size, restart.index, strip,
+                                                    *direct_quad_draw, output[0], output[1])) {
+                        quad_assembly = output;
+                        assembled = std::pair{output[0].buffer, output[0].offset};
+                    }
+                } catch (const vk::Exception& error) {
+                    if (error.GetResult() != VK_ERROR_OUT_OF_DEVICE_MEMORY &&
+                        error.GetResult() != VK_ERROR_OUT_OF_HOST_MEMORY) {
+                        throw;
+                    }
+                } catch (const std::bad_alloc&) {
+                }
+            } else if (first_byte <= size && !restart_in_range) {
+                assembled = quad_index_pass.Assemble(index_format, num_indices, 0, vk_buffer,
+                                                     vk_offset + first_byte, size - first_byte,
+                                                     buffer_size, strip);
+            }
+        } else {
+            const VkIndexType source_type = vk_index_type;
+            const u32 element_size = BytesPerIndex(source_type);
+            vk_index_type = plan.host_type;
+            // Direct draws can rebase firstIndex. Round down to an aligned source so small
+            // offsets still use the original storage buffer directly. Indirect arguments stay
+            // GPU-owned, so their firstIndex is relative to the original binding.
+            const VkDeviceSize prefix_bytes = VkDeviceSize{first_index} * element_size;
+            if (!indirect && prefix_bytes <= size) {
+                const VkDeviceSize alignment =
+                    (std::max)(VkDeviceSize{4}, device.GetStorageBufferAlignment());
+                const VkDeviceSize first_byte = vk_offset + prefix_bytes;
+                const VkDeviceSize aligned_byte = first_byte - first_byte % alignment;
+                if (aligned_byte > vk_offset) {
+                    removed_index_prefix =
+                        static_cast<u32>((aligned_byte - vk_offset) / element_size);
+                    const u32 removed_bytes = removed_index_prefix * element_size;
+                    vk_offset += removed_bytes;
+                    size -= removed_bytes;
+                }
+            }
+            const u64 required_indices = u64{DrawFirstIndex(first_index)} + num_indices;
+            if (num_indices == 0) {
+                assembled.emplace();
+            } else if (required_indices <= (std::numeric_limits<u32>::max)()) {
+                auto& pass =
+                    source_type == VK_INDEX_TYPE_UINT16 ? widen_uint16_pass : widen_uint8_pass;
+                if (!pass) {
+                    pass = std::make_unique<IndexWidenPass>(device, scheduler, compute_descriptor_pool,
+                                                           staging_pool, compute_descriptor_queue,
+                                                           source_type);
+                }
+                assembled = pass->Assemble(static_cast<u32>(required_indices), vk_buffer, vk_offset,
+                                           size, buffer_size, guest_marker.value_or(~0U));
+            }
+        }
+        if (!assembled) {
+            RejectIndexAssembly();
+            return;
+        }
+        std::tie(vk_buffer, vk_offset) = *assembled;
+    } else if (num_indices != 0 &&
+               (!vk_buffer || vk_offset % BytesPerIndex(vk_index_type) != 0 ||
+                (u64{first_index} + num_indices) * BytesPerIndex(vk_index_type) > size)) {
+        RejectIndexAssembly();
+        return;
     }
     if (vk_buffer == VK_NULL_HANDLE) {
         // Vulkan doesn't support null index buffers. Replace it with our own null buffer.
@@ -776,23 +989,28 @@ void BufferCacheRuntime::BindIndexBuffer(PrimitiveTopology topology, IndexFormat
         const u64 epoch = scheduler.RecordingEpoch();
         if (bound_index_valid && vk_buffer == bound_index_buffer &&
             vk_offset == bound_index_offset && vk_index_type == bound_index_type &&
-            epoch == bound_index_epoch) {
+            plan.native_marker == bound_restart_marker && epoch == bound_index_epoch) {
             return;
         }
         bound_index_valid = true;
         bound_index_buffer = vk_buffer;
         bound_index_offset = vk_offset;
         bound_index_type = vk_index_type;
+        bound_restart_marker = plan.native_marker;
         bound_index_epoch = epoch;
     }
-    scheduler.RecordState([vk_buffer, vk_offset, vk_index_type](vk::CommandBuffer cmdbuf) {
+    scheduler.RecordState([vk_buffer, vk_offset, vk_index_type, marker = plan.native_marker](
+                              vk::CommandBuffer cmdbuf) {
         cmdbuf.BindIndexBuffer(vk_buffer, vk_offset, vk_index_type);
+        if (marker) {
+            cmdbuf.SetPrimitiveRestartIndexEXT(*marker);
+        }
     });
 }
 
-void BufferCacheRuntime::BindQuadIndexBuffer(PrimitiveTopology topology, u32 first, u32 count) {
+void BufferCacheRuntime::BindQuadIndexBuffer(PrimitiveTopology topology, u32 count) {
     bound_index_valid = false;
-    if (count == 0) {
+    if (count < 4) {
         ReserveNullBuffer();
         scheduler.RecordState([this](vk::CommandBuffer cmdbuf) {
             cmdbuf.BindIndexBuffer(*null_buffer, 0, VK_INDEX_TYPE_UINT32);
@@ -800,82 +1018,28 @@ void BufferCacheRuntime::BindQuadIndexBuffer(PrimitiveTopology topology, u32 fir
         return;
     }
 
-    if (topology == PrimitiveTopology::Quads) {
-        quad_array_index_buffer->UpdateBuffer(first + count);
-        quad_array_index_buffer->BindBuffer(first);
-    } else if (topology == PrimitiveTopology::QuadStrip) {
-        quad_strip_index_buffer->UpdateBuffer(first + count);
-        quad_strip_index_buffer->BindBuffer(first);
-    }
-}
-
-void BufferCacheRuntime::BindVertexBuffer(u32 index, VkBuffer buffer, u32 offset, u32 size, u32 stride) {
-    if (index >= device.GetMaxVertexInputBindings()) {
+    auto& indices = topology == PrimitiveTopology::Quads ? *quad_array_index_buffer
+                                                         : *quad_strip_index_buffer;
+    if (!indices.UpdateBuffer(count)) {
+        index_assembly_failed = true;
         return;
     }
-    if (buffer != VK_NULL_HANDLE && size != 0 && IsVertexRepacked(index)) {
-        const auto repacked =
-            vertex_repack_pass->Assemble(buffer, offset, size, u64{offset} + size);
-        if (!repacked) {
-            return;
-        }
-        buffer = repacked->first;
-        offset = static_cast<u32>(repacked->second);
-        size = static_cast<u32>((u64{size} + 68) / 69 * 72);
-        stride = 72;
-    }
-    if (device.IsExtExtendedDynamicStateSupported()) {
-        scheduler.RecordState([index, buffer, offset, size, stride](vk::CommandBuffer cmdbuf) {
-            const VkDeviceSize vk_offset = buffer != VK_NULL_HANDLE ? offset : 0;
-            const VkDeviceSize vk_size = buffer != VK_NULL_HANDLE ? size : VK_WHOLE_SIZE;
-            const VkDeviceSize vk_stride = stride;
-            cmdbuf.BindVertexBuffers2EXT(index, 1, &buffer, &vk_offset, &vk_size, &vk_stride);
-        });
-    } else {
-        if (!device.HasNullDescriptor() && buffer == VK_NULL_HANDLE) {
-            ReserveNullBuffer();
-            buffer = *null_buffer;
-            offset = 0;
-        }
-        scheduler.RecordState([index, buffer, offset](vk::CommandBuffer cmdbuf) {
-            cmdbuf.BindVertexBuffer(index, buffer, offset);
-        });
-    }
+    indices.BindBuffer();
+}
+
+void BufferCacheRuntime::BindVertexBuffer(u32 index, Buffer& buffer, u32 offset, u32 size,
+                                          u32 stride) {
+    VideoCommon::HostBindings<Buffer> bindings;
+    bindings.min_index = index;
+    bindings.max_index = index + 1;
+    bindings.buffers.push_back(&buffer);
+    bindings.offsets.push_back(offset);
+    bindings.sizes.push_back(size);
+    bindings.strides.push_back(stride);
+    BindVertexBuffers(bindings);
 }
 
 void BufferCacheRuntime::BindVertexBuffers(VideoCommon::HostBindings<Buffer>& bindings) {
-    boost::container::static_vector<VkBuffer, VideoCommon::NUM_VERTEX_BUFFERS> buffer_handles(bindings.buffers.size());
-    for (u32 i = 0; i < bindings.buffers.size(); ++i) {
-        auto handle = bindings.buffers[i]->Handle();
-        if (handle == VK_NULL_HANDLE) {
-            bindings.offsets[i] = 0;
-            bindings.sizes[i] = VK_WHOLE_SIZE;
-            if (!device.HasNullDescriptor()) {
-                ReserveNullBuffer();
-                handle = *null_buffer;
-            }
-        }
-        buffer_handles[i] = handle;
-        const u32 binding = bindings.min_index + i;
-        if (handle != VK_NULL_HANDLE && IsVertexRepacked(binding) && bindings.strides[i] == 69 &&
-            bindings.sizes[i] > 0) {
-            const auto repacked = vertex_repack_pass->Assemble(
-                handle, static_cast<u32>(bindings.offsets[i]), static_cast<u32>(bindings.sizes[i]),
-                bindings.buffers[i]->SizeBytes());
-            if (!repacked) {
-                continue;
-            }
-            buffer_handles[i] = repacked->first;
-            bindings.offsets[i] = repacked->second;
-            bindings.sizes[i] = (bindings.sizes[i] + 68) / 69 * 72;
-            bindings.strides[i] = 72;
-            static bool reported = false;
-            if (!reported) {
-                LOG_INFO(Render_Vulkan, "GPU vertex repacking active: 69 -> 72 bytes");
-                reported = true;
-            }
-        }
-    }
     const u32 device_max = device.GetMaxVertexInputBindings();
     const u32 min_binding = (std::min)(bindings.min_index, device_max);
     const u32 max_binding = (std::min)(bindings.max_index, device_max);
@@ -883,6 +1047,48 @@ void BufferCacheRuntime::BindVertexBuffers(VideoCommon::HostBindings<Buffer>& bi
     if (binding_count == 0) {
         return;
     }
+    boost::container::static_vector<VkBuffer, VideoCommon::NUM_VERTEX_BUFFERS> buffer_handles(binding_count);
+    for (u32 i = 0; i < binding_count; ++i) {
+        const auto& buffer = *bindings.buffers[i];
+        VkBuffer handle = buffer.Handle();
+        const auto* layout = GetVertexRepackLayout(min_binding + i);
+        if (layout) {
+            bindings.strides[i] = layout->BindingStride();
+        } else if (bindings.strides[i] > device.GetMaxVertexInputBindingStride()) {
+            // Active attributes with an oversized stride already require a new layout.
+            bindings.strides[i] = 0;
+        }
+        if (handle == VK_NULL_HANDLE || (layout && bindings.sizes[i] == 0)) {
+            bindings.offsets[i] = 0;
+            bindings.sizes[i] = VK_WHOLE_SIZE;
+            if (device.HasNullDescriptor()) {
+                handle = VK_NULL_HANDLE;
+            } else {
+                ReserveNullBuffer();
+                handle = *null_buffer;
+            }
+        } else if (layout) {
+            if (!vertex_repack_pass) {
+                vertex_repack_pass = std::make_unique<VertexRepackPass>(
+                    device, scheduler, compute_descriptor_pool, staging_pool, compute_descriptor_queue);
+            }
+            const auto repacked = vertex_repack_pass->Assemble(
+                handle, bindings.offsets[i], bindings.sizes[i], buffer.SizeBytes(), *layout);
+            if (!repacked) {
+                vertex_repack_failed = true;
+                // The caller cleared all dirty flags for this batch before asking us to bind it.
+                for (u32 binding = min_binding; binding < max_binding; ++binding) {
+                    retry_vertex_bindings |= 1U << binding;
+                }
+                return;
+            }
+            handle = repacked->buffer;
+            bindings.offsets[i] = repacked->offset;
+            bindings.sizes[i] = repacked->size;
+        }
+        buffer_handles[i] = handle;
+    }
+    const bool set_stride = vertex_stride_mode == VertexStrideMode::Binding;
     static constexpr bool small_command = true;
     if (small_command && binding_count == 1) {
         const VkBuffer handle = buffer_handles.front();
@@ -890,8 +1096,10 @@ void BufferCacheRuntime::BindVertexBuffers(VideoCommon::HostBindings<Buffer>& bi
         if (device.IsExtExtendedDynamicStateSupported()) {
             const VkDeviceSize size = bindings.sizes.front();
             const VkDeviceSize stride = bindings.strides.front();
-            scheduler.RecordState([min_binding, handle, offset, size, stride](vk::CommandBuffer cmdbuf) {
-                cmdbuf.BindVertexBuffers2EXT(min_binding, 1, &handle, &offset, &size, &stride);
+            scheduler.RecordState([min_binding, handle, offset, size, stride, set_stride](
+                                      vk::CommandBuffer cmdbuf) {
+                cmdbuf.BindVertexBuffers2EXT(min_binding, 1, &handle, &offset, &size,
+                                             set_stride ? &stride : nullptr);
             });
         } else {
             scheduler.RecordState([min_binding, handle, offset](vk::CommandBuffer cmdbuf) {
@@ -901,8 +1109,12 @@ void BufferCacheRuntime::BindVertexBuffers(VideoCommon::HostBindings<Buffer>& bi
         return;
     }
     if (device.IsExtExtendedDynamicStateSupported()) {
-        scheduler.RecordState([bindings_ = std::move(bindings), buffer_handles_ = std::move(buffer_handles), binding_count](vk::CommandBuffer cmdbuf) {
-            cmdbuf.BindVertexBuffers2EXT(bindings_.min_index, binding_count, buffer_handles_.data(), bindings_.offsets.data(), bindings_.sizes.data(), bindings_.strides.data());
+        scheduler.RecordState([bindings_ = std::move(bindings),
+                               buffer_handles_ = std::move(buffer_handles), binding_count,
+                               set_stride](vk::CommandBuffer cmdbuf) {
+            cmdbuf.BindVertexBuffers2EXT(bindings_.min_index, binding_count, buffer_handles_.data(),
+                                         bindings_.offsets.data(), bindings_.sizes.data(),
+                                         set_stride ? bindings_.strides.data() : nullptr);
         });
     } else {
         scheduler.RecordState([bindings_ = std::move(bindings), buffer_handles_ = std::move(buffer_handles), binding_count](vk::CommandBuffer cmdbuf) {

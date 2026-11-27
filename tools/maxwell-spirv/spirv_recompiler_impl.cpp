@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <cstdio>
 #include <cstdlib>
 #include <sys/stat.h>
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
@@ -10,7 +11,6 @@
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/object_pool.h"
 #include "shader_recompiler/profile.h"
-#include "shader_recompiler/runtime_info.h"
 
 #include "../maxwell-disas/file_environment.h"
 
@@ -55,14 +55,19 @@ int SpirvShaderRecompilerImpl(int argc, char *argv[]) {
     host_info.ApplyDescriptorLimitPolicy();
     auto program = Shader::Maxwell::TranslateProgram(inst_pool, block_pool, env, cfg, host_info);
 
-    // IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Block>& block_pool,
-    //                              Environment& env, Flow::CFG& cfg, const HostTranslateInfo& host_info)
-    // std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info,
-    //                            IR::Program& program, Bindings& bindings, bool optimize)
+    // The dump tool targets a reference Vulkan 1.1 device with 32 lanes and full subgroup
+    // operations in the original Maxwell shader stages.
     Shader::Profile profile{};
-    Shader::RuntimeInfo runtime_info;
-    auto const spirv_pgm = Shader::Backend::SPIRV::EmitSPIRV(profile, program, true);
-    fwrite(spirv_pgm.data(), sizeof(u64), spirv_pgm.size(), stdout);
-
-    return EXIT_SUCCESS;
+    profile.supported_spirv = 0x00010300;
+    profile.unified_descriptor_binding = true;
+    profile.support_vote = true;
+    profile.support_ballot = true;
+    profile.support_shuffle = true;
+    profile.support_shuffle_relative = true;
+    profile.support_quad_shuffles = true;
+    profile.support_quad_shuffles_all_stages = true;
+    profile.max_subgroup_size = 32;
+    const auto spirv = Shader::Backend::SPIRV::EmitSPIRV(profile, program);
+    const size_t written = std::fwrite(spirv.data(), sizeof(spirv.front()), spirv.size(), stdout);
+    return written == spirv.size() && std::fflush(stdout) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

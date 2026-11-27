@@ -112,7 +112,9 @@ u64 ShaderCache::ComputeNativeKey() {
     const GPUVAddr program_base{kepler_compute->regs.code_loc.Address()};
     const GPUVAddr shader_addr{program_base + kepler_compute->launch_description.program_start};
     const std::optional<VAddr> cpu_shader_addr{gpu_memory->GpuToCpuAddress(shader_addr)};
-    const ShaderInfo* const info{cpu_shader_addr ? TryGet(*cpu_shader_addr) : nullptr};
+    const ShaderInfo* const info{
+        cpu_shader_addr ? TryGet(*cpu_shader_addr, kepler_compute->TensorModeForDispatch())
+                        : nullptr};
     return info && info->lowered_native ? info->lowered_native->native_program_key : 0;
 }
 
@@ -267,46 +269,47 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
 const ShaderInfo* ShaderCache::ComputeShader() {
     const GPUVAddr program_base{kepler_compute->regs.code_loc.Address()};
     const auto& qmd{kepler_compute->launch_description};
+    const TensorMode mode = kepler_compute->TensorModeForDispatch();
     const GPUVAddr shader_addr{program_base + qmd.program_start};
     const size_t memory_id = gpu_memory->GetID();
     const u64 map_serial = gpu_memory->GetMapSerial();
     const u64 inv_serial = invalidation_serial.load(std::memory_order_acquire);
     std::optional<VAddr> cpu_shader_addr;
     if (const ShaderInfo* const shader =
-            TryGetResolved(shader_addr, memory_id, map_serial, inv_serial, cpu_shader_addr)) {
+            TryGetResolved(shader_addr, memory_id, map_serial, inv_serial, cpu_shader_addr, mode)) {
         return shader;
     }
     if (!cpu_shader_addr) {
         LOG_ERROR(HW_GPU, "Invalid GPU address for shader {:#016x}", shader_addr);
         return nullptr;
     }
-    RethrowIfRejected(*cpu_shader_addr);
+    RethrowIfRejected(*cpu_shader_addr, mode);
     try {
-        ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start};
-        const ShaderInfo* const shader = MakeShaderInfo(env, *cpu_shader_addr);
+        ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start, mode};
+        const ShaderInfo* const shader = MakeShaderInfo(env, *cpu_shader_addr, mode);
         CacheResolved(shader_addr, memory_id, map_serial, inv_serial, shader);
         return shader;
     } catch (const Shader::Exception&) {
-        RememberRejection(*cpu_shader_addr);
+        RememberRejection(*cpu_shader_addr, mode);
         throw;
     }
 }
 
-void ShaderCache::RethrowIfRejected(VAddr addr) {
+void ShaderCache::RethrowIfRejected(VAddr addr, TensorMode mode) {
     std::scoped_lock lock{rejected_mutex};
-    if (const auto it = rejected_native.find(addr); it != rejected_native.end()) {
+    if (const auto it = rejected_native.find({addr, mode}); it != rejected_native.end()) {
         std::rethrow_exception(it->second);
     }
 }
 
 bool ShaderCache::IsRejected(VAddr addr) {
     std::scoped_lock lock{rejected_mutex};
-    return rejected_native.contains(addr);
+    return rejected_native.contains({addr, TensorMode::Default});
 }
 
-void ShaderCache::RememberRejection(VAddr addr) {
+void ShaderCache::RememberRejection(VAddr addr, TensorMode mode) {
     std::scoped_lock lock{rejected_mutex};
-    rejected_native.emplace(addr, std::current_exception());
+    rejected_native.emplace(LookupKey{addr, mode}, std::current_exception());
     // InnerInvalidation skips pages the filter never saw; a rewrite here must still drop this.
     page_filter.Mark(addr, 1);
     rejected_lowest.store((std::min)(rejected_lowest.load(std::memory_order_relaxed), addr),
@@ -338,10 +341,10 @@ void ShaderCache::GetGraphicsEnvironments(GraphicsEnvironments& result,
     }
 }
 
-ShaderInfo* ShaderCache::TryGet(VAddr addr) const {
+ShaderInfo* ShaderCache::TryGet(VAddr addr, TensorMode mode) const {
     std::scoped_lock lock{lookup_mutex};
 
-    const auto it = lookup_cache.find(addr);
+    const auto it = lookup_cache.find({addr, mode});
     if (it == lookup_cache.end()) {
         return nullptr;
     }
@@ -350,12 +353,14 @@ ShaderInfo* ShaderCache::TryGet(VAddr addr) const {
 
 const ShaderInfo* ShaderCache::TryGetResolved(GPUVAddr shader_addr, size_t memory_id,
                                               u64 map_serial, u64 inv_serial,
-                                              std::optional<VAddr>& out_cpu_addr) {
-    const size_t slot = ((shader_addr >> 4) ^ (shader_addr >> 16) ^ memory_id) &
+                                              std::optional<VAddr>& out_cpu_addr, TensorMode mode) {
+    const size_t slot = ((shader_addr >> 4) ^ (shader_addr >> 16) ^ memory_id ^
+                         (static_cast<size_t>(mode) << 5)) &
                         (ResolvedShaderCacheSize - 1);
     auto& entry = resolved_shader_cache[slot];
     if (entry.shader_addr == shader_addr && entry.memory_id == memory_id &&
         entry.map_serial == map_serial && entry.invalidation_serial == inv_serial &&
+        entry.tensor_mode == mode &&
         entry.info != nullptr) {
         return entry.info;
     }
@@ -363,13 +368,9 @@ const ShaderInfo* ShaderCache::TryGetResolved(GPUVAddr shader_addr, size_t memor
     if (!out_cpu_addr) {
         return nullptr;
     }
-    const ShaderInfo* const info = TryGet(*out_cpu_addr);
+    const ShaderInfo* const info = TryGet(*out_cpu_addr, mode);
     if (info != nullptr) {
-        entry.shader_addr = shader_addr;
-        entry.memory_id = memory_id;
-        entry.map_serial = map_serial;
-        entry.invalidation_serial = inv_serial;
-        entry.info = info;
+        CacheResolved(shader_addr, memory_id, map_serial, inv_serial, info);
     }
     return info;
 }
@@ -379,13 +380,15 @@ void ShaderCache::CacheResolved(GPUVAddr shader_addr, size_t memory_id, u64 map_
     if (!info) {
         return;
     }
-    const size_t slot = ((shader_addr >> 4) ^ (shader_addr >> 16) ^ memory_id) &
+    const size_t slot = ((shader_addr >> 4) ^ (shader_addr >> 16) ^ memory_id ^
+                         (static_cast<size_t>(info->tensor_mode) << 5)) &
                         (ResolvedShaderCacheSize - 1);
     auto& entry = resolved_shader_cache[slot];
     entry.shader_addr = shader_addr;
     entry.memory_id = memory_id;
     entry.map_serial = map_serial;
     entry.invalidation_serial = inv_serial;
+    entry.tensor_mode = info->tensor_mode;
     entry.info = info;
 }
 
@@ -414,7 +417,7 @@ void ShaderCache::InvalidatePagesInRegion(VAddr addr, size_t size) {
         addr <= rejected_highest.load(std::memory_order_relaxed)) {
         std::scoped_lock lock{rejected_mutex};
         boost::unordered::erase_if(rejected_native, [&](const auto& rejected) {
-            return rejected.first >= addr && rejected.first < addr_end;
+            return rejected.first.first >= addr && rejected.first.first < addr_end;
         });
     }
     const u64 page_end = (addr_end + YUZU_PAGESIZE - 1) >> YUZU_PAGEBITS;
@@ -441,7 +444,7 @@ void ShaderCache::RemovePendingShaders() {
     std::scoped_lock lock{lookup_mutex};
     for (Entry* const entry : marked_for_removal) {
         removed_shaders.push_back(entry->data);
-        auto const it = lookup_cache.find(entry->addr_start);
+        auto const it = lookup_cache.find({entry->addr_start, entry->tensor_mode});
         ASSERT(it != lookup_cache.end());
         lookup_cache.erase(it);
     }
@@ -509,15 +512,17 @@ void ShaderCache::UnmarkMemory(Entry* entry) {
 }
 
 ShaderCache::Entry* ShaderCache::NewEntry(VAddr addr, VAddr addr_end, ShaderInfo* data) {
-    auto entry = std::make_unique<Entry>(Entry{addr, addr_end, data});
+    auto entry = std::make_unique<Entry>(Entry{addr, addr_end, data, data->tensor_mode});
     Entry* const entry_pointer = entry.get();
 
-    lookup_cache.emplace(addr, std::move(entry));
+    lookup_cache.emplace(LookupKey{addr, data->tensor_mode}, std::move(entry));
     return entry_pointer;
 }
 
-const ShaderInfo* ShaderCache::MakeShaderInfo(GenericEnvironment& env, VAddr cpu_addr) {
+const ShaderInfo* ShaderCache::MakeShaderInfo(GenericEnvironment& env, VAddr cpu_addr,
+                                              TensorMode mode) {
     auto info = std::make_unique<ShaderInfo>();
+    info->tensor_mode = mode;
     if (const std::optional<u64> cached_hash{env.Analyze()}) {
         info->unique_hash = *cached_hash;
         info->size_bytes = env.CachedSizeBytes();

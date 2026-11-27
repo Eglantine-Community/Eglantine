@@ -22,6 +22,7 @@
 #include "video_core/renderer_vulkan/nvn/nvn_pass_state.h"
 #include "video_core/renderer_vulkan/nvn/nvn_impl.h"
 #include "video_core/renderer_vulkan/nvn/nvn_pipeline_cache.h"
+#include "video_core/renderer_vulkan/vk_indexed_quad.h"
 
 namespace Vulkan::Nvn {
 
@@ -264,6 +265,7 @@ struct DrawCounters {
     std::atomic<u64> draws_skipped{};
     /// Draws skipped because their pipeline compiles on a worker (use_asynchronous_shaders).
     std::atomic<u64> draws_skipped_async{};
+    std::atomic<u64> mesh_draws_skipped{};
     std::atomic<u64> pass_begins{};
     /// Sampled bindings of a colour image in GENERAL, sampled there with no layout transition.
     std::atomic<u64> sampled_in_general{};
@@ -318,6 +320,8 @@ struct DrawCounters {
     std::atomic<u64> uniform_snapshot_layers{};
     /// Draws that sampled one of their own render targets: the target was copied first.
     std::atomic<u64> feedback_copies{};
+    std::atomic<u64> feedback_mip_regions{};
+    std::atomic<u64> feedback_mip_regions_reused{};
     /// Such draws that could not be handled (multisampled target, no scratch image).
     std::atomic<u64> feedback_unsupported{};
     std::atomic<u64> placeholder_copies{}; ///< 1x1x1 2D placeholders copied to a 3D/cube scratch
@@ -335,6 +339,7 @@ struct DrawCounters {
     std::atomic<u64> feedback_repeat{};
     std::atomic<u64> render_targets_ops{};
     std::atomic<u64> render_targets_same{}; ///< SetRenderTargets that bound what was bound
+    std::atomic<u64> render_targets_overwritten{}; ///< Replaced by another binding before use
     /// Where a draw bound a dummy instead of what the game bound, by reason (index = DescReason)
     /// and bind point ([0] graphics, [1] compute).
     std::array<std::array<std::atomic<u64>, 16>, 2> fallbacks{};
@@ -460,24 +465,46 @@ struct DrawResources {
         std::shared_ptr<Storage> storage;
         std::shared_ptr<Texture> texture; ///< view source (serial from a private range)
         u32 slot{};
+        u64 bytes{};
+        u64 last_use{};
+        u64 retained_seq{~u64{0}};
         /// The last feedback copy into this scratch (DrawContext::PruneFreshFeedback): the source,
         /// the context and its `render_target_epoch` at the time, and the levels/layers copied.
         FeedbackSnapshot<Storage> copied;
     };
     std::vector<Scratch> scratch_images;
     u64 next_scratch_serial{0x8000'0000'0000'0000ull};
+    u64 scratch_use_clock{};
+    std::atomic<u64> scratch_image_bytes{};
+    std::atomic<u64> scratch_image_evictions{};
+    [[nodiscard]] u64 ScratchImageBudget() const;
+    /// Releases idle images oldest first and returns their allocation bytes. In-flight draws
+    /// own the scratch texture through InFlight::keepalive until the GPU finishes.
+    u64 TrimScratchImages(u64 target_bytes);
     /// A scratch image of the shape of `source`; `slot` tells apart the scratches of one draw.
-    /// Created lazily, kept for the context's lifetime. Null when it cannot be created.
-    Scratch* GetScratch(const Storage& source, u32 slot);
+    /// Created lazily and retained by the flight. Null when it cannot be created.
+    Scratch* GetScratch(const Storage& source, u32 slot, InFlight& flight);
     /// The scratch whose image is `storage` (null when it is not one).
     Scratch* FindScratch(const Storage& storage);
     /// The type a shader samples a 2D texture as (GetRetypedScratch).
     enum class RetypeTarget { Volume, Cube, Row };
     /// A scratch image of `source`'s format and the type a shader samples it as: a one-slice 3D
     /// image (Volume), a cube-compatible 2D image of six faces (Cube) or a 1D image of its width
-    /// (Row). `slot` tells apart the scratches of one draw. Created lazily and kept. Null on
+    /// (Row). `slot` tells apart the scratches of one draw. Retained by the flight. Null on
     /// failure.
-    Scratch* GetRetypedScratch(const Storage& source, u32 slot, RetypeTarget target);
+    Scratch* GetRetypedScratch(const Storage& source, u32 slot, RetypeTarget target,
+                              InFlight& flight);
+
+    struct ScratchShape {
+        VkImageType type;
+        VkExtent3D extent;
+        u32 levels;
+        u32 layers;
+        VkImageCreateFlags flags;
+    };
+    Scratch* GetScratchImage(const Storage& source, const ScratchShape& shape, u32 slot,
+                             InFlight& flight, u64 expected_bytes);
+    void RetainScratch(Scratch& scratch, InFlight& flight);
 
     // --- arena ---
     std::mutex arena_mutex;
@@ -491,9 +518,20 @@ struct DrawResources {
     /// A chunk of at least `min_size` bytes (null when device memory ran out).
     std::shared_ptr<ShadowChunk> AcquireShadow(u64 min_size);
     void ReleaseShadows(std::vector<std::shared_ptr<ShadowChunk>>& chunks);
+    /// Frees completed chunks kept for reuse and returns how many bytes were released.
+    u64 TrimCachedShadows(u64 bytes_to_release);
 
     // --- descriptor pools ---
     std::mutex descriptor_pool_mutex;
+    /// Portable UINT8 and UINT16 index widening pipelines. Descriptor sets live in the flight.
+    [[nodiscard]] VkPipeline IndexWidenPipeline(VkIndexType source_type);
+    vk::DescriptorSetLayout index_widen_set_layout;
+    vk::PipelineLayout index_widen_layout;
+    std::array<vk::Pipeline, 2> index_widen_pipelines;
+    std::array<bool, 2> index_widen_failed{};
+    [[nodiscard]] IndexedQuadGpu& QuadIndexedPipeline();
+    std::unique_ptr<IndexedQuadGpu> quad_indexed;
+
     std::vector<std::shared_ptr<vk::DescriptorPool>> free_descriptor_pools;
     std::shared_ptr<vk::DescriptorPool> AcquireDescriptorPool(u32 max_sets);
     void ReleaseDescriptorPools(std::vector<std::shared_ptr<vk::DescriptorPool>>& pools);

@@ -29,6 +29,7 @@
 #include "video_core/renderer_vulkan/vk_driver_build_report.h"
 #include "video_core/renderer_vulkan/vk_frame_dump.h"
 #include "video_core/nx2_draw_stats.h"
+#include "video_core/renderer_vulkan/vertex_repack.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_pipeline_library.h"
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
@@ -125,19 +126,6 @@ VkStencilOpState GetStencilFaceState(const StencilFace& face) {
     };
 }
 
-bool SupportsPrimitiveRestart(VkPrimitiveTopology topology) {
-    static constexpr std::array unsupported_topologies{
-        VK_PRIMITIVE_TOPOLOGY_POINT_LIST,
-        VK_PRIMITIVE_TOPOLOGY_LINE_LIST,
-        VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
-        VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY,
-        VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY,
-        VK_PRIMITIVE_TOPOLOGY_PATCH_LIST,
-        // VK_PRIMITIVE_TOPOLOGY_QUAD_LIST_EXT,
-    };
-    return std::ranges::find(unsupported_topologies, topology) == unsupported_topologies.end();
-}
-
 bool IsLine(VkPrimitiveTopology topology) {
     static constexpr std::array line_topologies{
         VK_PRIMITIVE_TOPOLOGY_LINE_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_STRIP,
@@ -171,7 +159,7 @@ PixelFormat DecodeFormat(u8 encoded_format) {
     return PixelFormatFromRenderTargetFormat(format);
 }
 
-RenderPassKey MakeRenderPassKey(const FixedPipelineState& state, const Device& device) {
+RenderPassKey MakeRenderPassKey(const FixedPipelineState& state) {
     RenderPassKey key{};
     std::ranges::transform(state.color_formats, key.color_formats.begin(), DecodeFormat);
     if (state.depth_enabled != 0) {
@@ -181,11 +169,6 @@ RenderPassKey MakeRenderPassKey(const FixedPipelineState& state, const Device& d
         key.depth_format = PixelFormat::Invalid;
     }
     key.samples = MaxwellToVK::MsaaMode(state.msaa_mode);
-    const bool has_color = std::ranges::any_of(key.color_formats, [](PixelFormat format) {
-        return format != PixelFormat::Invalid;
-    });
-    key.resolve_color =
-        key.samples != VK_SAMPLE_COUNT_1_BIT && has_color && device.IsTiler();
     return key;
 }
 
@@ -331,6 +314,18 @@ ConfigureFuncPtr ConfigureFunc(const std::array<VkShaderModule, NUM_STAGES>& mod
 } // Anonymous namespace
 
 // TODO(crueter): This is the worst-formatted code I have EVER seen
+bool GraphicsPipeline::HasOutOfRangeVertexInput(const Maxwell& regs) const {
+    const auto location = FindOutOfRangeVertexInput(
+        device.GetMaxVertexInputAttributes(), device.GetMaxVertexInputBindings(),
+        [&](u32 index) -> std::optional<u32> {
+            const auto& attr = regs.vertex_attrib_format[index];
+            return !attr.constant && stage_infos[0].loads.Generic(index)
+                       ? std::optional<u32>{attr.buffer.Value()}
+                       : std::nullopt;
+        });
+    return location.has_value();
+}
+
 GraphicsPipeline::GraphicsPipeline(
     Scheduler& scheduler_, BufferCache& buffer_cache_, TextureCache& texture_cache_,
     vk::PipelineCache& pipeline_cache_, VideoCore::ShaderNotify* shader_notify,
@@ -492,7 +487,7 @@ GraphicsPipeline::GraphicsPipeline(
     const auto queued_at = std::chrono::steady_clock::now();
     auto func{[this, shader_notify, &render_pass_cache, pipeline_statistics, queued_at] {
         const auto started_at = std::chrono::steady_clock::now();
-        const VkRenderPass render_pass{render_pass_cache.Get(MakeRenderPassKey(key.state, device))};
+        const VkRenderPass render_pass{render_pass_cache.Get(MakeRenderPassKey(key.state))};
         Validate();
         try {
             MakePipeline(render_pass);
@@ -911,7 +906,11 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     {
         Profile::Scope scope{Profile::Zone::UpdateBuffers};
         buffer_cache.UpdateGraphicsBuffers(is_indexed);
+        buffer_cache.runtime.ResetIndexAssemblyState();
         buffer_cache.BindHostGeometryBuffers(is_indexed);
+        if (buffer_cache.runtime.IndexAssemblyFailed()) {
+            return false;
+        }
     }
 
     {
@@ -1577,7 +1576,7 @@ void GraphicsPipeline::QueueLibraryParts(RenderPassCache& render_pass_cache) {
         }
         const auto begin = std::chrono::steady_clock::now();
         try {
-            MakePipeline(render_pass_cache.Get(MakeRenderPassKey(key.state, device)), true);
+            MakePipeline(render_pass_cache.Get(MakeRenderPassKey(key.state)), true);
         } catch (const vk::Exception& exception) {
             LOG_DEBUG(Render_Vulkan, "Graphics pipeline library parts not compiled: {}",
                       exception.what());
@@ -1655,13 +1654,19 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass, bool parts_only) {
     if (!key.state.dynamic_vertex_input) {
         const size_t num_vertex_arrays = (std::min)(
             Maxwell::NumVertexArrays, static_cast<size_t>(device.GetMaxVertexInputBindings()));
+        // The portability subset still requires legal declared strides when the binding command
+        // provides the actual strides, including zero.
+        const bool declare_placeholder_stride =
+            device.HasPortabilitySubset() && key.state.UsesDynamicVertexBindingStride();
         for (size_t index = 0; index < num_vertex_arrays; ++index) {
             const bool instanced = key.state.binding_divisors[index] != 0;
             const auto rate =
                 instanced ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX;
             vertex_bindings.push_back({
                 .binding = static_cast<u32>(index),
-                .stride = key.state.vertex_strides[index],
+                .stride = declare_placeholder_stride
+                              ? device.GetMinVertexInputBindingStrideAlignment()
+                              : key.state.vertex_strides[index],
                 .inputRate = rate,
             });
             if (instanced) {
@@ -1725,17 +1730,9 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass, bool parts_only) {
         .pNext = nullptr,
         .flags = 0,
         .topology = input_assembly_topology,
-        .primitiveRestartEnable =
-        // MoltenVK/Metal always has primitive restart enabled and cannot disable it
-        device.IsMoltenVK() ? VK_TRUE :
-        (dynamic.primitive_restart_enable != 0 &&
-                ((input_assembly_topology != VK_PRIMITIVE_TOPOLOGY_PATCH_LIST &&
-                  device.IsTopologyListPrimitiveRestartSupported()) ||
-                 SupportsPrimitiveRestart(input_assembly_topology) ||
-                 (input_assembly_topology == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST &&
-                  device.IsPatchListPrimitiveRestartSupported()))
-            ? VK_TRUE
-            : VK_FALSE),
+        .primitiveRestartEnable = dynamic.primitive_restart_enable != 0 &&
+                                  !MaxwellToVK::UsesConvertedQuadIndices(key.state.topology) &&
+                                  device.SupportsPrimitiveRestart(input_assembly_topology),
     };
     const VkPipelineTessellationStateCreateInfo tessellation_ci{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO,
@@ -1934,9 +1931,8 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass, bool parts_only) {
             VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY_EXT,
         };
         dynamic_states.insert(dynamic_states.end(), extended.begin(), extended.end());
-
-        // Buffer binding sets strides with vkCmdBindVertexBuffers2 even when vertex input
-        // is dynamic. Both states must be enabled; the last setter supplies the stride.
+    }
+    if (key.state.UsesDynamicVertexBindingStride()) {
         dynamic_states.push_back(VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE_EXT);
     }
 
@@ -2115,12 +2111,13 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass, bool parts_only) {
     // Parts for later pipelines come from QueueLibraryParts.
     if (library_cache && shader_set && !mesh_emulation) {
         try {
+            const GraphicsPipelineLibraryCache::ShaderObjects shader_objects{shader_set, layouts};
             if (parts_only) {
                 static_cast<void>(
-                    library_cache->Link(pipeline_ci, *pipeline_cache, shader_set, false));
+                    library_cache->Link(pipeline_ci, *pipeline_cache, shader_objects, false));
                 return;
             }
-            pipeline = library_cache->Link(pipeline_ci, *pipeline_cache, shader_set, true);
+            pipeline = library_cache->Link(pipeline_ci, *pipeline_cache, shader_objects, true);
         } catch (const vk::Exception& exception) {
             LOG_WARNING(Render_Vulkan, "Graphics pipeline library link failed ({}), compiling whole",
                         exception.what());
@@ -2132,8 +2129,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass, bool parts_only) {
     const bool linked = static_cast<bool>(pipeline);
     const bool can_fill_parts = !linked && fill_library_parts && library_cache && shader_set &&
                                 library_part_workers && !mesh_emulation;
-    // Parts are keyed by the shader set, so a set no other pipeline uses would compile four
-    // parts nothing links from, beside the whole pipeline: about twice the driver work.
+    // Only precompile parts for shader sets used by more than one pipeline.
     const bool shared_set =
         can_fill_parts && shader_set->pipelines.load(std::memory_order_relaxed) > 1;
     compiled_whole_for_library = can_fill_parts && shared_set;

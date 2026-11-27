@@ -33,11 +33,16 @@ public:
     }
 
     /// Arms the page in this generation, or moves an armed page up to it.
-    void Arm(u64 page, u64 page_generation) {
+    bool Arm(u64 page, u64 page_generation) {
         count.fetch_add(1, std::memory_order_relaxed);
-        if (!pages.insert_or_assign(page, page_generation).second) {
+        const auto [it, inserted] = pages.try_emplace(page, page_generation);
+        if (!inserted) {
             count.fetch_sub(1, std::memory_order_relaxed);
+            if (it->second < page_generation) {
+                it->second = page_generation;
+            }
         }
+        return inserted;
     }
 
     bool Armed(u64 page_begin, u64 page_end) const {

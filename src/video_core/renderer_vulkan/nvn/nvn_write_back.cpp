@@ -79,22 +79,15 @@ u64 MergeChangedWords(std::span<u8> guest, std::span<const u8> snapshot,
     return written;
 }
 
-bool WriteBackMerge::Supported(const Device& device) {
-    return device.IsKhrPushDescriptorSupported() && device.MaxPushDescriptors() >= 4;
-}
-
 WriteBackMerge::WriteBackMerge() = default;
 WriteBackMerge::~WriteBackMerge() = default;
 
-bool WriteBackMerge::Init(const Device& device) {
+bool WriteBackMerge::Init(const Device& device, bool allow_push_descriptors) {
     if (pipeline) {
         return true;
     }
-    if (!Supported(device)) {
-        LOG_WARNING(Render_Vulkan, "[nvn] write-back merge unavailable: the device has no push "
-                                   "descriptors for three storage buffers");
-        return false;
-    }
+    push_descriptors = allow_push_descriptors && device.IsKhrPushDescriptorSupported() &&
+                       device.MaxPushDescriptors() >= 4;
     alignment = (std::max)(device.GetStorageBufferAlignment(), VkDeviceSize{4});
     const u64 max_range = device.GetMaxStorageBufferRange();
     if (max_range <= alignment + 4) {
@@ -105,7 +98,7 @@ bool WriteBackMerge::Init(const Device& device) {
     // A part binds at most its own bytes plus the alignment below its first word in each buffer.
     part_bytes = (std::min)(MAX_PART_BYTES, (max_range - alignment) & ~u64{3});
     try {
-        const vk::Device& logical = device.GetLogical();
+        const vk::Device& dev = device.GetLogical();
         std::array<VkDescriptorSetLayoutBinding, 4> bindings{};
         for (u32 i = 0; i < bindings.size(); ++i) {
             bindings[i] = {
@@ -116,10 +109,10 @@ bool WriteBackMerge::Init(const Device& device) {
                 .pImmutableSamplers = nullptr,
             };
         }
-        set_layout = logical.CreateDescriptorSetLayout({
+        set_layout = dev.CreateDescriptorSetLayout({
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
             .pNext = nullptr,
-            .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
+            .flags = ComputeSetFlags(push_descriptors),
             .bindingCount = static_cast<u32>(bindings.size()),
             .pBindings = bindings.data(),
         });
@@ -128,7 +121,7 @@ bool WriteBackMerge::Init(const Device& device) {
             .offset = 0,
             .size = sizeof(PushConstants),
         };
-        pipeline_layout = logical.CreatePipelineLayout({
+        pipeline_layout = dev.CreatePipelineLayout({
             .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
             .pNext = nullptr,
             .flags = 0,
@@ -138,14 +131,14 @@ bool WriteBackMerge::Init(const Device& device) {
             .pPushConstantRanges = &push_range,
         });
         const std::span<const u32> code = NVN_WB_MERGE_COMP_SPV;
-        module = logical.CreateShaderModule({
+        module = dev.CreateShaderModule({
             .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
             .pNext = nullptr,
             .flags = 0,
             .codeSize = static_cast<u32>(code.size_bytes()),
             .pCode = code.data(),
         });
-        pipeline = logical.CreateComputePipeline(
+        pipeline = dev.CreateComputePipeline(
             VkComputePipelineCreateInfo{
                 .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
                 .pNext = nullptr,
@@ -165,6 +158,7 @@ bool WriteBackMerge::Init(const Device& device) {
             },
             // One small pipeline: the shared static pipeline cache is externally synchronized.
             VK_NULL_HANDLE);
+        logical = &dev;
     } catch (const vk::Exception& exception) {
         LOG_ERROR(Render_Vulkan, "[nvn] write-back merge pipeline failed: {}", exception.what());
         pipeline = {};
@@ -176,10 +170,42 @@ bool WriteBackMerge::Init(const Device& device) {
     return true;
 }
 
-u64 WriteBackMerge::Record(vk::CommandBuffer cmd, std::span<const MergeRange> ranges) const {
+bool MergeRange::TryAppend(const MergeRange& next, u64 join_alignment, u64 max_size) {
+    if (size == 0 || next.guest_off % join_alignment != 0 || size > max_size ||
+        next.size > max_size - size || result != next.result || snapshot != next.snapshot ||
+        guest != next.guest || stat_slot != next.stat_slot || lines != next.lines ||
+        result_off + size != next.result_off || snapshot_off + size != next.snapshot_off ||
+        guest_off + size != next.guest_off) {
+        return false;
+    }
+    size += next.size;
+    return true;
+}
+
+u64 WriteBackMerge::Record(vk::CommandBuffer cmd, std::span<const MergeRange> ranges,
+                           const AllocateComputeSet& allocate_set) const {
     ASSERT(pipeline);
     u64 recorded = 0;
     bool bound = false;
+    MergeRange pending{};
+    const auto flush = [&] {
+        if (pending.size == 0) {
+            return;
+        }
+        if (!bound) {
+            cmd.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
+            bound = true;
+        }
+        // Parts end at guest offsets that are multiples of 4, so only the range's own first and
+        // last words can be partial.
+        u64 begin = 0;
+        while (begin < pending.size) {
+            const u64 limit = ((pending.guest_off + begin) & ~u64{3}) + part_bytes;
+            const u64 end = (std::min)(pending.size, limit - pending.guest_off);
+            RecordPart(cmd, pending, begin, end, allocate_set);
+            begin = end;
+        }
+    };
     for (const MergeRange& range : ranges) {
         if (range.size == 0) {
             continue;
@@ -192,26 +218,23 @@ u64 WriteBackMerge::Record(vk::CommandBuffer cmd, std::span<const MergeRange> ra
                       range.result_off, range.snapshot_off, range.guest_off, range.size);
             continue;
         }
-        if (!bound) {
-            cmd.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
-            bound = true;
-        }
-        // Parts end at guest offsets that are multiples of 4, so only the range's own first and
-        // last words can be partial.
-        u64 begin = 0;
-        while (begin < range.size) {
-            const u64 limit = ((range.guest_off + begin) & ~u64{3}) + part_bytes;
-            const u64 end = (std::min)(range.size, limit - range.guest_off);
-            RecordPart(cmd, range, begin, end);
-            begin = end;
+        // Keep word masks and whole-line stores/counters unchanged at the join.
+        const bool uses_lines = (line_mode && range.lines) ||
+                                (stats != VK_NULL_HANDLE && range.stat_slot != 0xFFFFFFFFu);
+        const u64 join_alignment = uses_lines ? u64{unit_words} * 4 : 4;
+        const u64 max_joined_size = part_bytes - (pending.guest_off & 3);
+        if (!pending.TryAppend(range, join_alignment, max_joined_size)) {
+            flush();
+            pending = range;
         }
         ++recorded;
     }
+    flush();
     return recorded;
 }
 
 void WriteBackMerge::RecordPart(vk::CommandBuffer cmd, const MergeRange& range, u64 begin,
-                                u64 end) const {
+                                u64 end, const AllocateComputeSet& allocate_set) const {
     struct Binding {
         VkDescriptorBufferInfo info;
         u32 word;
@@ -274,7 +297,11 @@ void WriteBackMerge::RecordPart(vk::CommandBuffer cmd, const MergeRange& range, 
                                         (static_cast<u32>(std::countr_zero(unit_words)) << 8)
                                   : 0,
     };
-    cmd.PushDescriptorSetKHR(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline_layout, 0, writes);
+    if (!BindComputeDescriptors(*logical, cmd, *pipeline_layout, *set_layout, push_descriptors,
+                                writes, allocate_set)) {
+        // The replay discards this recording and invalidates its mirror state.
+        throw vk::Exception(VK_ERROR_OUT_OF_POOL_MEMORY);
+    }
     cmd.PushConstants(*pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, constants);
     cmd.Dispatch((words + line_phase + GROUP_SIZE - 1) / GROUP_SIZE, 1, 1);
 }

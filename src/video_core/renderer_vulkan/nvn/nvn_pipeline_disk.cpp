@@ -571,7 +571,8 @@ void CanonicalizeState(GraphicsFixedState& s, VertexInputMode mode) {
     using N::StateBits::Mask;
     s.provoking_first = s.provoking_first != 0 ? 1 : 0;
     s.pad1 = 0;
-    s.primitive_restart = s.primitive_restart != 0 ? 1 : 0;
+    // Quad markers have already been consumed when the host draws the triangles.
+    s.primitive_restart = s.primitive_restart != 0 && s.topology != 7 && s.topology != 8;
     s.restart_index = 0; // never read by pipeline creation (the draw supplies the index type)
     s.depth_clamp = s.depth_clamp != 0 ? 1 : 0;
     s.rasterizer_discard = s.rasterizer_discard != 0 ? 1 : 0;
@@ -890,9 +891,11 @@ LoadResult LoadFile(const std::filesystem::path& path, const Header& expected,
     return Parse(bytes, expected, contents);
 }
 
-bool WriteFileAtomic(const std::filesystem::path& path, std::span<const u8> data) {
+bool WriteFileAtomic(const std::filesystem::path& path, std::span<const u8> data,
+                     std::string_view temporary_suffix) {
     auto temporary = path;
     temporary += ".tmp";
+    temporary += temporary_suffix;
     {
         std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
         if (!file.is_open()) {

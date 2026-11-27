@@ -136,10 +136,7 @@ protected:
     std::shared_ptr<const LoweredNativeCode> LowerNativeCode(u32 source_header_size,
                                                               bool geometry = false);
     size_t native_source_size{};
-    /// Lower matrix multiplies too (KeplerCompute::EmulatesNativeTensorPrograms).
-    bool native_tensor{};
-    /// ... in the compact form (KeplerCompute::UsesCompactTensorPrograms).
-    bool native_compact_tensor{};
+    Shader::Ampere::TensorMode native_tensor_mode{};
     std::shared_ptr<const LoweredNativeCode> lowered_native;
 
     Tegra::Texture::TICEntry ReadTextureInfo(GPUVAddr tic_addr, u32 tic_limit,
@@ -267,6 +264,7 @@ public:
     explicit ComputeEnvironment(Tegra::Engines::KeplerCompute& kepler_compute_,
                                 Tegra::MemoryManager& gpu_memory_, GPUVAddr program_base_,
                                 u32 start_address_,
+                                Shader::Ampere::TensorMode tensor_mode,
                                 std::shared_ptr<const LoweredNativeCode> lowered_native_ = {});
 
     ~ComputeEnvironment() override = default;

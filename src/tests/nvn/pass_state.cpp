@@ -120,6 +120,7 @@ TEST_CASE("NVN pass state: template descriptors elide identical buffer and image
           "[nvn][pass_state]") {
     PassBoundState state;
     const auto layout = Handle<VkPipelineLayout>(0x100);
+    const auto update_template = Handle<VkDescriptorUpdateTemplate>(0x101);
     std::vector<VkDescriptorBufferInfo> buffers{{Handle<VkBuffer>(0x10), 0, 256}};
     std::vector<VkDescriptorImageInfo> images{
         {Handle<VkSampler>(0x20), Handle<VkImageView>(0x30),
@@ -127,40 +128,46 @@ TEST_CASE("NVN pass state: template descriptors elide identical buffer and image
         {Handle<VkSampler>(0x21), Handle<VkImageView>(0x31),
          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
     state.OnPipelineBind(layout, true);
-    REQUIRE_FALSE(state.TakeTemplateDescriptors(layout, buffers, images));
-    REQUIRE(state.TakeTemplateDescriptors(layout, buffers, images));
+    REQUIRE_FALSE(state.TakeTemplateDescriptors(layout, update_template, buffers, images));
+    REQUIRE(state.TakeTemplateDescriptors(layout, update_template, buffers, images));
 
     SECTION("a changed buffer offset or range records again") {
         buffers[0].offset = 128;
-        REQUIRE_FALSE(state.TakeTemplateDescriptors(layout, buffers, images));
-        REQUIRE(state.TakeTemplateDescriptors(layout, buffers, images));
+        REQUIRE_FALSE(state.TakeTemplateDescriptors(layout, update_template, buffers, images));
+        REQUIRE(state.TakeTemplateDescriptors(layout, update_template, buffers, images));
         buffers[0].range = 512;
-        REQUIRE_FALSE(state.TakeTemplateDescriptors(layout, buffers, images));
+        REQUIRE_FALSE(state.TakeTemplateDescriptors(layout, update_template, buffers, images));
     }
     SECTION("a changed image view, sampler or layout records again") {
         auto next_images = images;
         next_images[1].imageView = Handle<VkImageView>(0x99);
-        REQUIRE_FALSE(state.TakeTemplateDescriptors(layout, buffers, next_images));
+        REQUIRE_FALSE(state.TakeTemplateDescriptors(layout, update_template, buffers, next_images));
         next_images[1].sampler = Handle<VkSampler>(0x98);
-        REQUIRE_FALSE(state.TakeTemplateDescriptors(layout, buffers, next_images));
+        REQUIRE_FALSE(state.TakeTemplateDescriptors(layout, update_template, buffers, next_images));
         next_images[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        REQUIRE_FALSE(state.TakeTemplateDescriptors(layout, buffers, next_images));
-        REQUIRE(state.TakeTemplateDescriptors(layout, buffers, next_images));
+        REQUIRE_FALSE(state.TakeTemplateDescriptors(layout, update_template, buffers, next_images));
+        REQUIRE(state.TakeTemplateDescriptors(layout, update_template, buffers, next_images));
+    }
+    SECTION("a different update template on the same layout records again") {
+        const auto other_template = Handle<VkDescriptorUpdateTemplate>(0x102);
+        REQUIRE_FALSE(state.TakeTemplateDescriptors(layout, other_template, buffers, images));
+        REQUIRE(state.TakeTemplateDescriptors(layout, other_template, buffers, images));
+        REQUIRE_FALSE(state.TakeTemplateDescriptors(layout, update_template, buffers, images));
     }
     SECTION("a different pipeline layout invalidates template descriptors") {
         const auto other = Handle<VkPipelineLayout>(0x200);
         state.OnPipelineBind(other, true);
-        REQUIRE_FALSE(state.TakeTemplateDescriptors(other, buffers, images));
+        REQUIRE_FALSE(state.TakeTemplateDescriptors(other, update_template, buffers, images));
         state.OnPipelineBind(layout, true);
-        REQUIRE_FALSE(state.TakeTemplateDescriptors(layout, buffers, images));
+        REQUIRE_FALSE(state.TakeTemplateDescriptors(layout, update_template, buffers, images));
     }
     SECTION("ForgetDescriptors and Reset clear template descriptor tracking") {
         state.ForgetDescriptors();
-        REQUIRE_FALSE(state.TakeTemplateDescriptors(layout, buffers, images));
-        REQUIRE(state.TakeTemplateDescriptors(layout, buffers, images));
+        REQUIRE_FALSE(state.TakeTemplateDescriptors(layout, update_template, buffers, images));
+        REQUIRE(state.TakeTemplateDescriptors(layout, update_template, buffers, images));
         state.Reset();
         state.OnPipelineBind(layout, true);
-        REQUIRE_FALSE(state.TakeTemplateDescriptors(layout, buffers, images));
+        REQUIRE_FALSE(state.TakeTemplateDescriptors(layout, update_template, buffers, images));
     }
 }
 
@@ -327,6 +334,44 @@ TEST_CASE("NVN pass state: a mip chain copies the freshly rendered mip, repeat d
     REQUIRE_FALSE(scratch.Serves(replacement, &context_a, epoch.value, all_mips));
 }
 
+TEST_CASE("NVN feedback refreshes only changed mips of an unchanged image",
+          "[nvn][pass_state]") {
+    using Vulkan::Nvn::FeedbackMipVersions;
+    using Vulkan::Nvn::FeedbackSnapshot;
+    using Vulkan::Nvn::SubresourceSpan;
+    const auto source = std::make_shared<int>(0);
+    const auto other_source = std::make_shared<int>(1);
+    const int context = 0;
+    const int other_context = 0;
+    constexpr u32 generation = 2;
+    constexpr SubresourceSpan cube{0, 8, 0, 6};
+    FeedbackMipVersions versions(cube.levels);
+    FeedbackSnapshot<int> scratch;
+    scratch.Record(source, &context, 1, cube, &versions, generation);
+    REQUIRE(scratch.HasVersions(source, &context, generation, cube));
+    CHECK(scratch.MipsAreCurrent(cube, versions));
+
+    for (u32 mip = 1; mip < cube.levels - 1; ++mip) {
+        versions.Write(mip);
+        for (u32 test = 0; test < cube.levels; ++test) {
+            CHECK(scratch.MipIsCurrent(test, versions) == (test != mip));
+        }
+        CHECK_FALSE(scratch.MipsAreCurrent(cube, versions));
+        scratch.Record(source, &context, mip + 1, cube, &versions, generation);
+        CHECK(scratch.MipsAreCurrent(cube, versions));
+    }
+
+    versions.WriteAll();
+    versions.Write(3);
+    for (u32 mip = 0; mip < cube.levels; ++mip) {
+        CHECK_FALSE(scratch.MipIsCurrent(mip, versions));
+    }
+    CHECK_FALSE(scratch.HasVersions(source, &context, generation + 1, cube));
+    CHECK_FALSE(scratch.HasVersions(other_source, &context, generation, cube));
+    CHECK_FALSE(scratch.HasVersions(source, &other_context, generation, cube));
+    CHECK_FALSE(scratch.HasVersions(source, &context, generation, {0, 8, 1, 6}));
+}
+
 TEST_CASE("NVN pass state: vertex and index bindings", "[nvn][pass_state]") {
     PassBoundState state;
     const auto layout = Handle<VkPipelineLayout>(0x100);
@@ -352,6 +397,19 @@ TEST_CASE("NVN pass state: vertex and index bindings", "[nvn][pass_state]") {
     state.Reset();
     REQUIRE_FALSE(state.TakeStream(0, Handle<VkBuffer>(0x3), 0));
     REQUIRE_FALSE(state.TakeIndexBuffer(Handle<VkBuffer>(0x5), 32, VK_INDEX_TYPE_UINT32));
+}
+
+TEST_CASE("NVN pass state: custom restart changes invalidate the index bind", "[nvn][pass_state]") {
+    PassBoundState state;
+    const auto buffer = Handle<VkBuffer>(0x5);
+    REQUIRE_FALSE(state.TakeIndexBuffer(buffer, 16, VK_INDEX_TYPE_UINT16, 7));
+    REQUIRE(state.TakeIndexBuffer(buffer, 16, VK_INDEX_TYPE_UINT16, 7));
+    REQUIRE_FALSE(state.TakeIndexBuffer(buffer, 16, VK_INDEX_TYPE_UINT16, 9));
+    REQUIRE_FALSE(state.TakeIndexBuffer(buffer, 16, VK_INDEX_TYPE_UINT16));
+    REQUIRE(state.TakeIndexBuffer(buffer, 16, VK_INDEX_TYPE_UINT16));
+    REQUIRE_FALSE(state.TakeIndexBuffer(buffer, 16, VK_INDEX_TYPE_UINT16, 7));
+    state.ForgetIndexBuffer();
+    REQUIRE_FALSE(state.TakeIndexBuffer(buffer, 16, VK_INDEX_TYPE_UINT16, 7));
 }
 
 namespace {

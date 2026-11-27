@@ -17,12 +17,15 @@ namespace Vulkan {
 class MemoryAllocator;
 
 std::unique_ptr<WindowAdaptPass> MakeWindowAdaptPass(
-    const Device& device, VkFormat frame_format, Settings::ScalingFilter filter,
+    const Device& device, VkFormat frame_format, VkFormat source_format,
+    Settings::ScalingFilter filter,
     bool push_descriptor = false);
 
 std::unique_ptr<WindowAdaptPass> MakeNearestNeighbor(const Device& device, VkFormat frame_format, bool push_descriptor = false);
 std::unique_ptr<WindowAdaptPass> MakeBilinear(const Device& device, VkFormat frame_format, bool push_descriptor = false);
-std::unique_ptr<WindowAdaptPass> MakeBicubic(const Device& device, VkFormat frame_format, VkCubicFilterWeightsQCOM qcom_weights, bool push_descriptor = false);
+std::unique_ptr<WindowAdaptPass> MakeBicubic(
+    const Device& device, VkFormat frame_format, VkCubicFilterWeightsQCOM qcom_weights,
+    bool push_descriptor = false, VkFormat source_format = VK_FORMAT_UNDEFINED);
 std::unique_ptr<WindowAdaptPass> MakeSpline1(const Device& device, VkFormat frame_format, bool push_descriptor = false);
 std::unique_ptr<WindowAdaptPass> MakeGaussian(const Device& device, VkFormat frame_format, bool push_descriptor = false);
 std::unique_ptr<WindowAdaptPass> MakeLanczos(const Device& device, VkFormat frame_format, bool push_descriptor = false);

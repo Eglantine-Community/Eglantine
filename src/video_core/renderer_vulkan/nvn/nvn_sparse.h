@@ -18,8 +18,12 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -28,7 +32,7 @@
 
 namespace Vulkan::Nvn {
 
-/// Combine adjacent blocks of a single host row without changing their physical mappings.
+/// Combine adjacent unbinds of a single host row. Binds with backing stay individual.
 void CompactSparseImageBinds(std::vector<VkSparseImageMemoryBind>& binds, u32 granule_x,
                              u32 granule_y);
 
@@ -54,39 +58,53 @@ public:
     static constexpr u32 PagesPerBlock = 64;
     static constexpr u32 CachedBlockLimit = 4;
 
+    /// Select the pool's share of the usable main device-local heap.
+    [[nodiscard]] static u64 DefaultBudget(u64 heap_budget);
+    /// Keep empty blocks only when the reported heap has room for another allocation block.
+    [[nodiscard]] static u32 CachedBlockTarget(u64 budget, u64 used, u64 slack);
+
     SparsePagePool(const MemoryAllocator& allocator, u64 budget_bytes);
     ~SparsePagePool();
     SparsePagePool(const SparsePagePool&) = delete;
     SparsePagePool& operator=(const SparsePagePool&) = delete;
 
     /// A page usable by an image whose memory requirements allow `memory_type_bits`; NoPage when
-    /// the budget or the device memory is used up.
-    [[nodiscard]] u32 Allocate(u32 memory_type_bits);
+    /// the budget or the device memory is used up. On a VMA failure, records the release
+    /// generation from before the attempt.
+    [[nodiscard]] u32 Allocate(u32 memory_type_bits,
+                               std::optional<u64>* allocator_failure = nullptr);
     /// The page holding `key`'s texels, shared with every other tile of that key (one more
     /// reference). `reused`: the page existed before replay step `epoch`, so its texels were
     /// uploaded or written earlier in the command stream. NoPage when out of memory.
     [[nodiscard]] u32 AcquireShared(const SparseAliasKey& key, u32 memory_type_bits, u64 epoch,
-                                    bool& reused, bool allow_alloc = true);
+                                    bool& reused, bool allow_alloc = true,
+                                    std::optional<u64>* allocator_failure = nullptr);
     /// Whether `page` is currently held in the shared key map (regardless of key).
     [[nodiscard]] bool IsShared(u32 page) const;
     /// Whether `page` is the shared page of `key`.
     [[nodiscard]] bool HoldsKey(u32 page, const SparseAliasKey& key) const;
     void MarkSharedStale(u32 page);
     void ClearSharedStale(u32 page);
-    /// Drops one reference; the page is free when the last one goes.
-    void Free(u32 page);
+    /// Drops one reference; the page is free when the last one goes. Skip notification when
+    /// rolling back a reservation made for an unbound unit.
+    void Free(u32 page, bool notify = true);
     /// Bytes saved by sharing: references beyond the first of each shared page.
     [[nodiscard]] u64 SharedSavedBytes() const {
         std::scoped_lock lock{mutex_};
         return shared_extra_refs_ * PageBytes;
     }
     /// Release wholly unused allocations after their pages are no longer in GPU use.
-    void TrimUnusedBlocks();
-    /// Counts the pages given back: a starved tile is worth another try only after it changed.
+    u64 TrimUnusedBlocks(u32 keep_empty = CachedBlockLimit);
+    u64 TrimUnusedBlocks(const Device& device);
+    /// Pages returned to the pool, or a delayed retry after a device allocation failed.
     [[nodiscard]] u64 FreeGeneration() const {
-        std::scoped_lock lock{mutex_};
-        return free_generation_;
+        return free_generation_.load(std::memory_order_acquire);
     }
+    [[nodiscard]] u64 DeviceMemoryReleaseGeneration() const noexcept {
+        return allocator_.DeviceMemoryReleaseGeneration();
+    }
+    /// Wake starved tiles once after a delay, even when only another process freed memory.
+    void WakeAllocationRetries(std::chrono::steady_clock::time_point now);
     struct Where {
         VkDeviceMemory memory{};
         VkDeviceSize offset{};
@@ -105,17 +123,19 @@ private:
     struct Block {
         VmaAllocation allocation{};
         Where where;
-        u32 type_bits{}; ///< the memory types the block was allocated for
+        u32 memory_type{}; ///< the actual Vulkan memory type chosen by the allocator
         u32 used_pages{};
     };
 
-    u32 AllocateLocked(u32 memory_type_bits);
+    u32 AllocateLocked(u32 memory_type_bits, std::optional<u64>* allocator_failure);
+    u64 TrimUnusedBlocksLocked(u32 keep_empty);
 
     const MemoryAllocator& allocator_;
     const u64 budget_;
     mutable std::mutex mutex_;
     std::vector<Block> blocks_;
-    std::vector<u32> free_;
+    std::array<std::vector<u32>, VK_MAX_MEMORY_TYPES> free_;
+    u32 free_type_mask_{}; ///< which of the free lists are non-empty
     std::vector<u32> refs_;  ///< per page: references (0 free)
     std::vector<u64> epoch_; ///< per shared page: the replay step that allocated it
     std::vector<u8> stale_;  ///< per shared page: owning tile has un-uploaded guest changes
@@ -123,8 +143,9 @@ private:
     std::unordered_map<u32, SparseAliasKey> key_of_;
     u64 shared_extra_refs_{0};
     u64 used_{0};
-    u64 free_generation_{0};
+    std::atomic<u64> free_generation_{0};
     u32 empty_blocks_{0};
+    std::optional<std::chrono::steady_clock::time_point> retry_at_;
 };
 
 /// The tile state of one sparse storage.
@@ -155,7 +176,7 @@ public:
 
     /// Reads the sparse shape of `s.image` (created unbacked). False when it does not fit the
     /// tiles (the caller falls back to an ordinary image); `reason` says why.
-    [[nodiscard]] bool Attach(Context::Impl& impl, const Storage& s, const char*& reason);
+    [[nodiscard]] bool Attach(Context::Impl& impl, const Storage& s, bool shared_tiles, const char*& reason);
 
     [[nodiscard]] const SparseLayout& Layout() const noexcept {
         return layout_;
@@ -186,19 +207,23 @@ public:
     /// Every mapped tile is uploaded again (the game wrote the texture itself).
     void MarkAllDirty();
 
-    /// Units wait for a bind, an unbind or an upload. Starved units (no page was left) do not
-    /// count until a page was freed.
+    [[nodiscard]] bool HasPendingUnits() const {
+        return !pending_tiles_.empty() || !pending_tails_.empty();
+    }
+
+    /// Units wait for a bind, an unbind or an upload. Retry starved units after memory is released.
     [[nodiscard]] bool HasWork() const {
-        if (pending_tiles_.empty() && pending_tails_.empty()) {
-            return false;
-        }
-        return !starved_only_ || !pool_ || pool_->FreeGeneration() != starved_generation_;
+        return HasPendingUnits() &&
+               (!starved_only_ || !pool_ || pool_->FreeGeneration() != starved_generation_ ||
+                (starved_allocator_generation_ &&
+                 pool_->DeviceMemoryReleaseGeneration() != *starved_allocator_generation_));
     }
 
     /// Binds memory for the pending mapped tiles, unbinds the pending unmapped ones, and lists
     /// what has to be uploaded. The binds are done when it returns (the queue has run them).
     /// The dirty marks of the listed units are cleared: the caller uploads them or drops them.
-    [[nodiscard]] bool Prepare(Context::Impl& impl, const Storage& s, Uploads& uploads);
+    [[nodiscard]] bool Prepare(Context::Impl& impl, const Storage& s, Uploads& uploads,
+                               bool allow_gpu_wait = false);
 
     void SetTileHash(u32 id, u64 hash) {
         tile_hash_[id] = hash;
@@ -305,6 +330,7 @@ private:
     /// Everything pending found no page at generation `starved_generation_`.
     bool starved_only_{false};
     u64 starved_generation_{0};
+    std::optional<u64> starved_allocator_generation_;
 };
 
 } // namespace Vulkan::Nvn

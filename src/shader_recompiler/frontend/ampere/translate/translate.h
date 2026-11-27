@@ -16,6 +16,6 @@ namespace Shader::Ampere {
 void TranslateBlock(Environment& env, IR::Block* block, std::span<const Instruction> code,
                     u32 begin_offset, u32 end_offset, const LoweringOptions& options,
                     bool uses_async_copy, u32& required_texture_buffer,
-                    const std::vector<u8>* branch_targets, bool mkw_zero_depth_fallback = false);
+                    const std::vector<u8>* branch_targets);
 
 } // namespace Shader::Ampere

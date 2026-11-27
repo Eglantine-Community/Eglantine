@@ -40,7 +40,12 @@ set(EPOCH_EXCLUDED_REGEXES
 # keys the stored SPIR-V depends on, the guest state layouts those read, and the Vulkan profile
 # helpers feeding the translation.
 set(EPOCH_FILES
+    src/video_core/native_tensor_programs.h
+    src/video_core/vulkan_common/vulkan_device.cpp
+    src/video_core/vulkan_common/vulkan_device.h
     src/video_core/nvn/state_layouts.h
+    src/video_core/renderer_vulkan/nvn/nvn_draw_descriptors.cpp
+    src/video_core/renderer_vulkan/nvn/nvn_format.h
     src/video_core/renderer_vulkan/nvn/nvn_pipeline_cache.cpp
     src/video_core/renderer_vulkan/nvn/nvn_pipeline_cache.h
     src/video_core/renderer_vulkan/nvn/nvn_pipeline_cache_disk.cpp
@@ -50,6 +55,8 @@ set(EPOCH_FILES
     src/video_core/renderer_vulkan/nvn/nvn_pipeline_state.cpp
     src/video_core/renderer_vulkan/nvn/nvn_pipeline_state.h
     src/video_core/renderer_vulkan/nvn/nvn_pipeline_vk.cpp
+    src/video_core/renderer_vulkan/vk_shader_util.cpp
+    src/video_core/renderer_vulkan/vk_shader_util.h
     src/video_core/vulkan_common/cooperative_matrix.h
 )
 

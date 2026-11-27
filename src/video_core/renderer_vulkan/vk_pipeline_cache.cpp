@@ -94,7 +94,7 @@ using VideoCommon::GraphicsEnvironment;
 // translated again at boot and written back under the new one. Bump MIN_COMPATIBLE_CACHE_VERSION
 // too only when the record layout (environment or key serialization) changes, which deletes older
 // caches. 36 replaces Maxwell-lowered native blobs with direct native Ampere streams.
-constexpr u32 CACHE_VERSION = 36; // 36: native Ampere streams replace Maxwell lowering
+constexpr u32 CACHE_VERSION = 38; // 38: remove the title-specific native depth override
 static_assert(CACHE_VERSION == VideoCommon::ShaderWarm::WarmCacheVersion,
               "Shader precache files use the pipeline cache version");
 constexpr u32 MIN_COMPATIBLE_CACHE_VERSION = 36;
@@ -670,6 +670,9 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .support_int64_atomics = device.IsExtShaderAtomicInt64Supported(),
         .support_shared_int64_atomics = device.IsSharedInt64AtomicsSupported(),
         .support_derivative_control = true,
+        .support_image_gather_extended = device.IsShaderImageGatherExtendedSupported(),
+        .min_texel_gather_offset = device.GetMinTexelGatherOffset(),
+        .max_texel_gather_offset = device.GetMaxTexelGatherOffset(),
         .support_geometry_shader_passthrough = device.IsNvGeometryShaderPassthroughSupported(),
         .support_native_ndc = device.IsExtDepthClipControlSupported(),
         .support_scaled_attributes = !device.MustEmulateScaledFormats(),
@@ -707,14 +710,19 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .has_broken_spirv_subgroup_mask_vector_extract_dynamic =
             driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY &&
             device.GetDriverVersion() < VK_MAKE_VERSION(512, 672, 0),
-        .has_broken_spirv_subgroup_shuffle = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY,
+        .has_broken_spirv_subgroup_shuffle = device.HasBrokenSpirvSubgroupShuffle(),
         .has_broken_spirv_fragment_shuffle = driver_id == VK_DRIVER_ID_AMD_PROPRIETARY &&
                                              Common::EnvGate("EGLANTINE_AMD_FRAGMENT_SHUFFLE"),
         .max_subgroup_size = device.GetMaxSubgroupSize(),
         .has_broken_robust =
             device.IsNvidia() && device.GetNvidiaArch() <= NvidiaArchitecture::Arch_Pascal,
         .min_ssbo_alignment = device.GetStorageBufferAlignment(),
-        .max_user_clip_distances = device.GetMaxUserClipDistances()};
+        .max_user_clip_distances = device.GetMaxUserClipDistances(),
+        .support_uniform_buffer_standard_layout = device.IsUniformBufferStandardLayoutEnabled(),
+        .support_ballot = device.IsSubgroupFeatureSupported(VK_SUBGROUP_FEATURE_BALLOT_BIT),
+        .support_shuffle = device.IsSubgroupFeatureSupported(VK_SUBGROUP_FEATURE_SHUFFLE_BIT),
+        .support_quad_shuffles_all_stages = device.SupportsQuadSubgroupOperationsInAllStages(),
+        .native_float16_controls = device.GetNativeFloat16Controls()};
     profile.support_cooperative_hmma =
         device.IsCooperativeHmmaSupported() && TestCooperativeHmma(device);
 
@@ -728,8 +736,6 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .max_descriptor_set_uniform_buffers_dynamic =
             device.GetMaxDescriptorSetUniformBuffersDynamic(),
         .max_descriptor_set_storage_buffers = device.GetMaxDescriptorSetStorageBuffers(),
-        .max_descriptor_set_storage_buffers_dynamic =
-            device.GetMaxDescriptorSetStorageBuffersDynamic(),
         .max_descriptor_set_sampled_images = device.GetMaxDescriptorSetSampledImages(),
         .max_descriptor_set_storage_images = device.GetMaxDescriptorSetStorageImages(),
         .max_descriptor_set_input_attachements = device.GetMaxDescriptorSetInputAttachments(),
@@ -797,8 +803,6 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     dynamic_features.has_dynamic_vertex_input =
         device.IsExtVertexInputDynamicStateSupported() &&
         Settings::values.vertex_input_dynamic_state.GetValue();
-    dynamic_features.has_static_vertex_repack =
-        StaticVertexRepackEnabled(device.GetMinVertexInputBindingStrideAlignment());
 
     dynamic_features.has_provoking_vertex = device.IsExtProvokingVertexSupported();
     dynamic_features.has_provoking_vertex_first_mode = device.SupportsProvokingVertexFirstMode();
@@ -1058,8 +1062,10 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline(bool is_indexed) {
         graphics_miss = "stage-rejected";
         return nullptr;
     }
-    if (refresh_state) {
-        graphics_key.state.Refresh(*maxwell3d, dynamic_features);
+    if (refresh_state && !graphics_key.state.Refresh(*maxwell3d, dynamic_features, device)) {
+        current_pipeline = nullptr;
+        graphics_miss = "vertex-input-layout-unsupported";
+        return nullptr;
     }
     graphics_key_engine = reuse ? maxwell3d : nullptr;
     graphics_key_memory = memory;
@@ -1510,6 +1516,11 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
             (key.state.color_write_enable_dynamic != 0) !=
                 dynamic_features.has_color_write_enable ||
             (key.state.dynamic_vertex_input != 0) != dynamic_features.has_dynamic_vertex_input) {
+            return;
+        }
+
+        // Older static graphics keys may contain offsets cooked for the capture-specific layout.
+        if (!key.state.dynamic_vertex_input && !key.state.vertex_repack_layout_v2) {
             return;
         }
 
@@ -3017,19 +3028,6 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
     }
     translate_timer.reset();
-    if (host_info.max_descriptor_set_storage_buffers != 0) {
-        size_t total_storage_buffers{};
-        for (size_t index = uses_vertex_a && uses_vertex_b ? 1 : 0;
-             index < Maxwell::MaxShaderProgram; ++index) {
-            total_storage_buffers +=
-                Shader::NumDescriptors(programs[index].info.storage_buffers_descriptors);
-        }
-        if (total_storage_buffers > host_info.max_descriptor_set_storage_buffers) {
-            throw Shader::NotImplementedException(
-                "Pipeline binds {} storage buffers; descriptor set limit is {}",
-                total_storage_buffers, host_info.max_descriptor_set_storage_buffers);
-        }
-    }
     // Mesh emulation without VK_EXT_mesh_shader (prototype): a mesh program, after an optional
     // task program, drawing triangles without per-primitive outputs, before a pixel program only.
     std::optional<MeshEmulationSetup> mesh_emulation;
@@ -3152,6 +3150,21 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                      count, hash, mesh.mesh.max_vertices, mesh.mesh.vertex_lines.size(),
                      mesh.mesh.max_primitives, output_binding, has_task,
                      mesh_emulation->payload_stride, reads.empty() ? " none" : reads);
+        }
+    }
+    if (host_info.max_descriptor_set_storage_buffers != 0) {
+        // The shared layout includes the mesh output and, with a task shader, three
+        // additional buffers. They count once across all stages that can access them.
+        size_t total_storage_buffers = mesh_emulation ? (mesh_emulation->has_task ? 4U : 1U) : 0U;
+        for (size_t index = uses_vertex_a && uses_vertex_b ? 1 : 0;
+             index < Maxwell::MaxShaderProgram; ++index) {
+            total_storage_buffers +=
+                Shader::NumDescriptors(programs[index].info.storage_buffers_descriptors);
+        }
+        if (total_storage_buffers > host_info.max_descriptor_set_storage_buffers) {
+            throw Shader::NotImplementedException(
+                "Pipeline binds {} storage buffers; descriptor set limit is {}",
+                total_storage_buffers, host_info.max_descriptor_set_storage_buffers);
         }
     }
     // A tessellation pipeline the driver would refuse is skipped like a missing mesh pipeline:
@@ -3300,6 +3313,23 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 } else {
                     new_translations.emplace_back(recorded[index], std::move(entry));
                 }
+            }
+        }
+        if (stage_index == 0 && program.stage == Shader::Stage::VertexB &&
+            !key.state.dynamic_vertex_input) {
+            const auto out_of_range = FindOutOfRangeVertexInput(
+                device.GetMaxVertexInputAttributes(), device.GetMaxVertexInputBindings(),
+                [&](u32 location) -> std::optional<u32> {
+                    const auto& attr = key.state.attributes[location];
+                    return attr.enabled && program.info.loads.Generic(location)
+                               ? std::optional<u32>{attr.buffer.Value()}
+                               : std::nullopt;
+                });
+            if (out_of_range) {
+                LOG_WARNING(Render_Vulkan,
+                            "Vertex shader input {} at binding {} exceeds device limits",
+                            *out_of_range, key.state.attributes[*out_of_range].buffer.Value());
+                return nullptr;
             }
         }
         device.SaveShader(code);
@@ -3972,7 +4002,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(const ComputePipe
     const GPUVAddr program_base{kepler_compute->regs.code_loc.Address()};
     const auto& qmd{kepler_compute->launch_description};
     ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start,
-                           shader->lowered_native};
+                           shader->tensor_mode, shader->lowered_native};
     env.SetCachedSize(shader->size_bytes);
     env.KeepStoragePointers(keep_pointers);
 
@@ -4007,20 +4037,78 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(ShaderPools& pool
         env.Dump(hash, key.unique_hash);
     }
 
+    Shader::RuntimeInfo runtime_info{};
+    const u32 max_shared_memory = device.GetMaxComputeSharedMemorySize();
+    const auto native = env.NativeAmpereProgram();
+    if (native) {
+        const auto mode = native->options.tensor_mode;
+        if (mode == Shader::Ampere::TensorMode::Workgroup) {
+            const auto properties = device.GetPhysical().GetProperties();
+            if (key.workgroup_size != env.WorkgroupSize() ||
+                !VideoCommon::ValidTensorWorkgroup(key.workgroup_size,
+                    properties.limits.maxComputeWorkGroupSize,
+                    properties.limits.maxComputeWorkGroupInvocations)) {
+                throw Shader::NotImplementedException("Workgroup HMMA has an invalid local size");
+            }
+            runtime_info.warp_scratch_memory_limit = max_shared_memory;
+        }
+        using Shader::Ampere::TensorMode;
+        if (mode == TensorMode::Default && Shader::Ampere::HasHmma(native->code)) {
+            return {.failure = "legacy tensor record has no resolved dispatch mode"};
+        }
+        if (mode == TensorMode::Full || mode == TensorMode::Compact) {
+            const auto support = device.NativeTensorComputeSupport(key.workgroup_size);
+            using VideoCommon::NativeTensorLowering;
+            if (support == NativeTensorLowering::None || support == NativeTensorLowering::Workgroup ||
+                (mode == TensorMode::Compact && support != NativeTensorLowering::Compact)) {
+                throw Shader::NotImplementedException(
+                    "Native matrix multiply mode lacks a supported compute workgroup");
+            }
+        }
+    }
     auto program{TranslateStage(pools, env, env.StartAddress(), false, host_info)};
+    auto compute_profile = profile;
+    auto host_workgroup_size = key.workgroup_size;
+    const bool uses_collectives = program.info.UsesWarpCollectives() && !program.HasScalarWarp();
+    if (native && program.workgroup_size != key.workgroup_size) {
+        throw Shader::NotImplementedException("Native compute workgroup differs from dispatch");
+    }
+    if (!native && uses_collectives && device.CanRequireGuestWarpForCompute(program.workgroup_size)) {
+        compute_profile.max_subgroup_size = GuestWarpSize;
+        compute_profile.warp_size_potentially_larger_than_guest = false;
+    }
+    if (native && uses_collectives && runtime_info.warp_scratch_memory_limit == 0 &&
+        !ConfigureNativeComputeWarp(device, program, compute_profile, host_workgroup_size)) {
+        const auto limits = device.GetPhysical().GetProperties().limits;
+        if (key.workgroup_size != program.workgroup_size ||
+            !VideoCommon::ValidTensorWorkgroup(program.workgroup_size,
+                                              limits.maxComputeWorkGroupSize,
+                                              limits.maxComputeWorkGroupInvocations)) {
+            throw Shader::NotImplementedException("Guest warp scratch has an invalid local size");
+        }
+        runtime_info.warp_scratch_memory_limit = max_shared_memory;
+    }
     const VkDriverIdKHR driver_id = device.GetDriverID();
     const bool needs_shared_mem_clamp = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY ||
                                         driver_id == VK_DRIVER_ID_ARM_PROPRIETARY ||
                                         driver_id == VK_DRIVER_ID_MOLTENVK;
-    const u32 max_shared_memory = device.GetMaxComputeSharedMemorySize();
-    if (needs_shared_mem_clamp && program.shared_memory_size > max_shared_memory) {
+    if (needs_shared_mem_clamp && runtime_info.warp_scratch_memory_limit == 0 &&
+        program.shared_memory_size > max_shared_memory) {
         LOG_WARNING(
             Render_Vulkan,
             "Compute shader {:#016x} requests {}KB shared memory but device max is {}KB - clamping",
             key.unique_hash, program.shared_memory_size / 1024, max_shared_memory / 1024);
         program.shared_memory_size = max_shared_memory;
     }
-    const std::vector<u32> code{EmitSPIRV(profile, program)};
+    Shader::Backend::Bindings bindings;
+    const std::vector<u32> code{EmitSPIRV(compute_profile, runtime_info, program, bindings)};
+    if (program.info.uses_cooperative_matrix &&
+        (!device.SupportsFullComputeSubgroups() ||
+         !device.CanRequireGuestWarpForCompute(host_workgroup_size) ||
+         host_workgroup_size[0] % GuestWarpSize != 0)) {
+        throw Shader::NotImplementedException(
+            "Native matrix multiply requires full compute subgroups");
+    }
     device.SaveShader(code);
     vk::ShaderModule spv_module{BuildShader(device, code)};
 
@@ -4048,7 +4136,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(ShaderPools& pool
     return {.pipeline = std::make_unique<ComputePipeline>(
                 device, scheduler, vulkan_pipeline_cache, descriptor_pool, guest_descriptor_queue,
                 descriptor_buffer_ring, thread_worker, statistics, &shader_notify, program.info,
-                std::move(spv_module), key.unique_hash),
+                std::move(spv_module), key.unique_hash, host_workgroup_size),
             .null_pointer_slots = env.IsNativeProgram() ? env.NullStoragePointerSlots()
                                                         : std::vector<std::pair<u32, u32>>{},
             .null_table_slots = env.IsNativeProgram() ? env.UnmappedStoragePointerTableKeys()

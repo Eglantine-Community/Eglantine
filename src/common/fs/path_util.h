@@ -267,7 +267,6 @@ void SetAppDirectory(const std::string& app_directory);
 
 /**
  * Gets the directory that holds a title's Vulkan pipeline cache files.
- * Mario Kart World keeps them in a subdirectory of its shader cache directory.
  *
  * @param shader_dir Shader cache directory
  * @param title_id Title ID

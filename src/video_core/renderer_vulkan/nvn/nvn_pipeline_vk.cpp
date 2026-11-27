@@ -5,7 +5,9 @@
 // Vulkan objects of the NVN pipeline cache: render passes, descriptor/pipeline layouts and the
 // assembly of graphics and compute VkPipelines from translated stages.
 
+#include <algorithm>
 #include <array>
+#include <limits>
 #include <span>
 
 #include <boost/container/small_vector.hpp>
@@ -14,6 +16,7 @@
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "video_core/nvn/shader/nvn_driver_layout.h"
 #include "video_core/renderer_vulkan/nvn/nvn_bindless.h"
+#include "video_core/renderer_vulkan/nvn/nvn_debug.h"
 #include "video_core/renderer_vulkan/nvn/nvn_pipeline_impl.h"
 
 namespace Vulkan::Nvn {
@@ -190,9 +193,76 @@ bool PipelineCache::Impl::CanUsePush(u32 descriptor_count) const {
            device.DescriptorBufferProperties().bufferlessPushDescriptors;
 }
 
+std::optional<u32> Detail::FragmentSamplerPadding(
+    std::span<const VkDescriptorSetLayoutBinding> bindings, const GraphicsLayoutCapacity& caps) {
+    const auto is_fragment_sampler = [](const VkDescriptorSetLayoutBinding& entry) {
+        return entry.descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
+               entry.descriptorCount == 1 && entry.stageFlags == VK_SHADER_STAGE_FRAGMENT_BIT &&
+               entry.pImmutableSamplers == nullptr;
+    };
+    size_t first = bindings.size();
+    while (first > 0 && is_fragment_sampler(bindings[first - 1])) {
+        --first;
+    }
+    if (first == bindings.size()) {
+        return std::nullopt;
+    }
+    const u32 first_binding = bindings[first].binding;
+    if (std::ranges::any_of(bindings.first(first), [first_binding](const auto& entry) {
+            return entry.binding >= first_binding;
+        })) {
+        return std::nullopt;
+    }
+    const auto tail = bindings.subspan(first);
+    for (size_t i = 0; i < tail.size(); ++i) {
+        if (tail[i].binding != u64{first_binding} + i) {
+            return std::nullopt;
+        }
+    }
+    constexpr u32 class_size = 4;
+    const u32 extra = static_cast<u32>((class_size - tail.size() % class_size) % class_size);
+    if (u64{tail.back().binding} + extra > (std::numeric_limits<u32>::max)()) {
+        return std::nullopt;
+    }
+
+    u64 total = 0;
+    u64 samplers = extra;
+    u64 images = extra;
+    u64 fragment_resources =
+        extra + (std::min)(caps.limits.maxColorAttachments, static_cast<u32>(MAX_COLOR_TARGETS));
+    u64 fragment_samplers = extra;
+    u64 fragment_images = extra;
+    for (const auto& entry : bindings) {
+        const u32 count = entry.descriptorCount;
+        const bool sampler = entry.descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER ||
+                             entry.descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        const bool image = entry.descriptorType == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ||
+                           entry.descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
+                           entry.descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+        total += count;
+        samplers += sampler ? count : 0;
+        images += image ? count : 0;
+        if ((entry.stageFlags & VK_SHADER_STAGE_FRAGMENT_BIT) != 0) {
+            fragment_resources += count;
+            fragment_samplers += sampler ? count : 0;
+            fragment_images += image ? count : 0;
+        }
+    }
+    if (total + extra > caps.max_set_descriptors ||
+        (total <= caps.max_push_descriptors && total + extra > caps.max_push_descriptors) ||
+        samplers > caps.limits.maxDescriptorSetSamplers ||
+        images > caps.limits.maxDescriptorSetSampledImages ||
+        fragment_resources > caps.limits.maxPerStageResources ||
+        fragment_samplers > caps.limits.maxPerStageDescriptorSamplers ||
+        fragment_images > caps.limits.maxPerStageDescriptorSampledImages) {
+        return std::nullopt;
+    }
+    return extra;
+}
+
 std::shared_ptr<const SharedPipelineLayout> PipelineCache::Impl::CreateLayoutObjects(
     const VC::DescriptorLayout& descriptors, bool is_compute, VkShaderStageFlags push_stages,
-    const EmulatedMeshArtifact* emulated_mesh) {
+    const EmulatedMeshArtifact* emulated_mesh, bool allow_capacity) {
     boost::container::small_vector<VkDescriptorSetLayoutBinding, 32> bindings;
     boost::container::small_vector<VkDescriptorUpdateTemplateEntry, 32> template_entries;
     u32 total = 0;
@@ -259,18 +329,23 @@ std::shared_ptr<const SharedPipelineLayout> PipelineCache::Impl::CreateLayoutObj
                              static_cast<u32>(sizeof(RenderAreaLayout));
     }
 
-    std::vector<u32> key;
-    key.reserve(8 + bindings.size() * 4);
-    key.insert(key.end(), {is_compute ? 1u : 0u, push_descriptors ? 1u : 0u,
-                           partially_bound ? 1u : 0u,
-                           descriptors.uses_bindless_table ? 1u : 0u,
-                           can_template ? 1u : 0u,
-                           static_cast<u32>(push_stages), push_constant_size,
-                           static_cast<u32>(bindings.size())});
-    for (const VkDescriptorSetLayoutBinding& entry : bindings) {
-        key.insert(key.end(), {entry.binding, static_cast<u32>(entry.descriptorType),
-                               entry.descriptorCount, static_cast<u32>(entry.stageFlags)});
-    }
+    const bool try_capacity = allow_capacity && !is_compute && !emulated_mesh &&
+                              !descriptors.uses_bindless_table &&
+                              graphics_layout_capacity.has_value();
+    const auto layout_key = [&](std::span<const VkDescriptorSetLayoutBinding> entries) {
+        std::vector<u32> key;
+        key.reserve(8 + entries.size() * 4);
+        key.insert(key.end(), {push_descriptors, partially_bound, descriptors.uses_bindless_table,
+                               push_stages, push_constant_size, static_cast<u32>(entries.size())});
+        for (const auto& entry : entries) {
+            key.insert(key.end(), {entry.binding, static_cast<u32>(entry.descriptorType),
+                                   entry.descriptorCount, entry.stageFlags});
+        }
+        return key;
+    };
+    auto key = layout_key({bindings.data(), bindings.size()});
+    // The exact bindings define the template entries, including their tight payload offsets.
+    key.insert(key.end(), {is_compute, can_template, try_capacity});
     {
         std::scoped_lock lock{layout_cache_mutex};
         if (const auto it = layout_cache.find(key); it != layout_cache.end()) {
@@ -278,85 +353,114 @@ std::shared_ptr<const SharedPipelineLayout> PipelineCache::Impl::CreateLayoutObj
         }
     }
 
-    auto out = std::make_shared<SharedPipelineLayout>();
-    out->push_descriptors = push_descriptors;
-    out->push_constant_size = push_constant_size;
-    if (!bindings.empty()) {
-        boost::container::small_vector<VkDescriptorBindingFlags, 32> binding_flags;
-        VkDescriptorSetLayoutBindingFlagsCreateInfo binding_flags_ci{};
-        const void* next = nullptr;
-        if (partially_bound) {
-            binding_flags.assign(bindings.size(), VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT);
-            binding_flags_ci = {
-                .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO,
-                .pNext = nullptr,
-                .bindingCount = static_cast<u32>(binding_flags.size()),
-                .pBindingFlags = binding_flags.data(),
-            };
-            next = &binding_flags_ci;
+    const auto padding =
+        try_capacity ? FragmentSamplerPadding({bindings.data(), bindings.size()},
+                                              *graphics_layout_capacity)
+                     : std::nullopt;
+    const u32 extra = padding.value_or(0);
+    if (extra != 0) {
+        auto binding = bindings.back();
+        for (u32 i = 0; i < extra; ++i) {
+            ++binding.binding;
+            bindings.push_back(binding);
         }
-        out->set_layout = device.GetLogical().CreateDescriptorSetLayout({
-            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-            .pNext = next,
-            .flags = out->push_descriptors
-                         ? static_cast<VkDescriptorSetLayoutCreateFlags>(
-                               VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR)
-                         : VkDescriptorSetLayoutCreateFlags{0},
-            .bindingCount = static_cast<u32>(bindings.size()),
-            .pBindings = bindings.data(),
-        });
     }
-    if (descriptors.uses_bindless_table) {
-        // The table is set BINDLESS_SET: set 0 must exist even when the draw has no descriptors.
-        if (bindings.empty()) {
-            out->set_layout = device.GetLogical().CreateDescriptorSetLayout({
+    const auto make_handles = [&] {
+        auto handles = std::make_shared<PipelineLayoutHandles>();
+        if (!bindings.empty() || descriptors.uses_bindless_table) {
+            boost::container::small_vector<VkDescriptorBindingFlags, 32> binding_flags;
+            VkDescriptorSetLayoutBindingFlagsCreateInfo flags_ci{};
+            if (partially_bound) {
+                binding_flags.assign(bindings.size(), VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT);
+                flags_ci = {
+                    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO,
+                    .bindingCount = static_cast<u32>(binding_flags.size()),
+                    .pBindingFlags = binding_flags.data(),
+                };
+            }
+            handles->set_layout = device.GetLogical().CreateDescriptorSetLayout({
                 .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-                .pNext = nullptr,
-                .flags = 0,
-                .bindingCount = 0,
-                .pBindings = nullptr,
+                .pNext = partially_bound ? &flags_ci : nullptr,
+                .flags = push_descriptors
+                             ? static_cast<VkDescriptorSetLayoutCreateFlags>(
+                                   VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR)
+                             : VkDescriptorSetLayoutCreateFlags{0},
+                .bindingCount = static_cast<u32>(bindings.size()),
+                .pBindings = bindings.empty() ? nullptr : bindings.data(),
             });
         }
-        out->bindless_layout = MakeBindlessSetLayout(device);
-    }
-    VkPushConstantRange range{
-        .stageFlags = push_stages,
-        .offset = 0,
-        .size = push_constant_size,
-    };
-    const std::array<VkDescriptorSetLayout, 2> set_handles{
-        *out->set_layout, out->bindless_layout ? *out->bindless_layout : VK_NULL_HANDLE};
-    const u32 set_count = out->bindless_layout ? 2u : (set_handles[0] != VK_NULL_HANDLE ? 1u : 0u);
-    out->layout = device.GetLogical().CreatePipelineLayout({
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .setLayoutCount = set_count,
-        .pSetLayouts = set_count != 0 ? set_handles.data() : nullptr,
-        .pushConstantRangeCount = range.size != 0 ? 1u : 0u,
-        .pPushConstantRanges = range.size != 0 ? &range : nullptr,
-    });
-    if (can_template && !template_entries.empty()) {
-        out->update_template = device.GetLogical().CreateDescriptorUpdateTemplate({
-            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO,
-            .pNext = nullptr,
-            .flags = 0,
-            .descriptorUpdateEntryCount = static_cast<u32>(template_entries.size()),
-            .pDescriptorUpdateEntries = template_entries.data(),
-            .templateType = out->push_descriptors
-                                ? VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_PUSH_DESCRIPTORS_KHR
-                                : VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET,
-            .descriptorSetLayout = *out->set_layout,
-            .pipelineBindPoint =
-                is_compute ? VK_PIPELINE_BIND_POINT_COMPUTE : VK_PIPELINE_BIND_POINT_GRAPHICS,
-            .pipelineLayout = *out->layout,
-            .set = 0,
+        if (descriptors.uses_bindless_table) {
+            handles->bindless_layout = MakeBindlessSetLayout(device);
+        }
+        const VkPushConstantRange range{
+            .stageFlags = push_stages,
+            .offset = 0,
+            .size = push_constant_size,
+        };
+        const std::array<VkDescriptorSetLayout, 2> set_handles{
+            *handles->set_layout,
+            handles->bindless_layout ? *handles->bindless_layout : VK_NULL_HANDLE};
+        const u32 set_count =
+            handles->bindless_layout ? 2u : (set_handles[0] != VK_NULL_HANDLE ? 1u : 0u);
+        handles->layout = device.GetLogical().CreatePipelineLayout({
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .setLayoutCount = set_count,
+            .pSetLayouts = set_count != 0 ? set_handles.data() : nullptr,
+            .pushConstantRangeCount = range.size != 0 ? 1u : 0u,
+            .pPushConstantRanges = range.size != 0 ? &range : nullptr,
         });
-        out->template_entry_count = slot_offset;
+        return handles;
+    };
+    std::shared_ptr<const SharedPipelineLayout> result;
+    try {
+        auto out = std::make_shared<SharedPipelineLayout>();
+        out->push_descriptors = push_descriptors;
+        out->padded_bindings = extra != 0;
+        out->push_constant_size = push_constant_size;
+        if (padding) {
+            auto capacity_key = layout_key({bindings.data(), bindings.size()});
+            {
+                std::scoped_lock lock{layout_cache_mutex};
+                if (const auto it = capacity_layout_cache.find(capacity_key);
+                    it != capacity_layout_cache.end()) {
+                    out->handles = it->second;
+                }
+            }
+            if (!out->handles) {
+                auto handles = make_handles();
+                std::scoped_lock lock{layout_cache_mutex};
+                out->handles = capacity_layout_cache
+                                   .try_emplace(std::move(capacity_key), std::move(handles))
+                                   .first->second;
+            }
+        } else {
+            out->handles = make_handles();
+        }
+        if (can_template && !template_entries.empty()) {
+            out->update_template = device.GetLogical().CreateDescriptorUpdateTemplate({
+                .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO,
+                .descriptorUpdateEntryCount = static_cast<u32>(template_entries.size()),
+                .pDescriptorUpdateEntries = template_entries.data(),
+                .templateType = push_descriptors
+                                    ? VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_PUSH_DESCRIPTORS_KHR
+                                    : VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET,
+                .descriptorSetLayout = *out->handles->set_layout,
+                .pipelineBindPoint =
+                    is_compute ? VK_PIPELINE_BIND_POINT_COMPUTE : VK_PIPELINE_BIND_POINT_GRAPHICS,
+                .pipelineLayout = *out->handles->layout,
+                .set = 0,
+            });
+            out->template_entry_count = slot_offset;
+        }
+        result = std::move(out);
+    } catch (const vk::Exception&) {
+        if (extra == 0) {
+            throw;
+        }
+        result = CreateLayoutObjects(descriptors, is_compute, push_stages, emulated_mesh, false);
     }
     std::scoped_lock lock{layout_cache_mutex};
-    const auto [it, inserted] = layout_cache.try_emplace(std::move(key), std::move(out));
-    return it->second;
+    return layout_cache.try_emplace(std::move(key), std::move(result)).first->second;
 }
 
 VC::DescriptorLayout PipelineCache::Impl::MergeLayouts(
@@ -405,6 +509,23 @@ VC::DescriptorLayout PipelineCache::Impl::MergeLayouts(
 
 void PipelineCache::Impl::FillStages(PipelineBase& pipeline,
                                      std::span<const StageArtifact* const> stages) {
+    for (const VC::DescriptorBinding& binding : pipeline.descriptors.bindings) {
+        switch (binding.kind) {
+        case VC::DescriptorKind::UniformBuffer:
+        case VC::DescriptorKind::StorageBuffer:
+            pipeline.descriptor_buffer_count += binding.count;
+            break;
+        case VC::DescriptorKind::CombinedImageSampler:
+        case VC::DescriptorKind::StorageImage:
+            pipeline.descriptor_image_count += binding.count;
+            break;
+        case VC::DescriptorKind::UniformTexelBuffer:
+            pipeline.descriptor_texel_view_count += binding.count;
+            break;
+        case VC::DescriptorKind::StorageTexelBuffer:
+            break;
+        }
+    }
     if (ShaderLog::Enabled()) {
         pipeline.log = std::make_shared<PipelineLogInfo>();
     }
@@ -445,36 +566,38 @@ vk::ShaderModule CreateModule(const Device& device, std::span<const u32> spirv) 
     });
 }
 
-vk::Pipeline CreateCompute(const Device& device, VkPipelineLayout layout, VkShaderModule module,
-                           VkPipelineCache cache, const Disk::ShaderRecord* record = nullptr) {
-    const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup{
+VkComputePipelineCreateInfo ComputeInfo(const Device& device, VkPipelineLayout layout,
+                                        VkShaderModule module, const Disk::ShaderRecord* record) {
+    static constexpr VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
         .requiredSubgroupSize = GuestWarpSize,
     };
     const bool force_guest_warp = record && record->layout.requires_guest_warp &&
                                   device.CanRequireGuestWarpForCompute(record->workgroup_size);
-    const bool require_full_subgroups = force_guest_warp &&
-                                        device.SupportsFullComputeSubgroups() &&
-                                        record->workgroup_size[0] % GuestWarpSize == 0;
-    return device.GetLogical().CreateComputePipeline(
-        {
-            .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-            .stage =
-                {
-                    .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                    .pNext = force_guest_warp ? &subgroup : nullptr,
-                    .flags =
-                        require_full_subgroups
-                            ? VkPipelineShaderStageCreateFlags{VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT}
-                            : 0U,
-                    .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-                    .module = module,
-                    .pName = "main",
-                },
-            .layout = layout,
-            .basePipelineIndex = -1,
-        },
-        cache);
+    const bool require_full_subgroups = record && record->layout.requires_guest_warp &&
+                                        device.CanSetFullComputeSubgroups(record->workgroup_size);
+    return {
+        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage =
+            {
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                .pNext = force_guest_warp ? &subgroup : nullptr,
+                .flags = require_full_subgroups
+                             ? VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT
+                             : VkPipelineShaderStageCreateFlags{},
+                .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                .module = module,
+                .pName = "main",
+            },
+        .layout = layout,
+        .basePipelineIndex = -1,
+    };
+}
+
+vk::Pipeline CreateCompute(const Device& device, VkPipelineLayout layout, VkShaderModule module,
+                           VkPipelineCache cache, const Disk::ShaderRecord* record = nullptr) {
+    return device.GetLogical().CreateComputePipeline(ComputeInfo(device, layout, module, record),
+                                                     cache);
 }
 
 } // namespace
@@ -533,7 +656,9 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::AssembleGraphics(
     const GraphicsFixedState& state, const RenderPassKey& targets,
     const std::array<const StageArtifact*, GRAPHICS_STAGE_COUNT>& stages,
     const std::shared_ptr<ShaderSet>& gpl_set, bool warm_parts,
-    const EmulatedMeshArtifact* emulated_mesh) {
+    const EmulatedMeshArtifact* emulated_mesh, bool allow_capacity) {
+    const DriverCacheUse cache_use{*this};
+    bool padded_bindings = false;
     try {
         auto pipeline = std::make_shared<GraphicsPipeline>();
         pipeline->render_pass = GetRenderPass(targets);
@@ -556,7 +681,9 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::AssembleGraphics(
         }
         pipeline->descriptors = MergeLayouts(ordered);
         const std::shared_ptr<const SharedPipelineLayout> layout =
-            CreateLayoutObjects(pipeline->descriptors, false, push_stages, emulated_mesh);
+            CreateLayoutObjects(pipeline->descriptors, false, push_stages, emulated_mesh,
+                                allow_capacity);
+        padded_bindings = layout->padded_bindings;
         std::optional<VkPrimitiveTopology> emulated_topology;
         if (emulated_mesh) {
             auto& emulation = pipeline->mesh_emulation.emplace();
@@ -579,7 +706,7 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::AssembleGraphics(
             }
         }
         if (gpl_set) {
-            CreateShaderSetObjects(*gpl_set, pipeline->descriptors, push_stages);
+            CreateShaderSetModules(*gpl_set);
         }
 
         u32 flags = 0;
@@ -600,7 +727,7 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::AssembleGraphics(
                     auto& mesh_stage = record.stage == STAGE_TASK ? emulation.task_pipeline
                                                                   : emulation.mesh_pipeline;
                     mesh_stage =
-                        CreateCompute(device, *layout->layout, *module, *vk_cache, &record);
+                        CreateCompute(device, *layout->handles->layout, *module, *vk_cache, &record);
                 }
                 continue;
             }
@@ -609,7 +736,7 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::AssembleGraphics(
             VkShaderModule module = VK_NULL_HANDLE;
             if (gpl_set) {
                 // The set's modules: their handles are part of the library keys.
-                module = *gpl_set->modules[record.stage];
+                module = *gpl_set->modules[record.stage]->handle;
             } else {
                 modules.push_back(CreateModule(device, record.spirv));
                 module = *modules.back();
@@ -634,8 +761,7 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::AssembleGraphics(
             });
         }
         u32 viewport_count = 1;
-        if (!emulated_mesh && (flags & Disk::SHADER_STORES_VIEWPORT_INDEX) != 0 &&
-            device.SupportsMultiViewport()) {
+        if (!emulated_mesh && (flags & Disk::SHADER_STORES_VIEWPORT_INDEX) != 0 && device.SupportsMultiViewport()) {
             viewport_count = std::min<u32>(MAX_VIEWPORTS, device.GetMaxViewports());
         }
         const StageArtifact* const vertex = stages[STAGE_VERTEX];
@@ -686,9 +812,7 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::AssembleGraphics(
                 .state = &state,
                 .targets = &targets,
                 .render_pass = pipeline->render_pass,
-                // The shader parts are compiled with the set's layout (an identically defined
-                // one: the pipeline's own layout is compatible with it).
-                .layout = gpl_set ? *gpl_set->layout->layout : *layout->layout,
+                .layout = *layout->handles->layout,
                 .stages = stage_infos,
                 .viewport_count = viewport_count,
                 .attributes_read = pipeline->attributes_read,
@@ -705,46 +829,51 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::AssembleGraphics(
         for (const std::string& issue : issues) {
             NoteIssue(issue);
         }
-        if (gpl_set && warm_parts) {
-            // Preload: compile the parts (on this background thread) and keep them in the
-            // library cache; the linked pipeline is not used.
-            pipeline->pipeline = library_cache->Link(description.ci, *vk_cache, gpl_set, false);
-            return pipeline->pipeline ? pipeline : nullptr;
-        }
         if (gpl_set) {
+            const GraphicsPipelineLibraryCache::ShaderObjects shader_objects{gpl_set,
+                                                                             layout->handles};
+            if (warm_parts) {
+                // Only the library parts produced by this link are kept.
+                pipeline->pipeline =
+                    library_cache->Link(description.ci, *vk_cache, shader_objects, false);
+                return pipeline->pipeline ? pipeline : nullptr;
+            }
             try {
-                pipeline->pipeline = library_cache->Link(description.ci, *vk_cache, gpl_set, true);
+                pipeline->pipeline =
+                    library_cache->Link(description.ci, *vk_cache, shader_objects, true);
                 if (pipeline->pipeline) {
                     ++stat_gpl_cached_links;
                 } else {
-                    pipeline->pipeline = library_cache->Link(description.ci, *vk_cache, gpl_set,
-                                                             false, part_workers.get());
+                    pipeline->pipeline = library_cache->Link(
+                        description.ci, *vk_cache, shader_objects, false, part_workers.get());
                 }
             } catch (const vk::Exception& e) {
+                if (padded_bindings) {
+                    return AssembleGraphics(state, targets, stages, gpl_set, warm_parts,
+                                            emulated_mesh, false);
+                }
                 // A part or the link failed: compiled whole below.
                 NoteIssue(fmt::format("pipeline: library link failed, compiling whole: {}",
                                       FirstLine(e.what())));
                 pipeline->pipeline = vk::Pipeline{};
             }
-            pipeline->fast_linked = static_cast<bool>(pipeline->pipeline);
-            if (pipeline->fast_linked) {
+            if (pipeline->pipeline) {
+                pipeline->AdoptFastLink();
                 ++stat_gpl_fast_links;
             } else {
                 // Something the parts cannot express (no fragment program, static rasterizer
                 // discard): compiled whole, nothing to optimize later.
                 ++stat_gpl_whole;
-                description.ci.layout = *layout->layout;
             }
         }
-        if (!pipeline->pipeline) {
+        if (!pipeline->fast_linked) {
             pipeline->pipeline =
                 device.GetLogical().CreateGraphicsPipeline(description.ci, *vk_cache);
         }
         pipeline->shared_layout = layout;
-        pipeline->layout = *layout->layout;
-        pipeline->set_layout = layout->set_layout ? *layout->set_layout : VK_NULL_HANDLE;
-        pipeline->bindless_layout =
-            layout->bindless_layout ? *layout->bindless_layout : VK_NULL_HANDLE;
+        pipeline->layout = *layout->handles->layout;
+        pipeline->set_layout = *layout->handles->set_layout;
+        pipeline->bindless_layout = *layout->handles->bindless_layout;
         pipeline->update_template =
             layout->update_template ? *layout->update_template : VK_NULL_HANDLE;
         pipeline->push_descriptors = layout->push_descriptors;
@@ -754,6 +883,10 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::AssembleGraphics(
         FillStages(*pipeline, ordered);
         return pipeline;
     } catch (const vk::Exception& e) {
+        if (padded_bindings) {
+            return AssembleGraphics(state, targets, stages, gpl_set, warm_parts, emulated_mesh,
+                                    false);
+        }
         ++stat_failures;
         NoteIssue(fmt::format("pipeline: Vulkan error creating a graphics pipeline: {}",
                               FirstLine(e.what())));
@@ -766,7 +899,7 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::AssembleGraphics(
 }
 
 std::shared_ptr<ComputePipeline> PipelineCache::Impl::AssembleCompute(
-    const StageArtifact& stage, const VC::ComputeDriverLayout& compute_layout) {
+    const StageArtifact& stage, const VC::ComputeDriverLayout& compute_layout, bool save_binary) {
     try {
         auto pipeline = std::make_shared<ComputePipeline>();
         const std::array<const StageArtifact*, 1> single{&stage};
@@ -774,48 +907,26 @@ std::shared_ptr<ComputePipeline> PipelineCache::Impl::AssembleCompute(
         const std::shared_ptr<const SharedPipelineLayout> layout =
             CreateLayoutObjects(pipeline->descriptors, true, VK_SHADER_STAGE_COMPUTE_BIT);
         const Disk::ShaderRecord& record = *stage.record;
-        vk::ShaderModule shader_module = device.GetLogical().CreateShaderModule({
-            .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-            .pNext = nullptr,
-            .flags = 0,
-            .codeSize = record.spirv.size() * sizeof(u32),
-            .pCode = record.spirv.data(),
-        });
-        // As vk_compute_pipeline.cpp: only programs that need whole warps ask for 32 threads per
-        // subgroup (forcing it elsewhere makes Intel compile SIMD32).
-        const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
-            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
-            .pNext = nullptr,
-            .requiredSubgroupSize = GuestWarpSize,
-        };
-        const bool guest_warp = record.layout.requires_guest_warp &&
-                                device.IsExtSubgroupSizeControlSupported() &&
-                                device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT);
-        pipeline->pipeline = device.GetLogical().CreateComputePipeline(
-            {
-                .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-                .pNext = nullptr,
-                .flags = 0,
-                .stage =
-                    {
-                        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                        .pNext = guest_warp ? &subgroup_size_ci : nullptr,
-                        .flags = 0,
-                        .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-                        .module = *shader_module,
-                        .pName = "main",
-                        .pSpecializationInfo = nullptr,
-                    },
-                .layout = *layout->layout,
-                .basePipelineHandle = VK_NULL_HANDLE,
-                .basePipelineIndex = 0,
-            },
-            *vk_cache);
+        const auto shader_module = CreateModule(device, record.spirv);
+        const auto info = ComputeInfo(device, *layout->handles->layout, *shader_module, &record);
+        const bool report = Debug::Get().cache_log;
+        const auto start = report ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
+        pipeline->pipeline = CreateComputeBinary(info, record.program_hash, save_binary);
+        if (!pipeline->pipeline) {
+            const DriverCacheUse cache_use{*this};
+            pipeline->pipeline = device.GetLogical().CreateComputePipeline(info, *vk_cache);
+        }
+        if (report) {
+            const auto ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start);
+            LOG_INFO(Render_Vulkan, "[nvn] compute pipeline assembly {:016x}: {:.3f} ms",
+                     record.program_hash, ms.count());
+        }
         pipeline->shared_layout = layout;
-        pipeline->layout = *layout->layout;
-        pipeline->set_layout = layout->set_layout ? *layout->set_layout : VK_NULL_HANDLE;
-        pipeline->bindless_layout =
-            layout->bindless_layout ? *layout->bindless_layout : VK_NULL_HANDLE;
+        pipeline->layout = *layout->handles->layout;
+        pipeline->set_layout = *layout->handles->set_layout;
+        pipeline->bindless_layout = *layout->handles->bindless_layout;
         pipeline->update_template =
             layout->update_template ? *layout->update_template : VK_NULL_HANDLE;
         pipeline->push_descriptors = layout->push_descriptors;

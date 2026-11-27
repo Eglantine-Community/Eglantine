@@ -17,6 +17,7 @@
 
 #include <fmt/format.h>
 
+#include "common/frame_stats.h"
 #include "common/logging.h"
 #include "video_core/renderer_vulkan/nvn/nvn_debug.h"
 #include "video_core/renderer_vulkan/nvn/nvn_gpu_profile.h"
@@ -72,6 +73,11 @@ Config Read() {
     config.face = static_cast<u32>(EnvNumber("EDEN_NX2_NVN_FACE", 0));
     config.equal_lequal = EnvFlag("EDEN_NX2_NVN_RELAX_DEPTH_EQUAL");
     config.cache_log = EnvFlag("EDEN_NX2_NVN_CACHE_LOG");
+    config.pipeline_trace = EnvFlag("EDEN_NX2_NVN_PIPELINE_TRACE");
+    config.gpl_layout_capacity = EnvFlag("EDEN_NX2_NVN_GPL_LAYOUT_CAPACITY");
+    config.quiet_driver_cache = EnvFlag("EDEN_NX2_NVN_QUIET_DRIVER_CACHE", true);
+    config.compute_binaries = EnvFlag("EDEN_NX2_NVN_COMPUTE_BINARIES");
+    config.graphics_binaries = EnvFlag("EDEN_NX2_NVN_GRAPHICS_BINARIES");
     config.async_workers = static_cast<u32>(EnvNumber("EDEN_NX2_NVN_ASYNC_WORKERS", 0));
     config.upload_log = EnvFlag("EDEN_NX2_NVN_UPLOADLOG");
     config.storage_census = EnvFlag("EDEN_NX2_NVN_STORAGE_CENSUS");
@@ -127,6 +133,7 @@ Config Read() {
     }
     config.shadow_max_bytes = EnvNumber("EDEN_NX2_NVN_SHADOW_MAX_KIB", 1024) << 10;
     config.shadow_log = EnvFlag("EDEN_NX2_NVN_SHADOW_LOG");
+    config.shadow_bounds = EnvFlag("EDEN_NX2_TRY_SHADOW_BOUNDS");
     config.pool_mirror = static_cast<u32>((std::min<u64>)(EnvNumber("EDEN_NX2_NVN_POOL_MIRROR", 0), 2));
     config.pool_mirror_max_bytes = EnvNumber("EDEN_NX2_NVN_POOL_MIRROR_MAX_MIB", 4096) << 20;
     config.storage_budget_bytes = EnvNumber("EDEN_NX2_NVN_STORAGE_BUDGET_MIB", 0) << 20;
@@ -177,6 +184,9 @@ Config Read() {
     if (const char* mode = std::getenv("EDEN_NX2_NVN_DEPTH_MODE"); mode != nullptr && *mode != '\0') {
         config.depth_mode = std::atoi(mode) != 0 ? 1 : 0;
     }
+    config.auto_early_submit = std::getenv("EDEN_NX2_NVN_EARLY_SUBMIT_US") == nullptr &&
+                               std::getenv("EDEN_NX2_NVN_EARLY_FIRST_US") == nullptr &&
+                               std::getenv("EDEN_NX2_NVN_EARLY_PASS_US") == nullptr;
     config.early_interval_us = static_cast<u32>(EnvNumber("EDEN_NX2_NVN_EARLY_SUBMIT_US", 1500));
     config.early_first_us = static_cast<u32>(EnvNumber("EDEN_NX2_NVN_EARLY_FIRST_US", 300));
     config.early_pass_us = static_cast<u32>(EnvNumber("EDEN_NX2_NVN_EARLY_PASS_US", 4000));
@@ -414,6 +424,32 @@ void Reload() {
     g_timeline = EnvFlag("EDEN_NX2_NVN_TIMELINE");
 }
 
+PipelineTrace BeginPipelineTrace(u64 key, const char* source) noexcept {
+    static std::atomic<u64> next_job{1};
+    return {key, next_job.fetch_add(1, std::memory_order_relaxed), source};
+}
+
+void PipelineTrace::Event(const char* event, const char* detail,
+                          std::chrono::steady_clock::time_point when,
+                          u64 result_job) const noexcept {
+    if (job == 0) {
+        return;
+    }
+    if (when == std::chrono::steady_clock::time_point{}) {
+        when = std::chrono::steady_clock::now();
+    }
+    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(when.time_since_epoch());
+    try {
+        LOG_INFO(Render_Vulkan,
+                 "[nvn] pipeline_trace t_us={} guest_present={} key={:016x} job={} event={} "
+                 "source={} detail={} result_job={}",
+                 us.count(), Common::FrameStats::PresentCount(), key, job, event, source, detail,
+                 result_job);
+    } catch (...) {
+        // A diagnostic must not change the result of a pipeline request.
+    }
+}
+
 void TimelineEvent(const char* event, u64 seq, std::string_view detail) {
     const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                         std::chrono::steady_clock::now().time_since_epoch())
@@ -436,6 +472,35 @@ bool FrameSelected(u64 present_index) {
     return std::ranges::any_of(config.dump_frames, [&](u64 frame) {
         return present_index >= frame && present_index < frame + count;
     });
+}
+
+bool Survey::Limits::Valid() const {
+    constexpr u32 NORMALIZED = 1000;
+    constexpr u32 MAX_AREA = 100'000; // one tenth of the target
+    return left < right && top < bottom && right <= NORMALIZED && bottom <= NORMALIZED &&
+           (right - left) * (bottom - top) <= MAX_AREA && min_width != 0 && min_height != 0 &&
+           first_pass != 0 && max_passes != 0 && max_passes <= 128 &&
+           max_bytes != 0 && max_bytes <= (u64{64} << 20);
+}
+
+VkRect2D Survey::Limits::Crop(u32 width, u32 height) const {
+    const auto position = [](u32 value, u32 extent, u32 rounding) {
+        return static_cast<u32>((u64{value} * extent + rounding) / 1000);
+    };
+    const u32 x = position(left, width, 0);
+    const u32 y = position(top, height, 0);
+    return {{static_cast<s32>(x), static_cast<s32>(y)},
+            {position(right, width, 999) - x, position(bottom, height, 999) - y}};
+}
+
+bool Survey::Take(u64 size) {
+    if (size > limits.max_bytes - bytes) {
+        limited = true;
+        return false;
+    }
+    bytes += size;
+    ++attachments;
+    return true;
 }
 
 std::atomic<u32> g_request_phase{0};
@@ -471,34 +536,57 @@ void RequestDump(u32 pass, u32 draw, std::filesystem::path directory) {
     g_request_phase.compare_exchange_strong(idle, 1u, std::memory_order_relaxed);
 }
 
+void RequestSurvey(Survey::Limits limits, std::filesystem::path directory) {
+    Requests& requests = GetRequests();
+    std::scoped_lock lock{requests.mutex};
+    requests.pending = {.directory = std::move(directory), .survey = Survey{limits}};
+    requests.armed = true;
+    u32 idle = 0;
+    g_request_phase.compare_exchange_strong(idle, 1u, std::memory_order_relaxed);
+}
+
 bool OnPresent(u64 present_index) {
     if (g_request_phase.load(std::memory_order_relaxed) == 0) {
         return false;
     }
     Requests& requests = GetRequests();
     std::scoped_lock lock{requests.mutex};
+    const bool done = requests.active.frame != 0 && present_index >= requests.active.frame;
+    if (done && requests.active.survey) {
+        const Survey& survey = *requests.active.survey;
+        const auto summary = fmt::format("frame={} passes_seen={} passes_captured={} "
+                                         "attachments={} readback_bytes={} limited={}",
+                                         requests.active.frame, survey.passes_seen,
+                                         survey.passes_captured, survey.attachments, survey.bytes,
+                                         survey.limited);
+        AppendLine(requests.active.directory / "nvn-survey-summary.txt", summary);
+        LOG_INFO(Render_Vulkan, "[diag] nvn-survey: {}", summary);
+    }
     if (requests.armed) {
         requests.active = std::move(requests.pending);
         requests.pending = {};
         requests.armed = false;
         requests.active.frame = present_index + 1;
+        if (requests.active.survey) {
+            AppendLine(requests.active.directory / "nvn-survey.tsv",
+                       "frame\tpass\tqueue\tqueue_pass\tseq\tfirst_draw\tlast_draw\tslot\t"
+                       "texture\tfmt\taspect\tmip\tlayer\twidth\theight\tx\ty\t"
+                       "crop_width\tcrop_height\tbytes\tfile");
+            LOG_INFO(Render_Vulkan, "[diag] nvn-survey: frame {}", requests.active.frame);
+        }
         g_request_phase.store(2, std::memory_order_relaxed);
-        return false;
-    }
-    if (g_request_phase.load(std::memory_order_relaxed) == 2 &&
-        present_index >= requests.active.frame) {
+    } else if (done) {
         requests.active = {};
         g_request_phase.store(0, std::memory_order_relaxed);
-        return true;
     }
-    return false;
+    return done;
 }
 
-const RequestState* RequestFor(u64 frame) {
+RequestState* RequestFor(u64 frame) {
     if (g_request_phase.load(std::memory_order_relaxed) != 2) {
         return nullptr;
     }
-    const Requests& requests = GetRequests();
+    Requests& requests = GetRequests();
     return requests.active.frame == frame ? &requests.active : nullptr;
 }
 

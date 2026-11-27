@@ -135,6 +135,55 @@ TEST_CASE("ShaderPrecache: a compute entry reads back like a pipeline cache entr
     REQUIRE(env.IsCbufStorageBufferPointer(1, 0x10) == guess.storage_pointer_other);
 }
 
+TEST_CASE("ShaderPrecache: tensor mode is part of the serialized compute pipeline identity",
+          "[video_core][tensor]") {
+    using namespace Shader::Ampere;
+    constexpr std::array modes{TensorMode::Full, TensorMode::Compact, TensorMode::Stub};
+    constexpr std::array<u64, 10> header{};
+    constexpr std::array native{
+        Instruction{{0x102c723c, 0x30, 0x8ff, 0x04aff000}}, // HMMA.16816.F16
+        Instruction{{0x0000794d, 0, 0x03800000, 0}},        // EXIT
+    };
+    const ShaderWarm::ComputeControl control{{32, 1, 1}, 0, 0};
+    TempDir dir;
+    std::array<u64, modes.size()> hashes{};
+    for (size_t i = 0; i < modes.size(); ++i) {
+        const auto code = PackNativeAmpereCode(header, native, {.tensor_mode = modes[i]}, false);
+        ShaderWarm::LoweredCode lowered;
+        lowered.code.resize(code.size() * sizeof(u64));
+        std::memcpy(lowered.code.data(), code.data(), lowered.code.size());
+        ShaderWarm::ComputeKey expected_key{};
+        const auto entry = ShaderWarm::ComputeEntry(lowered, control, expected_key);
+        const auto file = dir.path / std::to_string(i);
+        WriteBytes(file, {reinterpret_cast<const char*>(entry.data()), entry.size()});
+
+        std::ifstream in(file, std::ios::binary);
+        in.exceptions(std::ifstream::failbit);
+        u32 env_count{};
+        in.read(reinterpret_cast<char*>(&env_count), sizeof(env_count));
+        REQUIRE(env_count == 1);
+        VideoCommon::FileEnvironment replay;
+        replay.Deserialize(in);
+        const auto loaded = replay.NativeAmpereProgram();
+        REQUIRE(loaded);
+        CHECK(loaded->options.tensor_mode == modes[i]);
+        CHECK(ResolveTensorMode(loaded->options) == modes[i]);
+        CHECK(NativeProgramKey(loaded->code) == NativeProgramKey(native));
+        Vulkan::ComputePipelineCacheKey key;
+        in.read(reinterpret_cast<char*>(&key), sizeof(key));
+        CHECK(key.unique_hash == VideoCommon::NativeShaderHash(code));
+        CHECK(key.workgroup_size == control.workgroup);
+        hashes[i] = key.unique_hash;
+    }
+    CHECK(hashes[0] != hashes[1]);
+    CHECK(hashes[0] != hashes[2]);
+    CHECK(hashes[1] != hashes[2]);
+    CHECK(ParseTensorMode("0") == TensorMode::Full);
+    CHECK(ParseTensorMode("fast") == TensorMode::Full);
+    CHECK(ParseTensorMode("compact") == TensorMode::Compact);
+    CHECK(ParseTensorMode("stub") == TensorMode::Stub);
+}
+
 TEST_CASE("ShaderPrecache: a program naming no texture bank reads bank 0", "[video_core]") {
     ShaderWarm::LoweredCode lowered;
     lowered.code.resize(16 * sizeof(u64));

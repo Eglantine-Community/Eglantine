@@ -7,6 +7,7 @@
 
 #include "common/common_types.h"
 #include "video_core/host_shaders/nvn_alias_transfer_comp_spv.h"
+#include "video_core/host_shaders/nvn_alias_transfer_words_comp_spv.h"
 #include "video_core/renderer_vulkan/nvn/nvn_alias_gpu.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 
@@ -33,16 +34,29 @@ static_assert(sizeof(PushConstants) == 48);
 constexpr u32 GROUP_X = 16;
 constexpr u32 GROUP_Y = 8;
 
-} // Anonymous namespace
-
-bool AliasTransferGpu::Supported(const Device& device) {
-    return device.IsKhrPushDescriptorSupported() && device.MaxPushDescriptors() >= 2 &&
-           device.IsStorageBuffer8BitAccessSupported();
+std::array<VkWriteDescriptorSet, 2> ScratchWrites(VkDescriptorSet set,
+                                                  const VkDescriptorBufferInfo& buffer) {
+    std::array<VkWriteDescriptorSet, 2> writes{};
+    for (u32 binding = 0; binding < writes.size(); ++binding) {
+        writes[binding] = {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = set,
+            .dstBinding = binding,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pBufferInfo = &buffer,
+        };
+    }
+    return writes;
 }
 
-AliasTransferGpu::AliasTransferGpu(const Device& device_) : device{device_} {
+} // Anonymous namespace
+
+AliasTransferGpu::AliasTransferGpu(const Device& device_)
+    : device{device_},
+      push_descriptors{device.IsKhrPushDescriptorSupported() && device.MaxPushDescriptors() >= 2} {
     // The shader addresses the scratch buffer with 32-bit offsets.
-    max_scratch = (std::min<u64>)(device.GetMaxStorageBufferRange(), u64{1} << 30);
+    max_scratch = (std::min<u64>)(device.GetMaxStorageBufferRange(), u64{1} << 30) & ~u64{3};
     const vk::Device& logical = device.GetLogical();
     const std::array<VkDescriptorSetLayoutBinding, 2> bindings{{
         {
@@ -63,7 +77,9 @@ AliasTransferGpu::AliasTransferGpu(const Device& device_) : device{device_} {
     set_layout = logical.CreateDescriptorSetLayout({
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
         .pNext = nullptr,
-        .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
+        .flags = push_descriptors
+                     ? VkDescriptorSetLayoutCreateFlags{VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR}
+                     : 0u,
         .bindingCount = static_cast<u32>(bindings.size()),
         .pBindings = bindings.data(),
     });
@@ -81,7 +97,10 @@ AliasTransferGpu::AliasTransferGpu(const Device& device_) : device{device_} {
         .pushConstantRangeCount = 1,
         .pPushConstantRanges = &push_range,
     });
-    const std::span<const u32> code = NVN_ALIAS_TRANSFER_COMP_SPV;
+    const std::span<const u32> code =
+        device.IsStorageBuffer8BitAccessSupported()
+            ? std::span<const u32>{NVN_ALIAS_TRANSFER_COMP_SPV}
+            : std::span<const u32>{NVN_ALIAS_TRANSFER_WORDS_COMP_SPV};
     module = logical.CreateShaderModule({
         .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
         .pNext = nullptr,
@@ -114,40 +133,21 @@ AliasTransferGpu::AliasTransferGpu(const Device& device_) : device{device_} {
 
 AliasTransferGpu::~AliasTransferGpu() = default;
 
-void AliasTransferGpu::Begin(vk::CommandBuffer cmd, VkBuffer scratch, u64 size) const {
-    const u64 aligned_size = (size + 3) & ~u64{3};
-    const VkDescriptorBufferInfo buffer_info{
-        .buffer = scratch,
-        .offset = 0,
-        .range = (std::min)(aligned_size, max_scratch),
-    };
-    const std::array<VkWriteDescriptorSet, 2> writes{{
-        {
-            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .pNext = nullptr,
-            .dstSet = VK_NULL_HANDLE,
-            .dstBinding = 0,
-            .dstArrayElement = 0,
-            .descriptorCount = 1,
-            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            .pImageInfo = nullptr,
-            .pBufferInfo = &buffer_info,
-            .pTexelBufferView = nullptr,
-        },
-        {
-            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .pNext = nullptr,
-            .dstSet = VK_NULL_HANDLE,
-            .dstBinding = 1,
-            .dstArrayElement = 0,
-            .descriptorCount = 1,
-            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            .pImageInfo = nullptr,
-            .pBufferInfo = &buffer_info,
-            .pTexelBufferView = nullptr,
-        },
-    }};
+void AliasTransferGpu::UpdateScratchSet(VkDescriptorSet set, VkBuffer scratch, u64 size) const {
+    const VkDescriptorBufferInfo buffer{scratch, 0, (size + 3) & ~u64{3}};
+    const auto writes = ScratchWrites(set, buffer);
+    device.GetLogical().UpdateDescriptorSets(writes, {});
+}
+
+void AliasTransferGpu::Begin(vk::CommandBuffer cmd, VkBuffer scratch, u64 size,
+                             VkDescriptorSet set) const {
     cmd.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
+    if (set != VK_NULL_HANDLE) {
+        cmd.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline_layout, 0, set, {});
+        return;
+    }
+    const VkDescriptorBufferInfo buffer{scratch, 0, (size + 3) & ~u64{3}};
+    const auto writes = ScratchWrites(VK_NULL_HANDLE, buffer);
     cmd.PushDescriptorSetKHR(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline_layout, 0, writes);
 }
 

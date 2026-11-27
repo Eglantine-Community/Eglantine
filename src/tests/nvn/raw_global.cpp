@@ -139,6 +139,7 @@ std::unique_ptr<Translated> Translate(std::span<const u64> program, bool raw_glo
 std::vector<u32> Emit(Translated& translated, bool profile_raw_global_memory) {
     Shader::Profile profile = MakeReferenceProfile();
     profile.support_descriptor_aliasing = true;
+    profile.support_uniform_buffer_standard_layout = true;
     profile.support_raw_global_memory = profile_raw_global_memory;
     Shader::RuntimeInfo runtime_info;
     runtime_info.previous_stage_stores.mask.set();

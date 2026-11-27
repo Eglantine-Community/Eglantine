@@ -113,6 +113,7 @@ public:
     struct WindowState {
         u32 acquired_mask{};
         u32 count{};
+        u32 active_count{};
         u64 presents{};
         u64 native_window{};
         u32 color_space{};
@@ -123,6 +124,7 @@ public:
         /// Display pacing (host steady-clock nanoseconds): when the last presented frame is shown,
         /// and per slot when its texture becomes free (0 = at once, ~0 = still on display).
         u64 last_display_ns{};
+        u64 displayed_release_ns{};
         s32 displayed_slot{-1};
         u64 avail_ns[4]{};
     };

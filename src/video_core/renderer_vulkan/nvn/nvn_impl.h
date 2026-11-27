@@ -52,6 +52,7 @@
 #include "video_core/renderer_vulkan/nvn/nvn_frame_gen.h"
 #include "video_core/renderer_vulkan/nvn/nvn_host_import.h"
 #include "video_core/renderer_vulkan/nvn/nvn_pool_mirror.h"
+#include "video_core/renderer_vulkan/nvn/nvn_pass_state.h"
 #include "video_core/renderer_vulkan/nvn/nvn_screenshot.h"
 #include "video_core/renderer_vulkan/nvn/nvn_rescale.h"
 #include "video_core/renderer_vulkan/nvn/nvn_texture_layout.h"
@@ -138,6 +139,13 @@ struct Pool {
     /// first).
     std::shared_ptr<ImportedChunk> chunk;
     ImportedBuffer imported;
+    struct SparseMirror {
+        VkMemoryRequirements requirements{};
+        std::vector<u8> bound;
+        std::vector<MemoryCommit> allocations;
+    };
+    /// Kept before the buffer so the Vulkan handle is destroyed before its bound memory.
+    std::unique_ptr<SparseMirror> sparse_mirror;
     vk::Buffer buffer;
     /// Contiguous host view of the guest storage (Imported and Mirror pools), null otherwise.
     u8* host{};
@@ -169,7 +177,7 @@ struct Pool {
         /// nothing wrote it since that the tracker does not see: unchanged unless the tracker
         /// reports a write, so it is not hashed again (Recorder::MirrorTakeCpuWrites).
         bool trusted{};
-        u64 raw_epoch{}; ///< MKW: raw completion epoch of this page's last comparison
+        u64 raw_epoch{}; ///< Raw write epoch of this page's last comparison
     };
     static constexpr u64 MIRROR_PAGE = 4096;
     std::vector<MirrorPage> mirror_pages;
@@ -250,7 +258,8 @@ struct Pool {
     bool mirror_track_tried{false};
     std::vector<u64> mirror_armed_bits;
     bool raw_written_through{false};
-    u64 split_raw_epoch_unaliased_seen{0};
+    /// Split mirror comparisons before this epoch cannot establish current contents.
+    u64 split_mirror_epoch{};
     std::shared_ptr<const std::atomic<u64>> mirror_write_epoch;
     u64 mirror_epoch_clean{}; ///< `mirror_write_epoch` before the last TakeWritten
     /// Per MIRROR_PAGE of the pool: `cpu_write_gen` of the last Impl::TakePoolCpuWrites that found
@@ -315,19 +324,6 @@ enum class StorageOrigin : u8 {
 /// uploads or refreshes the contents from guest memory, and copies in what overlapping textures
 /// wrote. Call `NoteGpuWrite` when the GPU writes the storage (`PrepareImages` does it for the
 /// layouts that write).
-/// Presents to wait before looking at an unchanged CPU-sourced storage again. The look is cheap (a
-/// 16 KiB signature): every present for the first uses (a video frame the CPU writes changes every
-/// frame or two), then less and less often up to every 30 presents (about half a second). The
-/// full hash of the bytes is compared every FULL_VERIFY_PRESENTS and when the game flushed the
-/// pool.
-inline constexpr u64 FULL_VERIFY_PRESENTS = 90;
-/// Bytes of scheduled full compares (not the every-check ones, see DetectGuestChange) one present
-/// may start; the rest wait for a later check.
-inline constexpr u64 FULL_HASH_BYTES_PER_PRESENT = u64{4} << 20;
-inline u64 CheckBackoff(u32 unchanged_checks) {
-    return unchanged_checks < 8 ? 0 : (std::min)(u64{1} << (unchanged_checks - 8), u64{30});
-}
-
 /// Image bytes the storage cache may hold before TrimStorageCache drops storages nobody uses
 /// (ContextOptions::storage_cache_budget_bytes overrides it). DK's pools hold about 2 GB of
 /// textures; 6 GB leaves room for decoded stand-ins.
@@ -374,6 +370,7 @@ struct Storage : std::enable_shared_from_this<Storage> {
     u32 bindless_tracked_count{0}; ///< BindlessState entries referencing this storage
     u32 bindless_active_count{0};  ///< BindlessState entries with active image views of this storage
     bool bindless_layout_queued{false};
+    bool bindless_sparse_queued{false};
 
     // Creation parameters (the image is created on first use).
     VkImageCreateFlags create_flags{};
@@ -396,41 +393,32 @@ struct Storage : std::enable_shared_from_this<Storage> {
     u64 sync_gen{0};
     /// DrawContext::render_target_epoch of the last feedback copy of this storage.
     u64 feedback_epoch{0};
+    /// Allocated only for multi-mip feedback sources.
+    std::unique_ptr<FeedbackMipVersions> feedback_mip_versions;
     /// Seq of the last submission that recorded a use of this storage (Recorder::NoteTouched).
     u64 touched_seq{~u64{0}};
     /// PoolIndex::write_gen seen at the last overlap resolution.
     u64 pool_gen_seen{~u64{0}};
-    /// CPU origin: hash of the guest bytes behind the contents, the check schedule. A check
-    /// compares a cheap signature of ~16 KiB spread over the storage (any change that touches a
-    /// sampled line shows at once, which is what a decoded video frame does); the full hash is
-    /// compared every `next_full_tick` and when the game flushed the pool.
+    /// Full hash of guest bytes at the last upload or when the GPU wrote the image.
     u64 guest_hash{0};
-    u64 sample_hash{0};
-    /// SampleGuestBytes of the guest bytes under the storage when the GPU took it over (the first
-    /// GPU write after an upload or creation); valid only for CPU-readable pools. The GPU never
-    /// writes guest memory here, so a different signature later means the CPU rewrote the bytes
-    /// after that write and this storage's pixels are older than them (Recorder::ResolveOverlaps;
-    /// a fallback for pools without CPU write tracking, see `gpu_takeover_armed`).
-    u64 gpu_guest_sig{0};
-    bool gpu_guest_sig_valid{false};
+    /// Full hash of the CPU-readable backing at GPU takeover or linear writeback completion.
+    /// Detects backing changes outside the CPU page tracker's coverage during overlap resolution.
+    std::optional<u64> gpu_guest_hash;
     /// The storage's pages were armed in its pool's `takeover_track` when the GPU took it over:
     /// GuestMemory::AnyWritten over them tells whether the CPU wrote them since (any bytes, also
-    /// the same ones again, which the signature cannot see).
+    /// the same ones again, which the hash cannot see).
     bool gpu_takeover_armed{false};
-    u32 unchanged_checks{0};
-    u64 next_check_tick{0};
-    u64 next_full_tick{0};
     u64 checked_seq{~u64{0}};
     bool force_check{false};
-    /// GPU origin: `sample_hash` is the guest signature taken at the first check after the last
-    /// GPU write (the baseline a CPU rewrite is compared with).
+    /// GPU origin: guest_hash describes the stale guest bytes, not the GPU image. It is
+    /// refreshed when GPU work writes back to guest memory.
     bool watch_valid{false};
     /// GPU origin on a linear storage in a CPU-readable pool: `seq` of the last submission that
     /// queued a write-back of the GPU's linear texels to guest memory (0: none, or settled).
     u64 linear_writeback_seq{0};
-    /// The CPU changed the bytes behind this storage at least once (checked in full from then on).
+    /// The CPU changed the bytes behind this storage at least once.
     bool dynamic{false};
-    /// CPU origin: the pool's `cpu_write_gen` when a full hash last found the guest bytes unchanged
+    /// The pool's `cpu_write_gen` when a full hash last found the guest bytes unchanged
     /// while the page tracker watched the pool (0: never). While no page under the storage has a
     /// later `page_write_gen`, the CPU did not write it and a check needs no hash
     /// (Impl::tex_hash_tracked).
@@ -746,6 +734,7 @@ struct RawGlobalRange {
     u64 guest;
     u64 device;
     u64 size;
+    bool operator==(const RawGlobalRange&) const = default;
 };
 static_assert(sizeof(RawGlobalRange) == 24);
 
@@ -757,6 +746,17 @@ struct RawGlobalSource {
     u64 size;
     u32 priority;
 };
+
+/// A possible raw route to imported split backing, with its offset in the separate mirror.
+struct RawSplitPoolRange {
+    RawGlobalRange source;
+    u64 pool_serial;
+    u64 pool_offset;
+};
+
+[[nodiscard]] bool CoversRawSplitPoolWrites(
+    std::span<const RawGlobalRange> raw, std::span<const RawSplitPoolRange> split,
+    std::span<const RawGlobalRange> aliases, const std::unordered_map<u64, u64>& mirrors);
 
 /// The table in device memory (a sorted array of RawGlobalRange) the shaders binary-search.
 struct RawTableBuffer {
@@ -805,6 +805,7 @@ struct Context::Impl {
     std::mutex& submit_mutex;
     std::unique_ptr<PresentTarget> present_target;
     ContextOptions options;
+    std::atomic<u64> device_memory_releases{0};
     VmaAllocator vma{};
     /// What `allocator` placed outside device-local memory (`[nvn] memory:` line).
     AllocationSpills spills;
@@ -883,6 +884,7 @@ struct Context::Impl {
         std::atomic<u64> mirror_upload_runs{};           ///< ... in this many copies
         std::atomic<u64> mirror_uploads{};               ///< UploadRange calls that copied anything
         std::atomic<u64> staging_chunks_reused{};
+        std::atomic<u64> staging_chunks_allocated{};
         std::atomic<u64> mirror_pages_hashed{};          ///< guest pages compared with the mirror
         std::atomic<u64> mirror_pages_trusted{}; ///< ... not compared: the tracker saw no write
         std::atomic<u64>
@@ -956,6 +958,7 @@ struct Context::Impl {
         std::atomic<u64> barrier_merge_emitted{};            ///< barrier commands recorded for waiting requests (each stands for one or more)
         std::atomic<u64> uploads{};              ///< storage uploads from guest memory
         std::atomic<u64> astc_gpu_uploads{};     ///< ASTC storages decoded on the GPU (no CPU work)
+        std::atomic<u64> sparse_astc_bc3_tiles{};
         std::atomic<u64> astc_gpu_bytes{};       ///< ... guest bytes they read
         std::atomic<u64> astc_cpu_fallbacks{};   ///< ASTC storages with GPU decode enabled that took the CPU path
         std::atomic<u64> astc_bc_encodes{};      ///< ASTC uploads re-encoded into a BC stand-in
@@ -980,6 +983,9 @@ struct Context::Impl {
         std::atomic<u64> virtual_maps{};
         std::atomic<u64> virtual_unresolved{};
         std::atomic<u64> virtual_sparse_binds{};
+        std::atomic<u64> virtual_sparse_queued_batches{};
+        std::atomic<u64> sparse_buffer_bound_bytes{};
+        std::atomic<u64> sparse_buffer_mirrors{};
         std::atomic<u64> sparse_write_pool_checks{};
         std::atomic<u64> texels_flushed{};
         std::atomic<u64> image_transitions{}; ///< image layout transitions recorded (PrepareImagesSpan)
@@ -989,6 +995,7 @@ struct Context::Impl {
         std::atomic<u64> submissions{};
         std::atomic<u64> presents{};
         std::atomic<u64> early_submits{}; ///< Command buffers submitted before their submission was recorded.
+        std::atomic<u64> pipeline_wait_submits{};
         std::atomic<u64> held_back_submissions{}; ///< Submissions that waited for a sync nobody had fenced yet.
         std::atomic<u64> parked_timeouts{};
         std::atomic<u64> event_signals{};       ///< SignalEvent records replayed.
@@ -1023,8 +1030,6 @@ struct Context::Impl {
     /// Newest submission whose GPU commands and mirror readbacks have finished (published right
     /// before `completion_callback`, whereas `completed_seq` is published right after it).
     std::atomic<u64> gpu_completed_seq{0};
-    /// Newest submission whose recorded segments contained actual GPU work and were submitted.
-    std::atomic<u64> gpu_submitted_seq{0};
     std::atomic<u64> storage_image_upgrades{0};
     std::atomic<u64> format_list_upgrades{0};
     /// What the replay thread is doing (diagnostics only).
@@ -1103,10 +1108,13 @@ struct Context::Impl {
 
     // The completion thread returns ordinary upload and download buffers after their final timeline signal.
     static constexpr u64 STAGING_CHUNK = u64{8} << 20;
+    static constexpr u64 LARGE_STAGING_CACHE_BYTES = u64{96} << 20;
     std::mutex staging_cache_mutex;
     std::array<vk::Buffer, 12> staging_cache;
     std::array<vk::Buffer, 2> large_staging_cache;
     [[nodiscard]] vk::Buffer AcquireStaging(u64 size);
+    void RecycleStaging(std::span<vk::Buffer> buffers);
+    u64 TrimCachedStaging(u64 bytes_to_release);
     std::mutex download_cache_mutex;
     std::array<vk::Buffer, 6> download_cache;
     [[nodiscard]] vk::Buffer AcquireDownload(u64 size);
@@ -1117,20 +1125,34 @@ struct Context::Impl {
 
     // --- replay thread only ---
     bool mario_kart_world{};
-    /// Sparse tiles mapped to the same guest bytes share one host page (SparseBacking). On by
-    /// default for MKW where the device can alias sparse memory; EDEN_NX2_NVN_SPARSE_SHARE=0 turns
-    /// it off, =1 on for every title.
+    /// Share compatible sparse tiles when the image supports aliasing. The environment can opt out.
     std::optional<bool> sparse_share_enabled;
     bool SparseShareEnabled();
     /// Counts SparseBacking::Prepare calls: a shared page allocated by an earlier call has its
     /// texels earlier in the command stream.
     u64 sparse_prepare_epoch{0};
-    std::optional<bool> mkw_bc3_atlas_supported;
-    bool MkwBc3AtlasSupported();
-    bool mkw_coalesce_early_submit{};
-    // Sparse binds on the Vulkan queue must wait for older command buffers using the image.
-    VkSemaphore mkw_last_submit_semaphore{VK_NULL_HANDLE};
-    u64 mkw_last_submit_value{};
+    std::optional<bool> astc_8x8_standin_supported;
+    bool Astc8x8StandinSupported();
+    // Timeline signal of the last successful graphics queue submission (replay thread only).
+    VkSemaphore last_submit_semaphore{VK_NULL_HANDLE};
+    u64 last_submit_value{};
+    bool gpu_sparse_wait{};
+    bool sparse_buffer_mirrors{};
+    vk::Semaphore sparse_timeline;
+    u64 sparse_bind_value{};
+    u64 sparse_wait_submitted{};
+    struct PendingSparseBind {
+        u64 value{};
+        std::shared_ptr<const Storage> storage;
+        std::vector<u32> old_pages;
+        std::shared_ptr<Pool> pool;
+    };
+    std::deque<PendingSparseBind> pending_sparse_binds;
+    VkResult SubmitSparseBind(VkBindSparseInfo info, PendingSparseBind pending);
+    VkResult RetireSparseBinds(u64 wait_value = 0);
+    void WaitForSparseImage(const Storage& storage);
+    /// Under submit_mutex. The first command submission after a bind waits at ALL_COMMANDS.
+    VkResult SubmitGraphics(std::span<VkSubmitInfo> submits, VkFence fence = VK_NULL_HANDLE);
     std::unordered_map<u64, std::shared_ptr<Pool>> pools;
     std::map<u64, std::shared_ptr<Pool>> pools_by_address;
     /// Bumped whenever a pool is created, destroyed or backed (the raw global table depends on
@@ -1144,8 +1166,12 @@ struct Context::Impl {
     /// device ranges are both contiguous share one range.
     struct RawGlobalTable {
         u64 generation{~u64{0}};
+        u64 pool_generation{~u64{0}};
+        u64 mapping_generation{~u64{0}};
         /// Sorted by guest address, never overlapping (FlattenRawGlobalRanges).
         std::vector<RawGlobalRange> entries;
+        /// Routes before selection by FlattenRawGlobalRanges, including virtual aliases.
+        std::vector<RawSplitPoolRange> split_ranges;
         /// The entries in device memory, read by the shaders (null when there are none). Draws
         /// keep it alive through InFlight::keepalive.
         std::shared_ptr<RawTableBuffer> device;
@@ -1173,6 +1199,11 @@ struct Context::Impl {
         std::shared_ptr<RawTableBuffer> device;
         u64 low{};
         u64 high{};
+        /// The ranges actually published in `device` and the split mirror of each included pool.
+        std::vector<RawGlobalRange> entries;
+        std::unordered_map<u64, u64> split_mirrors;
+        u64 checked_raw_generation{~u64{0}};
+        bool split_writes_covered{};
         /// Pools whose current mirror is kept current by the aliases in this table.
         std::vector<u64> pool_serials;
         std::vector<Pool*> pools;
@@ -1182,7 +1213,7 @@ struct Context::Impl {
     u64 raw_write_through_table_generation{0};
     /// Replay thread: rebuilt when the mirror set or either write-through switch changes.
     /// Overlapping pools are excluded so every address has one alias target.
-    [[nodiscard]] const RawWriteThroughTable& RawStoreAliasTable();
+    [[nodiscard]] const RawWriteThroughTable& RawStoreAliasTable(const RawGlobalTable& raw);
     /// Replay thread: uploads the table entries to a device-local buffer (null when empty or the
     /// upload failed).
     [[nodiscard]] std::shared_ptr<RawTableBuffer> UploadRawTable(
@@ -1250,7 +1281,7 @@ struct Context::Impl {
     void IndexPendingPoolWrite(u32 index, bool add);
     void PushPendingPoolWrite(PendingPoolWrite&& write);
     void RemovePendingPoolWrite(u32 index);
-    void RemovePendingPoolWritesWithin(u64 begin, u64 end);
+    void SupersedePendingPoolWrites(u64 begin, u64 end, bool invalidate_inline_overlaps);
     void SettlePendingPoolWrites();
     void RebuildPendingPoolIndex();
     void CollapsePendingPoolWrites();
@@ -1302,7 +1333,10 @@ struct Context::Impl {
         u64 seq{0};
     };
     std::array<UseSlot, 4096> use_cache{};
-    /// Replay thread: recently resolved pool ranges, valid while `pool_generation` is unchanged.
+    /// Replay-owned epoch of the pool address and serial maps. Backing promotion leaves
+    /// the pool objects and lookup ranges intact.
+    u64 pool_address_generation{};
+    /// Replay thread: recently resolved pool ranges.
     /// [begin, end) is the part of the pool no other pool starts in, so the answer is the same as
     /// the address map's for every address in it.
     struct ResolveSlot {
@@ -1313,6 +1347,21 @@ struct Context::Impl {
     };
     mutable std::array<ResolveSlot, 16> resolve_cache{};
     mutable u32 resolve_next{0};
+    /// EDEN_NX2_NVN_PHYSICAL_RESOLVE_CACHE: ranges of physical predecessors, reached by guest
+    /// address region. Contents depend on which pool wins at an address, independently of backing.
+    static constexpr u32 PHYSICAL_RESOLVE_CACHE_BITS = 11;
+    using PhysicalResolveCache = std::array<ResolveSlot, 1u << PHYSICAL_RESOLVE_CACHE_BITS>;
+    mutable std::unique_ptr<PhysicalResolveCache> physical_resolve_cache;
+    mutable bool physical_resolve_allocation_attempted{};
+    mutable u64 physical_resolve_hits{};
+    /// Replay-owned view of the address map. Build it after a present passes without invalidation
+    /// so creating a pool and immediately accessing it during startup uses the tree.
+    mutable std::vector<std::pair<u64, Pool*>> flat_pool_index;
+    mutable u64 flat_pool_index_deferred_at_present{};
+    mutable bool flat_pool_index_ready{};
+    mutable u64 flat_pool_index_builds{};
+    mutable u64 flat_pool_lookups{};
+    mutable u64 tree_pool_lookups{};
     struct ExactResolveSlot {
         u64 generation{~u64{0}};
         u64 mappings{};
@@ -1321,10 +1370,11 @@ struct Context::Impl {
         Pool* pool{};
         u64 offset{};
     };
-    mutable std::array<ExactResolveSlot, 4096> mkw_resolve_cache{};
-    u64 mkw_mapping_generation{};
-    mutable u64 mkw_resolve_hits{};
-    mutable u64 mkw_resolve_misses{};
+    /// Exact matches also depend on virtual mappings, which may select a different pool.
+    mutable std::array<ExactResolveSlot, 4096> exact_buffer_resolve_cache{};
+    u64 pool_mapping_generation{};
+    mutable u64 exact_buffer_resolve_hits{};
+    mutable u64 exact_buffer_resolve_misses{};
     std::vector<Retired> retired;
     /// Stand-ins whose format change waits for the next submission (Storage::pending_standin).
     std::vector<std::weak_ptr<Storage>> pending_standins;
@@ -1392,13 +1442,13 @@ struct Context::Impl {
     u64 image_recycle_bytes{0};
     u64 image_recycle_count{0};
     u64 image_recycle_tick{0};
-    /// Trim threshold (ContextOptions::storage_cache_budget_bytes) and the throttle of the passes
-    /// over the whole cache: the next one runs when the cache has grown past `trim_floor_bytes` or
-    /// at present `trim_next_present`. Replay thread only.
+    /// Cache budget and independent throttles for allocation and present passes.
     u64 storage_cache_budget{0};
     u64 trim_floor_bytes{0};
+    u64 trim_next_growth_present{0};
     u64 trim_next_present{0};
-    u64 trim_hard_next_present{0};
+    u64 trim_pressure_check_present{0};
+    u64 trim_pressure_next_present{0};
     u64 census_next_present{0};
     /// EDEN_NX2_NVN_TRIM_LEGACY: only the over-budget pass at image creation, without the age and
     /// device budget rules or the passes at presents.
@@ -1406,7 +1456,7 @@ struct Context::Impl {
     /// Idle render targets that can be rebuilt are dropped after this many presents without a use
     /// (0: never).
     u64 trim_age_presents{DEFAULT_STORAGE_TRIM_AGE_PRESENTS};
-    /// Device usage over the device budget at the last pass (0: within it, or not reported).
+    /// Bytes above the soft device-memory threshold at the last pass.
     u64 trim_device_excess{0};
     /// Strict mode's over-budget allocations seen by the last pass: a new one brings the next
     /// pass at a present forward.
@@ -1427,18 +1477,17 @@ struct Context::Impl {
     /// pools that hold one. Replay thread (the pool is shared with the threads releasing storages).
     std::shared_ptr<SparsePagePool> sparse_pages;
     std::set<u64> sparse_virtual_pools;
-    // MKW CPU flushes visit only virtual pools that map the physical pool being flushed.
-    std::unordered_map<u64, std::vector<u64>> mkw_sparse_physical_users;
-    bool mkw_sparse_users_dirty{true};
-    [[nodiscard]] std::span<const u64> MkwSparseVirtualUsers(u64 physical_serial);
+    // CPU flushes visit only virtual pools that map the physical pool being flushed.
+    std::unordered_map<u64, std::vector<u64>> sparse_physical_users;
+    bool sparse_users_dirty{true};
+    [[nodiscard]] std::span<const u64> SparseVirtualUsers(u64 physical_serial);
     /// Sparse tiles compared with their guest bytes in the present `sparse_verify_tick`.
     u64 sparse_verify_tick{~u64{0}};
     u32 sparse_verify_count{0};
     u32 virtual_storages_logged{0};
     u64 write_clock{0};
-    /// Clock the CPU-change checks are scheduled by: the present count, plus 1 per 16 ms while no
-    /// present happens (a loading screen), so checks never stall. Every new present moves it on,
-    /// also after such a stretch moved it ahead of the present count. Replay thread only.
+    /// Clock for sparse checks: advances with each present or after time spent without presents.
+    /// Replay thread only.
     u64 poll_tick{0};
     u64 poll_presents_seen{0};
     /// `poll_tick` at the last new present: the idle ticks of the current stretch count from here.
@@ -1446,8 +1495,6 @@ struct Context::Impl {
     std::chrono::steady_clock::time_point poll_last_change{};
     /// Recent time between presents in eighths of a tick: what an ordinary frame is (PollTick).
     u64 poll_frame_ticks_x8{0};
-    u64 full_hash_tick{~u64{0}};
-    u64 full_hash_bytes{0};
     [[nodiscard]] u64 PollTick();
     std::set<std::pair<u64, u64>> alias_logged;
     std::set<s32> unsupported_formats_logged;
@@ -1469,6 +1516,7 @@ struct Context::Impl {
     std::shared_ptr<WindowAdaptPass> window_filter;
     Settings::ScalingFilter window_filter_setting{static_cast<Settings::ScalingFilter>(~0u)};
     VkFormat window_filter_format{VK_FORMAT_UNDEFINED};
+    VkFormat window_filter_source_format{VK_FORMAT_UNDEFINED};
     VkExtent2D window_filter_extent{};
     bool window_filter_failed{};
     std::shared_ptr<::Vulkan::FSR> window_fsr;
@@ -1521,6 +1569,9 @@ struct Context::Impl {
     /// MirrorTakeStale over the whole pool, for the pages uniform bindings used (`wanted`).
     void MirrorTakeStaleWanted(Pool& pool, std::vector<std::pair<u64, u64>>& runs);
     void MirrorMarkPrefetch(Pool& pool, u64 offset, u64 size);
+    void RegisterMirrorPrefetch(Pool& pool, PoolMirror& mirror);
+    void WakeMirrorPrefetch(const PoolMirror& mirror);
+    void InvalidateMirrorPrefetch(PoolMirror& mirror);
     /// A draw stores through raw global memory: read-only mirrors do not hold the raw table's
     /// target, so every page of every one of them is copied in again at its next use. With
     /// `written_through` (the draw's stores also wrote the read-only mirror table) only the
@@ -1542,13 +1593,21 @@ struct Context::Impl {
     void ReleaseVramMirror(Pool& pool);
     /// Pools with a VRAM mirror (MirrorInvalidateAll) and their bytes (budget).
     std::vector<Pool*> vram_mirrored;
-    /// Subset of `vram_mirrored` whose `prefetch` flag is set (`PrefetchMirrors`).
+    /// Guest write tracking can signal one bit per mirror. Only the replay thread owns the slots.
+    struct PrefetchMirrorGroup {
+        static constexpr size_t CAPACITY = 64;
+        std::array<Pool*, CAPACITY> pools{};
+        std::shared_ptr<std::atomic<u64>> pending{std::make_shared<std::atomic<u64>>(0)};
+        u64 used{};
+    };
+    std::vector<PrefetchMirrorGroup> vram_prefetch_groups;
+    /// Mirrors whose memory provider cannot signal writes still need a currency check each pass.
     struct PrefetchMirrorEntry {
         Pool* pool{};
         PoolMirror* mirror{};
         const std::atomic<u64>* write_epoch{};
     };
-    std::vector<PrefetchMirrorEntry> vram_prefetch_mirrors;
+    std::vector<PrefetchMirrorEntry> vram_prefetch_poll;
     std::atomic<u64> vram_mirror_bytes{0}; ///< read by DescribeState
     bool vram_mirror_no_tracker_logged{false};
     /// EDEN_NX2_NVN_WB_MONITOR: counters of every mirror created (never removed; DescribeState).
@@ -1656,6 +1715,9 @@ struct Context::Impl {
     std::future<std::unique_ptr<AstcGpuDecoder>> astc_decoder_future;
     bool astc_decoder_failed{false};
     [[nodiscard]] AstcGpuDecoder* AstcDecoder();
+    std::unique_ptr<AstcBc3> sparse_astc_bc3;
+    std::future<std::unique_ptr<AstcBc3>> sparse_astc_bc3_future;
+    [[nodiscard]] AstcBc3* SparseAstcBc3();
     /// What ASTC stand-ins hold (nvn_format.h AstcStandin): EDEN_NX2_NVN_ASTC_STANDIN over the
     /// astc_recompression setting, Rgba8 on devices that hold ASTC or cannot run the BC encoder.
     AstcStandin astc_standin{AstcStandin::Rgba8};
@@ -1665,8 +1727,7 @@ struct Context::Impl {
     std::future<std::unique_ptr<BcGpuEncoder>> bc_encoder_future;
     bool bc_encoder_failed{false};
     [[nodiscard]] BcGpuEncoder* BcEncoder();
-    /// Replay thread: LRU pool of scratch BC stand-in images (up to 4 shapes within
-    /// BC_SCRATCH_BUDGET), plus a 4-slot ring of small scratches for barrier-batched chunks.
+    /// Replay thread: byte-bounded LRU pool of BC scratches, plus a small ring for batched chunks.
     static constexpr size_t BC_SMALL_SCRATCH_COUNT = 4;
     static constexpr u64 BC_SMALL_SCRATCH_MAX_BYTES = u64{4} << 20;
     std::array<std::shared_ptr<BcScratch>, BC_SMALL_SCRATCH_COUNT> bc_scratch_ring;
@@ -1691,6 +1752,8 @@ struct Context::Impl {
                                  bindless_storage_changed.size()] = &s;
         ++bindless_storage_change_epoch;
     }
+    std::vector<std::weak_ptr<Storage>> bindless_sparse_pending;
+    void NoteBindlessSparsePending(Storage& s);
     std::vector<std::shared_ptr<Storage>> bindless_layout_dirty;
     void NoteBindlessLayoutDirty(Storage& s) {
         if (s.bindless_active_count != 0 && !s.bindless_layout_queued && s.image &&
@@ -1788,7 +1851,6 @@ struct Context::Impl {
             InFlight* flight{nullptr};
             VkSemaphore queue_timeline{VK_NULL_HANDLE};
             u64 queue_signal_value{0};
-            bool has_gpu_work{false};
         };
         struct Mark {
             InFlight* flight{};
@@ -1830,8 +1892,11 @@ struct Context::Impl {
 
     // --- resources (nvn_resources.cpp) ---
     void CreatePoolNow(const VC::PoolDesc& desc);
-    /// Replay thread only: imports or allocates the pool's buffer the first time a command needs it.
-    void EnsureBacking(Pool& pool);
+    /// A nonzero size names a bounded descriptor range. Other callers need the entire pool.
+    bool EnsureBacking(Pool& pool, u64 offset = 0, u64 size = 0);
+    bool TryCreateSparseMirror(Pool& pool, u64 offset, u64 size);
+    bool BindSparseMirror(Pool& pool, VkBuffer buffer, Pool::SparseMirror& mirror, u64 offset,
+                          u64 size);
     /// Uploads the guest contents of GPU-only pools (buffers exist, `upload_pending`) in batches:
     /// one staging buffer and one submission for many pools. Replay thread.
     void UploadWholePools(std::span<Pool* const> targets);
@@ -1957,11 +2022,12 @@ struct Context::Impl {
     void NotifyHostWriteNow(u64 address, u64 size);
     void NotifyTextureWrittenNow(u64 texture_serial);
     /// Settles a pending GPU write-back on a linear storage once its submission has completed,
-    /// refreshing `gpu_guest_sig` and re-arming `takeover_track` against the written-back bytes.
+    /// refreshing `gpu_guest_hash` and re-arming `takeover_track` against the written-back bytes.
     bool SettleLinearWriteback(Storage& s);
-    /// Looks at a CPU-sourced storage's guest bytes when its check is due (a cheap signature, no
-    /// commands recorded) and sets `force_upload` when they changed. At most once per `seq`.
-    void DetectGuestChange(Storage& s, u64 seq);
+    /// Checks guest contents and sets `force_upload` when they changed. At most once per `seq`.
+    enum class GuestCheck { Observe, CaptureGpuWrite };
+    void DetectGuestChange(Storage& s, u64 seq, GuestCheck check = GuestCheck::Observe,
+                           std::optional<u64>* captured_hash = nullptr);
     /// Registers `pool` with the page tracker at the first call (no page armed yet) and folds the
     /// guest CPU writes since the last call into `mirror_pages` (untrusted, disarmed) and
     /// `page_write_gen`. False when the pool is not tracked. Replay thread.

@@ -51,8 +51,18 @@ VkShaderStageFlagBits ShaderStage(Shader::Stage stage);
 
 VkPrimitiveTopology PrimitiveTopology(const Device& device, Maxwell::PrimitiveTopology topology);
 
+// These guest primitives are assembled into a restart-free triangle list.
+constexpr bool UsesConvertedQuadIndices(Maxwell::PrimitiveTopology topology) {
+    return topology == Maxwell::PrimitiveTopology::Quads ||
+           topology == Maxwell::PrimitiveTopology::QuadStrip;
+}
+
 VkFormat VertexFormat(const Device& device, Maxwell::VertexAttribute::Type type,
-                      Maxwell::VertexAttribute::Size size);
+                      Maxwell::VertexAttribute::Size size, bool report_invalid = true);
+
+/// Size of one element after applying the host's vertex format fallback.
+u32 VertexFormatSize(const Device& device, Maxwell::VertexAttribute::Type type,
+                     Maxwell::VertexAttribute::Size size);
 
 VkCompareOp ComparisonOp(Maxwell::ComparisonOp comparison);
 

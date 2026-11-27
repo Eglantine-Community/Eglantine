@@ -65,27 +65,37 @@ u32 ParseBc7Quality(const char* text) {
     return BC7_QUALITY_DEFAULT;
 }
 
-void BcGpuEncoder::RecordCopy(vk::CommandBuffer cmd, VkImageView source, VkImageView destination,
+bool BcGpuEncoder::RecordCopy(vk::CommandBuffer cmd, VkImageView source, VkImageView destination,
                               VkImageView scratch, std::array<s32, 2> source_origin,
                               std::array<s32, 2> destination_origin,
                               std::array<s32, 2> block_origin, std::array<s32, 2> copy_size,
-                              std::array<s32, 2> scratch_size, u32 layers) {
+                              std::array<s32, 2> scratch_size, u32 layers,
+                              const AllocateComputeSet& allocate_set) {
     struct CopyConstants {
         std::array<s32, 2> source, destination, block, size, scratch;
     };
     const auto& logical = device.GetLogical();
     if (!copy_pipeline) {
+        copy_sampler = logical.CreateSampler({
+            .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+            .magFilter = VK_FILTER_NEAREST,
+            .minFilter = VK_FILTER_NEAREST,
+            .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+            .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        });
         std::array<VkDescriptorSetLayoutBinding, 3> bindings{};
         for (u32 i = 0; i < bindings.size(); ++i) {
             bindings[i] = {.binding = i,
                            .descriptorType = i == 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
-                                                    : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                                                    : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                            .descriptorCount = 1,
                            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT};
         }
         copy_set_layout = logical.CreateDescriptorSetLayout({
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-            .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
+            .flags = ComputeSetFlags(max_push_descriptors >= 3),
             .bindingCount = static_cast<u32>(bindings.size()),
             .pBindings = bindings.data(),
         });
@@ -97,7 +107,7 @@ void BcGpuEncoder::RecordCopy(vk::CommandBuffer cmd, VkImageView source, VkImage
             .pushConstantRangeCount = 1,
             .pPushConstantRanges = &range,
         });
-        copy_module = logical.CreateShaderModule({
+        const auto copy_module = logical.CreateShaderModule({
             .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
             .codeSize = sizeof(NVN_BC_COPY_COMP_SPV),
             .pCode = NVN_BC_COPY_COMP_SPV,
@@ -114,8 +124,8 @@ void BcGpuEncoder::RecordCopy(vk::CommandBuffer cmd, VkImageView source, VkImage
             VK_NULL_HANDLE);
     }
     const std::array<VkDescriptorImageInfo, 3> images{{
-        {VK_NULL_HANDLE, source, VK_IMAGE_LAYOUT_GENERAL},
-        {VK_NULL_HANDLE, destination, VK_IMAGE_LAYOUT_GENERAL},
+        {*copy_sampler, source, VK_IMAGE_LAYOUT_GENERAL},
+        {*copy_sampler, destination, VK_IMAGE_LAYOUT_GENERAL},
         {VK_NULL_HANDLE, scratch, VK_IMAGE_LAYOUT_GENERAL},
     }};
     std::array<VkWriteDescriptorSet, 3> writes{};
@@ -124,16 +134,20 @@ void BcGpuEncoder::RecordCopy(vk::CommandBuffer cmd, VkImageView source, VkImage
                      .dstBinding = i,
                      .descriptorCount = 1,
                      .descriptorType = i == 2 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
-                                              : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                                              : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                      .pImageInfo = &images[i]};
     }
     const CopyConstants constants{source_origin, destination_origin, block_origin, copy_size,
                                   scratch_size};
     cmd.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *copy_pipeline);
-    cmd.PushDescriptorSetKHR(VK_PIPELINE_BIND_POINT_COMPUTE, *copy_pipeline_layout, 0, writes);
+    if (!BindComputeDescriptors(logical, cmd, *copy_pipeline_layout, *copy_set_layout,
+                                max_push_descriptors >= 3, writes, allocate_set)) {
+        return false;
+    }
     cmd.PushConstants(*copy_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, constants);
     cmd.Dispatch((static_cast<u32>(scratch_size[0]) + 7) / 8,
                  (static_cast<u32>(scratch_size[1]) + 7) / 8, layers);
+    return true;
 }
 
 BcBlocks BcBlocksOf(AstcStandin standin, bool opaque) {
@@ -160,14 +174,13 @@ bool BcGpuEncoder::SupportsBc45(const Device& device) {
 bool BcGpuEncoder::SupportsBc7(const Device& device) {
     constexpr VkFormatFeatureFlags BC_FEATURES =
         VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
-    return Supported(device) && device.MaxPushDescriptors() >= 3 &&
+    return Supported(device) &&
            device.IsFormatSupported(VK_FORMAT_BC7_UNORM_BLOCK, BC_FEATURES, FormatType::Optimal) &&
            device.IsFormatSupported(VK_FORMAT_BC7_SRGB_BLOCK, BC_FEATURES, FormatType::Optimal);
 }
 
 bool BcGpuEncoder::Supported(const Device& device) {
-    if (!device.IsKhrPushDescriptorSupported() || device.MaxPushDescriptors() < 2 ||
-        !device.IsOptimalBcnSupported()) {
+    if (!device.IsOptimalBcnSupported()) {
         return false;
     }
     constexpr VkFormatFeatureFlags BC_FEATURES =
@@ -180,7 +193,9 @@ bool BcGpuEncoder::Supported(const Device& device) {
 }
 
 BcGpuEncoder::BcGpuEncoder(const Device& device_, bool bc7, std::span<const u32> bc_code)
-    : device{device_} {
+    : device{device_},
+      max_push_descriptors{device.IsKhrPushDescriptorSupported() ? device.MaxPushDescriptors()
+                                                                : 0} {
     const vk::Device& logical = device.GetLogical();
     const std::array<VkDescriptorSetLayoutBinding, 2> bindings{{
         {
@@ -201,7 +216,7 @@ BcGpuEncoder::BcGpuEncoder(const Device& device_, bool bc7, std::span<const u32>
     set_layout = logical.CreateDescriptorSetLayout({
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
         .pNext = nullptr,
-        .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
+        .flags = ComputeSetFlags(max_push_descriptors >= 2),
         .bindingCount = static_cast<u32>(bindings.size()),
         .pBindings = bindings.data(),
     });
@@ -281,7 +296,7 @@ BcGpuEncoder::BcGpuEncoder(const Device& device_, bool bc7, std::span<const u32>
     bc7_set_layout = logical.CreateDescriptorSetLayout({
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
         .pNext = nullptr,
-        .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
+        .flags = ComputeSetFlags(max_push_descriptors >= 3),
         .bindingCount = static_cast<u32>(bc7_bindings.size()),
         .pBindings = bc7_bindings.data(),
     });
@@ -343,9 +358,10 @@ BcGpuEncoder::BcGpuEncoder(const Device& device_, bool bc7, std::span<const u32>
 
 BcGpuEncoder::~BcGpuEncoder() = default;
 
-void BcGpuEncoder::RecordBc7(vk::CommandBuffer cmd, VkImageView source, u32 width, u32 height,
+bool BcGpuEncoder::RecordBc7(vk::CommandBuffer cmd, VkImageView source, u32 width, u32 height,
                              u32 layers, u32 quality, VkBuffer modes, u64 modes_size,
-                             VkBuffer output, u64 output_size) const {
+                             VkBuffer output, u64 output_size,
+                             const AllocateComputeSet& allocate_set) const {
     const VkDescriptorImageInfo image_info{
         .sampler = VK_NULL_HANDLE,
         .imageView = source,
@@ -400,7 +416,10 @@ void BcGpuEncoder::RecordBc7(vk::CommandBuffer cmd, VkImageView source, u32 widt
         cmd.Dispatch((constants.blocks_x + per_group - 1) / per_group, constants.blocks_y, layers);
     };
     cmd.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *bc7_pipelines[BC7_STAGE_456]);
-    cmd.PushDescriptorSetKHR(VK_PIPELINE_BIND_POINT_COMPUTE, *bc7_pipeline_layout, 0, writes);
+    if (!BindComputeDescriptors(device.GetLogical(), cmd, *bc7_pipeline_layout, *bc7_set_layout,
+                                max_push_descriptors >= 3, writes, allocate_set)) {
+        return false;
+    }
     dispatch(BC7_STAGE_456);
     // DirectXTex's order: 1, 3, 7, then the rarely chosen and slower three-subset modes.
     constexpr std::array<u32, 5> PARTITIONED_MODES{1, 3, 7, 0, 2};
@@ -415,11 +434,12 @@ void BcGpuEncoder::RecordBc7(vk::CommandBuffer cmd, VkImageView source, u32 widt
                         0, modes_written);
     constants.mode = 0;
     dispatch(BC7_STAGE_ENCODE);
+    return true;
 }
 
-void BcGpuEncoder::Record(vk::CommandBuffer cmd, VkImageView source, u32 width, u32 height,
+bool BcGpuEncoder::Record(vk::CommandBuffer cmd, VkImageView source, u32 width, u32 height,
                           u32 layers, BcBlocks blocks, bool refine, VkBuffer output,
-                          u64 output_size) const {
+                          u64 output_size, const AllocateComputeSet& allocate_set) const {
     const VkDescriptorImageInfo image_info{
         .sampler = VK_NULL_HANDLE,
         .imageView = source,
@@ -430,7 +450,7 @@ void BcGpuEncoder::Record(vk::CommandBuffer cmd, VkImageView source, u32 width, 
         .offset = 0,
         .range = output_size,
     };
-    const std::array<VkWriteDescriptorSet, 2> writes{{
+    std::array<VkWriteDescriptorSet, 2> writes{{
         {
             .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
             .pNext = nullptr,
@@ -465,9 +485,13 @@ void BcGpuEncoder::Record(vk::CommandBuffer cmd, VkImageView source, u32 width, 
         .out_offset = 0,
     };
     cmd.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *(refine ? pipeline_refined : pipeline));
-    cmd.PushDescriptorSetKHR(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline_layout, 0, writes);
+    if (!BindComputeDescriptors(device.GetLogical(), cmd, *pipeline_layout, *set_layout,
+                                max_push_descriptors >= 2, writes, allocate_set)) {
+        return false;
+    }
     cmd.PushConstants(*pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, constants);
     cmd.Dispatch((constants.blocks_x + 7) / 8, (constants.blocks_y + 7) / 8, layers);
+    return true;
 }
 
 std::shared_ptr<BcScratch> MakeBcScratch(const Device& device, const MemoryAllocator& allocator,

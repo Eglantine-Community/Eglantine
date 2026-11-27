@@ -12,7 +12,6 @@
 
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
-#include "common/game_presets.h"
 #include "common/logging.h"
 #include "common/scm_rev.h"
 #include "common/settings.h"
@@ -22,7 +21,7 @@
 #include "video_core/sampler_overrides.h"
 
 VideoCommon::NvnCacheTransition VideoCommon::ClearShaderCachesForNvn(
-    const std::filesystem::path& title_dir, bool mario_kart_world) {
+    const std::filesystem::path& title_dir) {
     namespace fs = std::filesystem;
     std::error_code ec;
     const auto title_status = fs::symlink_status(title_dir, ec);
@@ -43,21 +42,19 @@ VideoCommon::NvnCacheTransition VideoCommon::ClearShaderCachesForNvn(
         return NvnCacheTransition::Failed;
     }
     const auto collect_vulkan = [&](const fs::path& directory) {
+        const auto status = fs::symlink_status(directory, ec);
+        if (status.type() == fs::file_type::not_found) {
+            ec.clear();
+            return true;
+        }
+        if (ec || !fs::is_directory(status)) {
+            return false;
+        }
         return std::ranges::all_of(EMULATED_VULKAN_CACHE_FILES,
                                    [&](auto name) { return collect(directory / name); });
     };
-    if (!collect_vulkan(title_dir)) {
+    if (!collect_vulkan(title_dir) || !collect_vulkan(title_dir / MKW_EMULATED_CACHE_SUBDIR)) {
         return NvnCacheTransition::Failed;
-    }
-    if (mario_kart_world) {
-        const auto subdir = title_dir / MKW_EMULATED_CACHE_SUBDIR;
-        if (fs::exists(subdir, ec)) {
-            if (fs::is_symlink(subdir, ec) || ec || !collect_vulkan(subdir)) {
-                return NvnCacheTransition::Failed;
-            }
-        } else if (ec) {
-            return NvnCacheTransition::Failed;
-        }
     }
     if (legacy_files.empty()) {
         return NvnCacheTransition::Unchanged;
@@ -214,7 +211,7 @@ PipelineCache& DrawResources::Cache() {
         options.async_compile =
             !shader_refresh && Settings::values.use_asynchronous_shaders.GetValue();
         options.graphics_pipeline_library = Settings::values.nvn_pipeline_library.GetValue();
-        options.gpl_optimize_after_presents = 30;
+        options.gpl_optimize_after_presents = 240;
         options.dedup_dynamic_state = true;
         options.sync_diet = Settings::values.nvn_sync_diet.GetValue();
         options.shader_notify = impl.options.shader_notify;
@@ -239,12 +236,11 @@ void DrawResources::OpenCache(u64 title_id) {
         return;
     }
     PipelineCacheOptions options;
-    options.title_id = title_id;
     options.revision = Common::g_scm_rev;
     options.prefetch_graphics = !shader_refresh;
     options.async_compile = !shader_refresh && Settings::values.use_asynchronous_shaders.GetValue();
     options.graphics_pipeline_library = Settings::values.nvn_pipeline_library.GetValue();
-    options.gpl_optimize_after_presents = 30;
+    options.gpl_optimize_after_presents = 240;
     options.dedup_dynamic_state = true;
     options.sync_diet = Settings::values.nvn_sync_diet.GetValue();
     options.shader_notify = impl.options.shader_notify;
@@ -254,8 +250,8 @@ void DrawResources::OpenCache(u64 title_id) {
     options.raw_miss_reporting = true;
     if (options.async_compile) {
         LOG_INFO(Render_Vulkan,
-                 "[nvn] asynchronous shaders on: run-time pipeline compiles run on workers; the "
-                 "draws that may be skipped are skipped until they finish, dispatches wait{}",
+                 "[nvn] asynchronous shaders on: lookahead compiles pipelines on workers; "
+                 "draws and dispatches require their pipelines{}",
                  options.graphics_pipeline_library
                      ? " (nvn_pipeline_library: library parts are compiled and linked there too)"
                      : "");
@@ -271,20 +267,11 @@ void DrawResources::OpenCache(u64 title_id) {
     const auto transition =
         title_id != 0 && !isolated_cache && !shader_refresh &&
                 Settings::values.use_disk_shader_cache.GetValue()
-            ? VideoCommon::ClearShaderCachesForNvn(title_dir, impl.mario_kart_world)
+            ? VideoCommon::ClearShaderCachesForNvn(title_dir)
             : VideoCommon::NvnCacheTransition::Unchanged;
     if (transition == VideoCommon::NvnCacheTransition::Cleared) {
         LOG_INFO(Render_Vulkan, "[nvn] cleared shader caches for {:016x} on the switch from "
                                 "Emulated GPU to VTX-HLE", title_id);
-    }
-    // Isolate MKW's warm-start rendering regression from the opaque NVIDIA cache while keeping
-    // the portable pipeline records available for preload.
-    if (title_id == Settings::MarioKartWorldProgramId && impl.device.IsNvidia() &&
-        options.driver_cache_file && !shader_refresh) {
-        options.driver_cache_file = false;
-        LOG_INFO(Render_Vulkan,
-                 "[nvn] Mario Kart World: start with an empty NVIDIA driver pipeline cache; "
-                 "keep the NVN pipeline records");
     }
     if (shader_refresh) {
         options.driver_cache_file = false;
@@ -420,6 +407,10 @@ void DrawResources::OnProgramCreated(const std::shared_ptr<const VC::ProgramDesc
     for (u32 stage = 0; stage < STAGE_COUNT; ++stage) {
         if (!desc.control[stage].empty() && !desc.code[stage].empty()) {
             hashes[stage] = HashProgramStage(desc.control[stage], desc.code[stage]);
+            if (Debug::Get().pipeline_trace) {
+                LOG_INFO(Render_Vulkan, "[nvn] program stage registered: serial={} stage={} hash={:016x}",
+                         desc.serial, stage, hashes[stage]);
+            }
         }
     }
     program_hashes[desc.serial] = hashes;
@@ -744,32 +735,72 @@ DrawResources::Scratch* DrawResources::FindScratch(const Storage& storage) {
     return nullptr;
 }
 
-DrawResources::Scratch* DrawResources::GetScratch(const Storage& source, u32 slot) {
-    const VkImageCreateFlags cube_flag = source.create_flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+u64 DrawResources::ScratchImageBudget() const {
+    constexpr u64 MAX_SCRATCH_IMAGE_BYTES = u64{128} << 20;
+    return (std::min)(MAX_SCRATCH_IMAGE_BYTES, impl.storage_cache_budget / 16);
+}
+
+u64 DrawResources::TrimScratchImages(u64 target_bytes) {
+    const u64 before = scratch_image_bytes.load(std::memory_order_relaxed);
+    u64 bytes = before;
+    while (bytes > target_bytes) {
+        auto victim = scratch_images.end();
+        for (auto it = scratch_images.begin(); it != scratch_images.end(); ++it) {
+            if (it->texture.use_count() == 1 &&
+                (victim == scratch_images.end() || it->last_use < victim->last_use)) {
+                victim = it;
+            }
+        }
+        if (victim == scratch_images.end()) {
+            break;
+        }
+        // An idle image's descriptor views can be destroyed before its allocation.
+        TakeViews(*victim->texture);
+        bytes -= victim->bytes;
+        if (&*victim != &scratch_images.back()) {
+            *victim = std::move(scratch_images.back());
+        }
+        scratch_images.pop_back();
+        scratch_image_bytes.store(bytes, std::memory_order_relaxed);
+        scratch_image_evictions.fetch_add(1, std::memory_order_relaxed);
+    }
+    return before - bytes;
+}
+
+void DrawResources::RetainScratch(Scratch& scratch, InFlight& flight) {
+    scratch.last_use = ++scratch_use_clock;
+    if (scratch.retained_seq != flight.seq) {
+        flight.keepalive.push_back(scratch.texture);
+        scratch.retained_seq = flight.seq;
+    }
+}
+
+DrawResources::Scratch* DrawResources::GetScratchImage(const Storage& source,
+                                                       const ScratchShape& shape, u32 slot,
+                                                       InFlight& flight, u64 expected_bytes) {
     for (Scratch& scratch : scratch_images) {
         const Storage& s = *scratch.storage;
-        if (scratch.slot == slot && s.host.format == source.host.format && s.type == source.type &&
-            s.extent.width == source.extent.width && s.extent.height == source.extent.height &&
-            s.extent.depth == source.extent.depth && s.levels == source.levels &&
-            s.layers == source.layers && s.aspect == source.aspect &&
-            (s.create_flags & cube_flag) == cube_flag) {
+        if (scratch.slot == slot && s.host.format == source.host.format && s.type == shape.type &&
+            s.extent.width == shape.extent.width && s.extent.height == shape.extent.height &&
+            s.extent.depth == shape.extent.depth && s.levels == shape.levels &&
+            s.layers == shape.layers && s.aspect == source.aspect &&
+            (s.create_flags & shape.flags) == shape.flags) {
+            RetainScratch(scratch, flight);
             return &scratch;
         }
     }
+
+    const u64 budget = ScratchImageBudget();
+    TrimScratchImages(budget - (std::min)(expected_bytes, budget));
     auto storage = std::make_shared<Storage>();
     storage->host = source.host;
-    storage->type = source.type;
-    storage->extent = source.extent;
-    storage->levels = source.levels;
-    storage->layers = source.layers;
+    storage->type = shape.type;
+    storage->extent = shape.extent;
+    storage->levels = shape.levels;
+    storage->layers = shape.layers;
     storage->aspect = source.aspect;
     storage->samples = VK_SAMPLE_COUNT_1_BIT;
-    storage->create_flags =
-        VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
-        (source.type == VK_IMAGE_TYPE_3D
-             ? static_cast<VkImageCreateFlags>(VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT)
-             : 0u);
-    storage->create_flags |= cube_flag;
+    storage->create_flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | shape.flags;
     storage->usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                      VK_IMAGE_USAGE_SAMPLED_BIT;
     try {
@@ -792,10 +823,14 @@ DrawResources::Scratch* DrawResources::GetScratch(const Storage& source, u32 slo
         });
     } catch (const vk::Exception& exception) {
         LOG_ERROR(Render_Vulkan, "[nvn] feedback scratch image ({}x{}x{}, format {}) failed: {}",
-                  source.extent.width, source.extent.height, source.extent.depth,
+                  shape.extent.width, shape.extent.height, shape.extent.depth,
                   static_cast<int>(source.host.format), exception.what());
         return nullptr;
     }
+    if (storage->image.IsUnbacked()) {
+        return nullptr;
+    }
+    const u64 bytes = storage->image.GetMemoryBlock().size;
     // Written by copies only: no guest bytes behind it, nothing to upload or check.
     storage->contents_valid = true;
     storage->origin = StorageOrigin::Gpu;
@@ -803,12 +838,30 @@ DrawResources::Scratch* DrawResources::GetScratch(const Storage& source, u32 slo
     texture->serial = next_scratch_serial++;
     texture->storage = storage;
     texture->host = storage->host;
-    scratch_images.push_back({std::move(storage), std::move(texture), slot});
-    return &scratch_images.back();
+    scratch_images.push_back({std::move(storage), std::move(texture), slot, bytes});
+    const u64 cached = scratch_image_bytes.fetch_add(bytes, std::memory_order_relaxed) + bytes;
+    Scratch& added = scratch_images.back();
+    RetainScratch(added, flight);
+    if (cached <= budget) {
+        return &added;
+    }
+    const Storage& kept = *added.storage;
+    TrimScratchImages(budget);
+    return FindScratch(kept);
+}
+
+DrawResources::Scratch* DrawResources::GetScratch(const Storage& source, u32 slot,
+                                                  InFlight& flight) {
+    VkImageCreateFlags flags = source.create_flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+    if (source.type == VK_IMAGE_TYPE_3D) {
+        flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
+    }
+    return GetScratchImage(source, {source.type, source.extent, source.levels, source.layers, flags},
+                           slot, flight, source.vram_bytes);
 }
 
 DrawResources::Scratch* DrawResources::GetRetypedScratch(const Storage& source, u32 slot,
-                                                         RetypeTarget target) {
+                                                         RetypeTarget target, InFlight& flight) {
     const bool cube = target == RetypeTarget::Cube;
     const VkImageType type = cube                          ? VK_IMAGE_TYPE_2D
                              : target == RetypeTarget::Row ? VK_IMAGE_TYPE_1D
@@ -816,60 +869,9 @@ DrawResources::Scratch* DrawResources::GetRetypedScratch(const Storage& source, 
     const u32 layers = cube ? 6u : 1u;
     const VkExtent3D extent{source.extent.width,
                             target == RetypeTarget::Row ? 1u : source.extent.height, 1};
-    for (Scratch& scratch : scratch_images) {
-        const Storage& s = *scratch.storage;
-        if (scratch.slot == slot && s.host.format == source.host.format && s.type == type &&
-            s.extent.width == extent.width && s.extent.height == extent.height &&
-            s.extent.depth == 1 &&
-            s.layers == layers && s.aspect == source.aspect) {
-            return &scratch;
-        }
-    }
-    auto storage = std::make_shared<Storage>();
-    storage->host = source.host;
-    storage->type = type;
-    storage->extent = extent;
-    storage->levels = 1;
-    storage->layers = layers;
-    storage->aspect = source.aspect;
-    storage->samples = VK_SAMPLE_COUNT_1_BIT;
-    storage->create_flags =
-        VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
-        (cube ? static_cast<VkImageCreateFlags>(VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) : 0u);
-    storage->usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                     VK_IMAGE_USAGE_SAMPLED_BIT;
-    try {
-        storage->image = impl.allocator->CreateImage({
-            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-            .pNext = nullptr,
-            .flags = storage->create_flags,
-            .imageType = storage->type,
-            .format = storage->host.format,
-            .extent = storage->extent,
-            .mipLevels = 1,
-            .arrayLayers = layers,
-            .samples = VK_SAMPLE_COUNT_1_BIT,
-            .tiling = VK_IMAGE_TILING_OPTIMAL,
-            .usage = storage->usage,
-            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-            .queueFamilyIndexCount = 0,
-            .pQueueFamilyIndices = nullptr,
-            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-        });
-    } catch (const vk::Exception& exception) {
-        LOG_ERROR(Render_Vulkan, "[nvn] placeholder image (format {}, {}) failed: {}",
-                  static_cast<int>(source.host.format),
-                  cube ? "cube" : target == RetypeTarget::Row ? "1D" : "3D", exception.what());
-        return nullptr;
-    }
-    storage->contents_valid = true;
-    storage->origin = StorageOrigin::Gpu;
-    auto texture = std::make_shared<Texture>();
-    texture->serial = next_scratch_serial++;
-    texture->storage = storage;
-    texture->host = storage->host;
-    scratch_images.push_back({std::move(storage), std::move(texture), slot});
-    return &scratch_images.back();
+    const VkImageCreateFlags flags =
+        cube ? static_cast<VkImageCreateFlags>(VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) : 0u;
+    return GetScratchImage(source, {type, extent, 1, layers, flags}, slot, flight, 0);
 }
 
 std::shared_ptr<ArenaChunk> DrawResources::AcquireArena(u64 min_size) {
@@ -949,6 +951,20 @@ void DrawResources::ReleaseShadows(std::vector<std::shared_ptr<ShadowChunk>>& ch
         }
     }
     chunks.clear();
+}
+
+u64 DrawResources::TrimCachedShadows(u64 bytes_to_release) {
+    std::scoped_lock lock{shadow_mutex};
+    u64 released = 0;
+    const size_t trimmed = std::erase_if(free_shadows, [&](const auto& chunk) {
+        if (released >= bytes_to_release || chunk.use_count() != 1) {
+            return false;
+        }
+        released += chunk->size;
+        return true;
+    });
+    counters.shadow_chunks_destroyed.fetch_add(trimmed, std::memory_order_relaxed);
+    return released;
 }
 
 std::shared_ptr<vk::DescriptorPool> DrawResources::AcquireDescriptorPool(u32 max_sets) {

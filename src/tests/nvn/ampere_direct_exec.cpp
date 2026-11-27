@@ -15,13 +15,13 @@
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include "ampere_exec.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "shader_recompiler/frontend/ampere/control_flow.h"
 #include "shader_recompiler/frontend/ampere/instruction.h"
-#include "video_core/native_tensor_programs.h"
 
 namespace {
 
@@ -190,7 +190,8 @@ public:
 
     bool Run(std::span<const Inst> instructions, std::span<const u32> c1_words, u32 thread_x,
              u32 dispatch_x, std::span<const u32> init_words, std::span<u32> out_words,
-             u32 reg_count = 32, u32 shared_bytes = 0, u32 local_bytes = 0) {
+             u32 reg_count = 32, u32 shared_bytes = 0, u32 local_bytes = 0, u32 thread_y = 1,
+             u32 thread_z = 1) {
         using namespace std::chrono_literals;
         const u32 inst_bytes = static_cast<u32>(instructions.size() * sizeof(Inst));
         const u32 c1_offset = (inst_bytes + 0xffU) / 0x100U * 0x100U;
@@ -206,8 +207,8 @@ public:
         Put32(control, 0x50, local_bytes * 32U);
         control[0x56] = 5; // compute
         Put32(control, 0x58, thread_x);
-        Put32(control, 0x5c, 1);
-        Put32(control, 0x60, 1);
+        Put32(control, 0x5c, thread_y);
+        Put32(control, 0x60, thread_z);
         Put32(control, 0x64, shared_bytes);
         control[0xb1] = 1;
         control[0xb2] = 1;
@@ -576,6 +577,9 @@ TEST_CASE("Direct Ampere GPU execution: multi-lane warp ops and BRXU jump table"
     }
 
     SECTION("32-thread REDUX, R2UR, VOTEU, UIADD3, @UPn") {
+        const u32 threads = GENERATE(17U, 32U, 35U, 64U);
+        const u32 threshold = threads < 35 ? 10U : threads == 35 ? 32U : 42U;
+        CAPTURE(threads, threshold);
         // Storage buffer layout: out[tid] = {tid_val, sum_redux, smin_redux, r2ur_masked, vote_ballot, ur_pred_select}
         // Uses 1 workgroup of 32 threads:
         // R2:R3 = storage base (c[0][0x20/0x24])
@@ -590,7 +594,7 @@ TEST_CASE("Direct Ampere GPU execution: multi-lane warp ops and BRXU jump table"
         // @UP0 UMOV UR8, 0x77
         // @!UP0 UMOV UR8, 0x99
         // Store 8 words per thread
-        const std::array<Inst, 27> shader{{
+        const std::vector<Inst> shader{
             S2R(4, 33),                                            // SR_TID_X
             MovC0(2, 0x20),
             MovC0(3, 0x24),
@@ -605,7 +609,7 @@ TEST_CASE("Direct Ampere GPU execution: multi-lane warp ops and BRXU jump table"
             UMovImm(8, 0x99U),
             {{0x00000882U | (8U << 16), 0x77U, 0U, Sched}},        // @UP0 UMOV UR8, 0x77
             // Storage index: byte offset = R4 * 32 -> LEA R2, R4, R2, 5 (with carry -> R3 via IADD3.X? Use R6:R7 temp)
-            LeaReg(6, 4, 2, ZeroGpr, 5U, false, false, false, 1U),
+            LeaReg(6, 4, 2, ZeroGpr, 6U, false, false, false, 1U),
             Iadd3Reg(7, 3, ZeroGpr, ZeroGpr, false, false, false, 7U, 7U, true, 1U),
             Stg(6, 0U, 5U),
             MovFromUr(9, 4U), Stg(6, 4U, 9U),
@@ -613,27 +617,51 @@ TEST_CASE("Direct Ampere GPU execution: multi-lane warp ops and BRXU jump table"
             MovFromUr(9, 6U), Stg(6, 12U, 9U),
             MovFromUr(9, 7U), Stg(6, 16U, 9U),
             MovFromUr(9, 8U), Stg(6, 20U, 9U),
+            S2R(25, 0), Stg(6, 24U, 25),
+            S2R(26, 56), Stg(6, 28U, 26),
+            VoteU(27, 1, 0, 7),   // ALL of PT, ballot = the static active mask.
+            VoteU(28, 2, 2, 0),   // EQ of P0.
+            VoteU(29, 3, 0, 0),   // ALL of P0.
+            UMovImm(30, 0), {{0x00001882U | (30U << 16), 1U, 0U, Sched}},
+            UMovImm(31, 0), {{0x00002882U | (31U << 16), 1U, 0U, Sched}},
+            UMovImm(32, 0), {{0x00003882U | (32U << 16), 1U, 0U, Sched}},
+            MovFromUr(9, 27), Stg(6, 32U, 9),
+            MovFromUr(9, 30), Stg(6, 36U, 9),
+            MovFromUr(9, 31), Stg(6, 40U, 9),
+            MovFromUr(9, 32), Stg(6, 44U, 9),
             Exit,
-        }};
+        };
         auto patched = shader;
-        // Patch idx 7 to ISETP.GE.U32 P0, PT, R4, 10, PT (`0x80c` imm)
-        patched[7] = {{0x0000780cU | (4U << 24), 10U, (7U << 23) | (7U << 20) | (0U << 17) | (6U << 12), Sched}};
+        // R2UR/VOTE both use P0. In the 64-thread case the first warp has an empty mask.
+        patched[7] = {{0x0000780cU | (4U << 24), threshold,
+                       (7U << 23) | (7U << 20) | (0U << 17) | (6U << 12), Sched}};
 
-        std::vector<u32> out(32 * 8, 0);
-        REQUIRE(rig->Run(patched, {}, 32, 1, {}, out));
-
-        s32 expected_sum = 0;
-        s32 expected_min = std::numeric_limits<s32>::max();
-        for (u32 t = 0; t < 32; ++t) {
-            const s32 v = static_cast<s32>(t * 2) - 10;
-            expected_sum += v;
-            expected_min = (std::min)(expected_min, v);
+        std::vector<u32> out(threads * 16, 0);
+        REQUIRE(rig->Run(patched, {}, threads, 1, {}, out));
+        for (u32 t = 0; t < threads; ++t) {
+            CAPTURE(t);
+            const u32 warp_base = t & ~31U;
+            const u32 first = (std::max)(warp_base, threshold);
+            const u32 warp_end = (std::min)(warp_base + 32U, threads);
+            const u32 active = warp_end - warp_base;
+            const u32 active_mask = ~0u >> (32 - active);
+            const u32 mask = first < warp_end ? active_mask & (~0u << (first - warp_base)) : 0u;
+            const u32 sum = active * (2U * warp_base + active - 11U);
+            const u32 min = 2U * warp_base - 10U;
+            const u32 offset = t * 16;
+            CHECK(out[offset + 0] == 2U * t - 10U);
+            CHECK(out[offset + 1] == sum);
+            CHECK(out[offset + 2] == min);
+            CHECK(out[offset + 3] == (mask == 0 ? 999U : 2U * first - 10U));
+            CHECK(out[offset + 4] == mask);
+            CHECK(out[offset + 5] == (mask == 0 ? 0x99U : 0x77U));
+            CHECK(out[offset + 6] == t % 32U);
+            CHECK(out[offset + 7] == (1U << (t % 32U)));
+            CHECK(out[offset + 8] == active_mask);
+            CHECK(out[offset + 9] == 1U);
+            CHECK(out[offset + 10] == (mask == 0 || mask == active_mask ? 1U : 0U));
+            CHECK(out[offset + 11] == (mask == active_mask ? 1U : 0U));
         }
-        CHECK(out[1] == static_cast<u32>(expected_sum));
-        CHECK(out[2] == static_cast<u32>(expected_min));
-        CHECK(out[3] == 10U);         // lane 10 -> 10*2 - 10 = 10
-        CHECK(out[4] == 0xfffffc00U); // lanes 10..31 set
-        CHECK(out[5] == 0x77U);       // @UP0 took true branch
     }
 
     SECTION("BRXU uniform jump table with c1 targets") {
@@ -894,6 +922,157 @@ TEST_CASE("Direct Ampere GPU execution: Batch B1 scalar/packed conversions and F
     CHECK(res.outputs[0][7] == 0x10U);
 }
 
+TEST_CASE("Direct Ampere GPU execution: F2FP BF16 rounding and MERGE_C.H1",
+          "[nvn][ampere_direct_exec]") {
+    auto rig = Rig::Create();
+    if (!rig) {
+        SKIP("no Vulkan device");
+    }
+    constexpr std::array<Inst, 3> program{{
+        // F2FP.PACK_AB.BF16 R16, R8, R9
+        {{0x0810723eU, 9U, 1U << 12, Sched}},
+        // F2FP.MERGE_C.H1 R17, RZ, R9, R11
+        {{0xff11723eU, 9U, (1U << 14) | (1U << 8) | 11U, Sched}},
+        // F2FP.PACK_AB R18, R8, R9
+        {{0x0812723eU, 9U, 0, Sched}},
+    }};
+    constexpr std::array<Words, 6> inputs{{
+        {0xc0700000U, 0x40100000U, 0, 0x12345678U}, // -3.75 and 2.25
+        {0x3f808000U, 0x3f818000U, 0, 0x89abcdefU}, // ties with even and odd retained bits
+        {0x7f800001U, 0xff800000U, 0, 0xfedcba98U}, // signaling NaN and negative infinity
+        {0x40100000U, 0x7f800000U, 0, 0x55aa3300U}, // finite high half, +Inf low half
+        {0xff800000U, 0xc0700000U, 0, 0xaa556600U}, // -Inf high half, finite low half
+        {0x40000000U, 0xffc12345U, 0, 0x12345678U}, // finite high half, NaN low half
+    }};
+    const auto result = rig->Run(program, inputs);
+    INFO(result.error);
+    REQUIRE(result.error.empty());
+    REQUIRE(result.outputs.size() == inputs.size());
+    CHECK(result.outputs[0][0] == 0xc0704010U);
+    CHECK(result.outputs[0][1] == 0x12344080U);
+    CHECK(result.outputs[1][0] == 0x3f803f82U);
+    CHECK(result.outputs[1][1] == 0x89ab3c0cU);
+    CHECK(result.outputs[2][0] == 0x7fc0ff80U);
+    CHECK(result.outputs[2][1] == 0xfedcfc00U);
+    CHECK(result.outputs[3][0] == 0x40107f80U);
+    CHECK(result.outputs[3][1] == 0x55aa7c00U);
+    CHECK(result.outputs[3][2] == 0x40807c00U);
+    CHECK(result.outputs[4][0] == 0xff80c070U);
+    CHECK(result.outputs[4][1] == 0xaa55c380U);
+    CHECK(result.outputs[4][2] == 0xfc00c380U);
+    const auto is_half_nan = [](u32 bits) { return (bits & 0x7fffU) > 0x7c00U; };
+    CHECK((result.outputs[2][2] & 0xffffU) == 0xfc00U);
+    CHECK(is_half_nan(result.outputs[2][2] >> 16));
+    CHECK((result.outputs[5][1] >> 16) == 0x1234U);
+    CHECK(is_half_nan(result.outputs[5][1]));
+    CHECK((result.outputs[5][2] >> 16) == 0x4000U);
+    CHECK(is_half_nan(result.outputs[5][2]));
+}
+
+TEST_CASE("Direct Ampere GPU execution: F2FP FP16 ties and overflow",
+          "[nvn][ampere_direct_exec]") {
+    auto rig = Rig::Create();
+    if (!rig) {
+        SKIP("no Vulkan device");
+    }
+    const bool mixed_half_arithmetic = GENERATE(false, true);
+    constexpr std::array<Inst, 2> program{{
+        {{0x0810723eU, 9U, 0, Sched}}, // F2FP.PACK_AB R16, R8, R9
+        {{0x08117232U, 9U, 0, Sched}}, // HMUL2 R17, R8, R9
+    }};
+    struct Case {
+        u32 input;
+        u32 expected;
+    };
+    constexpr std::array cases{
+        Case{0x00000000U, 0x0000U}, Case{0x80000000U, 0x8000U},
+        Case{0x32ffffffU, 0x0000U}, Case{0x33000000U, 0x0000U},
+        Case{0x33000001U, 0x0001U}, Case{0xb3000000U, 0x8000U},
+        Case{0xb3000001U, 0x8001U}, Case{0x387fdfffU, 0x03ffU},
+        Case{0x387fe000U, 0x0400U}, Case{0x387fe001U, 0x0400U},
+        Case{0x3f800fffU, 0x3c00U}, Case{0x3f801000U, 0x3c00U},
+        Case{0x3f801001U, 0x3c01U}, Case{0x3f802fffU, 0x3c01U},
+        Case{0x3f803000U, 0x3c02U}, Case{0x3f803001U, 0x3c02U},
+        Case{0x477fe000U, 0x7bffU}, Case{0x477fefffU, 0x7bffU},
+        Case{0x477ff000U, 0x7c00U}, Case{0x477ff001U, 0x7c00U},
+        Case{0x47800000U, 0x7c00U}, Case{0xc77ff000U, 0xfc00U},
+    };
+    std::array<Words, cases.size()> inputs{};
+    for (size_t i = 0; i < cases.size(); ++i) {
+        inputs[i] = {cases[i].input, cases[cases.size() - 1 - i].input};
+    }
+    const auto program_size = mixed_half_arithmetic ? program.size() : 1;
+    const auto result = rig->Run(std::span{program}.first(program_size), inputs);
+    INFO(result.error);
+    REQUIRE(result.error.empty());
+    REQUIRE(result.outputs.size() == cases.size());
+    for (size_t i = 0; i < cases.size(); ++i) {
+        CAPTURE(i);
+        CHECK((result.outputs[i][0] >> 16) == cases[i].expected);
+        CHECK((result.outputs[i][0] & 0xffffU) == cases[cases.size() - 1 - i].expected);
+    }
+}
+
+TEST_CASE("Ampere packed half comparisons observe intermediate rounding",
+          "[nvn][ampere_direct_exec][half_roundtrip]") {
+    auto rig = Rig::Create();
+    if (!rig) {
+        SKIP("no Vulkan device");
+    }
+    constexpr std::array<Inst, 2> program{{
+        {{0x0810723eU, 9U, 0, Sched}}, // F2FP.PACK_AB R16, R8, R9
+        {{0x10117233U, 10U, (7U << 23) | (1U << 12), Sched}}, // HSET2.LT R17, R16, R10, PT
+    }};
+    constexpr std::array<Words, 3> inputs{{
+        {0x3f7fffffU, 0x3f800000U, 0x3c003c00U, 0}, // just below one, exactly one
+        {0x3f7fe000U, 0xbf800001U, 0x3c00bc00U, 0}, // previous half below one, just below -1
+        {0xb3000000U, 0xb3000001U, 0x00000000U, 0}, // ties to -0, rounds to -2^-24
+    }};
+    const auto result = rig->Run(program, inputs);
+    INFO(result.error);
+    REQUIRE(result.error.empty());
+    REQUIRE(result.outputs.size() == inputs.size());
+    CHECK(result.outputs[0][0] == 0x3c003c00U);
+    CHECK(result.outputs[0][1] == 0U);
+    CHECK(result.outputs[1][0] == 0x3bffbc00U);
+    CHECK(result.outputs[1][1] == 0xffff0000U);
+    CHECK(result.outputs[2][0] == 0x80008001U);
+    CHECK(result.outputs[2][1] == 0x0000ffffU);
+}
+
+TEST_CASE("Ampere shared byte stores preserve adjacent lanes in the same word",
+          "[nvn][ampere_direct_exec][shared_subword]") {
+    auto rig = CustomComputeRig::Create();
+    if (!rig) {
+        SKIP("no Vulkan device");
+    }
+    constexpr u32 threads = 64;
+    const Inst barrier{{0x00007b1dU, 0, 0, Sched}};
+    const std::array shader{
+        S2R(4, 33), MovC0(2, 0x20), MovC0(3, 0x24),
+        LeaReg(6, 4, 2, ZeroGpr, 2, false, false, false, 0),
+        Iadd3Reg(7, 3, ZeroGpr, ZeroGpr, false, false, false, 7, 7, true, 0),
+        ImadImm(10, 4, 4, ZeroGpr),
+        Inst{{0x0a007388U, ZeroGpr, 4U << 9, Sched}}, // STS [R10], RZ
+        barrier,
+        MovImm(11, 65), Iadd3Reg(8, 4, 11, ZeroGpr),
+        Inst{{0x04007388U, 8, 0, Sched}}, // STS.U8 [R4], R8
+        barrier,
+        MovImm(11, ~3U), Lop3Reg(10, 4, 11, ZeroGpr, 0xc0), // R10 = tid & ~3
+        Inst{{0x0a097984U, 0, 4U << 9, Sched}}, // LDS R9, [R10]
+        Stg(6, 0, 9), Exit,
+    };
+    const std::vector<u32> initial(threads, 0xcccccccc);
+    auto output = initial;
+    REQUIRE(rig->Run(shader, {}, threads, 1, initial, output, 32, threads * sizeof(u32)));
+    for (u32 tid = 0; tid < threads; ++tid) {
+        const u32 first = 65 + (tid & ~3U);
+        const u32 expected = first | ((first + 1) << 8) | ((first + 2) << 16) | ((first + 3) << 24);
+        CAPTURE(tid);
+        CHECK(output[tid] == expected);
+    }
+}
+
 TEST_CASE("Direct Ampere GPU execution: Batch B2 shared, LDGSTS dynamic enable, and global atomics",
           "[nvn][ampere_direct_exec]") {
     auto rig = CustomComputeRig::Create();
@@ -1044,11 +1223,250 @@ namespace {
 
 } // namespace
 
+TEST_CASE("Ampere lane registers describe the guest warp in a multidimensional workgroup",
+          "[nvn][ampere_direct_exec][lane_registers]") {
+    auto rig = CustomComputeRig::Create();
+    if (!rig) {
+        SKIP("no Vulkan device");
+    }
+
+    constexpr u32 width = 8;
+    constexpr u32 height = 5;
+    constexpr u32 threads = width * height;
+    std::vector<Inst> program{
+        S2R(4, 33), S2R(5, 34), ImadImm(4, 5, width, 4),
+        MovC0(2, 0x20), MovC0(3, 0x24),
+        LeaReg(6, 4, 2, ZeroGpr, 2, false, false, false, 0),
+        Iadd3Reg(7, 3, ZeroGpr, ZeroGpr, false, false, false, 7, 7, true, 0),
+    };
+    constexpr std::array<u32, 6> registers{0, 56, 57, 58, 59, 60};
+    for (u32 i = 0; i < registers.size(); ++i) {
+        program.push_back(S2R(8, registers[i]));
+        program.push_back(Stg(6, i * threads * sizeof(u32), 8));
+    }
+    program.push_back(Exit);
+    const std::vector<u32> initial(threads * registers.size(), 0xcdcdcdcd);
+    auto output = initial;
+    REQUIRE(rig->Run(program, {}, width, 1, initial, output, 32, 0, 0, height));
+    for (u32 tid = 0; tid < threads; ++tid) {
+        const u32 lane = tid % 32;
+        const u32 eq = 1U << lane;
+        const u32 lt = eq - 1;
+        const std::array expected{lane, eq, lt, lt | eq, ~(lt | eq), ~lt};
+        for (u32 i = 0; i < expected.size(); ++i) {
+            CAPTURE(tid, i);
+            CHECK(output[i * threads + tid] == expected[i]);
+        }
+    }
+}
+
+TEST_CASE("Ampere compute exchanges register values within each guest warp",
+          "[nvn][ampere_direct_exec][warp_exchange]") {
+    auto rig = CustomComputeRig::Create();
+    if (!rig) {
+        SKIP("no Vulkan device");
+    }
+    constexpr u32 threads = 64;
+    constexpr u32 column = threads * sizeof(u32);
+    const std::array shader{
+        S2R(4, 33), MovC0(2, 0x20), MovC0(3, 0x24),
+        LeaReg(6, 4, 2, ZeroGpr, 2, false, false, false, 0),
+        Iadd3Reg(7, 3, ZeroGpr, ZeroGpr, false, false, false, 7, 7, true, 0),
+        Inst{{0x04087989U, 0x04200000U, 0xffU, Sched}},       // SHFL.UP P0, R8, R4, 1, RZ
+        Inst{{0x04097f89U, 0x08401f00U, 0xe0000U, Sched}},   // SHFL.DOWN PT, R9, R4, 2, 31
+        Inst{{0x040a7f89U, 0x0c801f00U, 0xe0000U, Sched}},   // SHFL.BFLY PT, R10, R4, 4, 31
+        Inst{{0x040b7f89U, 0x00e01f00U, 0xe0000U, Sched}},   // SHFL.IDX PT, R11, R4, 7, 31
+        MovImm(12, 1), SelReg(12, 12, ZeroGpr, 0),
+        Stg(6, 0, 8), Stg(6, column, 9), Stg(6, 2 * column, 10),
+        Stg(6, 3 * column, 11), Stg(6, 4 * column, 12), Exit,
+    };
+    const std::vector<u32> input(5 * threads, 0xcdcdcdcdU);
+    std::vector<u32> output(input.size());
+    REQUIRE(rig->Run(shader, {}, threads, 1, input, output));
+    for (u32 t = 0; t < threads; ++t) {
+        const u32 lane = t % 32;
+        CAPTURE(t);
+        CHECK(output[t] == (lane == 0 ? t : t - 1));
+        CHECK(output[threads + t] == (lane < 30 ? t + 2 : t));
+        CHECK(output[2 * threads + t] == (t ^ 4U));
+        CHECK(output[3 * threads + t] == (t - lane + 7));
+        CHECK(output[4 * threads + t] == (lane != 0 ? 1U : 0U));
+    }
+}
+
+TEST_CASE("Ampere TID and SHFL agree across two guest warps in a 3D workgroup",
+          "[nvn][ampere_direct_exec][workgroup_3d]") {
+    auto rig = CustomComputeRig::Create();
+    if (!rig) {
+        SKIP("no Vulkan device");
+    }
+
+    const auto shape = GENERATE((std::array<u32, 3>{4, 4, 4}),
+                                (std::array<u32, 3>{2, 4, 8}));
+    const auto [width, height, depth] = shape;
+    CAPTURE(width, height, depth);
+    const u32 threads = width * height * depth;
+    constexpr u32 WordsPerThread = 8;
+    constexpr u32 XorMask = 0x15; // Changes X, Y and Z in both local shapes.
+    constexpr u32 LastWarpLane = 31;
+
+    const std::array program{
+        S2R(4, 33), S2R(5, 34), S2R(6, 35), // SR_TID.X/Y/Z
+        ImadImm(7, 6, height, 5),           // R7 = y + height * z
+        ImadImm(8, 7, width, 4),            // R8 = linear index
+        S2R(9, 0), S2R(10, 32),            // SR_LANEID, SR_TID
+        Inst{{0x080b7f89U, (3U << 26) | (XorMask << 21) | (31U << 8), 0xe0000U, Sched}},
+        Inst{{0x080c7f89U, (LastWarpLane << 21) | (31U << 8), 0xe0000U, Sched}},
+        MovC0(20, 0x20), MovC0(21, 0x24),
+        LeaReg(20, 8, 20, ZeroGpr, 5, false, false, false, 0),
+        Iadd3Reg(21, 21, ZeroGpr, ZeroGpr, false, false, false, 7, 7, true, 0),
+        Stg(20, 0, 4), Stg(20, 4, 5), Stg(20, 8, 6), Stg(20, 12, 8),
+        Stg(20, 16, 9), Stg(20, 20, 11), Stg(20, 24, 12), Stg(20, 28, 10),
+        Exit,
+    };
+
+    const std::vector<u32> initial(threads * WordsPerThread, 0xc0decafe);
+    std::vector<u32> result(initial.size());
+    REQUIRE(rig->Run(program, {}, width, 1, initial, result, 32, 0, 0, height, depth));
+    for (u32 z = 0; z < depth; ++z) {
+        for (u32 y = 0; y < height; ++y) {
+            for (u32 x = 0; x < width; ++x) {
+                const u32 linear = x + width * (y + height * z);
+                const u32 offset = linear * WordsPerThread;
+                const u32 warp_base = linear & ~LastWarpLane;
+                const u32 lane = linear & LastWarpLane;
+                CAPTURE(x, y, z, linear);
+                CHECK(result[offset] == x);
+                CHECK(result[offset + 1] == y);
+                CHECK(result[offset + 2] == z);
+                CHECK(result[offset + 3] == linear);
+                CHECK(result[offset + 4] == lane);
+                CHECK(result[offset + 5] == (warp_base | (lane ^ XorMask)));
+                CHECK(result[offset + 6] == (warp_base | LastWarpLane));
+                CHECK(result[offset + 7] == (x | (y << 16) | (z << 26)));
+            }
+        }
+    }
+}
+
+TEST_CASE("Ampere HMMA preserves independent guest warps in a 64-thread workgroup",
+          "[nvn][ampere_direct_exec][tensor_workgroup]") {
+    auto rig = CustomComputeRig::Create();
+    if (!rig) {
+        SKIP("no Vulkan device");
+    }
+
+    // ptxas sm_86: mma.sync.aligned.m16n8k{16,8}.row.col.f16.f16.f16.f16.
+    // Both operations consume the same A, B and C fragments.
+    constexpr Inst hmma16{{0x040c723c, 8, 0x80a, 0x004fe200}};
+    constexpr Inst hmma8{{0x040e723c, 8, 0x00a, 0x000fde00}};
+    constexpr u32 threads = 64;
+    const u32 x = GENERATE(64U, 8U);
+    const bool guest_shared = x == 8;
+    CAPTURE(x);
+    constexpr u32 column_bytes = threads * sizeof(u32);
+    std::vector<Inst> program{
+        S2R(18, 33),
+    };
+    if (guest_shared) {
+        program.push_back(S2R(19, 34));
+        program.push_back(LeaReg(18, 19, 18, ZeroGpr, 3, false, false));
+        program.push_back(ImadImm(22, 18, 4, ZeroGpr));
+        program.push_back({{0x16007388U, 18U, (4U << 9), Sched}}); // STS.32 [R22], R18
+    }
+    const std::array setup{MovC0(20, 0x20), MovC0(21, 0x24),
+        LeaReg(20, 18, 20, ZeroGpr, 2, false, false, false, 0),
+        Iadd3Reg(21, 21, ZeroGpr, ZeroGpr, false, false, false, 7, 7, true, 0),
+        Ldg(4, 20, 0), Ldg(5, 20, column_bytes), MovReg(6, 4), MovReg(7, 5),
+        MovImm(8, 0x3c003c00), MovImm(9, 0x40004000),
+        MovImm(10, 0x3c003c00), MovImm(11, 0x40004000),
+        hmma16, hmma8,
+    };
+    program.insert(program.end(), setup.begin(), setup.end());
+    for (u32 i = 0; i < 4; ++i) {
+        program.push_back(Stg(20, (2 + i) * column_bytes, 12 + i));
+    }
+    if (guest_shared) {
+        program.push_back({{0x16177984U, 0U, (4U << 9), Sched}}); // LDS.32 R23, [R22]
+        program.push_back(Stg(20, 6 * column_bytes, 23));
+    }
+    program.push_back(S2R(26, 0));
+    program.push_back(S2R(27, 56));
+    program.push_back(Stg(20, 7 * column_bytes, 26));
+    program.push_back(Stg(20, 8 * column_bytes, 27));
+    program.push_back(Exit);
+
+    // A has different rows and warp bases. B and C differ between fragments.
+    // All products and sums are exact in binary16.
+    std::vector<u32> input(9 * threads, 0xcdcdcdcd);
+    for (u32 tid = 0; tid < threads; ++tid) {
+        const float first = static_cast<float>((tid / 32) * 16 + (tid % 32) / 4 + 1);
+        input[tid] = PackF16Pair(first, first);
+        input[threads + tid] = PackF16Pair(first + 8, first + 8);
+    }
+    std::vector<u32> output(input.size());
+    REQUIRE(rig->Run(program, {}, x, 1, input, output, 32,
+                     guest_shared ? column_bytes : 0, 0, threads / x));
+    for (u32 tid = 0; tid < threads; ++tid) {
+        const float first = static_cast<float>((tid / 32) * 16 + (tid % 32) / 4 + 1);
+        CAPTURE(tid);
+        for (u32 i = 0; i < 4; ++i) {
+            const float product = (first + (i % 2) * 8) * (i < 2 ? 24 : 8) + (i % 2) + 1;
+            CHECK(output[(2 + i) * threads + tid] == PackF16Pair(product, product));
+        }
+        if (guest_shared) {
+            CHECK(output[6 * threads + tid] == tid);
+        }
+        CHECK(output[7 * threads + tid] == tid % 32);
+        CHECK(output[8 * threads + tid] == (1u << (tid % 32)));
+    }
+}
+
+TEST_CASE("Ampere HMMA accepts a predicate that differs between guest warps",
+          "[nvn][ampere_direct_exec][tensor_workgroup]") {
+    auto rig = CustomComputeRig::Create();
+    if (!rig) {
+        SKIP("no Vulkan device");
+    }
+
+    constexpr u32 threads = 64;
+    constexpr u32 column = threads * sizeof(u32);
+    const std::array program{
+        S2R(18, 33), MovC0(20, 0x20), MovC0(21, 0x24),
+        LeaReg(20, 18, 20, ZeroGpr, 2, false, false),
+        Iadd3Reg(21, 21, ZeroGpr, ZeroGpr, false, false, false, 7, 7, true, 0),
+        Ldg(22, 20, 0),
+        Inst{{0x16ff73a1U, 0, 0, Sched}},                                    // MATCH.ALL P0, R22
+        Inst{{0x12177f89U, (3U << 26) | (1U << 21) | (0x1fU << 8), 0x000e0000U, Sched}},
+        MovImm(4, 0x3c003c00), MovImm(5, 0x3c003c00), MovImm(8, 0x3c003c00),
+        MovImm(12, 0x34003400), MovImm(13, 0x34003400),
+        Inst{{0x040c023cU, 8, 255, Sched}},                                  // @P0 HMMA.1688
+        Inst{{0x12187f89U, (3U << 26) | (1U << 21) | (0x1fU << 8), 0x000e0000U, Sched}},
+        Stg(20, column, 12), Stg(20, 2 * column, 13),
+        Stg(20, 3 * column, 23), Stg(20, 4 * column, 24), Exit,
+    };
+    std::vector<u32> input(5 * threads, 0xcdcdcdcd);
+    for (u32 lane = 0; lane < threads; ++lane) {
+        input[lane] = lane < 32 ? 77 : lane;
+    }
+    auto output = input;
+    REQUIRE(rig->Run(program, {}, threads, 1, input, output));
+    for (u32 lane = 0; lane < threads; ++lane) {
+        CAPTURE(lane);
+        const u32 expected = lane < 32 ? PackF16Pair(8.f, 8.f) : 0x34003400U;
+        CHECK(output[threads + lane] == expected);
+        CHECK(output[2 * threads + lane] == expected);
+        CHECK(output[3 * threads + lane] == (lane ^ 1u));
+        CHECK(output[4 * threads + lane] == (lane ^ 1u));
+    }
+}
+
 TEST_CASE("Direct Ampere GPU execution: Batch B3 SHFL, MATCH.ALL, MOVM, LDSM, and HMMA",
           "[nvn][ampere_direct_exec]") {
-    // Enable native tensor lowering cleanly (compact for OoT program ID) and restore on exit.
+    const u32 width = GENERATE(32U, 16U);
+    CAPTURE(width);
     const u64 prev_program_id = Settings::GetCurrentProgramID();
-    Settings::SetCurrentProgramID(VideoCommon::OcarinaOfTimeProgramId);
+    Settings::SetCurrentProgramID(0);
     SCOPE_EXIT { Settings::SetCurrentProgramID(prev_program_id); };
 
     auto rig = CustomComputeRig::Create();
@@ -1072,7 +1490,9 @@ TEST_CASE("Direct Ampere GPU execution: Batch B3 SHFL, MATCH.ALL, MOVM, LDSM, an
     //   out[384..415]  : LDSM.16.MT88.1 (must equal MOVM of LDSM.M88!)
     //   out[416..447]  : HMMA.16816.F16 D0 (row g)
     //   out[448..479]  : HMMA.16816.F16 D1 (row g+8)
-    //   out[480..511]  : Guarded @P0 HMMA.1688.F16 D0 (tests expanded SSA HMMA path inside compact pipeline!)
+    //   out[480..511]  : Uniformly enabled @P0 HMMA.1688.F16 D0
+    //   out[512..543]  : Uniformly disabled @P1 HMMA.1688.F16 preserves D0
+    //   out[544..575]  : Repeat LDSM after HMMA to verify scratch reuse
     const auto stg_at = [](u32 base_reg, u32 val_reg, u32 byte_offset) -> Inst {
         return Stg(base_reg, byte_offset, val_reg);
     };
@@ -1080,7 +1500,7 @@ TEST_CASE("Direct Ampere GPU execution: Batch B3 SHFL, MATCH.ALL, MOVM, LDSM, an
         return Ldg(dst_reg, base_reg, byte_offset);
     };
     std::vector<Inst> prog{
-        S2R(4U, 33U),                                                       // R4 = tid (0..31)
+        S2R(4U, 0U),                                                        // R4 = lane (0..31)
         MovC0(2U, 0x20U),
         MovC0(3U, 0x24U),
         // R6:R7 = base + tid * 4
@@ -1116,10 +1536,13 @@ TEST_CASE("Direct Ampere GPU execution: Batch B3 SHFL, MATCH.ALL, MOVM, LDSM, an
         {{0x04167824U, 16U, 0x078e02ffU, Sched}},
         {{0x1613783bU, 0U, 0x00000000U, Sched}},
         {{0x1615783bU, 0U, 0x00004000U, Sched}},
-        // 5. HMMA.16816.F16 R24:R25, R8..R11, R12..R13, R14..R15 (compact unguarded on OoT!)
+        // 5. HMMA.16816.F16 R24:R25, R8..R11, R12..R13, R14..R15 (unguarded)
         {{0x0818723cU, 12U, (1U << 11) | 14U, Sched}},
-        // 6. @P0 HMMA.1688.F16 R26:R27, R8..R9, R12, RZ (guarded -> always exercises expanded SSA path!)
-        {{0x081a023cU, 12U, 255U, Sched}},
+        // 6. HMMA.1688.F16 under both outcomes of a warp-uniform predicate.
+        {{0x081a023cU, 12U, 255U, Sched}},                                  // @P0
+        MovImm(28U, 0x3c003c00U),
+        {{0x081c123cU, 12U, 255U, Sched}},                                  // @P1
+        {{0x161d783bU, 0U, 0x00000000U, Sched}},                            // LDSM R29, [R22]
         // Write outputs:
         stg_at(6U, 17U, 1024U),
         stg_at(6U, 20U, 1152U),
@@ -1129,6 +1552,8 @@ TEST_CASE("Direct Ampere GPU execution: Batch B3 SHFL, MATCH.ALL, MOVM, LDSM, an
         stg_at(6U, 24U, 1664U),
         stg_at(6U, 25U, 1792U),
         stg_at(6U, 26U, 1920U),
+        stg_at(6U, 28U, 2048U),
+        stg_at(6U, 29U, 2176U),
         Exit,
     };
 
@@ -1160,7 +1585,7 @@ TEST_CASE("Direct Ampere GPU execution: Batch B3 SHFL, MATCH.ALL, MOVM, LDSM, an
     B[8][0] = 1.0f;
     C[0][0] = 0.0f;
 
-    std::vector<u32> init(512, 0U);
+    std::vector<u32> init(576, 0U);
     for (u32 t = 0; t < 32; ++t) {
         const u32 g = t / 4U;
         const u32 i = t % 4U;
@@ -1173,8 +1598,8 @@ TEST_CASE("Direct Ampere GPU execution: Batch B3 SHFL, MATCH.ALL, MOVM, LDSM, an
         init[192U + t] = PackF16Pair(C[g][2U * i], C[g][2U * i + 1U]);
     }
 
-    std::vector<u32> out(512, 0U);
-    REQUIRE(rig->Run(prog, {}, 32U, 1U, init, out, 32U, 512U, 0U));
+    std::vector<u32> out(576, 0U);
+    REQUIRE(rig->Run(prog, {}, width, 1U, init, out, 32U, 512U, 0U, 32U / width));
 
     for (u32 t = 0; t < 32; ++t) {
         CAPTURE(t);
@@ -1210,5 +1635,7 @@ TEST_CASE("Direct Ampere GPU execution: Batch B3 SHFL, MATCH.ALL, MOVM, LDSM, an
         CHECK(out[416U + t] == exp_d0);
         CHECK(out[448U + t] == exp_d1);
         CHECK(out[480U + t] == exp_k8);
+        CHECK(out[512U + t] == 0x3c003c00U);
+        CHECK(out[544U + t] == init[t]);
     }
 }

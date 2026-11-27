@@ -1,9 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2026 Vortex727 (FUKKO)
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <limits>
 #include <string_view>
 #include <thread>
 
@@ -12,6 +14,7 @@
 #include "common/settings.h"
 #include "tests/nvn/hle_rig.h"
 #include "video_core/nvn/timestamp_mode.h"
+#include "video_core/renderer_vulkan/nvn/nvn_counters.h"
 
 // The counter timestamp mode (EDEN_NX2_NVN_TIMESTAMPS): parsing, tick conversion, the legacy tick
 // source and what nvnDeviceGetTimestampInNanoseconds / nvnDeviceGetCurrentTimestampInNanoseconds
@@ -290,6 +293,73 @@ TEST_CASE("NVN timestamps: GpuClockMap follows a GPU clock that runs slow", "[nv
     CHECK(window_error > 0);
     CHECK(window_error <= Delay);
     CHECK(global_error < -20'000'000);
+}
+
+TEST_CASE("NVN Vulkan timestamps: apply the reported bit width and unwrap delayed samples",
+          "[nvn][timestamps]") {
+    Vulkan::Nvn::TimestampTickClock clock;
+    CHECK(clock.Convert(0x10fc, 0xff, 1.25) == 0);
+    CHECK(clock.Convert(0x2202, 0xff, 1.25) == 7);
+    CHECK(clock.Convert(0x10fe, 0xff, 1.25) == 2);
+    CHECK(clock.Convert(0x2307, 0xff, 1.25) == 13);
+    CHECK(clock.Convert(0x2304, 0xff, 1.25) == 10);
+    CHECK(clock.Convert(0x23fa, 0xff, 1.25) == -2);
+}
+
+TEST_CASE("NVN Vulkan timestamps: rebasing the device clock preserves the guest epoch",
+          "[nvn][timestamps]") {
+    constexpr std::array<u64, 5> Raw{102'400, 102'450, 102'440, 102'500, 102'550};
+    constexpr std::array<s64, 5> ReadTimes{
+        31'000'000'010, 31'000'000'200, 31'000'000'250, 35'500'000'000, 44'000'000'000};
+    constexpr u64 Mask = std::numeric_limits<u64>::max();
+    constexpr double Period = 2.0;
+    for (const auto policy : {GpuClockMap::Policy::Global, GpuClockMap::Policy::Window}) {
+        GpuClockMap baseline{policy};
+        GpuClockMap rebased{policy};
+        Vulkan::Nvn::TimestampTickClock clock;
+        for (std::size_t i = 0; i < Raw.size(); ++i) {
+            const auto relative = clock.Convert(Raw[i], Mask, Period);
+            REQUIRE(relative.has_value());
+            CHECK(rebased.Map(*relative, ReadTimes[i]) ==
+                  baseline.Map(static_cast<s64>(Raw[i] * Period), ReadTimes[i]));
+        }
+    }
+}
+
+TEST_CASE("NVN Vulkan timestamps: a full-width clock wraps without losing small deltas",
+          "[nvn][timestamps]") {
+    constexpr u64 Mask = std::numeric_limits<u64>::max();
+    Vulkan::Nvn::TimestampTickClock clock;
+    CHECK(clock.Convert(Mask - 2, Mask, 1.25) == 0);
+    CHECK(clock.Convert(1, Mask, 1.25) == 5);
+    CHECK(clock.Convert(Mask, Mask, 1.25) == 2);
+    CHECK(clock.Convert(9, Mask, 1.25) == 15);
+}
+
+TEST_CASE("NVN Vulkan timestamps: ambiguous and unrepresentable samples leave the anchor intact",
+          "[nvn][timestamps]") {
+    constexpr u64 Mask = std::numeric_limits<u64>::max();
+    Vulkan::Nvn::TimestampTickClock clock;
+    CHECK_FALSE(clock.Convert(7, 0, 2.0).has_value());
+    CHECK_FALSE(clock.Convert(7, Mask, std::numeric_limits<double>::infinity()).has_value());
+    CHECK_FALSE(clock.Convert(7, Mask, std::numeric_limits<double>::quiet_NaN()).has_value());
+    CHECK(clock.Convert(0, Mask, 2.0) == 0);
+    CHECK_FALSE(clock.Convert(u64{1} << 63, Mask, 2.0).has_value());
+    CHECK_FALSE(clock.Convert(u64{1} << 62, Mask, 2.0).has_value());
+    CHECK(clock.Convert(3, Mask, 2.0) == 6);
+}
+
+TEST_CASE("NVN Vulkan timestamps: the guest clock mapping handles signed boundaries",
+          "[nvn][timestamps]") {
+    constexpr s64 Min = std::numeric_limits<s64>::min();
+    constexpr s64 Max = std::numeric_limits<s64>::max();
+    GpuClockMap global{GpuClockMap::Policy::Global};
+    CHECK(global.Map(Max, Max) == Max);
+    CHECK(global.Map(Min, Max) == Min);
+    CHECK(global.Map(Max, Min) == Min);
+    GpuClockMap window{GpuClockMap::Policy::Window};
+    CHECK(window.Map(0, Min) == Min);
+    CHECK(window.Map(0, Max) == Max);
 }
 
 TEST_CASE("NVN timestamps: GpuClockMap follows a GPU clock that runs fast", "[nvn][timestamps]") {

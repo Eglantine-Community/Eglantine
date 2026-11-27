@@ -823,6 +823,22 @@ bool MemoryManager::IsMemoryDirty(GPUVAddr gpu_addr, size_t size,
     return result;
 }
 
+size_t MemoryManager::MaxMappedRange(GPUVAddr gpu_addr, size_t size) const {
+    if (!IsWithinGPUAddressRange(gpu_addr)) {
+        return 0;
+    }
+    const size_t limit = (std::min<u64>)(size, address_space_size - gpu_addr);
+    size_t mapped = 0;
+    while (mapped < limit) {
+        const size_t run = MaxContinuousRange(gpu_addr + mapped, limit - mapped);
+        if (run == 0) {
+            break;
+        }
+        mapped += run;
+    }
+    return mapped;
+}
+
 size_t MemoryManager::MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const {
     // Native storage buffers ask this for up to 8 MiB on each bind, ~90,000 times a second in
     // Ocarina of Time: answer from the runs kept at map time instead of walking pages.
@@ -1087,8 +1103,7 @@ bool MemoryManager::IsGranularRange(GPUVAddr gpu_addr, std::size_t size) const {
     if (GetEntry(gpu_addr, true) == EntryType::Mapped) [[likely]] {
         size_t page_index = gpu_addr >> big_page_bits;
         if (IsBigPageContinuous(page_index)) [[likely]] {
-            const std::size_t page{(page_index & big_page_mask) + size};
-            return page <= big_page_size;
+            return size <= big_page_size - (gpu_addr & big_page_mask);
         }
         const std::size_t page{(gpu_addr & Core::DEVICE_PAGEMASK) + size};
         return page <= Core::DEVICE_PAGESIZE;

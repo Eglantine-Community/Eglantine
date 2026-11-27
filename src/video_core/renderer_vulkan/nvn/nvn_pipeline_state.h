@@ -60,7 +60,8 @@ struct TranslationSwitches {
     bool undef_is_zero{true};            ///< EDEN_NX2_UNDEF_ZERO unset or not 0
     bool tensor_mode_set{};              ///< EDEN_NX2_TENSOR present
     std::string tensor_mode;             ///< its value (selects the HMMA lowering)
-    u8 tensor_lowering{};                ///< the title's VideoCommon::NativeTensorLowering
+    u8 tensor_lowering{};                ///< VideoCommon::NativeTensorLowering for eligible workgroups
+    bool tensor_full_fallback{};          ///< use inline HMMA in other workgroups
     bool raw_coverage{};                 ///< EDEN_NX2_RAW_COVERAGE=1 (the miss ring reports)
     bool lean_global_memory{false};      ///< EDEN_NX2_LEAN_SSBO set and not 0
     bool raw_global_fast{};              ///< EDEN_NX2_TRY_RAWGLOBAL_FAST=1 (last-hit translation)
@@ -121,6 +122,7 @@ void MakeKeyState(GraphicsFixedState& state, VertexInputMode mode,
 void BuildVertexInput(const Device& device, const GraphicsFixedState& layout,
                       u32 attributes_read, VertexInput& out, std::vector<std::string>& issues);
 
+[[nodiscard]] VkPrimitiveTopology ToVkTopology(u32 topology);
 [[nodiscard]] Shader::InputTopology ToInputTopology(u32 nvn_topology);
 /// nullopt: the alpha test is off (ALWAYS or an invalid value).
 [[nodiscard]] std::optional<Shader::CompareFunction> ToAlphaTestFunction(u32 nvn_alpha_func);
@@ -172,6 +174,8 @@ struct DynamicStateCaps {
 
 [[nodiscard]] DynamicBlendState MakeDynamicBlendState(const GraphicsFixedState& state,
                                                       const RenderPassKey& targets);
+[[nodiscard]] bool UsesColorLogicOp(const GraphicsFixedState& state,
+                                   const RenderPassKey& targets);
 void StripDynamicKeyState(GraphicsFixedState& state, const DynamicStateCaps& caps,
                           bool has_tessellation);
 
@@ -197,7 +201,7 @@ struct GraphicsPipelineParams {
     /// Declare the DynamicFixedState states dynamic (VK_DYNAMIC_STATE_CULL_MODE ...
     /// DEPTH_BIAS_ENABLE) and leave their create-info fields at fixed values, so that pipelines
     /// differing only in them get equal pre-rasterization and fragment shader library keys. Needs
-    /// VK_EXT_extended_dynamic_state and VK_EXT_extended_dynamic_state2.
+    /// Vulkan 1.3 or both VK_EXT_extended_dynamic_state and VK_EXT_extended_dynamic_state2.
     bool dynamic_fixed{};
     bool dynamic_blend{};
     bool dynamic_alpha_to_coverage{};

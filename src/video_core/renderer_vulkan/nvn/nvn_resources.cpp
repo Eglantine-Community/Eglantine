@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #include <unordered_set>
 
 #include <fmt/format.h>
@@ -243,7 +244,7 @@ void Context::Impl::ImmediateSubmit(const std::function<void(vk::CommandBuffer)>
         .pNext = nullptr,
         .flags = 0,
     });
-    const VkSubmitInfo submit_info{
+    VkSubmitInfo submit_info{
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .pNext = nullptr,
         .waitSemaphoreCount = 0,
@@ -256,7 +257,7 @@ void Context::Impl::ImmediateSubmit(const std::function<void(vk::CommandBuffer)>
     };
     {
         std::scoped_lock lock{submit_mutex};
-        vk::Check(queue.Submit(submit_info, *fence));
+        vk::Check(SubmitGraphics({&submit_info, 1}, *fence));
     }
     vk::Check(fence.Wait());
     std::scoped_lock lock{free_commands_mutex};
@@ -264,19 +265,49 @@ void Context::Impl::ImmediateSubmit(const std::function<void(vk::CommandBuffer)>
 }
 
 bool Context::Impl::ResolveBuffer(u64 address, u64 size, Pool*& pool, u64& offset) const {
-    const u64 generation = pool_generation.load(std::memory_order_acquire);
+    // Keep the backing acquire for callers. The result only depends on the replay-owned
+    // address/serial maps, the virtual mappings, and immutable pool descriptors.
+    (void)pool_generation.load(std::memory_order_acquire);
+    const u64 generation = pool_address_generation;
+    static const bool use_physical_resolve_cache = [] {
+        const char* value = std::getenv("EDEN_NX2_NVN_PHYSICAL_RESOLVE_CACHE");
+        return value != nullptr && value[0] == '1';
+    }();
+    ResolveSlot* physical = nullptr;
+    if (use_physical_resolve_cache) {
+        if (!physical_resolve_allocation_attempted) {
+            physical_resolve_allocation_attempted = true;
+            physical_resolve_cache.reset(new (std::nothrow) PhysicalResolveCache{});
+        }
+        if (physical_resolve_cache) {
+            const u64 key = (address >> 16) * 0x9e3779b97f4a7c15ULL;
+            physical = &(*physical_resolve_cache)[key >> (64 - PHYSICAL_RESOLVE_CACHE_BITS)];
+            if (physical->generation == pool_address_generation && address >= physical->begin &&
+                address < physical->end) {
+                ++physical_resolve_hits;
+                Pool* const candidate = physical->pool;
+                const u64 candidate_offset = address - physical->begin;
+                if (candidate_offset > candidate->size || size > candidate->size - candidate_offset) {
+                    return false;
+                }
+                pool = candidate;
+                offset = candidate_offset;
+                return true;
+            }
+        }
+    }
     const u64 key = ((address >> 4) ^ (size * 0xd6e8feb86659fd93ULL)) * 0x9e3779b97f4a7c15ULL;
-    ExactResolveSlot* const exact = &mkw_resolve_cache[key >> 52];
-    if (exact->generation == generation && exact->mappings == mkw_mapping_generation &&
+    ExactResolveSlot* const exact = &exact_buffer_resolve_cache[key >> 52];
+    if (exact->generation == generation && exact->mappings == pool_mapping_generation &&
         exact->address == address && exact->size == size) {
         pool = exact->pool;
         offset = exact->offset;
-        ++mkw_resolve_hits;
+        ++exact_buffer_resolve_hits;
         return true;
     }
-    ++mkw_resolve_misses;
+    ++exact_buffer_resolve_misses;
     const auto remember = [&] {
-        *exact = {generation, mkw_mapping_generation, address, size, pool, offset};
+        *exact = {generation, pool_mapping_generation, address, size, pool, offset};
     };
     for (const ResolveSlot& slot : resolve_cache) {
         if (slot.generation == generation && address >= slot.begin && address < slot.end) {
@@ -284,19 +315,59 @@ bool Context::Impl::ResolveBuffer(u64 address, u64 size, Pool*& pool, u64& offse
             if (size <= cached.size - (address - cached.address)) {
                 pool = slot.pool;
                 offset = address - cached.address;
+                if (physical) {
+                    *physical = {pool_address_generation, slot.begin, slot.end, pool};
+                }
                 remember();
                 return true;
             }
             break; // the slow path decides
         }
     }
-    auto it = pools_by_address.upper_bound(address);
-    if (it == pools_by_address.begin()) {
-        return false;
+    static const bool use_flat_pool_index = [] {
+        const char* value = std::getenv("EDEN_NX2_NVN_FLAT_POOL_INDEX");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (use_flat_pool_index && !flat_pool_index_ready &&
+        stats.presents.load(std::memory_order_relaxed) != flat_pool_index_deferred_at_present) {
+        try {
+            flat_pool_index.clear();
+            flat_pool_index.reserve(pools_by_address.size());
+            for (const auto& [start, owned] : pools_by_address) {
+                flat_pool_index.emplace_back(start, owned.get());
+            }
+            flat_pool_index_ready = true;
+            ++flat_pool_index_builds;
+        } catch (const std::bad_alloc&) {
+            flat_pool_index.clear();
+            flat_pool_index_deferred_at_present = stats.presents.load(std::memory_order_relaxed);
+        }
     }
-    const auto next = it;
-    --it;
-    Pool& candidate = *it->second;
+    Pool* resolved = nullptr;
+    u64 limit = ~u64{0};
+    if (use_flat_pool_index && flat_pool_index_ready) {
+        ++flat_pool_lookups;
+        const auto next =
+            std::ranges::upper_bound(flat_pool_index, address, {}, &std::pair<u64, Pool*>::first);
+        if (next == flat_pool_index.begin()) {
+            return false;
+        }
+        resolved = std::prev(next)->second;
+        if (next != flat_pool_index.end()) {
+            limit = next->first;
+        }
+    } else {
+        ++tree_pool_lookups;
+        const auto next = pools_by_address.upper_bound(address);
+        if (next == pools_by_address.begin()) {
+            return false;
+        }
+        resolved = std::prev(next)->second.get();
+        if (next != pools_by_address.end()) {
+            limit = next->first;
+        }
+    }
+    Pool& candidate = *resolved;
     if (address < candidate.address || address - candidate.address > candidate.size ||
         size > candidate.size - (address - candidate.address)) {
         return false;
@@ -311,7 +382,11 @@ bool Context::Impl::ResolveBuffer(u64 address, u64 size, Pool*& pool, u64& offse
     }
     pool = &candidate;
     offset = address - candidate.address;
-    const u64 limit = next != pools_by_address.end() ? next->first : ~u64{0};
+    if (physical) {
+        // The next pool's start bounds which pool wins. A request starting here may still extend
+        // past that start, so the hit above checks the full physical size.
+        *physical = {pool_address_generation, candidate.address, limit, pool};
+    }
     resolve_cache[resolve_next++ % resolve_cache.size()] = {
         generation, candidate.address, (std::min)(candidate.address + candidate.size, limit),
         &candidate};
@@ -326,11 +401,17 @@ void Context::Impl::CreatePoolNow(const VC::PoolDesc& desc) {
     pool->size = desc.size;
     pool->flags = desc.flags;
     pools[desc.serial] = pool;
+    if (sparse_virtual_pools.contains(desc.serial)) {
+        sparse_users_dirty = true;
+    }
     ++pool_generation;
+    ++pool_address_generation;
     if (desc.size == 0) {
         return;
     }
     pools_by_address[desc.guest_address] = pool;
+    flat_pool_index_ready = false;
+    flat_pool_index_deferred_at_present = stats.presents.load(std::memory_order_relaxed);
 
     if (desc.flags & PoolFlag::Virtual) {
         // No guest storage and no buffer: a table of mapped ranges (MapVirtual). Buffers placed in
@@ -373,55 +454,64 @@ std::optional<Context::Impl::ChunkWindow> Context::Impl::ImportWindow(u64 addres
     }
     const auto align_down = [align](u64 v) { return v & ~(align - 1); };
     const auto align_up = [align](u64 v) { return (v + align - 1) & ~(align - 1); };
-    const u64 window_gran = (std::max)(ChunkSize, align);
-    // Grid-align the chunk window on 16 MiB boundaries around the pool, cut down to the
-    // contiguous run of mapped pages and clipped against existing chunks so windows never overlap.
+    const u64 last_aligned = align_down((std::numeric_limits<u64>::max)());
+    if (size == 0 || address > last_aligned || size > last_aligned - address) {
+        return std::nullopt;
+    }
     const u64 pool_begin = align_down(address);
     const u64 pool_end = align_up(address + size);
-    const u64 window_begin = align_down(pool_begin & ~(window_gran - 1));
-    const u64 window_end =
-        pool_end <= (std::numeric_limits<u64>::max)() - (window_gran - 1)
-            ? align_up((pool_end + window_gran - 1) & ~(window_gran - 1))
-            : pool_end;
-    u8* const base = host - (address - pool_begin);
-    const auto mapped_like_base = [&](u64 page) {
-        // Signed: pages below the pool lie before `base`.
-        const auto delta = static_cast<std::ptrdiff_t>(page - pool_begin);
-        return memory->Pointer(page) == base + delta &&
-               memory->Pointer(page + align - 1) == base + delta + align - 1;
-    };
-    u64 low = pool_begin;
-    while (low > window_begin && mapped_like_base(low - align)) {
-        low -= align;
+    // Spend the chunk budget on the contiguous mapping around this pool. A fixed grid can
+    // split a short mapping and force another import for a buffer crossing the grid boundary.
+    const u64 pool_span = pool_end - pool_begin;
+    const u64 extra = (std::max)(ChunkSize, pool_span) - pool_span;
+    const uintptr_t h_pool_low = reinterpret_cast<uintptr_t>(host) - (address - pool_begin);
+    if (pool_span > (std::numeric_limits<uintptr_t>::max)() - h_pool_low) {
+        return std::nullopt;
     }
-    u64 high = pool_end;
-    while (high < window_end && mapped_like_base(high)) {
-        high += align;
-    }
-    const uintptr_t h_pool_low = reinterpret_cast<uintptr_t>(base);
-    const uintptr_t h_pool_high = h_pool_low + (pool_end - pool_begin);
-    uintptr_t h_low = h_pool_low - (pool_begin - low);
-    uintptr_t h_high = h_pool_low + (high - pool_begin);
+    const uintptr_t h_pool_high = h_pool_low + pool_span;
+    u64 before = (std::min<u64>)({extra, pool_begin, h_pool_low});
+    u64 after = (std::min<u64>)({extra, last_aligned - pool_end,
+                                 (std::numeric_limits<uintptr_t>::max)() - h_pool_high});
     for (const auto& candidate : import_chunks) {
         const uintptr_t c_low = reinterpret_cast<uintptr_t>(candidate->host);
         const uintptr_t c_high = c_low + candidate->size;
-        if (c_high <= h_low || c_low >= h_high) {
-            continue;
-        }
         if (c_high <= h_pool_low) {
-            h_low = (std::max)(h_low, c_high);
+            before = (std::min<u64>)(before, h_pool_low - c_high);
         } else if (c_low >= h_pool_high) {
-            h_high = (std::min)(h_high, c_low);
+            after = (std::min<u64>)(after, c_low - h_pool_high);
         } else {
             return std::nullopt;
         }
     }
-    low = align_up(pool_begin - static_cast<u64>(h_pool_low - h_low));
-    high = align_down(pool_begin + static_cast<u64>(h_high - h_pool_low));
-    if (low > pool_begin || high < pool_end || high <= low) {
+    const auto maps_to_chunk = [&](u64 va) {
+        const u8* const ptr = memory->Pointer(va);
+        return ptr && static_cast<u64>(reinterpret_cast<uintptr_t>(ptr)) - h_pool_low == va - pool_begin;
+    };
+    const auto mapped_like_base = [&](u64 page) {
+        // The host import alignment can span multiple guest pages.
+        for (u64 delta = 0; delta < align; delta += Pool::MIRROR_PAGE) {
+            if (!maps_to_chunk(page + delta)) {
+                return false;
+            }
+        }
+        return maps_to_chunk(page + align - 1);
+    };
+    if ((pool_begin != address && !mapped_like_base(pool_begin)) ||
+        (pool_end != address + size && !mapped_like_base(pool_end - align))) {
         return std::nullopt;
     }
-    return ChunkWindow{base - static_cast<std::ptrdiff_t>(pool_begin - low), low, high - low};
+    // Prefer space for subsequent pools, and spend the remaining budget below this pool.
+    const u64 window_end = pool_end + align_down(after);
+    u64 high = pool_end;
+    while (high < window_end && mapped_like_base(high)) {
+        high += align;
+    }
+    const u64 window_begin = pool_begin - align_down((std::min)(before, extra - (high - pool_end)));
+    u64 low = pool_begin;
+    while (low > window_begin && mapped_like_base(low - align)) {
+        low -= align;
+    }
+    return ChunkWindow{memory->Pointer(low), low, high - low};
 }
 
 VkResult Context::Impl::ImportPoolBuffer(Pool& pool, u8* host, std::string& error) {
@@ -514,7 +604,116 @@ bool Context::Impl::InImportedChunk(const u8* host, u64 size) const {
     return false;
 }
 
-void Context::Impl::EnsureBacking(Pool& pool) {
+bool Context::Impl::TryCreateSparseMirror(Pool& pool, u64 offset, u64 size) {
+    constexpr u32 flags = PoolFlag::Physical | PoolFlag::Compressible | PoolFlag::GpuNoAccess;
+    if (!sparse_buffer_mirrors || HostImportEnabled() || (pool.flags & flags) != flags ||
+        (pool.flags & PoolFlag::CpuNoAccess) != 0 || pool.size < (u64{16} << 20) ||
+        size == 0 || size >= pool.size) {
+        return false;
+    }
+    // These physical pools cannot be promoted to raw-global mirrors. Virtual aliases resolve to
+    // the same buffer and physical offsets before their descriptors are built.
+    const VkBufferCreateInfo info{
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .flags = VK_BUFFER_CREATE_SPARSE_BINDING_BIT | VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT,
+        .size = pool.size,
+        .usage = POOL_BUFFER_USAGE,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+    VkBuffer handle{};
+    if (dld.vkCreateBuffer(logical, &info, nullptr, &handle) != VK_SUCCESS) {
+        return false;
+    }
+    vk::Buffer buffer{handle, logical, vma, VK_NULL_HANDLE, {}, false, {}, dld};
+    auto mirror = std::make_unique<Pool::SparseMirror>();
+    mirror->requirements = device.GetLogical().GetBufferMemoryRequirements(handle);
+    mirror->bound.resize(mirror->requirements.size / mirror->requirements.alignment);
+    pool.InitMirrorPages(static_cast<size_t>((pool.size + Pool::MIRROR_PAGE - 1) / Pool::MIRROR_PAGE));
+    if (!BindSparseMirror(pool, handle, *mirror, offset, size)) {
+        pool.InitMirrorPages(0);
+        return false;
+    }
+    pool.host = const_cast<u8*>(GuestPointer(pool.address, pool.size));
+    pool.sparse_mirror = std::move(mirror);
+    pool.buffer = std::move(buffer);
+    pool.backing = Pool::Backing::Mirror;
+    ++pool_generation;
+    pool.pending.store(false, std::memory_order_release);
+    stats.pools_mirrored.fetch_add(1, std::memory_order_relaxed);
+    stats.pools_mirrored_no_import.fetch_add(1, std::memory_order_relaxed);
+    stats.sparse_buffer_mirrors.fetch_add(1, std::memory_order_relaxed);
+    LOG_INFO(Render_Vulkan,
+             "[nvn] sparse buffer mirror: pool {:#x}, {} MiB logical, first range {:#x}+{:#x}",
+             pool.address, pool.size >> 20, offset, size);
+    return true;
+}
+
+bool Context::Impl::BindSparseMirror(Pool& pool, VkBuffer buffer, Pool::SparseMirror& mirror,
+                                    u64 offset, u64 size) {
+    const VkMemoryRequirements& requirements = mirror.requirements;
+    const u64 alignment = requirements.alignment;
+    // Mirror uploads copy whole guest pages even for a partial descriptor range.
+    const u64 granule = (std::max)(alignment, Pool::MIRROR_PAGE);
+    if (size != 0 && (offset >= pool.size || size > pool.size - offset)) {
+        return false;
+    }
+    const size_t first = size != 0 ? (offset / granule * granule) / alignment : 0;
+    const size_t last = size != 0
+                            ? (std::min)(mirror.bound.size(),
+                                         (offset + size + granule - 1) / granule * granule / alignment)
+                            : mirror.bound.size();
+    auto block = mirror.bound.begin() + first;
+    const auto end = mirror.bound.begin() + last;
+    block = std::find(block, end, u8{0});
+    if (block == end) {
+        return true;
+    }
+
+    std::vector<MemoryCommit> allocations;
+    std::vector<VkSparseMemoryBind> binds;
+    u64 bytes = 0;
+    while (block != end) {
+        const auto next = std::find(block, end, u8{1});
+        VkMemoryRequirements run = requirements;
+        run.size = static_cast<u64>(next - block) * alignment;
+        VmaAllocationInfo location{};
+        const VmaAllocation allocation = allocator->AllocateSparseMemory(run, location);
+        if (!allocation) {
+            return false;
+        }
+        MemoryCommit commit{vma, allocation, location};
+        allocations.push_back(std::move(commit));
+        binds.push_back({.resourceOffset = static_cast<u64>(block - mirror.bound.begin()) * alignment,
+                         .size = run.size,
+                         .memory = location.deviceMemory,
+                         .memoryOffset = location.offset});
+        bytes += run.size;
+        block = std::find(next, end, u8{0});
+    }
+    mirror.allocations.reserve(mirror.allocations.size() + allocations.size());
+    const VkSparseBufferMemoryBindInfo bind{
+        .buffer = buffer, .bindCount = static_cast<u32>(binds.size()), .pBinds = binds.data()};
+    const VkResult result = SubmitSparseBind({.sType = VK_STRUCTURE_TYPE_BIND_SPARSE_INFO,
+                                               .bufferBindCount = 1,
+                                               .pBufferBinds = &bind},
+                                              {.pool = pools.at(pool.serial)});
+    if (result != VK_SUCCESS) {
+        if (result == VK_ERROR_DEVICE_LOST) {
+            NoteDeviceLost("binding sparse pool mirror");
+        }
+        return false;
+    }
+    for (auto& allocation : allocations) {
+        mirror.allocations.push_back(std::move(allocation));
+    }
+    std::fill(mirror.bound.begin() + first, end, u8{1});
+    stats.sparse_buffer_bound_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    LOG_DEBUG(Render_Vulkan, "[nvn] sparse buffer mirror: pool {:#x}, bound {} bytes",
+              pool.address, bytes);
+    return true;
+}
+
+bool Context::Impl::EnsureBacking(Pool& pool, u64 offset, u64 size) {
     // Called for every buffer range an op touches: the common case (backed long ago) must not
     // even start the stall timer.
     const bool was_pending = pool.pending.load(std::memory_order_acquire);
@@ -522,13 +721,19 @@ void Context::Impl::EnsureBacking(Pool& pool) {
         !was_pending && pool.backing == Pool::Backing::Mirror && !pool.buffer && pool.size > 0;
     // upload_pending is only read once `pending` is false (the backing thread writes it before).
     if (!was_pending && !pool.upload_pending && !need_mirror) {
-        return;
+        if (pool.sparse_mirror) {
+            return BindSparseMirror(pool, *pool.buffer, *pool.sparse_mirror, offset, size);
+        }
+        return pool.backing != Pool::Backing::None;
     }
     const Common::FrameStats::Scope stall{Common::FrameStats::Cause::PoolBacking};
     const bool log = Debug::Get().upload_log;
     const auto begin = log ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (was_pending) {
         std::scoped_lock lock{backing_mutex};
+        if (pool.pending.load(std::memory_order_relaxed) && TryCreateSparseMirror(pool, offset, size)) {
+            return true;
+        }
         BackPoolLocked(pool);
     }
     const bool deferred_mirror = pool.backing == Pool::Backing::Mirror && !pool.buffer && pool.size > 0;
@@ -573,6 +778,7 @@ void Context::Impl::EnsureBacking(Pool& pool) {
                  std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin)
                      .count());
     }
+    return pool.backing != Pool::Backing::None;
 }
 
 void Context::Impl::BackingMain() {
@@ -939,69 +1145,59 @@ void Context::Impl::CreateTextureNow(const VC::TextureDesc& d) {
     ++texture_change_epoch;
 }
 
-bool Context::Impl::MkwBc3AtlasSupported() {
-    if (mkw_bc3_atlas_supported) {
-        return *mkw_bc3_atlas_supported;
+bool Context::Impl::Astc8x8StandinSupported() {
+    if (astc_standin == AstcStandin::Rgba8 || !BcGpuEncoder::Supported(device)) {
+        return false;
     }
+    if (astc_8x8_standin_supported) {
+        return *astc_8x8_standin_supported;
+    }
+
+    constexpr VkImageUsageFlags USAGE = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                         VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                         VK_IMAGE_USAGE_SAMPLED_BIT;
+    constexpr VkFormatFeatureFlags FEATURES = VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+                                               VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
+                                               VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                                               VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+    const auto physical = device.GetPhysical();
     const bool sparse_device = device.IsSparseResidencyImageSupported(VK_IMAGE_TYPE_2D) &&
                                device.CanUseUnbackedSparseImages();
-    bool supported = astc_standin != AstcStandin::Rgba8;
-    if (supported && sparse_device) {
-        for (VkFormat format : {VK_FORMAT_BC3_UNORM_BLOCK, VK_FORMAT_BC3_SRGB_BLOCK}) {
-            if (!supported) {
-                break;
-            }
-            auto image = allocator->CreateUnbackedImage({
-                .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-                .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
-                .imageType = VK_IMAGE_TYPE_2D,
-                .format = format,
-                .extent = {8192, 8192, 1},
-                .mipLevels = 14,
-                .arrayLayers = 68,
-                .samples = VK_SAMPLE_COUNT_1_BIT,
-                .tiling = VK_IMAGE_TILING_OPTIMAL,
-                .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                         VK_IMAGE_USAGE_SAMPLED_BIT,
-                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-                .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-            });
-            supported = static_cast<bool>(image);
-            if (image) {
-                const auto requirements =
-                    device.GetLogical().GetImageSparseMemoryRequirements(*image);
-                const auto memory = device.GetLogical().GetImageMemoryRequirements(*image);
-                supported =
-                    memory.alignment == SPARSE_TILE_BYTES &&
-                    std::ranges::any_of(requirements, [](const auto& requirement) {
-                        const auto& props = requirement.formatProperties;
-                        return props.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT &&
-                               props.imageGranularity.width == 256 &&
-                               props.imageGranularity.height == 256 &&
-                               props.imageGranularity.depth == 1 &&
-                               !(props.flags & VK_SPARSE_IMAGE_FORMAT_SINGLE_MIPTAIL_BIT);
-                    });
-            }
+    const auto supported = [&](VideoCore::Surface::PixelFormat pixel_format) {
+        const HostFormat decoded{.pixel_format = pixel_format, .needs_transcode = true};
+        const VkFormat format = ToBcStandin(decoded, astc_standin).format;
+        if ((physical.GetFormatProperties(format).optimalTilingFeatures & FEATURES) != FEATURES) {
+            return false;
         }
-    } else if (supported) {
-        constexpr VkFormatFeatureFlags FEATURES = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
-                                                  VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
-                                                  VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
-        for (VkFormat format : {VK_FORMAT_BC3_UNORM_BLOCK, VK_FORMAT_BC3_SRGB_BLOCK}) {
-            if (!device.IsFormatSupported(format, FEATURES, FormatType::Optimal)) {
-                supported = false;
-                break;
-            }
+        VkPhysicalDeviceImageFormatInfo2 info{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
+            .format = format,
+            .type = VK_IMAGE_TYPE_2D,
+            .tiling = VK_IMAGE_TILING_OPTIMAL,
+            .usage = USAGE,
+            .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
+        };
+        VkImageFormatProperties2 props{.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2};
+        if (physical.GetImageFormatProperties2(info, props) != VK_SUCCESS) {
+            return false;
         }
-    }
-    mkw_bc3_atlas_supported = supported;
-    LOG_INFO(Render_Vulkan, "[nvn] Mario Kart World: ASTC 8x8 {} backing {}",
-             sparse_device ? "sparse atlas" : "non-sparse",
-             supported ? (sparse_device
-                              ? "BC3 (one quarter of RGBA8 backing, full guest dimensions)"
-                              : "BC3 (one quarter of RGBA8 backing, optimal tiling)")
-                       : "RGBA8 (BC3 format/usage unavailable or recompression disabled)");
-    return supported;
+        if (!sparse_device) {
+            return true;
+        }
+        info.flags |= VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT;
+        if (SparseShareEnabled()) {
+            info.flags |= VK_IMAGE_CREATE_SPARSE_ALIASED_BIT;
+        }
+        // SparseBacking::Attach checks the granularity and mip tail of the actual image.
+        return physical.GetImageFormatProperties2(info, props) == VK_SUCCESS;
+    };
+    using VideoCore::Surface::PixelFormat;
+    const bool usable = supported(PixelFormat::ASTC_2D_8X8_UNORM) &&
+                        supported(PixelFormat::ASTC_2D_8X8_SRGB);
+    astc_8x8_standin_supported = usable;
+    LOG_INFO(Render_Vulkan, "[nvn] ASTC 8x8 texture copy backing: {}",
+             AstcStandinName(usable ? astc_standin : AstcStandin::Rgba8));
+    return usable;
 }
 
 std::shared_ptr<Texture> Context::Impl::BuildTexture(const VC::TextureDesc& d) {
@@ -1179,8 +1375,6 @@ std::shared_ptr<Texture> Context::Impl::BuildTexture(const VC::TextureDesc& d) {
     }
     if (astc_gpu_enabled && host->needs_transcode &&
         VideoCore::Surface::IsPixelFormatASTC(host->pixel_format) &&
-        (host->format == VK_FORMAT_A8B8G8R8_SRGB_PACK32 ||
-         host->format == VK_FORMAT_A8B8G8R8_UNORM_PACK32) &&
         storage->type == VK_IMAGE_TYPE_2D && storage->samples == VK_SAMPLE_COUNT_1_BIT) {
         // The GPU decoder writes the levels through UNORM storage views (sRGB stand-ins have no
         // storage support of their own: the views carry the usage, see DrawResources::GetView).
@@ -1220,7 +1414,7 @@ std::shared_ptr<Texture> Context::Impl::BuildTexture(const VC::TextureDesc& d) {
             });
             storage->sparse = std::move(sparse);
             if (sparse_virtual_pools.insert(d.pool_serial).second) {
-                mkw_sparse_users_dirty = true;
+                sparse_users_dirty = true;
             }
         } else if (layout.size >= (u64{4} << 20) && virtual_storages_logged++ < 24) {
             LOG_INFO(Render_Vulkan,
@@ -1276,32 +1470,18 @@ std::shared_ptr<Texture> Context::Impl::BuildTexture(const VC::TextureDesc& d) {
         storage->create_flags |= VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
     }
 
-    // Every MKW ASTC 8x8 copy source and atlas uses the same fixed BC3 format. Smart per-image
-    // formats would make streaming copies incompatible, and recreating an atlas loses GPU writes.
-    const bool mkw_atlas_copy_format = mario_kart_world && IsAstc8x8(host->pixel_format);
-    const bool mkw_bc3 = mkw_atlas_copy_format && host->needs_transcode &&
-                         storage->type == VK_IMAGE_TYPE_2D &&
-                         storage->samples == VK_SAMPLE_COUNT_1_BIT && MkwBc3AtlasSupported();
-    if (mkw_bc3) {
-        storage->astc_gpu = false;
-        storage->usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                         VK_IMAGE_USAGE_SAMPLED_BIT;
-        storage->create_flags &= ~VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
-        SetStandin(*storage, AstcStandin::Bc3);
-        texture->host = storage->host;
-    }
-    // Other sampled ASTC images retain the selected stand-in policy.
-    if (!mkw_atlas_copy_format && astc_standin != AstcStandin::Rgba8 && host->needs_transcode &&
-        VideoCore::Surface::IsPixelFormatASTC(host->pixel_format) &&
+    // Dense and sparse ASTC 8x8 textures can exchange uploads by image copy. Give both
+    // encodings one backing family so a copy never requires recreating an image with GPU writes.
+    const bool fixed_standin = IsAstc8x8(host->pixel_format);
+    if (host->needs_transcode && VideoCore::Surface::IsPixelFormatASTC(host->pixel_format) &&
         storage->type == VK_IMAGE_TYPE_2D && storage->samples == VK_SAMPLE_COUNT_1_BIT &&
-        !storage->sparse) {
+        (fixed_standin ? Astc8x8StandinSupported()
+                       : astc_standin != AstcStandin::Rgba8 && !storage->sparse)) {
         storage->astc_gpu = false;
         storage->usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                          VK_IMAGE_USAGE_SAMPLED_BIT;
         storage->create_flags &= ~VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
-        // Smart selection: BC3 until EnsureImage reads the guest bytes (ChooseSmartStandin).
-        storage->smart_standin = smart_bc.enabled;
-        storage->host = *host;
+        storage->smart_standin = !fixed_standin && smart_bc.enabled;
         SetStandin(*storage, astc_standin);
         texture->host = storage->host;
     }
@@ -1436,9 +1616,12 @@ void Context::Impl::DestroyNow(u64 serial) {
             pool->mirror_track = 0;
         }
         ++pool_generation;
+        ++pool_address_generation;
         const auto by_address = pools_by_address.find(pool->address);
         if (by_address != pools_by_address.end() && by_address->second == pool) {
             pools_by_address.erase(by_address);
+            flat_pool_index_ready = false;
+            flat_pool_index_deferred_at_present = stats.presents.load(std::memory_order_relaxed);
         }
         EvictPoolStorages(serial);
         if (pool->device_address != 0) {
@@ -1502,8 +1685,48 @@ void Context::Impl::DestroyNow(u64 serial) {
     }
 }
 
+bool CoversRawSplitPoolWrites(std::span<const RawGlobalRange> raw,
+                              std::span<const RawSplitPoolRange> split,
+                              std::span<const RawGlobalRange> aliases,
+                              const std::unordered_map<u64, u64>& mirrors) {
+    const auto find = [](std::span<const RawGlobalRange> table, u64 address) {
+        const auto next = std::ranges::upper_bound(table, address, {}, &RawGlobalRange::guest);
+        return next == table.begin() ? next : std::prev(next);
+    };
+    for (const auto& [source, serial, offset] : split) {
+        const u64 end = source.guest + source.size;
+        for (auto entry = find(raw, source.guest); entry != raw.end() && entry->guest < end;
+             ++entry) {
+            const u64 begin = (std::max)(source.guest, entry->guest);
+            const u64 part_end = (std::min)(end, entry->guest + entry->size);
+            const u64 relative = begin - source.guest;
+            // Flattening can replace all or part of a candidate with a different backing.
+            if (begin >= part_end ||
+                entry->device + (begin - entry->guest) != source.device + relative) {
+                continue;
+            }
+            const auto mirror = mirrors.find(serial);
+            if (mirror == mirrors.end()) {
+                return false;
+            }
+            u64 cursor = begin;
+            for (auto alias = find(aliases, cursor); cursor < part_end; ++alias) {
+                if (alias == aliases.end() || alias->guest > cursor ||
+                    cursor - alias->guest >= alias->size ||
+                    alias->device + (cursor - alias->guest) !=
+                        mirror->second + offset + (cursor - source.guest)) {
+                    return false;
+                }
+                cursor = (std::min)(part_end, alias->guest + alias->size);
+            }
+        }
+    }
+    return true;
+}
+
 const Context::Impl::RawGlobalTable& Context::Impl::RawGlobalMemoryTable() {
-    if (raw_table.generation == pool_generation.load(std::memory_order_acquire)) {
+    if (raw_table.pool_generation == pool_generation.load(std::memory_order_acquire) &&
+        raw_table.mapping_generation == pool_mapping_generation) {
         return raw_table;
     }
     using Clock = std::chrono::steady_clock;
@@ -1599,6 +1822,9 @@ const Context::Impl::RawGlobalTable& Context::Impl::RawGlobalMemoryTable() {
                         device.GetLogical().GetBufferDeviceAddress(*run.imported.buffer);
                 }
                 sources.push_back({pool->address + run.offset, run.device_address, run.size, 1});
+                table.split_ranges.push_back(
+                    {{pool->address + run.offset, run.device_address, run.size},
+                     pool->serial, run.offset});
             }
             table.pool_serials.push_back(pool->serial);
             table.pools.push_back(pool.get());
@@ -1687,10 +1913,11 @@ const Context::Impl::RawGlobalTable& Context::Impl::RawGlobalMemoryTable() {
                         split.device_address =
                             device.GetLogical().GetBufferDeviceAddress(*split.imported.buffer);
                     }
-                    sources.push_back({virtual_pool->address + offset +
-                                           (part_begin - run.physical_offset),
-                                       split.device_address + (part_begin - split.offset),
-                                       part_end - part_begin, 1});
+                    const RawGlobalRange range{
+                        virtual_pool->address + offset + (part_begin - run.physical_offset),
+                        split.device_address + (part_begin - split.offset), part_end - part_begin};
+                    sources.push_back({range.guest, range.device, range.size, 1});
+                    table.split_ranges.push_back({range, physical->serial, part_begin});
                 }
                 table.pool_serials.push_back(physical->serial);
                 table.pools.push_back(physical);
@@ -1754,14 +1981,20 @@ const Context::Impl::RawGlobalTable& Context::Impl::RawGlobalMemoryTable() {
     table.mirror_pools.erase(dup.begin(), dup.end());
     table.entries = FlattenRawGlobalRanges(std::move(sources));
     const size_t total_ranges = table.entries.size();
-    table.device = UploadRawTable(table.entries);
+    // A remap can change only the pool handles or split provenance, leaving the shader bytes
+    // identical. The old buffer is immutable and can be retained by both snapshots.
+    table.device = raw_table.device && table.entries == raw_table.entries
+                       ? raw_table.device
+                       : UploadRawTable(table.entries);
     if (!table.device && !table.entries.empty()) {
         // No usable table: every raw access is dropped (counted).
         stats.raw_global_ranges_dropped.fetch_add(table.entries.size(), std::memory_order_relaxed);
     }
     // A gauge: the pools the current table leaves out (mirror or unbacked), not a running sum.
     stats.raw_global_pools_skipped.store(skipped, std::memory_order_relaxed);
-    table.generation = pool_generation;
+    table.generation = raw_table.generation + 1;
+    table.pool_generation = pool_generation.load(std::memory_order_relaxed);
+    table.mapping_generation = pool_mapping_generation;
     stats.raw_global_rebuilds.fetch_add(1, std::memory_order_relaxed);
     if (log_rebuild) {
         u64 bytes = 0;
@@ -1786,7 +2019,16 @@ const Context::Impl::RawGlobalTable& Context::Impl::RawGlobalMemoryTable() {
     return raw_table;
 }
 
-const Context::Impl::RawWriteThroughTable& Context::Impl::RawStoreAliasTable() {
+const Context::Impl::RawWriteThroughTable& Context::Impl::RawStoreAliasTable(
+    const RawGlobalTable& raw) {
+    const auto check_coverage = [&raw](RawWriteThroughTable& aliases) {
+        if (aliases.checked_raw_generation != raw.generation) {
+            aliases.split_writes_covered = !raw.device ||
+                CoversRawSplitPoolWrites(raw.entries, raw.split_ranges, aliases.entries,
+                                         aliases.split_mirrors);
+            aliases.checked_raw_generation = raw.generation;
+        }
+    };
     const bool read_only_enabled = Common::DiagRequest::TrySwitchEnabled("TRY_RO_MIRROR_EXACT");
     const bool storage_enabled = Common::DiagRequest::TrySwitchEnabled("TRY_STORAGE_RAW_WRITE_THROUGH");
     const u64 current_split_gen = split_alias_generation.load(std::memory_order_acquire);
@@ -1794,6 +2036,7 @@ const Context::Impl::RawWriteThroughTable& Context::Impl::RawStoreAliasTable() {
         raw_write_through_table.split_generation == current_split_gen &&
         raw_write_through_table.read_only_enabled == read_only_enabled &&
         raw_write_through_table.storage_enabled == storage_enabled) {
+        check_coverage(raw_write_through_table);
         return raw_write_through_table;
     }
     struct AliasSource {
@@ -1870,16 +2113,19 @@ const Context::Impl::RawWriteThroughTable& Context::Impl::RawStoreAliasTable() {
             }
             if (pool->backing == Pool::Backing::Mirror && !pool->split_runs.empty()) {
                 pool->raw_written_through = true;
+                table.split_mirrors.emplace(pool->serial, pool->device_address);
             }
             table.pool_serials.push_back(pool->serial);
             table.pools.push_back(pool);
         }
+        table.entries = std::move(entries);
     }
     for (const auto& [pool, was_written_through] : prev_split_alias) {
         if (was_written_through && !pool->raw_written_through && !pool->split_runs.empty()) {
             pool->ClearAllMirrorTrusted();
         }
     }
+    check_coverage(table);
     stats.vram_raw_alias_rebuilds.fetch_add(1, std::memory_order_relaxed);
     raw_write_through_table = std::move(table);
     return raw_write_through_table;
@@ -2185,8 +2431,8 @@ u32 Context::Impl::PromoteMissedRawPools(const VideoCommon::RawCoverageRing& win
 }
 
 bool Context::Impl::PromoteRawMirrorPool(Pool& pool, u64 miss_address) {
-    EnsureBacking(pool);
-    if (pool.backing != Pool::Backing::Mirror || !pool.buffer || pool.mirror_pages.empty()) {
+    if (pool.sparse_mirror || !EnsureBacking(pool) || pool.backing != Pool::Backing::Mirror ||
+        !pool.buffer || pool.mirror_pages.empty()) {
         pool.raw_mirror_refused = true;
         return false;
     }

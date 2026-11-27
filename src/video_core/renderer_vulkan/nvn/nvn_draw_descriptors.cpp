@@ -404,8 +404,14 @@ TextureInfo InfoOfTexture(const Texture& texture) {
     const s32 target = texture.desc.view.set_target ? texture.desc.view.target : texture.desc.target;
     TextureInfo info;
     info.type = TypeOfTarget(target);
-    info.format = ShaderFormatOf(texture.host.pixel_format);
-    info.is_integer = VideoCore::Surface::IsPixelFormatInteger(texture.host.pixel_format);
+    const auto& view = texture.desc.view;
+    const VkImageAspectFlags aspect = texture.storage
+        ? TextureViewAspect(texture.storage->aspect, texture.desc.stencil, view.set_dsmode,
+                            view.dsmode)
+        : VK_IMAGE_ASPECT_COLOR_BIT;
+    const auto sample_format = TextureSampleFormat(texture.host.pixel_format, aspect);
+    info.format = ShaderFormatOf(sample_format);
+    info.is_integer = VideoCore::Surface::IsPixelFormatInteger(sample_format);
     return info;
 }
 
@@ -807,12 +813,8 @@ bool DrawContext::ViewKeyOf(const Texture& texture, const Storage& s, Shader::Te
     // A BC stand-in is viewed in its storage's BC format (each storage chooses its own), with the
     // texture object's sRGB-ness.
     key.format = s.host.bc_standin ? StandinViewFormat(texture.host, s.host) : texture.host.format;
-    key.aspect = s.aspect;
-    if (s.host.depth && s.host.stencil) {
-        const bool want_stencil = texture.desc.stencil ||
-                                  (texture.desc.view.set_dsmode && texture.desc.view.dsmode == 2);
-        key.aspect = want_stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
-    }
+    key.aspect = TextureViewAspect(s.aspect, texture.desc.stencil, texture.desc.view.set_dsmode,
+                                   texture.desc.view.dsmode);
     key.base_level = (std::min)(level_base, s.levels - 1);
     // A view cannot address zero levels or layers: a count of 0 (SetLevels / SetLayers with no
     // range) is the full range from the base on.
@@ -949,21 +951,45 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
         const char* value = std::getenv("EDEN_NX2_NVN_READ_ONLY_DEPTH");
         return value == nullptr || value[0] != '0';
     }();
+    static const bool scaled_read_only_depth = [] {
+        const char* value = std::getenv("EDEN_NX2_NVN_SCALED_READ_ONLY_DEPTH");
+        return value != nullptr && value[0] == '1';
+    }();
     const Storage* depth_attachment =
         depth_target.texture ? depth_target.texture->storage.get() : nullptr;
-    const bool allow_read_only_depth =
-        graphics && read_only_depth_probe && impl.device.ApiVersion() >= VK_API_VERSION_1_3 &&
-        impl.device.GetDriverID() == VK_DRIVER_ID_MESA_RADV && !targets_scaled &&
-        !depth_target.alias && depth_attachment != nullptr &&
-        depth_attachment->host.format == VK_FORMAT_D32_SFLOAT &&
-        depth_attachment->aspect == VK_IMAGE_ASPECT_DEPTH_BIT &&
-        depth_attachment->samples == VK_SAMPLE_COUNT_1_BIT && depth_attachment->levels == 1 &&
-        depth_attachment->layers == 1 && !layout.stores_raw_global_memory &&
-        !MakeDynamicFixedState(fixed).depth_write_enable &&
-        std::ranges::none_of(layout.bindings, [](const VC::DescriptorBinding& binding) {
-            return binding.is_written;
-        });
-    if (pass_open && pass_read_only_depth && allow_read_only_depth) {
+    const auto scaled_attachments_ready = [&] {
+        // BeginPass can fall back to the native attachments when it cannot allocate a twin.
+        // Use the same pixels a feedback copy would have seen before BeginPass.
+        return scaled_read_only_depth && depth_target.native && depth_attachment->image &&
+               depth_attachment->current_layout != VK_IMAGE_LAYOUT_UNDEFINED &&
+               depth_attachment->scale_owner == depth_target.native->storage.get() &&
+               Rescale::TwinIsCurrent(depth_target.native->storage->scale_state) &&
+               std::ranges::all_of(std::span{color_targets}.first(color_target_count),
+                                   [](const TargetBinding& target) {
+                                       return !target.native || target.texture->storage->image;
+                                   });
+    };
+    // Vulkan 1.3 provides STORE_OP_NONE, so the attachment can be sampled without a store
+    // operation racing shader reads. Every draw must also leave the depth attachment untouched.
+    std::optional<bool> read_only_depth_allowed;
+    const auto allows_read_only_depth = [&] {
+        if (!read_only_depth_allowed.has_value()) {
+            read_only_depth_allowed =
+                graphics && read_only_depth_probe && impl.device.ApiVersion() >= VK_API_VERSION_1_3 &&
+                !depth_target.alias && depth_attachment != nullptr &&
+                depth_attachment->host.format == VK_FORMAT_D32_SFLOAT &&
+                depth_attachment->aspect == VK_IMAGE_ASPECT_DEPTH_BIT &&
+                depth_attachment->samples == VK_SAMPLE_COUNT_1_BIT &&
+                depth_attachment->levels == 1 && depth_attachment->layers == 1 &&
+                !layout.stores_raw_global_memory && !MakeDynamicFixedState(fixed).depth_write_enable &&
+                (!targets_scaled || scaled_attachments_ready()) &&
+                std::ranges::none_of(layout.bindings, [](const VC::DescriptorBinding& binding) {
+                    return binding.is_written;
+                });
+        }
+        return *read_only_depth_allowed;
+    };
+    if (pass_open && pass_read_only_depth && allows_read_only_depth()) {
         plan.read_only_depth = true;
     }
     scratch_writes.clear();
@@ -971,14 +997,10 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
     scratch_images.clear();
     scratch_views.clear();
     scratch_template_ok = pipe.update_template != VK_NULL_HANDLE;
-    size_t total = 0;
-    for (const VC::DescriptorBinding& binding : layout.bindings) {
-        total += binding.count;
-    }
     scratch_writes.reserve(layout.bindings.size() + mesh_buffers);
-    scratch_buffers.reserve(total + mesh_buffers);
-    scratch_images.reserve(total);
-    scratch_views.reserve(total);
+    scratch_buffers.reserve(pipe.descriptor_buffer_count + mesh_buffers);
+    scratch_images.reserve(pipe.descriptor_image_count);
+    scratch_views.reserve(pipe.descriptor_texel_view_count);
 
     prof_zero_size = false;
     std::array<BufferRef, BIND_STAGES> driver_bank{};
@@ -1036,8 +1058,9 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
         plan.raw_global_writes = layout.stores_raw_global_memory;
         plan.raw_global = true;
         if (layout.raw_stores_written_through) {
-            alias_table = &impl.RawStoreAliasTable();
+            alias_table = &impl.RawStoreAliasTable(*raw_table);
             plan.raw_stores_written_through = true;
+            plan.raw_split_writes_covered = alias_table->split_writes_covered;
             alias_header = {alias_table->device.get(), alias_table->low, alias_table->high};
             alias_generation = alias_table->generation + 1;
             // The mirror buffers the stores reach live until the submission completes.
@@ -1065,6 +1088,9 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
         u32 stage;
         u32 slot;
     };
+    const u64 storage_alignment = impl.device.GetStorageBufferAlignment();
+    const u64 storage_alignment_mask = storage_alignment - 1;
+    const u64 max_storage_range = impl.device.GetMaxStorageBufferRange();
     const auto buffer_info = [&](const BufferBinding& binding, bool write, bool uniform,
                                  const SinkSite* sink = nullptr,
                                  CachedBuffer* slot_cache = nullptr) {
@@ -1100,6 +1126,10 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
             return fallback();
         }
         const u64 current_seq = host->HostFlight().seq;
+        // NvnStorageOffset in the shader uses the guest address rounded down to this alignment.
+        // Keep the leading bytes in the range so the shader still reaches the original end.
+        const u64 prefix = uniform ? 0 : binding.address & storage_alignment_mask;
+        const u64 address = binding.address - prefix;
         u64 size = 0;
         BufferRef ref;
         bool resolved = false;
@@ -1107,7 +1137,7 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
             const u64 pool_gen = impl.pool_generation.load(std::memory_order_acquire);
             if (slot_cache->address == binding.address && slot_cache->binding_size == bound_size &&
                 slot_cache->pool_gen == pool_gen &&
-                slot_cache->mapping_gen == impl.mkw_mapping_generation &&
+                slot_cache->mapping_gen == impl.pool_mapping_generation &&
                 slot_cache->alias_gen == impl.ro_alias_generation &&
                 slot_cache->ref.pool != nullptr &&
                 !slot_cache->ref.pool->pending.load(std::memory_order_acquire) &&
@@ -1148,7 +1178,8 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                 prof_zero_size = true;
                 unsized = true;
             }
-            size = uniform ? (std::min)(bound_size, MAX_UNIFORM_RANGE) : bound_size;
+            size = uniform ? (std::min)(bound_size, MAX_UNIFORM_RANGE)
+                           : (std::min)(bound_size, max_storage_range - prefix) + prefix;
             if (uniform) {
                 // The driver binds uniform buffers in whole 256-byte units
                 // (nvnCommandBufferBindUniformBuffer rounds the size up), so the range may run up
@@ -1166,7 +1197,11 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                     size = boundary - binding.address;
                 }
             }
-            resolved = ResolveBuffer(binding.address, size, write, ref, ShadowPolicy::Defer);
+            resolved = ResolveBuffer(address, size, write, ref, ShadowPolicy::Defer,
+                                     !uniform && !unsized);
+            if (resolved && !uniform && (ref.offset & storage_alignment_mask) != 0) {
+                resolved = false;
+            }
             if (resolved && slot_cache != nullptr && !unsized && ref.pool != nullptr &&
                 !ref.pool->pending.load(std::memory_order_acquire) && !ref.pool->upload_pending &&
                 (ref.pool->backing == Pool::Backing::Imported ||
@@ -1174,7 +1209,7 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                 *slot_cache = {
                     .ref = ref,
                     .pool_gen = impl.pool_generation.load(std::memory_order_acquire),
-                    .mapping_gen = impl.mkw_mapping_generation,
+                    .mapping_gen = impl.pool_mapping_generation,
                     .alias_gen = impl.ro_alias_generation,
                     .address = binding.address,
                     .binding_size = bound_size,
@@ -1189,8 +1224,7 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
         bool overlaps = false;
         if (!unsized && !inline_updates.empty()) {
             for (const InlineUpdate& update : inline_updates) {
-                if (update.address < binding.address + size &&
-                    binding.address < update.address + update.size) {
+                if (update.address < address + size && address < update.address + update.size) {
                     overlaps = true;
                     break;
                 }
@@ -1201,8 +1235,7 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
             return resolved && !write && snapshot_range == UniformSnapshotView::npos &&
                    (ref.pool->backing == Pool::Backing::DeviceLocal ||
                     HasOverlappingShadow(*ref.pool, ref.pool_offset, ref.pool_offset + size) ||
-                    impl.NeedsGpuFlushForUniform(binding.address, binding.address + size,
-                                                 current_seq));
+                    impl.NeedsGpuFlushForUniform(address, address + size, current_seq));
         };
         if (misaligned && check_needs_gpu_source()) {
             const BufferRef copy = AllocArena(size, 256, nullptr);
@@ -1221,42 +1254,40 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
             }
         }
         bool flush_inline_to_pool = false;
-        if (overlaps && !misaligned && resolved && !write &&
-            snapshot_range == UniformSnapshotView::npos) {
-            if (!pass_open || check_needs_gpu_source()) {
-                flush_inline_to_pool = true;
-                plan.flush_inline = true;
-            }
+        if (overlaps && resolved) {
+            // Storage descriptors must keep pointing at the pool. Other shader bindings can
+            // alias them, and stores must reach the guest even if the update only hits the prefix.
+            flush_inline_to_pool =
+                !uniform || (!misaligned && snapshot_range == UniformSnapshotView::npos &&
+                             (!pass_open || check_needs_gpu_source()));
+            plan.flush_inline |= flush_inline_to_pool;
         }
-        const bool use_private_copy = (overlaps && !flush_inline_to_pool) || misaligned;
+        const bool use_private_copy = uniform && ((overlaps && !flush_inline_to_pool) || misaligned);
         if (cs_mode != CostSplit::Mode::Count) [[unlikely]] {
             CostSplitNote(uniform ? CostSplit::Data::Uniform : CostSplit::Data::Storage, ref, size,
                           use_private_copy);
         }
         if (use_private_copy) {
-            if (write) {
-                host->HostUnsupported("Draw", "storage buffer under an inline uniform update");
-            }
             // A private copy: memory (when readable) with the updates applied in order.
             u8* pointer = nullptr;
             const BufferRef copy = AllocArena(size, 256, &pointer);
             if (copy.buffer) {
                 if (snapshot_range != UniformSnapshotView::npos) {
-                    std::memcpy(pointer, usnap.Bytes(snapshot_range, binding.address), size);
+                    std::memcpy(pointer, usnap.Bytes(snapshot_range, address), size);
                 } else {
-                    if (const u8* source = impl.GuestPointer(binding.address, size)) {
+                    if (const u8* source = impl.GuestPointer(address, size)) {
                         std::memcpy(pointer, source, size);
                     } else if (VC::GuestMemory* memory = impl.guest.load(std::memory_order_acquire);
-                               !memory || !memory->Read(binding.address, pointer, size)) {
+                               !memory || !memory->Read(address, pointer, size)) {
                         std::memset(pointer, 0, size);
                     }
-                    impl.ApplyPendingInlineWrites(binding.address, pointer, size, current_seq);
+                    impl.ApplyPendingInlineWrites(address, pointer, size, current_seq);
                 }
                 for (const InlineUpdate& update : inline_updates) {
-                    const u64 begin = (std::max)(update.address, binding.address);
-                    const u64 end = (std::min)(update.address + update.size, binding.address + size);
+                    const u64 begin = (std::max)(update.address, address);
+                    const u64 end = (std::min)(update.address + update.size, address + size);
                     if (begin < end) {
-                        CopyInlineUniformBytes(pointer + (begin - binding.address),
+                        CopyInlineUniformBytes(pointer + (begin - address),
                                                update.data + (begin - update.address), end - begin);
                     }
                 }
@@ -1274,7 +1305,8 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
         }
         if (graphics && !write && !unsized) {
             if (const BufferRef copy = TryCopyMirrorRangeToArena(
-                    *ref.pool, ref.pool_offset, binding.address, size, uniform ? 256 : 64);
+                    *ref.pool, ref.pool_offset, address, size,
+                    uniform ? 256 : (std::max<u64>)(storage_alignment, 64));
                 copy.buffer) {
                 if (cs_mode != CostSplit::Mode::Count) [[unlikely]] {
                     CostSplitNote(uniform ? CostSplit::Data::Uniform : CostSplit::Data::Storage,
@@ -1306,7 +1338,7 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                       static_cast<u32>(scratch_buffers.size()), shadowable, ubo_candidate);
         if (cs_mode != CostSplit::Mode::Count && !write) [[unlikely]] {
             CostSplitToRing(uniform ? CostSplit::Data::Uniform : CostSplit::Data::Storage, ref,
-                            binding.address, size);
+                            address, size);
         }
         return VkDescriptorBufferInfo{ref.buffer, ref.offset, size};
     };
@@ -1559,9 +1591,11 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                         Texture* view_texture = texture.get();
                         bool scratch = false;
                         bound = true;
-                        if (allow_read_only_depth && &s == depth_attachment && !is_image &&
-                            !twin && key.format == VK_FORMAT_D32_SFLOAT &&
-                            wanted == VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL) {
+                        if (&s == depth_attachment && !is_image &&
+                            static_cast<bool>(twin) == targets_scaled &&
+                            key.format == VK_FORMAT_D32_SFLOAT &&
+                            wanted == VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL &&
+                            allows_read_only_depth()) {
                             plan.read_only_depth = true;
                             plan.UseImage(texture->storage, wanted, true, false, false, false,
                                           key.format);
@@ -1612,7 +1646,8 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                                 }
                                 if (!entry) {
                                     DrawResources::Scratch* made = resources.GetScratch(
-                                        s, static_cast<u32>(plan.feedback.size()));
+                                        s, static_cast<u32>(plan.feedback.size()),
+                                        host->HostFlight());
                                     if (made) {
                                         plan.feedback.push_back({texture->storage, made->storage,
                                                                  made->texture, key.base_level,
@@ -1700,7 +1735,7 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                             }
                             DrawResources::Scratch* made = resources.GetRetypedScratch(
                                 s, 200u + static_cast<u32>(binding.type) + 64u * prior_sources,
-                                target);
+                                target, host->HostFlight());
                             if (made) {
                                 if (placeholder_logged
                                         .insert(texture->serial << 8 ^ static_cast<u64>(binding.type))
@@ -1983,7 +2018,13 @@ bool DrawContext::TargetOverlapsView(const Storage& storage, const ViewKey& key)
     return overlaps(depth_target);
 }
 
-void DrawContext::RecordFeedbackCopies(DrawPlan& plan) {
+static bool TrackFeedbackMips(const Storage& source) {
+    return source.levels > 1 && source.type == VK_IMAGE_TYPE_2D &&
+           source.aspect == VK_IMAGE_ASPECT_COLOR_BIT && !source.sparse && !source.scaled &&
+           !source.scale_owner && !source.host.needs_transcode && !source.host.bc_standin;
+}
+
+bool DrawContext::RecordFeedbackCopies(DrawPlan& plan) {
     GpuProf::Flight* const prof = plan.feedback.empty() ? nullptr : ProfFlight();
     const GpuProf::Scope prof_scope{
         prof, prof ? host->HostCmd() : vk::CommandBuffer{},
@@ -1999,11 +2040,61 @@ void DrawContext::RecordFeedbackCopies(DrawPlan& plan) {
         Storage& scratch = *copy.scratch;
         host->HostNoteTouched(copy.source);
         host->HostNoteTouched(copy.scratch);
-        if (host->HostNeedsCommands(source, false)) {
+        if (Storage* const native = source.scale_owner) {
+            // The snapshot precedes BeginPass, which normally refreshes scaled attachments.
+            if (!host->HostPrepareScaledTarget(*native)) {
+                host->HostFailed("Draw", "could not prepare the scaled feedback source");
+                return false;
+            }
+        } else if (host->HostNeedsCommands(source, false)) {
             host->HostEnsureContents(source, false);
         }
         if (!source.image || !scratch.image) {
             continue; // FinishImages binds a dummy for a view that cannot be made
+        }
+        DrawResources::Scratch* record = resources.FindScratch(scratch);
+        const SubresourceSpan covered{copy.level, copy.levels, copy.layer, copy.layers};
+        FeedbackMipVersions* versions = nullptr;
+        std::array<VkImageCopy, 32> regions; // at most one mip per bit of the image extent
+        size_t region_count = 0;
+        if (copy.retype_layers == 0 && !copy.retype_row) {
+            if (record && TrackFeedbackMips(source)) {
+                if (!source.feedback_mip_versions) {
+                    source.feedback_mip_versions = std::make_unique<FeedbackMipVersions>(source.levels);
+                }
+                versions = source.feedback_mip_versions.get();
+            }
+            const bool previous_versions =
+                versions && scratch.current_layout != VK_IMAGE_LAYOUT_UNDEFINED &&
+                record->copied.HasVersions(copy.source, this, source.image_gen, covered);
+            const bool is_3d = source.type == VK_IMAGE_TYPE_3D;
+            for (u32 level = copy.level; level < copy.level + copy.levels; ++level) {
+                if (previous_versions && record->copied.MipIsCurrent(level, *versions)) {
+                    continue;
+                }
+                const VkImageSubresourceLayers subresource{
+                    .aspectMask = source.aspect,
+                    .mipLevel = level,
+                    .baseArrayLayer = is_3d ? 0u : copy.layer,
+                    .layerCount = is_3d ? 1u : copy.layers,
+                };
+                regions[region_count++] = {
+                    .srcSubresource = subresource,
+                    .srcOffset = {0, 0, 0},
+                    .dstSubresource = subresource,
+                    .dstOffset = {0, 0, 0},
+                    .extent = {(std::max)(source.extent.width >> level, 1u),
+                               (std::max)(source.extent.height >> level, 1u),
+                               is_3d ? (std::max)(source.extent.depth >> level, 1u) : 1u},
+                };
+            }
+            counters.feedback_mip_regions_reused += copy.levels - region_count;
+            if (region_count == 0) {
+                record->copied.Record(copy.source, this, render_target_epoch.value, covered,
+                                      versions, source.image_gen);
+                ++counters.feedback_skipped;
+                continue;
+            }
         }
         {
             const std::array<std::pair<Storage*, VkImageLayout>, 2> layouts{{
@@ -2049,38 +2140,22 @@ void DrawContext::RecordFeedbackCopies(DrawPlan& plan) {
             host->HostCmd().CopyImage(*source.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                       *scratch.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
             host->HostMarkTransferWritten();
-            if (DrawResources::Scratch* record = resources.FindScratch(scratch)) {
+            if (record) {
                 record->copied.Record(copy.source, this, render_target_epoch.value, {0, 1, 0, 1});
             }
             ++counters.placeholder_copies;
             continue;
         }
-        const bool is_3d = source.type == VK_IMAGE_TYPE_3D;
-        for (u32 level = copy.level; level < copy.level + copy.levels; ++level) {
-            const VkImageSubresourceLayers subresource{
-                .aspectMask = source.aspect,
-                .mipLevel = level,
-                .baseArrayLayer = is_3d ? 0u : copy.layer,
-                .layerCount = is_3d ? 1u : copy.layers,
-            };
-            const VkImageCopy region{
-                .srcSubresource = subresource,
-                .srcOffset = {0, 0, 0},
-                .dstSubresource = subresource,
-                .dstOffset = {0, 0, 0},
-                .extent = {(std::max)(source.extent.width >> level, 1u),
-                           (std::max)(source.extent.height >> level, 1u),
-                           is_3d ? (std::max)(source.extent.depth >> level, 1u) : 1u},
-            };
-            host->HostCmd().CopyImage(*source.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                      *scratch.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
-        }
+        host->HostCmd().CopyImage(*source.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                  *scratch.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                  std::span{regions}.first(region_count));
         host->HostMarkTransferWritten();
-        if (DrawResources::Scratch* record = resources.FindScratch(scratch)) {
-            record->copied.Record(copy.source, this, render_target_epoch.value,
-                                  {copy.level, copy.levels, copy.layer, copy.layers});
+        if (record) {
+            record->copied.Record(copy.source, this, render_target_epoch.value, covered, versions,
+                                  source.image_gen);
         }
         ++counters.feedback_copies;
+        counters.feedback_mip_regions += region_count;
         ++((source.host.depth || source.host.stencil) ? counters.feedback_depth
                                                       : counters.feedback_color);
         if (source.feedback_epoch == render_target_epoch.value) {
@@ -2088,6 +2163,7 @@ void DrawContext::RecordFeedbackCopies(DrawPlan& plan) {
         }
         source.feedback_epoch = render_target_epoch.value;
     }
+    return true;
 }
 
 void DrawContext::PruneFreshFeedback(DrawPlan& plan) {
@@ -2095,14 +2171,31 @@ void DrawContext::PruneFreshFeedback(DrawPlan& plan) {
         if (copy.retype_layers != 0) {
             return false;
         }
-        const DrawResources::Scratch* record = resources.FindScratch(*copy.scratch);
-        if (!record ||
-            !record->copied.Serves(copy.source, this, render_target_epoch.value,
-                                   {copy.level, copy.levels, copy.layer, copy.layers})) {
+        DrawResources::Scratch* record = resources.FindScratch(*copy.scratch);
+        if (!record || copy.scratch->current_layout == VK_IMAGE_LAYOUT_UNDEFINED) {
+            return false;
+        }
+        const SubresourceSpan wanted{copy.level, copy.levels, copy.layer, copy.layers};
+        const bool same_epoch =
+            record->copied.Serves(copy.source, this, render_target_epoch.value, wanted);
+        const Storage& source = *copy.source;
+        if (source.scale_owner && !Rescale::TwinIsCurrent(source.scale_owner->scale_state)) {
+            return false;
+        }
+        const bool unchanged = !same_epoch && !copy.retype_row && source.feedback_mip_versions &&
+                               TrackFeedbackMips(source) &&
+                               record->copied.HasVersions(copy.source, this, source.image_gen, wanted) &&
+                               record->copied.MipsAreCurrent(wanted, *source.feedback_mip_versions);
+        if (!same_epoch && !unchanged) {
             return false;
         }
         if (host->HostNeedsCommands(*copy.source, false)) {
             return false; // the guest changed the bytes: the scratch is stale
+        }
+        if (unchanged) {
+            record->copied.Record(copy.source, this, render_target_epoch.value, wanted,
+                                  source.feedback_mip_versions.get(), source.image_gen);
+            counters.feedback_mip_regions_reused += copy.levels;
         }
         ++counters.feedback_skipped;
         return true;
@@ -2295,7 +2388,9 @@ bool DrawContext::PrepareOutsidePass(DrawPlan& plan) {
         if (plan.flush_inline && !inline_updates.empty()) {
             FlushInlineUpdates();
         }
-        RecordFeedbackCopies(plan);
+        if (!RecordFeedbackCopies(plan)) {
+            return false;
+        }
         transition_scratch.clear();
         for (DrawPlan::ImageUse& use : plan.images) {
             if (use.skip) {
@@ -2421,7 +2516,7 @@ bool DrawContext::PrepareOutsidePass(DrawPlan& plan) {
     if (plan.raw_global_writes) {
         pass_buffer_writes = true;
         pass_shader_writes = true;
-        host->HostNoteRawGlobalWrite(plan.raw_stores_written_through);
+        host->HostNoteRawGlobalWrite(plan.raw_split_writes_covered);
         // The raw table reaches the guest bytes of a read-only mirror's pool: the pages it holds
         // may be stale from this draw on, unless the stores also wrote the mirror (the read-only
         // mirror table the draw was given).
@@ -2541,7 +2636,8 @@ bool DrawContext::PushPlan(PipelineBase& pipe, DrawPlan& plan, VkPipelineBindPoi
     }
     if (track) {
         if (use_template && scratch_views.empty()) {
-            if (bound_state.TakeTemplateDescriptors(pipe.layout, scratch_buffers, scratch_images)) {
+            if (bound_state.TakeTemplateDescriptors(pipe.layout, pipe.update_template,
+                                                    scratch_buffers, scratch_images)) {
                 ++counters.elided_descriptors;
                 return true;
             }
@@ -2659,7 +2755,7 @@ bool DrawContext::PushPlan(PipelineBase& pipe, DrawPlan& plan, VkPipelineBindPoi
     return true;
 }
 
-VkDescriptorSet DrawContext::AllocateSet(VkDescriptorSetLayout layout) {
+VkDescriptorSet DrawContext::AllocateSet(VkDescriptorSetLayout layout, bool propagate_error) {
     constexpr u32 SETS_PER_POOL = 256;
     // A pool can run out of one descriptor type before SETS_PER_POOL sets: start a new one and
     // retry once (the old pool stays in the flight until completion, then resets for reuse).
@@ -2686,7 +2782,12 @@ VkDescriptorSet DrawContext::AllocateSet(VkDescriptorSetLayout layout) {
             ++set_pool_used;
             return set;
         }
-        if (fresh || (result != VK_ERROR_OUT_OF_POOL_MEMORY && result != VK_ERROR_FRAGMENTED_POOL)) {
+        const bool pool_full = result == VK_ERROR_OUT_OF_POOL_MEMORY ||
+                               result == VK_ERROR_FRAGMENTED_POOL;
+        if (propagate_error && !pool_full) {
+            vk::Check(result);
+        }
+        if (fresh || !pool_full) {
             return VK_NULL_HANDLE;
         }
         set_pool_used = SETS_PER_POOL; // depleted: the next attempt starts a new pool

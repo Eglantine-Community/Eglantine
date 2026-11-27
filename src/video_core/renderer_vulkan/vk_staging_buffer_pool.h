@@ -19,6 +19,8 @@ namespace Vulkan {
 class Device;
 class Scheduler;
 
+[[nodiscard]] VkDeviceSize StagingAllocationLimit(const Device& device);
+
 struct StagingBufferRef {
     VkBuffer buffer;
     VkDeviceAddress device_address;
@@ -27,6 +29,16 @@ struct StagingBufferRef {
     MemoryUsage usage;
     u32 log2_level;
     u64 index;
+    vk::Buffer::Readback readback{};
+    // A readback snapshot may subsequently be patched by the CPU. Invalidate it only once.
+    mutable bool host_readable{};
+
+    void Invalidate() const {
+        if (!host_readable) {
+            readback.Invalidate();
+            host_readable = true;
+        }
+    }
 };
 
 class StagingBufferPool {
@@ -38,6 +50,8 @@ public:
     ~StagingBufferPool();
 
     StagingBufferRef Request(size_t size, MemoryUsage usage, bool deferred = false);
+    /// Flush an exclusive mapped upload acquired with Request(..., Upload, true).
+    void FlushDeferredUpload(const StagingBufferRef& ref);
     void FreeDeferred(StagingBufferRef& ref);
 
     [[nodiscard]] VkBuffer StreamBuf() const noexcept {
@@ -73,6 +87,7 @@ private:
                 .usage = usage,
                 .log2_level = log2_level,
                 .index = index,
+                .readback = buffer.HostReadback(),
             };
         }
     };

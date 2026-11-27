@@ -20,6 +20,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -195,6 +196,14 @@ public:
         return std::unique_ptr<Rig>(new Rig(std::move(vulkan)));
     }
 
+    [[nodiscard]] bool SupportsDepthStencilSampling() const {
+        constexpr VkFormatFeatureFlags required =
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        const auto properties =
+            vulkan->device->GetPhysical().GetFormatProperties(VK_FORMAT_D32_SFLOAT_S8_UINT);
+        return (properties.optimalTilingFeatures & required) == required;
+    }
+
     struct Result {
         std::string error; // empty when the program ran
         std::vector<std::array<u32, OutputWords>> outputs;
@@ -206,6 +215,8 @@ public:
         std::vector<VC::ClearTexturePayload> clears;
         u32 uniform_slot;
         u64 uniform_offset;
+        std::optional<VC::TextureDesc> view;
+        std::optional<VC::ClearDepthStencilPayload> depth_stencil_clear;
     };
 
 
@@ -257,6 +268,9 @@ public:
         context->CreateProgram(MakeProgram(serial, program));
         if (sampled_texture) {
             context->CreateTexture(sampled_texture->texture);
+            if (sampled_texture->view) {
+                context->CreateTexture(*sampled_texture->view);
+            }
             context->CreateSampler(sampled_texture->sampler);
         }
 
@@ -264,6 +278,16 @@ public:
         if (sampled_texture) {
             for (const VC::ClearTexturePayload& clear : sampled_texture->clears) {
                 PushRecord(list, VC::Op::ClearTexture, clear, {}, 0xF);
+            }
+            if (sampled_texture->depth_stencil_clear) {
+                const VC::RenderTargetRef depth{
+                    .texture = {.serial = sampled_texture->texture.serial},
+                };
+                PushRecord(list, VC::Op::SetRenderTargets,
+                           VC::SetRenderTargetsPayload{.color_count = 0, .has_depth = 1},
+                           {reinterpret_cast<const u8*>(&depth), sizeof(depth)});
+                PushRecord(list, VC::Op::ClearDepthStencil, *sampled_texture->depth_stencil_clear);
+                PushRecord(list, VC::Op::SetRenderTargets, VC::SetRenderTargetsPayload{});
             }
         }
         PushRecord(list, VC::Op::BindProgram,
@@ -292,11 +316,16 @@ public:
         submission.lists.push_back(std::move(list));
         submission.retained_serials = {serial, 1};
         if (sampled_texture) {
-            submission.retained_serials.push_back(sampled_texture->texture.serial);
+            const u64 texture = sampled_texture->texture.serial;
+            const u64 sampled = sampled_texture->view ? sampled_texture->view->serial : texture;
+            submission.retained_serials.push_back(texture);
+            if (sampled != texture) {
+                submission.retained_serials.push_back(sampled);
+            }
             submission.retained_serials.push_back(sampled_texture->sampler.serial);
             submission.texture_pool_snapshot =
                 VC::IdSnapshot{std::make_shared<const std::vector<u64>>(
-                    std::vector<u64>{0, sampled_texture->texture.serial})};
+                    std::vector<u64>{0, sampled})};
             submission.sampler_pool_snapshot =
                 VC::IdSnapshot{std::make_shared<const std::vector<u64>>(
                     std::vector<u64>{0, sampled_texture->sampler.serial})};

@@ -156,6 +156,16 @@ std::optional<HostFormat> ResolveHostFormat(const Device& device, s32 nvn_format
     if (!pixel_format) {
         return std::nullopt;
     }
+    if (VideoCore::Surface::IsPixelFormatASTC(*pixel_format) && !device.IsOptimalAstcSupported()) {
+        // NVN chooses its own BC stand-ins per storage. The base decode format must not
+        // inherit the Maxwell texture cache's recompression setting.
+        const bool srgb = VideoCore::Surface::IsPixelFormatSRGB(*pixel_format);
+        return HostFormat{
+            .format = srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM,
+            .pixel_format = *pixel_format,
+            .needs_transcode = true,
+        };
+    }
     const auto info = MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, true, *pixel_format);
     if (info.format == VK_FORMAT_UNDEFINED) {
         return std::nullopt;
@@ -169,7 +179,6 @@ std::optional<HostFormat> ResolveHostFormat(const Device& device, s32 nvn_format
     // the device cannot sample the guest's compressed format; those textures cannot take the
     // guest bytes as they are.
     result.needs_transcode =
-        (VideoCore::Surface::IsPixelFormatASTC(*pixel_format) && !device.IsOptimalAstcSupported()) ||
         (VideoCore::Surface::IsPixelFormatBCn(*pixel_format) && !device.IsOptimalBcnSupported()) ||
         (VideoCore::Surface::IsPixelFormatETC2(*pixel_format) && !device.IsOptimalEtc2Supported());
     switch (*pixel_format) {

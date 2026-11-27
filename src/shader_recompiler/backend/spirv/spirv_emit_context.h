@@ -11,7 +11,10 @@
 
 #include <array>
 #include <bit>
+#include <memory>
 #include <optional>
+#include <span>
+#include <type_traits>
 
 #include <sirit/sirit.h>
 #include "common/container/unordered_map.h"
@@ -138,6 +141,19 @@ struct StorageTypeDefinitions {
     StorageTypeDefinition U32x4{};
 };
 
+enum class StorageAtomicCas : size_t {
+    Increment,
+    Decrement,
+    AddF32,
+    AddF16x2,
+    MinF16x2,
+    MaxF16x2,
+    AddPackedF32x2,
+    MinPackedF32x2,
+    MaxPackedF32x2,
+    Count,
+};
+
 struct StorageDefinitions {
     Id U8{};
     Id S8{};
@@ -148,6 +164,8 @@ struct StorageDefinitions {
     Id U64{};
     Id U32x2{};
     Id U32x4{};
+    Id write_subword_cas_loop{};
+    std::array<Id, static_cast<size_t>(StorageAtomicCas::Count)> atomic_cas{};
 };
 
 enum class InputGenericLoadOp {
@@ -204,25 +222,90 @@ public:
 
     Id AddLabel(Id label) {
         bindless_block_cache.Clear();
+        EndEntryBroadcastReuse();
         return Sirit::Module::AddLabel(label);
     }
 
     Id AddLabel() {
-        bindless_block_cache.Clear();
-        return Sirit::Module::AddLabel();
+        return AddLabel(OpLabel());
     }
+
+    Id OpFunctionCall(Id result_type, Id function, std::span<const Id> arguments = {}) {
+        EndEntryBroadcastReuse();
+        return Sirit::Module::OpFunctionCall(result_type, function, arguments);
+    }
+
+    template <typename... Args>
+        requires(... && std::is_convertible_v<Args, Id>)
+    Id OpFunctionCall(Id result_type, Id function, Args... arguments) {
+        return OpFunctionCall(result_type, function, std::span<const Id>({arguments...}));
+    }
+
+    Id OpControlBarrier(Id execution, Id memory, Id semantics) {
+        EndEntryBroadcastReuse();
+        return Sirit::Module::OpControlBarrier(execution, memory, semantics);
+    }
+
+    Id OpMemoryBarrier(Id scope, Id semantics) {
+        EndEntryBroadcastReuse();
+        return Sirit::Module::OpMemoryBarrier(scope, semantics);
+    }
+
+    void BeginEntryBroadcastReuse() {
+        reuse_entry_broadcasts = stage == Stage::Compute && profile.support_ballot &&
+                                 !profile.support_shuffle;
+    }
+
+    Id BroadcastSubgroupU32(Id subgroup_scope, Id value, u32 lane);
 
     [[nodiscard]] Id Def(const IR::Value& value);
 
+    [[nodiscard]] bool HasScalarWarp() const noexcept {
+        return scalar_warp;
+    }
+
+    void EnableNativeFloat16RTE() {
+        native_float16_rte = true;
+    }
+
+    [[nodiscard]] bool UsesNativeFloat16RTE() const {
+        return native_float16_rte;
+    }
+
+    [[nodiscard]] StorageDefinitions& StorageBinding(const IR::Value& binding);
     [[nodiscard]] Id BitOffset8(const IR::Value& offset);
     [[nodiscard]] Id BitOffset16(const IR::Value& offset);
+    [[nodiscard]] Id LoadPackedCbuf(Id cbuf, Id element, bool pair,
+                                     std::optional<u32> immediate_element = {});
 
     /// Whether this stage has subgroup operations. Mesh emulation runs task and mesh programs
     /// as compute shaders, so they have what compute shaders have.
     [[nodiscard]] bool SupportsSubgroups() const {
-        return profile.SupportsSubgroupStage(runtime_info.mesh_as_compute ? Stage::Compute
-                                                                          : stage);
+        return profile.supported_spirv >= 0x00010300 && profile.SupportsSubgroupStage(SubgroupStage());
     }
+
+    [[nodiscard]] bool SupportsQuadShuffles() const {
+        const Stage subgroup_stage = SubgroupStage();
+        return SupportsSubgroups() && profile.support_quad_shuffles &&
+               (subgroup_stage == Stage::Compute || subgroup_stage == Stage::Fragment ||
+                profile.support_quad_shuffles_all_stages);
+    }
+
+    [[nodiscard]] Stage SubgroupStage() const {
+        // This flag also marks the real fragment stage when it consumes emulated mesh outputs.
+        return runtime_info.mesh_as_compute && (stage == Stage::Task || stage == Stage::Mesh)
+                   ? Stage::Compute
+                   : stage;
+    }
+
+    [[nodiscard]] bool RemapsGuestComputeLocalId() const {
+        return stage == Stage::Compute && !runtime_info.mesh_as_compute &&
+               runtime_info.warp_scratch_memory_limit == 0 &&
+               !HasScalarWarp() &&
+               profile.compute_warp_local_id_from_subgroup;
+    }
+
+    [[nodiscard]] Id LoadGuestLocalInvocationId();
 
     Id Const(u32 value) {
         return CachedConstant(u32_constants, U32[1], value, value);
@@ -330,6 +413,12 @@ public:
 
     Id workgroup_id{};
     Id local_invocation_id{};
+    Id local_invocation_index{};
+    Id workgroup_warp_scratch{};
+    u32 workgroup_warp_threads{};
+    Id workgroup_warp_payload{};
+    Id workgroup_warp_ballot_predicate{};
+    Id workgroup_warp_ballot{};
     Id invocation_id{};
     Id patch_vertices_in{};
     Id sample_id{};
@@ -385,23 +474,10 @@ public:
     Id shared_memory_u32x2{};
     Id shared_memory_u32x4{};
 
-    Id shared_memory_u32_type{};
-
     Id shared_store_u8_func{};
     Id shared_store_u16_func{};
     Id increment_cas_shared{};
-    Id increment_cas_ssbo{};
     Id decrement_cas_shared{};
-    Id decrement_cas_ssbo{};
-    Id f32_add_cas{};
-    Id f16x2_add_cas{};
-    Id f16x2_min_cas{};
-    Id f16x2_max_cas{};
-    Id f32x2_add_cas{};
-    Id f32x2_min_cas{};
-    Id f32x2_max_cas{};
-
-    Id write_storage_cas_loop_func{};
 
     Id load_global_func_u32{};
     Id load_global_func_u32x2{};
@@ -490,7 +566,7 @@ public:
     Id load_const_func_u32{};
     Id load_const_func_f32{};
     Id load_const_func_u32x2{};
-    Id load_const_func_u32x4{};
+    Id packed_cbuf_word_pointer{};
 
     // Sirit::Id doesn't play nice with *::set<>
     ::Common::unordered_set<u32> non_uniform_ids;
@@ -508,6 +584,13 @@ public:
     bool uses_nonuniform_storage_texel_buffer{};
 
 private:
+    void EndEntryBroadcastReuse() {
+        if (reuse_entry_broadcasts) {
+            reuse_entry_broadcasts = false;
+            subgroup_broadcasts.reset();
+        }
+    }
+
     void DefineCommonTypes(const Info& info);
     void DefineCommonConstants();
     void DefineInterfaces(const IR::Program& program);
@@ -522,7 +605,10 @@ private:
     void DefineTextures(const Info& info, u32& binding, u32& scaling_index);
     void DefineImages(const Info& info, u32& binding, u32& scaling_index);
     void DefineAttributeMemAccess(const Info& info);
-    void DefineWriteStorageCasLoopFunction(const Info& info);
+    void DefineStorageAtomicCasLoops(const IR::Program& program);
+    void DefineStorageAtomicCasLoop(StorageDefinitions& storage, StorageAtomicCas kind);
+    void DefineWriteStorageCasLoopFunctions(const IR::Program& program);
+    Id DefineWriteStorageCasLoopFunction(Id ssbo);
     void DefineGlobalMemoryFunctions(const IR::Program& program);
     void DefineRawGlobalMemoryFunctions(const Info& info);
     void DefineRescalingInput(const Info& info);
@@ -534,6 +620,17 @@ private:
     void DefineOutputs(const IR::Program& program);
     void DefineMesh(const IR::Program& program);
     void DefineMeshEmulationOutput();
+
+    std::array<Id, static_cast<size_t>(StorageAtomicCas::Count)> storage_atomic_cas_ops{};
+    using SubgroupBroadcasts = ::Common::unordered_map<u64, Id>;
+    std::unique_ptr<SubgroupBroadcasts> subgroup_broadcasts;
+    bool reuse_entry_broadcasts{};
+    bool native_float16_rte{};
+    bool scalar_warp{};
+    std::array<u32, 3> guest_workgroup_size{};
+    Id subgroup_id{};
+    Id subgroup_size_input{};
+
 };
 
 } // namespace Shader::Backend::SPIRV

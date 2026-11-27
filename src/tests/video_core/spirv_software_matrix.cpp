@@ -26,6 +26,7 @@
 #include "shader_recompiler/frontend/maxwell/decode.h"
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/program_header.h"
+#include "video_core/native_tensor_programs.h"
 
 namespace {
 using namespace Shader;
@@ -36,7 +37,7 @@ struct TensorProgram {
     IR::Program program;
     Profile profile;
 
-    explicit TensorProgram(u32 count = 1, u32 software_depth = 0) {
+    explicit TensorProgram(u32 count = 1, u32 software_depth = 0, bool workgroup = false) {
         program.stage = Stage::Compute;
         program.workgroup_size = {64, 1, 1};
         program.blocks = {&block};
@@ -46,13 +47,19 @@ struct TensorProgram {
         program.info.uses_subgroup_shuffles = count != 0 && software_depth != 0;
         program.info.uses_subgroup_invocation_id = count != 0;
         profile.supported_spirv = 0x00010500;
+        profile.support_shuffle = true;
         profile.supported_subgroup_stages = 1U << static_cast<u32>(Stage::Compute);
         profile.max_subgroup_size = 32;
         IR::IREmitter ir{block};
         if (count == 0) {
             return;
         }
-        const auto lane = ir.LaneId();
+        const auto lane = workgroup ? ir.LocalInvocationIdX() : ir.LaneId();
+        if (workgroup) {
+            program.info.uses_subgroup_invocation_id = false;
+            profile.supported_subgroup_stages = 0;
+            profile.support_shuffle = false;
+        }
         std::array<IR::U32, 8> inputs;
         for (u32 i = 0; i < inputs.size(); ++i) {
             inputs[i] = software_depth ? ir.IAdd(ir.Imm32(0x3c003c00U + i * 0x01000100U),
@@ -465,4 +472,234 @@ TEST_CASE("Compact HMMA lowering emits one helper call per matrix multiply",
     IrPools guarded_pools;
     const auto guarded_ir = translate(guarded_pools, {.tensor = true, .compact_tensor = true}, guarded);
     CHECK(count_opcode(guarded_ir, IR::Opcode::TensorMulAdd) == 0);
+    IrPools workgroup_pools;
+    const Ampere::LoweringOptions workgroup{.tensor_mode = Ampere::TensorMode::Workgroup};
+    CHECK_THROWS_AS(translate(workgroup_pools, workgroup, guarded), NotImplementedException);
+
+    // SHFL.UP writes false on lane zero and true on the other lanes.
+    constexpr Ampere::Instruction LaneId{{0x00047919U, 0, 0, 0}};
+    constexpr Ampere::Instruction ShuffleUp{{0x04087989U, 0x04200000U, 0xffU, 0}};
+    auto divergent_hmma = guarded[2];
+    divergent_hmma.words[0] &= ~0xf000U; // @P0, latest definition from SHFL.
+    const std::array varying{LoadPtrLo, LoadPtrHi, LaneId, ShuffleUp, divergent_hmma, Store, Exit};
+    IrPools varying_pools;
+    CHECK_THROWS_AS(translate(varying_pools, workgroup, varying), NotImplementedException);
+}
+
+TEST_CASE("Workgroup HMMA bounds memory and rejects ambiguous control flow", "[tensor_scratch]") {
+    using Type = IR::AbstractSyntaxNode::Type;
+    const auto emit = [](TensorProgram& fixture, u32 budget) {
+        Backend::Bindings bindings;
+        RuntimeInfo runtime_info{};
+        runtime_info.warp_scratch_memory_limit = budget;
+        return Backend::SPIRV::EmitSPIRV(fixture.profile, runtime_info, fixture.program, bindings);
+    };
+    for (const u32 depth : {8U, 16U}) {
+        for (const bool explicit_layout : {false, true}) {
+            TensorProgram safe{2, depth, true};
+            safe.program.shared_memory_size = 256;
+            safe.profile.support_explicit_workgroup_layout = explicit_layout;
+            if (!explicit_layout) {
+                safe.profile.supported_spirv = 0x00010000;
+            }
+            const u32 budget = 256 + (depth == 8 ? 3 : 6) * 64 * sizeof(u32);
+            REQUIRE(safe.program.info.UsesWarpCollectives());
+            const auto module = emit(safe, budget);
+            REQUIRE_FALSE(safe.program.info.UsesWarpCollectives());
+            REQUIRE_FALSE(HasCapability(module, 61)); // GroupNonUniform
+            const auto entries = Instructions(module, 15); // OpEntryPoint
+            REQUIRE(entries.size() == 1);
+            // The "main" string, including its NUL, occupies two words after model and id.
+            REQUIRE(entries.front().size() >= 4);
+            const auto interfaces = std::span{entries.front()}.subspan(4);
+            for (const auto& variable : Instructions(module, 59)) { // OpVariable
+                if (variable.at(2) == 4) { // Workgroup
+                    const bool listed = std::ranges::find(interfaces, variable.at(1)) != interfaces.end();
+                    CHECK(listed == (module[1] >= 0x00010400));
+                }
+            }
+            REQUIRE(Instructions(module, 224).size() == 2); // OpControlBarrier, both in the helper
+            REQUIRE(Instructions(module, 345).empty()); // OpGroupNonUniformShuffle
+            REQUIRE(Instructions(module, 57).size() == 2); // Two sequential helper calls
+            if (const char* output = std::getenv("EDEN_TENSOR_TEST_OUTPUT")) {
+                const auto filename = "workgroup-" + std::to_string(depth) +
+                                      (explicit_layout ? "-explicit.spv" : "-implicit.spv");
+                std::ofstream file{std::filesystem::path{output} / filename, std::ios::binary};
+                file.write(reinterpret_cast<const char*>(module.data()),
+                           static_cast<std::streamsize>(module.size() * sizeof(u32)));
+                REQUIRE(file.good());
+            }
+            TensorProgram no_space{1, depth, true};
+            no_space.program.shared_memory_size = 256;
+            no_space.profile.support_explicit_workgroup_layout = explicit_layout;
+            REQUIRE_THROWS_AS(emit(no_space, budget - 1), NotImplementedException);
+        }
+        TensorProgram partial{1, depth, true};
+        partial.program.workgroup_size = {17, 5, 1};
+        REQUIRE_THROWS_AS(emit(partial, 32768), NotImplementedException);
+        TensorProgram divergent{1, depth, true};
+        divergent.program.syntax_list.insert(divergent.program.syntax_list.begin(),
+                                             {{}, Type::If});
+        REQUIRE_THROWS_AS(emit(divergent, 32768), NotImplementedException);
+        TensorProgram split{1, depth, true};
+        split.program.syntax_list.insert(split.program.syntax_list.begin(), {{}, Type::Loop});
+        REQUIRE_THROWS_AS(emit(split, 32768), NotImplementedException);
+        TensorProgram early{1, depth, true};
+        early.program.syntax_list.insert(early.program.syntax_list.begin(), {{}, Type::Return});
+        REQUIRE_THROWS_AS(emit(early, 32768), NotImplementedException);
+        TensorProgram mixed{1, depth, true};
+        IR::IREmitter ir{mixed.block};
+        mixed.program.info.uses_subgroup_vote = true;
+        static_cast<void>(ir.VoteAll(ir.IEqual(ir.LocalInvocationIdX(), ir.Imm32(0))));
+        const auto module = emit(mixed, (depth == 8 ? 3 : 6) * 64 * sizeof(u32));
+        CHECK_FALSE(HasCapability(module, 61)); // GroupNonUniform
+        CHECK(Instructions(module, 224).size() >= 3); // Includes warp publication
+        CHECK_FALSE(mixed.program.info.UsesWarpCollectives());
+    }
+
+    TensorProgram shared_load{1, 8U, true};
+    shared_load.program.shared_memory_size = 256;
+    shared_load.program.info.uses_int16 = true;
+    IR::IREmitter load_ir{shared_load.block};
+    static_cast<void>(load_ir.LoadShared(16, false, load_ir.Imm32(0)));
+    CHECK_FALSE(HasCapability(emit(shared_load, 32768), 4441)); // VariablePointersStorageBuffer
+
+    TensorProgram storage_store{1, 8U, true};
+    storage_store.program.info.uses_int16 = true;
+    storage_store.program.info.storage_buffers_descriptors = {{0, 0, 1, true}};
+    IR::IREmitter store_ir{storage_store.block};
+    storage_store.block.AppendNewInst(IR::Opcode::WriteStorageU16,
+                                      {store_ir.Imm32(0), store_ir.Imm32(0), store_ir.Imm32(123)});
+    const auto storage_module = emit(storage_store, 32768);
+    CHECK_FALSE(HasCapability(storage_module, 4441));
+    CHECK_FALSE(Instructions(storage_module, 230).empty()); // OpAtomicCompareExchange
+}
+
+TEST_CASE("Workgroup HMMA mode survives native shader cache encoding", "[tensor_scratch]") {
+    using namespace Shader::Ampere;
+    constexpr Instruction Hmma16{{0x040c723c, 8, 0x80a, 0x004fe200}};
+    constexpr std::array<u64, 10> Header{};
+    const std::array native{Hmma16};
+    const auto packed = PackNativeAmpereCode(
+        Header, native, {.tensor_mode = TensorMode::Workgroup}, false);
+    const auto unpacked = UnpackNativeAmpereCode(packed);
+    REQUIRE(unpacked.has_value());
+    CHECK(unpacked->options.tensor_mode == TensorMode::Workgroup);
+    REQUIRE(unpacked->instructions.size() == 1);
+    CHECK(unpacked->instructions[0].words == Hmma16.words);
+    CHECK(packed != PackNativeAmpereCode(Header, native, {.tensor_mode = TensorMode::Compact},
+                                         false));
+    const u32 limits[3]{128, 64, 64};
+    CHECK(VideoCommon::ValidTensorWorkgroup({8, 8, 1}, limits, 64));
+    CHECK_FALSE(VideoCommon::ValidTensorWorkgroup({8, 9, 1}, limits, 64));
+    CHECK_FALSE(VideoCommon::ValidTensorWorkgroup({129, 1, 1}, limits, 256));
+    CHECK_FALSE(VideoCommon::ValidTensorWorkgroup({128, 0, 1}, limits, 256));
+    CHECK(VideoCommon::CanUseWorkgroupTensor({8, 8, 1}));
+    CHECK_FALSE(VideoCommon::CanUseWorkgroupTensor({17, 5, 1}));
+}
+
+TEST_CASE("Guest warp scratch verifies convergence, budget and subgroup metadata",
+          "[warp_scratch]") {
+    using Type = IR::AbstractSyntaxNode::Type;
+    const auto make_ops = [](TensorProgram& fixture) {
+        IR::IREmitter ir{fixture.block};
+        fixture.program.workgroup_size = {8, 4, 1};
+        fixture.program.shared_memory_size = 256;
+        fixture.program.info.uses_local_invocation_id = true;
+        fixture.program.info.uses_subgroup_vote = true;
+        fixture.profile.supported_subgroup_stages = 0;
+        const auto predicate = ir.INotEqual(ir.LocalInvocationIdX(), ir.Imm32(0));
+        static_cast<void>(ir.SubgroupBallot(predicate));
+        static_cast<void>(ir.VoteAny(predicate));
+    };
+    const auto emit = [](TensorProgram& fixture, u32 budget) {
+        Backend::Bindings bindings;
+        RuntimeInfo runtime_info{};
+        runtime_info.warp_scratch_memory_limit = budget;
+        return Backend::SPIRV::EmitSPIRV(fixture.profile, runtime_info, fixture.program, bindings);
+    };
+    for (const bool explicit_layout : {false, true}) {
+        TensorProgram workgroup{0};
+        make_ops(workgroup);
+        workgroup.profile.support_explicit_workgroup_layout = explicit_layout;
+        const auto code = emit(workgroup, 256 + 32 * sizeof(u32));
+        CHECK_FALSE(HasCapability(code, 61)); // GroupNonUniform
+        // Repeated uses of the same ballot need only the first publication barrier.
+        CHECK(Instructions(code, 224).size() == 1);
+        CHECK_FALSE(workgroup.program.info.UsesWarpCollectives());
+
+        TensorProgram over_budget{0};
+        make_ops(over_budget);
+        over_budget.profile.support_explicit_workgroup_layout = explicit_layout;
+        CHECK_THROWS_AS(emit(over_budget, 256 + 32 * sizeof(u32) - 1), NotImplementedException);
+    }
+    TensorProgram divergent{0};
+    make_ops(divergent);
+    divergent.program.syntax_list.insert(divergent.program.syntax_list.begin(), {{}, Type::If});
+    CHECK_THROWS_AS(emit(divergent, 32768), NotImplementedException);
+    TensorProgram partial{0};
+    make_ops(partial);
+    partial.program.workgroup_size = {16, 3, 1};
+    CHECK_NOTHROW(emit(partial, 32768));
+}
+
+TEST_CASE("One compute invocation lowers warp operations without subgroup capabilities",
+          "[scalar_warp]") {
+    for (const u32 version : {0x00010000U, 0x00010500U}) {
+        TensorProgram fixture{0};
+        fixture.program.workgroup_size = {1, 1, 1};
+        fixture.program.info.uses_local_invocation_id = true;
+        fixture.program.info.uses_subgroup_invocation_id = true;
+        fixture.program.info.uses_subgroup_mask = true;
+        fixture.program.info.uses_subgroup_vote = true;
+        fixture.program.info.uses_subgroup_shuffles = true;
+        fixture.profile.support_shuffle = false;
+        fixture.profile.support_ballot = false;
+        fixture.profile.support_vote = false;
+        fixture.profile.supported_spirv = version;
+        REQUIRE(fixture.program.info.UsesWarpCollectives());
+
+        IR::IREmitter ir{fixture.block};
+        const auto value = ir.LocalInvocationIdX();
+        const auto predicate = ir.INotEqual(value, ir.Imm32(0));
+        const auto lane = ir.LaneId();
+        const auto bound = ir.Imm32(31);
+        const auto mask = ir.Imm32(0);
+        static_cast<void>(ir.VoteAll(predicate));
+        static_cast<void>(ir.VoteAny(predicate));
+        static_cast<void>(ir.VoteEqual(predicate));
+        static_cast<void>(ir.SubgroupBallot(predicate));
+        static_cast<void>(ir.SubgroupEqMask());
+        static_cast<void>(ir.SubgroupLtMask());
+        static_cast<void>(ir.SubgroupLeMask());
+        static_cast<void>(ir.SubgroupGtMask());
+        static_cast<void>(ir.SubgroupGeMask());
+        static_cast<void>(ir.GetInBoundsFromOp(ir.ShuffleIndex(value, lane, bound, mask)));
+        static_cast<void>(ir.GetInBoundsFromOp(ir.ShuffleUp(value, lane, mask, mask)));
+        static_cast<void>(ir.GetInBoundsFromOp(ir.ShuffleDown(value, lane, bound, mask)));
+        static_cast<void>(ir.GetInBoundsFromOp(ir.ShuffleButterfly(value, lane, bound, mask)));
+
+        const auto code = fixture.Emit(version == 0x00010000U ? "scalar-warp-1.0" : "scalar-warp-1.5");
+        CHECK_FALSE(HasCapability(code, 61)); // GroupNonUniform
+        CHECK(Instructions(code, 224).empty()); // OpControlBarrier
+        CHECK_FALSE(fixture.program.info.UsesWarpCollectives());
+    }
+}
+
+TEST_CASE("The scalar warp path excludes other warp consumers", "[scalar_warp]") {
+    TensorProgram fixture{0};
+    fixture.program.workgroup_size = {1, 1, 1};
+    REQUIRE(fixture.program.HasScalarWarp());
+    fixture.program.info.uses_quad_shuffles = true;
+    CHECK_FALSE(fixture.program.HasScalarWarp());
+    fixture.program.info.uses_quad_shuffles = false;
+    fixture.program.info.uses_fswzadd = true;
+    CHECK_FALSE(fixture.program.HasScalarWarp());
+    fixture.program.info.uses_fswzadd = false;
+    fixture.program.workgroup_size = {1, 2, 1};
+    CHECK_FALSE(fixture.program.HasScalarWarp());
+
+    TensorProgram hmma{1, 16};
+    hmma.program.workgroup_size = {1, 1, 1};
+    CHECK_THROWS_AS(hmma.Emit(), NotImplementedException);
 }

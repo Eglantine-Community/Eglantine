@@ -1782,6 +1782,72 @@ F16F32F64 IREmitter::ConvertIToF(size_t dest_bitsize, size_t src_bitsize, bool i
                      : ConvertUToF(dest_bitsize, src_bitsize, value, control);
 }
 
+namespace {
+
+[[nodiscard]] F32 PackRoundedF32(IREmitter& ir, const U32& normalized, const U32& msb,
+                                const U1& negative, FpRounding rounding) {
+    // The top 24 bits include the implicit one. Bit 7 is the halfway bit and
+    // bits 0-6 indicate whether there was anything below it.
+    const U32 significand = ir.ShiftRightLogical(normalized, ir.Imm32(8U));
+    const U32 remainder = ir.BitwiseAnd(normalized, ir.Imm32(0xffU));
+    U1 increment = ir.Imm1(false);
+    if (rounding == FpRounding::RN) {
+        const U32 odd = ir.BitwiseAnd(significand, ir.Imm32(1U));
+        increment = ir.IGreaterThan(remainder, ir.ISub(ir.Imm32(0x80U), odd), false);
+    } else if (rounding != FpRounding::RZ) {
+        const U1 round_away = rounding == FpRounding::RM ? negative : ir.LogicalNot(negative);
+        increment = ir.LogicalAnd(ir.INotEqual(remainder, ir.Imm32(0U)), round_away);
+    }
+    const U32 adjustment{ir.Select(increment, ir.Imm32(1U), ir.Imm32(0U))};
+    const U32 rounded = ir.IAdd(significand, adjustment);
+    // Adding the implicit one supplies the last step of the exponent bias. A
+    // carry from rounding advances the exponent again.
+    const U32 exponent = ir.ShiftLeftLogical(ir.IAdd(msb, ir.Imm32(126U)), ir.Imm32(23U));
+    const U32 sign{ir.Select(negative, ir.Imm32(0x80000000U), ir.Imm32(0U))};
+    const U32 bits = ir.BitwiseOr(ir.IAdd(exponent, rounded), sign);
+    return ir.BitCast<F32>(
+        U32{ir.Select(ir.IEqual(normalized, ir.Imm32(0U)), ir.Imm32(0U), bits)});
+}
+
+} // Anonymous namespace
+
+F32 IREmitter::ConvertI32ToF32Rounded(const U32& src, bool is_signed, FpRounding rounding) {
+    const U1 negative = is_signed ? ILessThan(src, Imm32(0U), true) : Imm1(false);
+    const U32 magnitude = is_signed ? U32{Select(negative, INeg(src), src)} : src;
+    const U32 msb = FindUMsb(magnitude);
+    // The mask also keeps a zero input (FindUMsb returns -1) from shifting by 32.
+    const U32 shift = BitwiseAnd(ISub(Imm32(31U), msb), Imm32(31U));
+    return PackRoundedF32(*this, ShiftLeftLogical(magnitude, shift), msb, negative, rounding);
+}
+
+F32 IREmitter::ConvertI64ToF32Rounded(const U32& lo, const U32& hi, bool is_signed,
+                                     FpRounding rounding) {
+    const U1 negative = is_signed ? ILessThan(hi, Imm32(0U), true) : Imm1(false);
+    U32 mag_lo = lo;
+    U32 mag_hi = hi;
+    if (is_signed) {
+        const U32 carry{Select(IEqual(lo, Imm32(0U)), Imm32(1U), Imm32(0U))};
+        mag_lo = U32{Select(negative, INeg(lo), lo)};
+        mag_hi = U32{Select(negative, IAdd(BitwiseNot(hi), carry), hi)};
+    }
+
+    const U1 has_high_word = INotEqual(mag_hi, Imm32(0U));
+    const U32 top{Select(has_high_word, mag_hi, mag_lo)};
+    const U32 top_msb = FindUMsb(top);
+    const U32 shift = BitwiseAnd(ISub(Imm32(31U), top_msb), Imm32(31U));
+    const U32 msb{Select(has_high_word, IAdd(top_msb, Imm32(32U)), top_msb)};
+
+    // Fill the low bits of the normalized word, then fold anything below it
+    // into bit 0. The two shifts avoid a shift by 32 when shift is zero.
+    const U32 low_bits = ShiftRightLogical(
+        ShiftRightLogical(mag_lo, ISub(Imm32(31U), shift)), Imm32(1U));
+    const U1 has_tail = INotEqual(ShiftLeftLogical(mag_lo, shift), Imm32(0U));
+    const U32 sticky{Select(has_tail, Imm32(1U), Imm32(0U))};
+    const U32 tail{Select(has_high_word, BitwiseOr(low_bits, sticky), Imm32(0U))};
+    const U32 normalized = BitwiseOr(ShiftLeftLogical(top, shift), tail);
+    return PackRoundedF32(*this, normalized, msb, negative, rounding);
+}
+
 U8U16U32U64 IREmitter::UConvert(size_t result_bitsize, const U8U16U32U64& value) {
     switch (result_bitsize) {
     case 8:

@@ -539,6 +539,7 @@ Row ProcessShader(u64 index, const StoredShader& shader, const WorkerConfig& con
         host_info.nvn_raw_global_memory = true;
         profile.support_raw_global_memory = true;
         profile.support_descriptor_aliasing = true;
+        profile.support_uniform_buffer_standard_layout = true;
     }
     if (DefaultPathHostRequested()) {
         // What the default path's PipelineCache::TranslateHostInfo sets for a Switch 2 title.

@@ -18,6 +18,10 @@ namespace Tegra::Engines {
 
 void Maxwell3D::DrawManager::ProcessMethodCall(Maxwell3D& maxwell3d, u32 method, u32 argument) {
     switch (method) {
+    case MAXWELL3D_REG_INDEX(native_draw.index_count):
+        return DrawNative(maxwell3d, true);
+    case MAXWELL3D_REG_INDEX(native_draw.vertex_count):
+        return DrawNative(maxwell3d, false);
     case MAXWELL3D_REG_INDEX(clear_surface):
         return Clear(maxwell3d, 1);
     case MAXWELL3D_REG_INDEX(draw.begin):
@@ -115,6 +119,38 @@ bool Maxwell3D::DrawManager::IsInstanceLoopMethod(u32 method) noexcept {
         return true;
     default:
         return false;
+    }
+}
+
+void Maxwell3D::DrawManager::DrawNative(Maxwell3D& maxwell3d, bool indexed) {
+    const auto& regs = maxwell3d.regs;
+    const auto& draw = regs.native_draw;
+    const u32 count = indexed ? draw.index_count : draw.vertex_count;
+    const u32 instances = draw.iterate_instances ? draw.instance_count : 1U;
+    if (count == 0 || instances == 0) {
+        return;
+    }
+    if (draw.topology.Value() > Regs::PrimitiveTopology::Patches) {
+        LOG_DEBUG(HW_GPU, "Unsupported native draw topology {:#x}", u32(draw.topology.Value()));
+        return;
+    }
+    if (draw.split_mode != Regs::Draw::SplitMode::NormalBeginNormal ||
+        draw.primitive_id != Regs::Draw::PrimitiveId::First ||
+        draw.instance_id != Regs::Draw::InstanceId::First) {
+        LOG_DEBUG(HW_GPU, "Unsupported native draw continuation control {:#x}", draw.control);
+        return;
+    }
+    const u32 base_instance = draw.ignore_base_instance ? 0 : regs.global_base_instance_index;
+    const u32 base_vertex = draw.ignore_base_vertex ? 0 : regs.global_base_vertex_index;
+    if (indexed) {
+        DrawIndex(maxwell3d, draw.topology.Value(), draw.first_index, count, base_vertex,
+                  base_instance, instances);
+    } else {
+        if (base_vertex != 0) {
+            LOG_DEBUG(HW_GPU, "Unsupported global base vertex {:#x} for native array draw", base_vertex);
+            return;
+        }
+        DrawArray(maxwell3d, draw.topology.Value(), draw.first_vertex, count, base_instance, instances);
     }
 }
 

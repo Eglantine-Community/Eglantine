@@ -15,6 +15,7 @@
 #include "common/diag_request.h"
 #include "common/logging.h"
 #include "common/settings.h"
+#include "shader_recompiler/exception.h"
 #include "video_core/buffer_cache/raw_coverage.h"
 #include "video_core/nvn/shader/nvn_program_map.h"
 #include "video_core/nvn/state_layouts.h"
@@ -382,50 +383,6 @@ VkStencilOp ToStencilOp(u32 op) {
     return static_cast<VkStencilOp>(op - 1);
 }
 
-VkPrimitiveTopology ToVkTopology(u32 topology) {
-    switch (topology) {
-    case 0:
-        return VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
-    case 1:
-        return VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
-    case 2:
-        return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; // LINE_LOOP: the replay closes the loop
-    case 3:
-        return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
-    case 4:
-        return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    case 5:
-        return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
-    case 6:
-        return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
-    case 7:
-        return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; // QUADS: converted by the replay
-    case 8:
-        return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; // QUAD_STRIP: converted by the replay
-    case 9:
-        return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; // POLYGON
-    case 10:
-        return VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY;
-    case 11:
-        return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY;
-    case 12:
-        return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY;
-    case 13:
-        return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
-    case 14:
-        return VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
-    default:
-        return VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
-    }
-}
-
-bool IsStripOrFan(VkPrimitiveTopology topology) {
-    return topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP ||
-           topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP ||
-           topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN ||
-           topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY ||
-           topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
-}
 
 VkSampleCountFlagBits ToSampleCount(u32 samples) {
     switch (samples) {
@@ -480,6 +437,44 @@ bool IsIntegerColorFormat(VkFormat format, bool& is_signed) {
 }
 
 } // Anonymous namespace
+
+VkPrimitiveTopology ToVkTopology(u32 topology) {
+    switch (topology) {
+    case 0:
+        return VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+    case 1:
+        return VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+    case 2:
+        return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; // LINE_LOOP: the replay closes the loop
+    case 3:
+        return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
+    case 4:
+        return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    case 5:
+        return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+    case 6:
+        return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+    case 7:
+        return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; // QUADS: converted by the replay
+    case 8:
+        return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; // QUAD_STRIP: converted by the replay
+    case 9:
+        return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; // POLYGON
+    case 10:
+        return VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY;
+    case 11:
+        return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY;
+    case 12:
+        return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY;
+    case 13:
+        return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
+    case 14:
+        return VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
+    default:
+        return VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
+    }
+}
+
 
 bool FormatHasDepth(VkFormat format) {
     switch (format) {
@@ -718,6 +713,12 @@ DynamicBlendState MakeDynamicBlendState(const GraphicsFixedState& state,
         };
     }
     return out;
+}
+
+bool UsesColorLogicOp(const GraphicsFixedState& state, const RenderPassKey& targets) {
+    return state.rasterizer_discard == 0 &&
+           VCN::ColorState::LogicOp(state.color) != VCN::STATE_LOGIC_OP_COPY &&
+           std::ranges::any_of(targets.color, [](s32 format) { return format != VK_FORMAT_UNDEFINED; });
 }
 
 void StripDynamicKeyState(GraphicsFixedState& state, const DynamicStateCaps& caps,
@@ -995,6 +996,9 @@ Shader::Profile MakeProfile(const Device& device) {
         .support_int64_atomics = device.IsExtShaderAtomicInt64Supported(),
         .support_shared_int64_atomics = device.IsSharedInt64AtomicsSupported(),
         .support_derivative_control = true,
+        .support_image_gather_extended = device.IsShaderImageGatherExtendedSupported(),
+        .min_texel_gather_offset = device.GetMinTexelGatherOffset(),
+        .max_texel_gather_offset = device.GetMaxTexelGatherOffset(),
         .support_geometry_shader_passthrough = device.IsNvGeometryShaderPassthroughSupported(),
         .support_native_ndc = device.IsExtDepthClipControlSupported(),
         .support_scaled_attributes = !device.MustEmulateScaledFormats(),
@@ -1032,19 +1036,18 @@ Shader::Profile MakeProfile(const Device& device) {
         .has_broken_spirv_subgroup_mask_vector_extract_dynamic =
             driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY &&
             device.GetDriverVersion() < VK_MAKE_VERSION(512, 672, 0),
-        .has_broken_spirv_subgroup_shuffle = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY,
-        // Fragment shuffles are expanded into broadcasts on devices that run subgroup operations in
-        // the fragment stage and have the ballot feature but not the shuffle one.
-        .has_broken_spirv_fragment_shuffle =
-            (subgroup_stages & VK_SHADER_STAGE_FRAGMENT_BIT) != 0 &&
-            device.IsSubgroupFeatureSupported(VK_SUBGROUP_FEATURE_BALLOT_BIT) &&
-            !device.IsSubgroupFeatureSupported(VK_SUBGROUP_FEATURE_SHUFFLE_BIT),
+        .has_broken_spirv_subgroup_shuffle = device.HasBrokenSpirvSubgroupShuffle(),
         .max_subgroup_size = device.GetMaxSubgroupSize(),
         .has_broken_robust =
             device.IsNvidia() && device.GetNvidiaArch() <= NvidiaArchitecture::Arch_Pascal,
         .min_ssbo_alignment = device.GetStorageBufferAlignment(),
         .max_user_clip_distances = device.GetMaxUserClipDistances(),
-        .support_raw_global_memory = RawGlobalMemorySupported(device)};
+        .support_raw_global_memory = RawGlobalMemorySupported(device),
+        .support_uniform_buffer_standard_layout = device.IsUniformBufferStandardLayoutEnabled(),
+        .support_ballot = device.IsSubgroupFeatureSupported(VK_SUBGROUP_FEATURE_BALLOT_BIT),
+        .support_shuffle = device.IsSubgroupFeatureSupported(VK_SUBGROUP_FEATURE_SHUFFLE_BIT),
+        .support_quad_shuffles_all_stages = device.SupportsQuadSubgroupOperationsInAllStages(),
+        .native_float16_controls = device.GetNativeFloat16Controls()};
 }
 
 Shader::HostTranslateInfo MakeHostInfo(const Device& device, const Shader::Profile& profile) {
@@ -1053,13 +1056,12 @@ Shader::HostTranslateInfo MakeHostInfo(const Device& device, const Shader::Profi
         .min_ssbo_alignment = device.GetStorageBufferAlignment(),
         .max_per_stage_descriptor_sampled_images = device.GetMaxPerStageDescriptorSampledImages(),
         .max_per_stage_resources = device.GetMaxPerStageResources(),
+        .max_per_stage_descriptor_storage_buffers = device.GetMaxPerStageDescriptorStorageBuffers(),
         .max_descriptor_set_samplers = device.GetMaxDescriptorSetSamplers(),
         .max_descriptor_set_uniform_buffers = device.GetMaxDescriptorSetUniformBuffers(),
         .max_descriptor_set_uniform_buffers_dynamic =
             device.GetMaxDescriptorSetUniformBuffersDynamic(),
         .max_descriptor_set_storage_buffers = device.GetMaxDescriptorSetStorageBuffers(),
-        .max_descriptor_set_storage_buffers_dynamic =
-            device.GetMaxDescriptorSetStorageBuffersDynamic(),
         .max_descriptor_set_sampled_images = device.GetMaxDescriptorSetSampledImages(),
         .max_descriptor_set_storage_images = device.GetMaxDescriptorSetStorageImages(),
         .max_descriptor_set_input_attachements = device.GetMaxDescriptorSetInputAttachments(),
@@ -1177,22 +1179,17 @@ void DescribeGraphicsPipeline(const Device& device, const GraphicsPipelineParams
         issues.push_back("topology: tessellation stages without PATCHES (drawn as patches)");
         topology = VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
     }
-    const bool restart_supported =
-        topology == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST
-            ? device.IsPatchListPrimitiveRestartSupported()
-            : (IsStripOrFan(topology) || device.IsTopologyListPrimitiveRestartSupported());
+    const bool restart_requested = !emulated_mesh && state.primitive_restart != 0 &&
+                                   state.topology != 7 && state.topology != 8;
+    const bool restart_supported = device.SupportsPrimitiveRestart(topology);
     out.input_assembly = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
         .topology = topology,
-        .primitiveRestartEnable =
-            !emulated_mesh &&
-                    ((state.primitive_restart != 0 && restart_supported) || device.IsMoltenVK())
-                ? VK_TRUE
-                : VK_FALSE,
+        .primitiveRestartEnable = restart_requested && restart_supported,
     };
-    if (!emulated_mesh && state.primitive_restart != 0 && !restart_supported) {
+    if (restart_requested && !restart_supported) {
         issues.push_back("primitive restart: not supported for this topology on the device");
     }
     u32 patch_points = state.patch_vertices;
@@ -1338,7 +1335,10 @@ void DescribeGraphicsPipeline(const Device& device, const GraphicsPipelineParams
                                device.IsExtExtendedDynamicState3BlendingSupported() &&
                                device.SupportsDynamicState3LogicOpEnable() &&
                                device.IsExtExtendedDynamicState2ExtrasSupported();
-    const bool logic_op_enabled = VCN::ColorState::LogicOp(state.color) != VCN::STATE_LOGIC_OP_COPY;
+    const bool logic_op_enabled = UsesColorLogicOp(state, targets);
+    if (logic_op_enabled && !device.SupportsLogicOp()) {
+        throw Shader::NotImplementedException("NVN color logic operation without Vulkan logicOp");
+    }
     bool unknown_blend = false;
     bool advanced_blend = false;
     bool blend_on_integer = false;
@@ -1592,9 +1592,11 @@ u64 HashTranslationSwitches(const TranslationSwitches& switches) {
                            switches.resolution_down_shift, switches.resolution_up_factor_bits,
                            switches.resolution_down_factor_bits);
     }
-    // Only in the text for the titles whose tensor programs are lowered: other keys stay valid.
     if (switches.tensor_lowering != 0) {
         key += fmt::format(" tensor_lowering={}", static_cast<int>(switches.tensor_lowering));
+    }
+    if (switches.tensor_full_fallback) {
+        key += " tensor_full_fallback=1";
     }
     if (Common::DiagRequest::TrySwitchDiffersFromDefault("TRY_DIRECT_UNUSED_ATOMICS")) {
         key += fmt::format(" direct_unused={}", switches.direct_unused_atomics);

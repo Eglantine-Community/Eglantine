@@ -16,10 +16,12 @@
 #include <optional>
 #include <span>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 #include "common/bit_field.h"
 #include "common/common_funcs.h"
 #include "common/common_types.h"
+#include "common/hash.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/engines/engine_upload.h"
 #include "video_core/game_dlss_status.h"
@@ -30,6 +32,10 @@
 
 namespace Core {
 class System;
+}
+
+namespace Shader::Ampere {
+enum class TensorMode : u8;
 }
 
 namespace VideoCommon {
@@ -281,13 +287,10 @@ public:
     bool IsDlssDispatch() const {
         return native_mode && dlss_chain.active;
     }
-    /// Whether the matrix multiplies (tensor-core instructions) of the program being dispatched
-    /// are emulated: in a game DLSS evaluation when the game's own network may draw, and always
-    /// for Donkey Kong Bananza and Ocarina of Time.
-    [[nodiscard]] bool EmulatesNativeTensorPrograms() const;
-    /// Whether those matrix multiplies use the compact software form (one shared helper per
-    /// program) instead of the inline expansion: Ocarina of Time's network.
-    [[nodiscard]] bool UsesCompactTensorPrograms() const;
+    /// Tensor translation policy for the active compute workgroup and upscaling path.
+    [[nodiscard]] Shader::Ampere::TensorMode TensorModeForDispatch() const {
+        return native_mode ? dispatch_tensor_mode : Shader::Ampere::TensorMode{};
+    }
 
     /// GPU thread split with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2), called by
     /// the front instead of CallMethod for native compute engines: runs their macros and macro
@@ -394,11 +397,13 @@ private:
     std::array<f32, 2> dlss_jitter{};
     struct RejectedComputeProgram {
         std::string message;
-        bool emulates_tensor{};
         bool matrix_multiply{};
         u32 upscale_failures{};
     };
-    std::unordered_map<GPUVAddr, RejectedComputeProgram> rejected_compute_programs;
+    std::unordered_map<std::pair<GPUVAddr, Shader::Ampere::TensorMode>, RejectedComputeProgram,
+                       Common::PairHash> rejected_compute_programs;
+    [[nodiscard]] Shader::Ampere::TensorMode SelectDispatchTensorMode() const;
+    Shader::Ampere::TensorMode dispatch_tensor_mode{};
     u64 seen_unreject_epoch{}; ///< Nx2Debug::UnrejectEpoch when the map was last valid
     bool ProcessNativeMethod(Core::System& system, u32 method, u32 argument, bool is_last_call);
     NativeQmdScheduler native_qmd;

@@ -5,7 +5,9 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstring>
+#include <limits>
 
 #include "common/assert.h"
 #include "common/logging.h"
@@ -86,10 +88,9 @@ CounterEngine::CounterEngine(
     timestamp_period = properties.limits.timestampPeriod > 0.0f ? properties.limits.timestampPeriod
                                                                  : 1.0;
     const auto families = device.GetPhysical().GetQueueFamilyProperties();
-    u32 valid_bits = 64;
-    if (device.GetGraphicsFamily() < families.size()) {
-        valid_bits = families[device.GetGraphicsFamily()].timestampValidBits;
-    }
+    const u32 graphics_family = device.GetGraphicsFamily();
+    const u32 valid_bits =
+        graphics_family < families.size() ? families[graphics_family].timestampValidBits : 0;
     timestamp_mask = valid_bits >= 64 ? ~u64{0} : (u64{1} << valid_bits) - 1;
 
     VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
@@ -596,28 +597,68 @@ void CounterEngine::WriteTimestamp(vk::CommandBuffer cmd, CounterFlight& flight,
     flight.timestamps.push_back(std::move(report));
 }
 
-u64 CounterEngine::TicksToNanoseconds(u64 ticks) {
-    u64 raw = ticks & timestamp_mask;
-    if (timestamp_mask != ~u64{0}) {
-        // Counters narrower than 64 bits wrap; reports arrive roughly in time order.
-        if (raw < last_ticks && last_ticks - raw > (timestamp_mask >> 1)) {
-            ++tick_epoch;
-        }
-        last_ticks = raw;
-        raw += tick_epoch * (timestamp_mask + 1);
+std::optional<s64> TimestampTickClock::Convert(u64 sample, u64 mask, double period) {
+    if (mask == 0 || !std::isfinite(period) || period <= 0) {
+        return std::nullopt;
     }
-    const s64 gpu_ns = static_cast<s64>(static_cast<double>(raw) * timestamp_period);
+    const u64 raw = sample & mask;
+    if (newest_ticks < 0) {
+        newest_raw = raw;
+        newest_ticks = 0;
+        return 0;
+    }
+    const u64 forward = (raw - newest_raw) & mask;
+    const u64 half = (mask >> 1) + 1;
+    if (forward == half) {
+        return std::nullopt;
+    }
+    s64 elapsed = newest_ticks;
+    if (forward < half) {
+        if (forward > static_cast<u64>(std::numeric_limits<s64>::max() - newest_ticks)) {
+            return std::nullopt;
+        }
+        elapsed += static_cast<s64>(forward);
+    } else {
+        // A late sample may precede the latest rollover. It must not move the anchor backwards.
+        elapsed -= static_cast<s64>((newest_raw - raw) & mask);
+    }
+    const long double ns = static_cast<long double>(elapsed) * period;
+    // A comparison against the exact power of two also works when long double is binary64.
+    if (ns < -0x1p63L || ns >= 0x1p63L) {
+        return std::nullopt;
+    }
+    if (elapsed > newest_ticks) {
+        newest_ticks = elapsed;
+        newest_raw = raw;
+    }
+    return static_cast<s64>(ns);
+}
+
+u64 CounterEngine::TicksToNanoseconds(u64 ticks) {
+    const u64 now = VideoCommon::Nvn::GuestClockNanoseconds();
+    const auto gpu_ns = tick_clock.Convert(ticks, timestamp_mask, timestamp_period);
+    if (!gpu_ns || now > static_cast<u64>(std::numeric_limits<s64>::max())) {
+        return now;
+    }
     // A report is processed some time after the GPU wrote it, and the GPU clock drifts against the
     // guest clock (the epoch of the title's own tick counter and of
-    // nvnDeviceGetCurrentTimestampInNanoseconds): GpuClockMap takes the offset with the least
-    // delay over the last few seconds.
-    return static_cast<u64>(
-        clock_map.Map(gpu_ns, static_cast<s64>(VideoCommon::Nvn::GuestClockNanoseconds())));
+    // nvnDeviceGetCurrentTimestampInNanoseconds). GpuClockMap includes the first sample's epoch
+    // in the guest offset and takes the offset with the least delay over the last few seconds.
+    return static_cast<u64>((std::max)(s64{0}, clock_map.Map(*gpu_ns, static_cast<s64>(now))));
 }
 
 void CounterEngine::Complete(CounterFlight& flight, VideoCommon::Nvn::GuestMemory* memory) {
     const bool legacy =
         VideoCommon::Nvn::CurrentTimestampMode() == VideoCommon::Nvn::TimestampMode::Legacy;
+    struct TimestampResult {
+        u64 ticks;
+        u64 available;
+    };
+    static_assert(sizeof(TimestampResult) == 2 * sizeof(u64));
+    std::array<TimestampResult, BLOCK_QUERIES> results;
+    u32 read_block = ~u32{0};
+    bool batch_valid = false;
+    const vk::Device& logical = device.GetLogical();
     for (TimestampReport& report : flight.timestamps) {
         u64 field = 0; // legacy: the guest GPU clock (LegacyReportField); real: GPU time on the guest clock
         if (legacy) {
@@ -626,13 +667,36 @@ void CounterEngine::Complete(CounterFlight& flight, VideoCommon::Nvn::GuestMemor
             field = VideoCommon::Nvn::LegacyReportField();
         } else {
             u64 ticks = 0;
-            const VkResult result = device.GetLogical().GetQueryResults(
-                *flight.blocks[report.query.block].timestamp, report.query.slot, 1, sizeof(ticks),
-                &ticks, sizeof(ticks), VK_QUERY_RESULT_64_BIT);
+            bool available = false;
+            if (timestamp_mask != 0) {
+                const QueryBlock& block = flight.blocks[report.query.block];
+                if (read_block != report.query.block) {
+                    read_block = report.query.block;
+                    batch_valid = false;
+                    // WriteTimestamp fills each block in slot order. Read the used slots at once
+                    // and still map and publish every report in the order it was recorded.
+                    if (block.timestamp_used > 1) {
+                        const VkResult result = logical.GetQueryResults(
+                            *block.timestamp, 0, block.timestamp_used,
+                            block.timestamp_used * sizeof(TimestampResult), results.data(),
+                            sizeof(TimestampResult),
+                            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+                        batch_valid = result == VK_SUCCESS || result == VK_NOT_READY;
+                    }
+                }
+                if (batch_valid && results[report.query.slot].available != 0) {
+                    ticks = results[report.query.slot].ticks;
+                    available = true;
+                } else {
+                    // Preserve the individual nonblocking read on error or an unavailable slot.
+                    available = logical.GetQueryResults(*block.timestamp, report.query.slot, 1,
+                                                        sizeof(ticks), &ticks, sizeof(ticks),
+                                                        VK_QUERY_RESULT_64_BIT) == VK_SUCCESS;
+                }
+            }
             // A submission that never ran (failed, aborted) has no ticks: stamp it with now.
             field = VideoCommon::Nvn::GuestNanosecondsToReportField(
-                result == VK_SUCCESS ? TicksToNanoseconds(ticks)
-                                     : VideoCommon::Nvn::GuestClockNanoseconds());
+                available ? TicksToNanoseconds(ticks) : VideoCommon::Nvn::GuestClockNanoseconds());
         }
         if (report.host) {
             std::memcpy(report.host + sizeof(u64), &field, sizeof(field));

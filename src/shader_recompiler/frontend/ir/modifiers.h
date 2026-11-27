@@ -31,6 +31,7 @@ struct FpControl {
     bool no_contraction{false};
     FpRounding rounding{FpRounding::DontCare};
     FmzMode fmz_mode{FmzMode::DontCare};
+    bool require_rounding{false}; ///< I32-to-F32 rounding must be resolved before emission
 };
 static_assert(sizeof(FpControl) <= sizeof(u32));
 

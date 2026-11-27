@@ -512,7 +512,8 @@ void DrawContext::Dispatch(const VC::DispatchPayload& p) {
         // waits for its build. A skipped dispatch leaves the buffers and images it writes stale for
         // every later draw (one-time setup, GPU-driven culling), not one frame of geometry.
         compute = resources.Cache().GetCompute(
-            request, nullptr, [this](u64 hash) { PrefetchUpcomingGraphics(last_mode, 0, hash); });
+            request, nullptr, [this](u64 hash) { PrefetchUpcomingGraphics(last_mode, 0, hash); },
+            [this] { host->HostSubmitBeforePipelineWait(); });
         if (first_dispatch) {
             const auto compile_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                         std::chrono::steady_clock::now() - compile_start)

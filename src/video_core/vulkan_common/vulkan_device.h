@@ -25,6 +25,14 @@
 #include "common/settings.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
+namespace Shader {
+struct NativeFloat16Controls;
+}
+
+namespace VideoCommon {
+enum class NativeTensorLowering : u8;
+}
+
 VK_DEFINE_HANDLE(VmaAllocator)
 VK_DEFINE_HANDLE(VmaPool)
 
@@ -33,19 +41,18 @@ VK_DEFINE_HANDLE(VmaPool)
 // If the Vulkan version is lower than the required version, the named extension is required.
 #define FOR_EACH_VK_FEATURE_1_1(FEATURE)                                                           \
     FEATURE(KHR, 16BitStorage, 16BIT_STORAGE, bit16_storage)                                       \
-    FEATURE(KHR, ShaderAtomicInt64, SHADER_ATOMIC_INT64, shader_atomic_int64)                      \
-    FEATURE(KHR, ShaderDrawParameters, SHADER_DRAW_PARAMETERS, shader_draw_parameters)             \
-    FEATURE(KHR, ShaderFloat16Int8, SHADER_FLOAT16_INT8, shader_float16_int8)                      \
-    FEATURE(KHR, UniformBufferStandardLayout, UNIFORM_BUFFER_STANDARD_LAYOUT,                      \
-            uniform_buffer_standard_layout)                                                        \
-    FEATURE(KHR, VariablePointer, VARIABLE_POINTERS, variable_pointer)
+    FEATURE(KHR, ShaderDrawParameters, SHADER_DRAW_PARAMETERS, shader_draw_parameters)
 
 #define FOR_EACH_VK_FEATURE_1_2(FEATURE)                                                           \
     FEATURE(EXT, DescriptorIndexing, DESCRIPTOR_INDEXING, descriptor_indexing)                     \
     FEATURE(EXT, HostQueryReset, HOST_QUERY_RESET, host_query_reset)                               \
     FEATURE(KHR, 8BitStorage, 8BIT_STORAGE, bit8_storage)                                          \
     FEATURE(KHR, BufferDeviceAddress, BUFFER_DEVICE_ADDRESS, buffer_device_address)                \
+    FEATURE(KHR, ShaderAtomicInt64, SHADER_ATOMIC_INT64, shader_atomic_int64)                       \
+    FEATURE(KHR, ShaderFloat16Int8, SHADER_FLOAT16_INT8, shader_float16_int8)                        \
     FEATURE(KHR, TimelineSemaphore, TIMELINE_SEMAPHORE, timeline_semaphore)                        \
+    FEATURE(KHR, UniformBufferStandardLayout, UNIFORM_BUFFER_STANDARD_LAYOUT,                      \
+            uniform_buffer_standard_layout)                                                        \
     FEATURE(KHR, VulkanMemoryModel, VULKAN_MEMORY_MODEL, vulkan_memory_model)
 
 #define FOR_EACH_VK_FEATURE_1_3(FEATURE)                                                           \
@@ -56,12 +63,14 @@ VK_DEFINE_HANDLE(VmaPool)
     FEATURE(KHR, Maintenance4, MAINTENANCE_4, maintenance4)                                        \
     FEATURE(KHR, Synchronization2, SYNCHRONIZATION_2, synchronization2)
 
-#define FOR_EACH_VK_FEATURE_1_4(FEATURE)
+#define FOR_EACH_VK_FEATURE_1_4(FEATURE)                                                           \
+    FEATURE(KHR, IndexTypeUint8, INDEX_TYPE_UINT8, index_type_uint8)
 
 // Define all features which may be used by the implementation and require an extension here.
 #define FOR_EACH_VK_FEATURE_EXT(FEATURE)                                                           \
     FEATURE(EXT, BorderColorSwizzle, BORDER_COLOR_SWIZZLE, border_color_swizzle)                   \
     FEATURE(EXT, ColorWriteEnable, COLOR_WRITE_ENABLE, color_write_enable)                         \
+    FEATURE(EXT, ConditionalRendering, CONDITIONAL_RENDERING, conditional_rendering)              \
     FEATURE(EXT, CustomBorderColor, CUSTOM_BORDER_COLOR, custom_border_color)                      \
     FEATURE(EXT, DepthBiasControl, DEPTH_BIAS_CONTROL, depth_bias_control)                         \
     FEATURE(EXT, DepthClipControl, DEPTH_CLIP_CONTROL, depth_clip_control)                         \
@@ -71,7 +80,7 @@ VK_DEFINE_HANDLE(VmaPool)
     FEATURE(EXT, ExtendedDynamicState3, EXTENDED_DYNAMIC_STATE_3, extended_dynamic_state3)         \
     FEATURE(EXT, GraphicsPipelineLibrary, GRAPHICS_PIPELINE_LIBRARY, graphics_pipeline_library)    \
     FEATURE(EXT, 4444Formats, 4444_FORMATS, format_a4b4g4r4)                                       \
-    FEATURE(EXT, IndexTypeUint8, INDEX_TYPE_UINT8, index_type_uint8)                               \
+    FEATURE(EXT, LegacyVertexAttributes, LEGACY_VERTEX_ATTRIBUTES, legacy_vertex_attributes)       \
     FEATURE(EXT, LineRasterization, LINE_RASTERIZATION, line_rasterization)                        \
     FEATURE(EXT, MeshShader, MESH_SHADER, mesh_shader)                                             \
     FEATURE(EXT, PrimitiveTopologyListRestart, PRIMITIVE_TOPOLOGY_LIST_RESTART,                    \
@@ -83,6 +92,7 @@ VK_DEFINE_HANDLE(VmaPool)
     FEATURE(KHR, CooperativeMatrix, COOPERATIVE_MATRIX, cooperative_matrix)                        \
     FEATURE(KHR, Maintenance5, MAINTENANCE_5, maintenance5)                                        \
     FEATURE(KHR, Maintenance6, MAINTENANCE_6, maintenance6)                                        \
+    FEATURE(KHR, PipelineBinary, PIPELINE_BINARY, pipeline_binary)                                \
     FEATURE(KHR, PipelineExecutableProperties, PIPELINE_EXECUTABLE_PROPERTIES,                     \
             pipeline_executable_properties)                                                        \
     FEATURE(KHR, ShaderQuadControl, SHADER_QUAD_CONTROL, shader_quad_control)                      \
@@ -92,7 +102,6 @@ VK_DEFINE_HANDLE(VmaPool)
 // Define miscellaneous extensions which may be used by the implementation here.
 #define FOR_EACH_VK_EXTENSION(EXTENSION)                                                           \
     EXTENSION(EXT, ASTC_DECODE_MODE, astc_decode_mode)                                             \
-    EXTENSION(EXT, CONDITIONAL_RENDERING, conditional_rendering)                                   \
     EXTENSION(EXT, CONSERVATIVE_RASTERIZATION, conservative_rasterization)                         \
     EXTENSION(EXT, DEPTH_RANGE_UNRESTRICTED, depth_range_unrestricted)                             \
     EXTENSION(EXT, EXTERNAL_MEMORY_HOST, external_memory_host)                                     \
@@ -108,6 +117,7 @@ VK_DEFINE_HANDLE(VmaPool)
     EXTENSION(KHR, DRAW_INDIRECT_COUNT, draw_indirect_count)                                       \
     EXTENSION(KHR, DRIVER_PROPERTIES, driver_properties)                                           \
     EXTENSION(KHR, PUSH_DESCRIPTOR, push_descriptor)                                               \
+    EXTENSION(KHR, PORTABILITY_SUBSET, portability_subset)                                         \
     EXTENSION(KHR, SAMPLER_MIRROR_CLAMP_TO_EDGE, sampler_mirror_clamp_to_edge)                     \
     EXTENSION(KHR, SHADER_FLOAT_CONTROLS, shader_float_controls)                                   \
     EXTENSION(KHR, SPIRV_1_4, spirv_1_4)                                                           \
@@ -131,9 +141,7 @@ VK_DEFINE_HANDLE(VmaPool)
 // Define extensions which must be supported.
 #define FOR_EACH_VK_MANDATORY_EXTENSION(EXTENSION_NAME)                                            \
     EXTENSION_NAME(VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME)                                 \
-    EXTENSION_NAME(VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME)                                        \
-    EXTENSION_NAME(VK_KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_EXTENSION_NAME)                             \
-    EXTENSION_NAME(VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME)
+    EXTENSION_NAME(VK_KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_EXTENSION_NAME)
 
 // Define extensions where the absence of the extension may result in a degraded experience.
 #define FOR_EACH_VK_RECOMMENDED_EXTENSION(EXTENSION_NAME)                                          \
@@ -141,8 +149,6 @@ VK_DEFINE_HANDLE(VmaPool)
     EXTENSION_NAME(VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME)                               \
     EXTENSION_NAME(VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME)                                       \
     EXTENSION_NAME(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME)                                 \
-    EXTENSION_NAME(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME)                                   \
-    EXTENSION_NAME(VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME)                                 \
     EXTENSION_NAME(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME)                                 \
     EXTENSION_NAME(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)                                     \
     EXTENSION_NAME(VK_EXT_4444_FORMATS_EXTENSION_NAME)                                             \
@@ -174,16 +180,13 @@ VK_DEFINE_HANDLE(VmaPool)
     FEATURE_NAME(features, sampleRateShading)                                                      \
     FEATURE_NAME(features, shaderClipDistance)                                                     \
     FEATURE_NAME(features, shaderCullDistance)                                                     \
-    FEATURE_NAME(features, shaderImageGatherExtended)                                              \
     FEATURE_NAME(features, shaderStorageImageWriteWithoutFormat)                                   \
     FEATURE_NAME(features, tessellationShader)                                                     \
     FEATURE_NAME(features, vertexPipelineStoresAndAtomics)                                         \
     FEATURE_NAME(features, wideLines)                                                              \
     FEATURE_NAME(host_query_reset, hostQueryReset)                                                 \
     FEATURE_NAME(shader_demote_to_helper_invocation, shaderDemoteToHelperInvocation)               \
-    FEATURE_NAME(shader_draw_parameters, shaderDrawParameters)                                     \
-    FEATURE_NAME(variable_pointer, variablePointers)                                               \
-    FEATURE_NAME(variable_pointer, variablePointersStorageBuffer)
+    FEATURE_NAME(shader_draw_parameters, shaderDrawParameters)
 
 // Define features where the absence of the feature may result in a degraded experience.
 #define FOR_EACH_VK_RECOMMENDED_FEATURE(FEATURE_NAME)                                              \
@@ -195,7 +198,7 @@ VK_DEFINE_HANDLE(VmaPool)
     FEATURE_NAME(depth_bias_control, depthBiasExact)                                               \
     FEATURE_NAME(descriptor_indexing, descriptorBindingPartiallyBound)                             \
     FEATURE_NAME(descriptor_indexing, shaderSampledImageArrayNonUniformIndexing)                   \
-    FEATURE_NAME(extended_dynamic_state, extendedDynamicState)                                     \
+    FEATURE_NAME(features, shaderImageGatherExtended)                                              \
     FEATURE_NAME(format_a4b4g4r4, formatA4B4G4R4)                                                  \
     FEATURE_NAME(robust_image_access, robustImageAccess)                                           \
     FEATURE_NAME(index_type_uint8, indexTypeUint8)                                                 \
@@ -207,13 +210,13 @@ VK_DEFINE_HANDLE(VmaPool)
     FEATURE_NAME(synchronization2, synchronization2)                                               \
     FEATURE_NAME(timeline_semaphore, timelineSemaphore)                                            \
     FEATURE_NAME(transform_feedback, transformFeedback)                                            \
-    FEATURE_NAME(uniform_buffer_standard_layout, uniformBufferStandardLayout)                      \
     FEATURE_NAME(vertex_input_dynamic_state, vertexInputDynamicState)
 
 // These features are not required but can be helpful for drivers that can use it.
 #define FOR_EACH_VK_OPTIONAL_FEATURE(FEATURE_NAME)                                                 \
     FEATURE_NAME(bit16_storage, uniformAndStorageBuffer16BitAccess)                                \
-    FEATURE_NAME(bit8_storage, uniformAndStorageBuffer8BitAccess)
+    FEATURE_NAME(bit8_storage, uniformAndStorageBuffer8BitAccess)                                 \
+    FEATURE_NAME(uniform_buffer_standard_layout, uniformBufferStandardLayout)
 
 namespace Vulkan {
 
@@ -224,6 +227,12 @@ enum class FormatType { Linear, Optimal, Buffer };
 
 /// Subgroup size of the guest emulated hardware (Nvidia has 32 threads per subgroup).
 const u32 GuestWarpSize = 32;
+
+struct ComputeWarpLayout {
+    std::array<u32, 3> local_size;
+    u32 min_width;
+    u32 max_width;
+};
 
 enum class NvidiaArchitecture {
     Arch_KeplerOrOlder,
@@ -367,49 +376,46 @@ public:
         return features.features.sparseBinding && graphics_family_sparse_binding;
     }
 
-    /// 2D images whose memory can be bound in parts, on the graphics queue.
-    /// Images of `type` whose memory can be bound in parts, on the graphics queue.
-    bool IsSparseResidencyImageSupported(VkImageType type) const {
-        if (!IsSparseBindingSupported()) {
+    bool IsSparseResidencyBufferSupported() const {
+        return IsSparseBindingSupported() && features.features.sparseResidencyBuffer;
+    }
+
+    /// Sparse residency features enabled for this image and queue.
+    bool IsSparseResidencyImageSupported(VkImageType type,
+                                         VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT) const {
+        const bool supported_type =
+            (type == VK_IMAGE_TYPE_2D && features.features.sparseResidencyImage2D) ||
+            (type == VK_IMAGE_TYPE_3D && features.features.sparseResidencyImage3D &&
+             samples == VK_SAMPLE_COUNT_1_BIT);
+        if (!IsSparseBindingSupported() || !supported_type) {
             return false;
         }
-        switch (type) {
-        case VK_IMAGE_TYPE_2D:
-            return features.features.sparseResidencyImage2D;
-        case VK_IMAGE_TYPE_3D:
-            return features.features.sparseResidencyImage3D;
-        default:
-            return false;
+        switch (samples) {
+        case VK_SAMPLE_COUNT_1_BIT:  return true;
+        case VK_SAMPLE_COUNT_2_BIT:  return features.features.sparseResidency2Samples;
+        case VK_SAMPLE_COUNT_4_BIT:  return features.features.sparseResidency4Samples;
+        case VK_SAMPLE_COUNT_8_BIT:  return features.features.sparseResidency8Samples;
+        case VK_SAMPLE_COUNT_16_BIT: return features.features.sparseResidency16Samples;
+        default:                     return false;
         }
     }
 
     bool IsSparseResidencyImage2DSupported() const {
-        return IsSparseBindingSupported() && features.features.sparseResidencyImage2D;
+        return IsSparseResidencyImageSupported(VK_IMAGE_TYPE_2D);
     }
 
-    /// Whether a sparse image may bind the same memory to several of its blocks.
     bool IsSparseResidencyAliasedSupported() const {
-        return IsSparseResidencyImage2DSupported() && features.features.sparseResidencyAliased;
+        return IsSparseBindingSupported() && features.features.sparseResidencyAliased;
     }
 
-    /// Whether images with no memory bound may be sampled and used as attachments. AMD's proprietary
-    /// drivers fault on it (the GPU hangs shortly after the first such draw), so large images there
-    /// are backed normally. Mesa RADV is allowed when residencyNonResidentStrict guarantees unbound
-    /// reads return zero and writes are discarded.
-    /// EDEN_NX2_SPARSE_UNBACKED=1 allows unbound images on any driver, =0 on none.
+    /// Reads from unbound regions are deterministic only with strict nonresident access.
     bool CanUseUnbackedSparseImages() const {
-        static const char forced = [] {
+        static const bool allowed = [] {
             const char* value = std::getenv("EDEN_NX2_SPARSE_UNBACKED");
-            return value == nullptr ? '\0' : value[0];
+            return value == nullptr || value[0] != '0';
         }();
-        if (forced == '0' || forced == '1') {
-            return forced == '1';
-        }
-        const VkDriverIdKHR id = GetDriverID();
-        if (id == VK_DRIVER_ID_MESA_RADV) {
-            return properties.properties.sparseProperties.residencyNonResidentStrict == VK_TRUE;
-        }
-        return id != VK_DRIVER_ID_AMD_PROPRIETARY && id != VK_DRIVER_ID_AMD_OPEN_SOURCE;
+        return allowed && IsSparseBindingSupported() &&
+               properties.properties.sparseProperties.residencyNonResidentStrict;
     }
 
     /// Whether a pipeline cache can be read while pipelines build into it, as Vulkan allows. Intel's
@@ -467,7 +473,6 @@ public:
     FN_MAX_LIMIT_ELEM(DescriptorSetUniformBuffers) \
     FN_MAX_LIMIT_ELEM(DescriptorSetUniformBuffersDynamic) \
     FN_MAX_LIMIT_ELEM(DescriptorSetStorageBuffers) \
-    FN_MAX_LIMIT_ELEM(DescriptorSetStorageBuffersDynamic) \
     FN_MAX_LIMIT_ELEM(DescriptorSetSampledImages) \
     FN_MAX_LIMIT_ELEM(DescriptorSetStorageImages) \
     FN_MAX_LIMIT_ELEM(DescriptorSetInputAttachments) \
@@ -479,6 +484,8 @@ public:
 FN_MAX_LIMIT_LIST
 #undef FN_MAX_LIMIT_ELEM
 #undef FN_MAX_LIMIT_LIST
+
+    [[nodiscard]] Shader::NativeFloat16Controls GetNativeFloat16Controls() const;
 
     /// Returns float control properties of the device.
     const VkPhysicalDeviceFloatControlsPropertiesKHR& FloatControlProperties() const {
@@ -589,6 +596,17 @@ FN_MAX_LIMIT_LIST
     /// Whether a compute pipeline can request a guest-sized subgroup for this local size.
     bool CanRequireGuestWarpForCompute(const std::array<u32, 3>& workgroup_size) const;
 
+    /// Upper bound imposed by required subgroup size 32, or zero when unavailable.
+    u64 MaxComputeInvocationsWithGuestWarp() const;
+
+    /// A full native subgroup layout for which the guest's linear thread IDs can be reconstructed.
+    std::optional<ComputeWarpLayout> GetComputeWarpLayout(const std::array<u32, 3>& size) const;
+    std::array<u32, 2> DefaultComputeSubgroupRange() const;
+    bool CanSetFullComputeSubgroups(const std::array<u32, 3>& host_size) const;
+
+    VideoCommon::NativeTensorLowering NativeTensorComputeSupport(
+        const std::array<u32, 3>& workgroup_size) const;
+
     bool SupportsFullComputeSubgroups() const {
         return extensions.subgroup_size_control && features.subgroup_size_control.computeFullSubgroups;
     }
@@ -596,6 +614,14 @@ FN_MAX_LIMIT_LIST
     /// Returns true if the device supports the provided subgroup feature.
     bool IsSubgroupFeatureSupported(VkSubgroupFeatureFlagBits feature) const {
         return properties.subgroup_properties.supportedOperations & feature;
+    }
+
+    bool HasBrokenSpirvSubgroupShuffle() const {
+        return GetDriverID() == VK_DRIVER_ID_QUALCOMM_PROPRIETARY;
+    }
+
+    bool SupportsQuadSubgroupOperationsInAllStages() const {
+        return properties.subgroup_properties.quadOperationsInAllStages;
     }
 
     VkShaderStageFlags GetSubgroupSupportedStages() const {
@@ -635,6 +661,18 @@ FN_MAX_LIMIT_LIST
     /// Returns true if formatless image load is supported.
     bool IsFormatlessImageLoadSupported() const {
         return features.features.shaderStorageImageReadWithoutFormat;
+    }
+
+    bool IsShaderImageGatherExtendedSupported() const {
+        return features.features.shaderImageGatherExtended;
+    }
+
+    s32 GetMinTexelGatherOffset() const {
+        return properties.properties.limits.minTexelGatherOffset;
+    }
+
+    u32 GetMaxTexelGatherOffset() const {
+        return properties.properties.limits.maxTexelGatherOffset;
     }
 
     /// Returns true if storage images of the extended formats (e.g. R16F, RG16F, R8) are supported.
@@ -682,9 +720,9 @@ FN_MAX_LIMIT_LIST
         return extensions.geometry_shader_passthrough;
     }
 
-    /// Returns true if the device supports VK_KHR_uniform_buffer_standard_layout.
-    bool IsKhrUniformBufferStandardLayoutSupported() const {
-        return extensions.uniform_buffer_standard_layout;
+    /// Returns true if uniformBufferStandardLayout was enabled at device creation.
+    bool IsUniformBufferStandardLayoutEnabled() const {
+        return features.uniform_buffer_standard_layout.uniformBufferStandardLayout;
     }
 
     /// Returns true if the device supports VK_EXT_external_memory_host (enabled for VTX-HLE only).
@@ -726,9 +764,9 @@ FN_MAX_LIMIT_LIST
         return extensions.swapchain_mutable_format;
     }
 
-    /// Returns true if VK_KHR_shader_float_controls is enabled.
+    /// Whether shader float control properties are available through core Vulkan or the extension.
     bool IsKhrShaderFloatControlsSupported() const {
-        return extensions.shader_float_controls;
+        return instance_version >= VK_API_VERSION_1_2 || extensions.shader_float_controls;
     }
 
     /// Returns true if the device supports VK_KHR_workgroup_memory_explicit_layout.
@@ -785,19 +823,19 @@ FN_MAX_LIMIT_LIST
         return extensions.image_format_list || instance_version >= VK_API_VERSION_1_2;
     }
 
-    /// Returns true if the device supports VK_EXT_primitive_topology_list_restart.
-    bool IsTopologyListPrimitiveRestartSupported() const {
-        return features.primitive_topology_list_restart.primitiveTopologyListRestart;
+    bool SupportsPrimitiveRestart(VkPrimitiveTopology topology) const;
+
+    bool SupportsCustomRestartIndex() const noexcept {
+#ifdef VK_EXT_primitive_restart_index
+        return features.primitive_restart_index.primitiveRestartIndex == VK_TRUE;
+#else
+        return false;
+#endif
     }
 
-    /// Returns true if the device supports VK_EXT_primitive_topology_list_restart.
-    bool IsPatchListPrimitiveRestartSupported() const {
-        return features.primitive_topology_list_restart.primitiveTopologyPatchListRestart;
-    }
-
-    /// Returns true if the device supports VK_EXT_index_type_uint8.
+    /// Returns true if uint8 index bindings were enabled through core Vulkan, KHR or EXT.
     bool IsExtIndexTypeUint8Supported() const {
-        return extensions.index_type_uint8;
+        return features.index_type_uint8.indexTypeUint8 == VK_TRUE;
     }
 
     /// Returns true if the device supports VK_EXT_sampler_filter_minmax.
@@ -928,14 +966,14 @@ FN_MAX_LIMIT_LIST
         return features.border_color_swizzle.borderColorSwizzleFromImage;
     }
 
-    /// Returns true if the device supports VK_EXT_extended_dynamic_state.
+    /// Whether the renderer uses the first group of extended dynamic states.
     bool IsExtExtendedDynamicStateSupported() const {
-        return extensions.extended_dynamic_state;
+        return use_extended_dynamic_state;
     }
 
-    /// Returns true if the device supports VK_EXT_extended_dynamic_state2.
+    /// Whether the renderer uses dynamic depth bias enable, primitive restart and rasterizer discard.
     bool IsExtExtendedDynamicState2Supported() const {
-        return extensions.extended_dynamic_state2;
+        return use_extended_dynamic_state2;
     }
 
     bool IsExtExtendedDynamicState2ExtrasSupported() const {
@@ -1007,6 +1045,14 @@ FN_MAX_LIMIT_LIST
 
     bool SupportsDynamicState3ProvokingVertexMode() const {
         return dynamic_state3_provoking_vertex_mode;
+    }
+
+    bool SupportsDrawIndirectFirstInstance() const {
+        return features.features.drawIndirectFirstInstance;
+    }
+
+    bool SupportsLogicOp() const {
+        return features.features.logicOp;
     }
 
     bool SupportsDynamicState3LogicOpEnable() const {
@@ -1084,7 +1130,8 @@ FN_MAX_LIMIT_LIST
     }
 
     bool IsExtConditionalRendering() const {
-        return extensions.conditional_rendering;
+        return extensions.conditional_rendering &&
+               features.conditional_rendering.conditionalRendering;
     }
 
     bool IsExtAstcDecodeModeSupported() const {
@@ -1167,6 +1214,10 @@ FN_MAX_LIMIT_LIST
     /// Size of the main device-local heap (EDEN_NX2_VRAM_LIMIT_MIB applied).
     u64 GetMainHeapSize() const;
 
+    /// Budget for allocations in the main local heap, or its size without VK_EXT_memory_budget.
+    /// Excludes usage from other heaps, which is only relevant to aggregate usage thresholds.
+    u64 GetMainHeapAllocationBudget() const;
+
     /// The driver's current memory budget for this process (VK_EXT_memory_budget), in
     /// GetDeviceMemoryUsage() terms: the usage at which the main device-local heap reaches its
     /// budget. 0 without the extension. The unused part of the allocator's blocks is not
@@ -1177,6 +1228,15 @@ FN_MAX_LIMIT_LIST
     /// allocation in (the unused part of its blocks). GetDeviceMemoryUsage() does not count it,
     /// yet the driver does: with the heap at its budget it is not available to new images.
     u64 GetDeviceMemorySlack() const;
+
+    struct DeviceMemoryBudget {
+        u64 usage;
+        u64 budget;
+        u64 slack;
+    };
+
+    /// Values from the same driver and allocator samples. Budget is 0 without the extension.
+    [[nodiscard]] DeviceMemoryBudget GetDeviceMemoryBudgetSnapshot() const;
 
     u32 GetSetsPerPool() const {
         return sets_per_pool;
@@ -1206,6 +1266,26 @@ FN_MAX_LIMIT_LIST
 
     u32 GetMaxVertexInputBindings() const {
         return properties.properties.limits.maxVertexInputBindings;
+    }
+
+    u32 GetMaxVertexInputBindingStride() const {
+        return properties.properties.limits.maxVertexInputBindingStride;
+    }
+
+    u32 GetMaxVertexInputAttributeOffset() const {
+        return properties.properties.limits.maxVertexInputAttributeOffset;
+    }
+
+    bool HasPortabilitySubset() const {
+        return extensions.portability_subset;
+    }
+
+    bool HasNativeUnalignedVertexFetch() const {
+        return extensions.legacy_vertex_attributes;
+    }
+
+    bool SupportsVertexAttributeAccessBeyondStride() const {
+        return vertex_attribute_access_beyond_stride;
     }
 
     u32 GetMaxViewports() const {
@@ -1249,6 +1329,13 @@ FN_MAX_LIMIT_LIST
         return extensions.maintenance5;
     }
 
+    /// Returns true if pipeline binary import and export are available.
+    bool IsKhrPipelineBinarySupported() const {
+        return extensions.pipeline_binary && dld.vkCreatePipelineBinariesKHR &&
+               dld.vkDestroyPipelineBinaryKHR && dld.vkGetPipelineBinaryDataKHR &&
+               dld.vkGetPipelineKeyKHR && dld.vkReleaseCapturedPipelineDataKHR;
+    }
+
     /// Returns true if polygon mode POINT supports gl_PointSize.
     bool SupportsPolygonModePointSize() const {
         return extensions.maintenance5 && properties.maintenance5.polygonModePointSize;
@@ -1281,12 +1368,6 @@ FN_MAX_LIMIT_LIST
         return extensions.maintenance8;
     }
 
-    /// Returns true if the device supports UINT8 index buffer conversion via compute shader.
-    bool SupportsUint8Indices() const {
-        return features.bit8_storage.storageBuffer8BitAccess &&
-               features.bit16_storage.storageBuffer16BitAccess;
-    }
-
     [[nodiscard]] static constexpr bool CheckBrokenCompute(VkDriverId driver_id,
                                                            u32 driver_version) {
         if (driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS) {
@@ -1311,10 +1392,9 @@ FN_MAX_LIMIT_LIST
         return properties.driver.driverID == VK_DRIVER_ID_MOLTENVK;
     }
 
-    /// The multiple vertex input binding strides must be. Metal needs 4 bytes, which MoltenVK
-    /// reports as minVertexInputBindingStrideAlignment through VK_KHR_portability_subset.
+    /// Minimum stride alignment reported by the portability subset, in bytes.
     u32 GetMinVertexInputBindingStrideAlignment() const noexcept {
-        return IsMoltenVK() ? 4 : 1;
+        return min_vertex_input_binding_stride_alignment;
     }
 
     NvidiaArchitecture GetNvidiaArch() const noexcept {
@@ -1413,6 +1493,9 @@ private:
 #undef FEATURE_CORE
 #undef FEATURE_EXT
 
+#ifdef VK_EXT_primitive_restart_index
+        VkPhysicalDevicePrimitiveRestartIndexFeaturesEXT primitive_restart_index{};
+#endif
         VkPhysicalDeviceFeatures features{};
     };
 
@@ -1424,6 +1507,7 @@ private:
         VkPhysicalDeviceDescriptorBufferPropertiesEXT descriptor_buffer{};
         VkPhysicalDeviceSubgroupSizeControlProperties subgroup_size_control{};
         VkPhysicalDeviceTransformFeedbackPropertiesEXT transform_feedback{};
+        VkPhysicalDeviceLegacyVertexAttributesPropertiesEXT legacy_vertex_attributes{};
         VkPhysicalDeviceMaintenance5PropertiesKHR maintenance5{};
         VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT graphics_pipeline_library{};
         VkPhysicalDeviceMeshShaderPropertiesEXT mesh_shader{};
@@ -1461,6 +1545,10 @@ private:
     bool has_radeon_gpu_profiler{};            ///< Has Radeon GPU Profiler attached.
     bool supports_d24_depth{};                 ///< Supports D24 depth buffers.
     bool must_emulate_scaled_formats{};        ///< Requires scaled vertex format emulation
+    u32 min_vertex_input_binding_stride_alignment{1};
+    bool vertex_attribute_access_beyond_stride{true};
+    bool use_extended_dynamic_state{};
+    bool use_extended_dynamic_state2{};
     bool dynamic_state2_patch_control_points{};
     bool dynamic_state3_blending{};            ///< Has blending features of dynamic_state3.
     bool dynamic_state3_enables{};             ///< Has at least one enable feature of dynamic_state3.

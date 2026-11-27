@@ -6,6 +6,7 @@
 
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
+#include "shader_recompiler/frontend/ir/modifiers.h"
 
 namespace Shader::Backend::SPIRV {
 namespace {
@@ -150,14 +151,65 @@ Id EmitConvertU32U64(EmitContext& ctx, Id value) {
     return ctx.OpUConvert(ctx.U32[1], value);
 }
 
-Id EmitConvertF16F32(EmitContext& ctx, Id value) {
-#ifdef __ANDROID__
-    return ctx.OpFConvert(ctx.F16[1], value);
-#else
-    const auto result = ctx.OpFConvert(ctx.F16[1], value);
-    const auto isOverflowing = ctx.OpIsNan(ctx.U1, result);
-    return ctx.OpSelect(ctx.F16[1], isOverflowing, ctx.Constant(ctx.F16[1], 0), result);
-#endif
+Id Float32ToHalfBitsRTE(EmitContext& ctx, Id value, u32 components) {
+    const Id integer{ctx.U32[components]};
+    const Id boolean{components == 1 ? ctx.U1 : ctx.TypeVector(ctx.U1, 2)};
+    const auto constant = [&](u32 x) {
+        return components == 1 ? ctx.Const(x) : ctx.Const(x, x);
+    };
+    const Id one{constant(1U)};
+    const Id bits{ctx.OpBitcast(integer, value)};
+    const Id magnitude{ctx.OpBitwiseAnd(integer, bits, constant(0x7fffffffU))};
+    const Id sign{ctx.OpBitwiseAnd(integer,
+                                  ctx.OpShiftRightLogical(integer, bits, constant(16U)),
+                                  constant(0x8000U))};
+
+    const Id exponent{ctx.OpShiftRightLogical(integer, magnitude, constant(23U))};
+    const Id significand{ctx.OpBitwiseOr(integer, ctx.OpBitwiseAnd(integer, magnitude, constant(0x7fffffU)),
+                                        constant(0x800000U))};
+
+    // Normals retain 11 significand bits. Subnormals shift further. At 25 bits even the
+    // largest significand rounds to zero, including binary32 subnormal inputs.
+    const Id min_exp{constant(101U)};
+    const Id normal_exp{constant(113U)};
+    const Id bounded_exp{ctx.profile.has_broken_spirv_clamp
+                             ? ctx.OpUMin(integer, ctx.OpUMax(integer, exponent, min_exp), normal_exp)
+                             : ctx.OpUClamp(integer, exponent, min_exp, normal_exp)};
+    const Id shift{ctx.OpISub(integer, constant(126U), bounded_exp)};
+    const Id half_ulp{ctx.OpShiftLeftLogical(integer, one, ctx.OpISub(integer, shift, one))};
+    const Id odd{ctx.OpBitwiseAnd(integer, ctx.OpShiftRightLogical(integer, significand, shift), one)};
+    const Id bias{ctx.OpIAdd(integer, ctx.OpISub(integer, half_ulp, one), odd)};
+    const Id rounded{ctx.OpShiftRightLogical(integer, ctx.OpIAdd(integer, significand, bias), shift)};
+
+    // The leading bit of a rounded normal supplies one unit of the binary16 exponent.
+    const Id excess{ctx.OpISub(integer, ctx.OpUMax(integer, exponent, normal_exp), normal_exp)};
+    const Id biased{ctx.OpIAdd(integer, ctx.OpShiftLeftLogical(integer, excess, constant(10U)), rounded)};
+    const Id saturated{ctx.OpUMin(integer, biased, constant(0x7c00U))};
+    const Id unsigned_half{ctx.OpSelect(integer,
+        ctx.OpUGreaterThan(boolean, magnitude, constant(0x7f800000U)), constant(0x7e00U), saturated)};
+    return ctx.OpBitwiseOr(integer, sign, unsigned_half);
+}
+
+Id EmitConvertF16F32(EmitContext& ctx, IR::Inst* inst, Id value) {
+    if (inst->Flags<IR::FpControl>().rounding != IR::FpRounding::RN) {
+        return ctx.OpFConvert(ctx.F16[1], value);
+    }
+    if (ctx.UsesNativeFloat16RTE()) {
+        // Every float32 subnormal rounds to half zero. Pass signed zero for these inputs
+        // so float32 denorm flushing cannot change the result without a float32 mode.
+        const Id integer{ctx.U32[1]};
+        const Id raw{ctx.OpBitcast(integer, value)};
+        const Id magnitude{ctx.OpBitwiseAnd(integer, raw, ctx.Const(0x7fffffffU))};
+        const Id small{ctx.OpULessThan(ctx.U1, magnitude, ctx.Const(0x00800000U))};
+        const Id signed_zero{ctx.OpBitwiseAnd(integer, raw, ctx.Const(0x80000000U))};
+        const Id input{ctx.OpSelect(integer, small, signed_zero, raw)};
+        return ctx.OpFConvert(ctx.F16[1], ctx.OpBitcast(ctx.F32[1], input));
+    }
+    // Vulkan's implicit conversion rounding does not guarantee RN. A two-half bitcast
+    // materializes the exact value without requiring the optional Int16 capability.
+    const Id bits{Float32ToHalfBitsRTE(ctx, value, 1)};
+    const Id halves{ctx.OpBitcast(ctx.F16[2], bits)};
+    return ctx.OpCompositeExtract(ctx.F16[1], halves, 0);
 }
 
 Id EmitConvertF32F16(EmitContext& ctx, Id value) {

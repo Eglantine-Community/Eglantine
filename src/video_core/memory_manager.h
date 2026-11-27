@@ -185,6 +185,9 @@ public:
     bool IsMemoryDirty(GPUVAddr gpu_addr, size_t size,
                        VideoCommon::CacheType which = VideoCommon::CacheType::All) const;
 
+    /// Length of the mapped GPU prefix, including adjacent VA runs backed by different pages.
+    size_t MaxMappedRange(GPUVAddr gpu_addr, size_t size) const;
+
     size_t MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const;
 
     /// MaxContinuousRange by walking the page tables (the answer with Nx2Perf off).

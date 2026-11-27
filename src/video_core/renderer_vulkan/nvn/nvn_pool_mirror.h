@@ -180,6 +180,8 @@ struct PoolMirror {
     /// a pass begin (DrawContext::PrefetchMirrors), so the draws of the pass find the pages earlier
     /// bindings used current instead of reading host memory.
     bool prefetch{false};
+    static constexpr size_t NO_PREFETCH_SLOT = ~size_t{0};
+    size_t prefetch_slot{NO_PREFETCH_SLOT};
     /// The pages those bindings used so far (bits set by DrawContext::ApplyMirrors and
     /// VtxCovServeOrMiss): the prefetch's working set, which bounds its copies (null until the
     /// first use).
@@ -191,7 +193,6 @@ struct PoolMirror {
     u32 ubo_thrash_streak{0};
 
     void MarkWanted(u64 pool_size, u64 offset, u64 size) {
-        prefetch = true;
         if (!wanted) {
             wanted = std::make_unique<MirrorPages>(pool_size);
         }

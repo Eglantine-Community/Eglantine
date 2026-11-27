@@ -993,17 +993,6 @@ struct AmpereBranchTableInfo {
     return std::nullopt;
 }
 
-[[nodiscard]] std::optional<std::string_view> ResolveTensorMode(
-    const LoweringOptions& options) noexcept {
-    if (const char* const forced_mode = std::getenv("EDEN_NX2_TENSOR"); forced_mode != nullptr) {
-        return std::string_view{forced_mode};
-    }
-    if (!options.tensor) {
-        return std::nullopt;
-    }
-    return options.compact_tensor ? std::string_view{"compact"} : std::string_view{"1"};
-}
-
 [[nodiscard]] bool ValidateTier2Instruction(std::span<const Instruction> code, u32 index,
                                             const Instruction& insn,
                                             const LoweringOptions& options,
@@ -1111,15 +1100,17 @@ struct AmpereBranchTableInfo {
             return fail("native scalar float conversion mode");
         }
         return true;
-    case 0x23e: case 0xa3e: // F2FP
-        if (insn.Bits(62, 2) || insn.Bits(72, 1) || insn.Bits(73, 5) || insn.Bits(79, 2) ||
-            insn.Bits(81, 10) || insn.Bits(91, 1)) {
+    case 0x23e: case 0xa3e: { // F2FP
+        const bool merge = insn.Bits(78, 1) != 0U;
+        const u32 allowed_modifier = merge ? 1U : (1U << 4); // MERGE_C.H1 or PACK_AB.BF16
+        if (insn.Bits(62, 2) || (insn.Bits(72, 6) & ~allowed_modifier) || insn.Bits(79, 13)) {
             return fail("native float packing modifiers");
         }
         if (opcode == 0xa3e && !ValidCbuf(insn)) {
             return fail("native constant buffer address");
         }
         return true;
+    }
     case 0x232: case 0x832: case 0xa32: // HMUL2
         if (insn.Bits(78, 2) || insn.Bits(81, 10) || insn.Bits(91, 1)) {
             return fail("native half multiply mode");
@@ -1884,7 +1875,7 @@ struct AmpereBranchTableInfo {
         }
         return true;
     case 0x23c: { // HMMA.1688/.16816.F16
-        if (!ResolveTensorMode(options)) {
+        if (ResolveTensorMode(options) == TensorMode::Disabled) {
             return fail("native matrix multiply (set EDEN_NX2_TENSOR to emulate)");
         }
         const u32 dest = insn.Bits(16, 8);
@@ -2141,9 +2132,11 @@ bool IsDirectTier2Opcode(u32 opcode) noexcept {
     }
 }
 
-bool CanIfConvertPredicated(const Instruction& insn) noexcept {
+bool CanIfConvertPredicated(const Instruction& insn, TensorMode tensor_mode) noexcept {
     const u32 opcode = insn.Bits(0, 12);
     switch (opcode) {
+    case 0x23c: // HMMA, subject to a warp-uniform predicate proof.
+        return tensor_mode == TensorMode::Workgroup;
     // Moves, static constant loads, special registers
     case 0x202: case 0x802: case 0xa02: case 0xc02:
     case 0x882: case 0xc82:
@@ -2500,8 +2493,12 @@ namespace Flow {
 
 CFG::CFG(Environment& env_, ObjectPool<Block>& block_pool_, std::span<const Instruction> code_,
          bool exits_to_dispatcher_)
+    : CFG(env_, block_pool_, code_, exits_to_dispatcher_, TensorMode::Disabled) {}
+
+CFG::CFG(Environment& env_, ObjectPool<Block>& block_pool_, std::span<const Instruction> code_,
+         bool exits_to_dispatcher_, TensorMode tensor_mode_)
     : env{env_}, block_pool{block_pool_}, code{code_},
-      exits_to_dispatcher{exits_to_dispatcher_} {
+      exits_to_dispatcher{exits_to_dispatcher_}, tensor_mode{tensor_mode_} {
     if (exits_to_dispatcher) {
         dispatch_block = block_pool.Create(Block{});
         dispatch_block->begin = {};
@@ -2686,7 +2683,7 @@ CFG::AnalysisState CFG::AnalyzeInst(Block* block, FunctionId function_id, Maxwel
         break;
     }
 
-    if (pred_bits == 7 || CanIfConvertPredicated(insn)) {
+    if (pred_bits == 7 || CanIfConvertPredicated(insn, tensor_mode)) {
         return AnalysisState::Continue;
     }
     AnalyzeCondInst(block, function_id, pc, EndClass::Branch, GuardCondition(opcode, pred_bits));

@@ -456,7 +456,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         bind_stage_info(4);
     }
     buffer_cache.UpdateGraphicsBuffers(is_indexed);
-    buffer_cache.BindHostGeometryBuffers(is_indexed);
+    if (!buffer_cache.BindHostGeometryBuffers(is_indexed)) {
+        return false;
+    }
 
     if (!IsBuilt()) {
         WaitForBuild();

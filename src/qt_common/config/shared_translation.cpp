@@ -582,6 +582,7 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                           {
                               PAIR(CpuBackend, Dynarmic, tr("Dynarmic")),
                               PAIR(CpuBackend, Nce, tr("NCE")),
+                              PAIR(CpuBackend, ScarletNx, tr("ScarletNX (experimental)")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::FullscreenMode>::Index(),
                           {

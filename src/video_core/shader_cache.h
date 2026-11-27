@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "common/hash.h"
 #include <ranges>
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
@@ -44,6 +45,7 @@ struct ShaderInfo {
     size_t size_bytes{};
     /// Lowered code of a native program, reused when its pipelines are built.
     std::shared_ptr<const LoweredNativeCode> lowered_native;
+    Shader::Ampere::TensorMode tensor_mode{};
 };
 
 class ShaderCache : public VideoCommon::ChannelSetupCaches<VideoCommon::ChannelInfo> {
@@ -51,11 +53,14 @@ class ShaderCache : public VideoCommon::ChannelSetupCaches<VideoCommon::ChannelI
     static constexpr u64 YUZU_PAGESIZE = u64(1) << YUZU_PAGEBITS;
 
     static constexpr size_t NUM_PROGRAMS = 6;
+    using TensorMode = Shader::Ampere::TensorMode;
+    using LookupKey = std::pair<VAddr, TensorMode>;
 
     struct Entry {
         VAddr addr_start;
         VAddr addr_end;
         ShaderInfo* data;
+        TensorMode tensor_mode;
 
         bool is_memory_marked = true;
 
@@ -142,10 +147,11 @@ private:
     /// @note Doesn't check for ranges, the given address has to be the start of the shader
     /// @param addr Start address of the shader, this doesn't cache for region
     /// @return Pointer to a valid shader, nullptr when nothing is found
-    ShaderInfo* TryGet(VAddr addr) const;
+    ShaderInfo* TryGet(VAddr addr, TensorMode mode = TensorMode::Default) const;
 
     const ShaderInfo* TryGetResolved(GPUVAddr shader_addr, size_t memory_id, u64 map_serial,
-                                     u64 inv_serial, std::optional<VAddr>& out_cpu_addr);
+                                     u64 inv_serial, std::optional<VAddr>& out_cpu_addr,
+                                     TensorMode mode = TensorMode::Default);
     void CacheResolved(GPUVAddr shader_addr, size_t memory_id, u64 map_serial, u64 inv_serial,
                        const ShaderInfo* info) noexcept;
 
@@ -184,29 +190,30 @@ private:
     Entry* NewEntry(VAddr addr, VAddr addr_end, ShaderInfo* data);
 
     /// @brief Create a new shader entry and register it
-    const ShaderInfo* MakeShaderInfo(GenericEnvironment& env, VAddr cpu_addr);
+    const ShaderInfo* MakeShaderInfo(GenericEnvironment& env, VAddr cpu_addr,
+                                     TensorMode mode = TensorMode::Default);
 
     /// Rethrows the error a native program at this address was rejected with, if any.
-    void RethrowIfRejected(VAddr addr);
+    void RethrowIfRejected(VAddr addr, TensorMode mode = TensorMode::Default);
     /// Whether a native program at this address was rejected.
     bool IsRejected(VAddr addr);
     /// Remembers the exception being handled as this address's rejection.
-    void RememberRejection(VAddr addr);
+    void RememberRejection(VAddr addr, TensorMode mode = TensorMode::Default);
     /// Hash of the state task and mesh programs are translated with.
     u64 MeshStateHash() const;
 
     mutable std::mutex lookup_mutex;
     std::mutex invalidation_mutex;
 
-    ::Common::unordered_map<u64, std::unique_ptr<Entry>> lookup_cache;
+    ::Common::unordered_map<LookupKey, std::unique_ptr<Entry>, ::Common::PairHash> lookup_cache;
     ::Common::unordered_map<u64, std::vector<Entry*>> invalidation_cache;
     std::vector<std::unique_ptr<ShaderInfo>> storage;
     std::vector<Entry*> marked_for_removal;
 
-    /// Native programs the lowering rejected, by address, so each draw or dispatch rethrows the
+    /// Native programs the lowering rejected, by address and tensor mode, so a dispatch rethrows the
     /// first error instead of lowering again; dropped when guest memory there is written.
     std::mutex rejected_mutex;
-    ::Common::unordered_map<u64, std::exception_ptr> rejected_native;
+    ::Common::unordered_map<LookupKey, std::exception_ptr, ::Common::PairHash> rejected_native;
     /// Bounds of every address ever rejected (never shrinks): a quick test for invalidations.
     std::atomic<VAddr> rejected_lowest{~VAddr{}};
     std::atomic<VAddr> rejected_highest{};
@@ -217,6 +224,7 @@ private:
         size_t memory_id{~size_t{0}};
         u64 map_serial{};
         u64 invalidation_serial{};
+        TensorMode tensor_mode{};
         const ShaderInfo* info{};
     };
     std::array<ResolvedShaderCacheEntry, ResolvedShaderCacheSize> resolved_shader_cache{};

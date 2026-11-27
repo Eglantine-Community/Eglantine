@@ -1,0 +1,187 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#version 450 core
+
+layout(local_size_x = 64) in;
+
+const uint CHUNK_INDICES = 256;
+const uint QUAD_STRIP = 1u;
+
+layout(std430, set = 0, binding = 0) readonly buffer Source {
+    uint words[];
+} source;
+
+layout(std430, set = 0, binding = 1) writeonly buffer Indices {
+    uint values[];
+} indices;
+
+struct Chunk {
+    uint head; // number of indices before first restart, later the run length on entry
+    uint tail; // number of indices after last restart, later the first output quad ordinal
+    uint inner;
+};
+
+layout(std430, set = 0, binding = 2) buffer Scratch {
+    // VkDrawIndexedIndirectCommand, followed by one Chunk for each interval of CHUNK_INDICES.
+    uint draw_index_count;
+    uint draw_instance_count;
+    uint draw_first_index;
+    int draw_vertex_offset;
+    uint draw_first_instance;
+    Chunk chunks[];
+} scratch;
+
+layout(push_constant) uniform Constants {
+    uint index_count;
+    uint index_width;
+    uint source_bias;
+    uint restart_index;
+    uint flags;
+    uint instance_count;
+    int vertex_offset;
+    uint first_instance;
+    uint draw_index_limit;
+    uint phase;
+} pc;
+
+uint ReadIndex(uint index) {
+    uint byte_address = pc.source_bias + index * pc.index_width;
+    uint shift = (byte_address & 3u) * 8u;
+    uint word = byte_address >> 2u;
+    uint value = source.words[word] >> shift;
+    // An unaligned halfword or word can cross a source word boundary.
+    if (shift + pc.index_width * 8u > 32u) {
+        value |= source.words[word + 1u] << (32u - shift);
+    }
+    if (pc.index_width == 1u) {
+        return value & 0xffu;
+    }
+    return pc.index_width == 2u ? value & 0xffffu : value;
+}
+
+uint QuadCount(uint run) {
+    if ((pc.flags & QUAD_STRIP) != 0u) {
+        return run >= 4u ? run / 2u - 1u : 0u;
+    }
+    return run / 4u;
+}
+
+bool CompletesQuad(uint run) {
+    uint step = (pc.flags & QUAD_STRIP) != 0u ? 2u : 4u;
+    return run >= 4u && run % step == 0u;
+}
+
+void WriteQuad(uint quad, uint first) {
+    uint a = ReadIndex(first);
+    uint b = ReadIndex(first + 1u);
+    uint c = ReadIndex(first + 2u);
+    uint d = ReadIndex(first + 3u);
+    if ((pc.flags & QUAD_STRIP) != 0u) {
+        uint next = c;
+        c = d;
+        d = next;
+    }
+    uint base = quad * 6u;
+    indices.values[base] = a;
+    indices.values[base + 1u] = b;
+    indices.values[base + 2u] = c;
+    indices.values[base + 3u] = a;
+    indices.values[base + 4u] = c;
+    indices.values[base + 5u] = d;
+}
+
+void WriteCommand(uint quads) {
+    scratch.draw_index_count = min(quads * 6u, pc.draw_index_limit);
+    scratch.draw_instance_count = pc.instance_count;
+    scratch.draw_first_index = 0u;
+    scratch.draw_vertex_offset = pc.vertex_offset;
+    scratch.draw_first_instance = pc.first_instance;
+}
+
+void SummarizeChunk(uint chunk, uint first, uint count) {
+    uint head = count;
+    uint run = 0u;
+    uint inner = 0u;
+    for (uint i = 0u; i < count; ++i) {
+        if (ReadIndex(first + i) == pc.restart_index) {
+            if (head == count) {
+                head = i;
+            } else {
+                inner += QuadCount(run);
+            }
+            run = 0u;
+        } else {
+            ++run;
+        }
+    }
+    if (head != count) {
+        inner += QuadCount(run);
+    }
+    scratch.chunks[chunk] = Chunk(head, run, inner);
+}
+
+void ScanChunks(uint count) {
+    uint run = 0u;
+    uint total = 0u;
+    for (uint chunk = 0u; chunk < count; ++chunk) {
+        uint length = min(CHUNK_INDICES, pc.index_count - chunk * CHUNK_INDICES);
+        Chunk local = scratch.chunks[chunk];
+        scratch.chunks[chunk].head = run;
+        scratch.chunks[chunk].tail = total;
+        total += QuadCount(run + local.head) - QuadCount(run) + local.inner;
+        run = local.head == length ? run + length : local.tail;
+    }
+    WriteCommand(total);
+}
+
+void EmitChunk(uint chunk, uint first, uint count) {
+    uint run = scratch.chunks[chunk].head;
+    uint output_quad = scratch.chunks[chunk].tail;
+    for (uint i = first; i - first < count; ++i) {
+        if (ReadIndex(i) == pc.restart_index) {
+            run = 0u;
+            continue;
+        }
+        ++run;
+        if (CompletesQuad(run)) {
+            WriteQuad(output_quad++, i - 3u);
+        }
+    }
+}
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    uint step = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    if (pc.phase == 0u) {
+        uint quads = QuadCount(pc.index_count);
+        if (id == 0u) {
+            WriteCommand(quads);
+        }
+        uint index_step = (pc.flags & QUAD_STRIP) != 0u ? 2u : 4u;
+        for (uint quad = id; quad < quads; quad += step) {
+            WriteQuad(quad, quad * index_step);
+            if (step >= quads - quad) break;
+        }
+        return;
+    }
+
+    uint chunks = (pc.index_count - 1u) / CHUNK_INDICES + 1u;
+    if (pc.phase == 2u) {
+        if (id == 0u) {
+            ScanChunks(chunks);
+        }
+        return;
+    }
+
+    for (uint chunk = id; chunk < chunks; chunk += step) {
+        uint first = chunk * CHUNK_INDICES;
+        uint length = min(CHUNK_INDICES, pc.index_count - first);
+        if (pc.phase == 1u) {
+            SummarizeChunk(chunk, first, length);
+        } else {
+            EmitChunk(chunk, first, length);
+        }
+        if (step >= chunks - chunk) break;
+    }
+}

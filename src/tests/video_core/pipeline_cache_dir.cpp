@@ -43,10 +43,10 @@ TEST_CASE("Pipeline cache directory is created for a title on a fresh cache",
     CHECK(fs::is_directory(dir));
 }
 
-TEST_CASE("Mario Kart World pipeline cache subdirectory is created on a fresh cache",
+TEST_CASE("Mario Kart World uses the generic title pipeline cache directory",
           "[video_core][vulkan][pipeline_cache_dir]") {
     ScratchShaderDir shader;
-    const auto expected = shader.path / "0400c3f00006e000" / "mkw_zero_depth_v1";
+    const auto expected = shader.path / "0400c3f00006e000";
     REQUIRE_FALSE(fs::exists(shader.path / "0400c3f00006e000"));
     CHECK(Vulkan::CreatePipelineCacheDir(shader.path, MarioKartWorldProgramId) == expected);
     CHECK(fs::is_directory(expected));

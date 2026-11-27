@@ -53,8 +53,7 @@ struct ImportedChunk {
     u64 device_address{};
 };
 
-/// VK_EXT_external_memory_host import. Loads vkGetMemoryHostPointerPropertiesEXT with
-/// vkGetDeviceProcAddr and reads minImportedHostPointerAlignment itself.
+/// VK_EXT_external_memory_host import qualified by the external capabilities of each buffer.
 class HostImporter {
 public:
     /// `allocator` is stored in imported buffers so they are destroyed with the right owner; it is
@@ -112,8 +111,11 @@ public:
                                  std::string& error) const;
 
 private:
+    VkResult CheckBufferImport(const VkBufferCreateInfo& buffer, std::string& error) const;
+
     const Device& device;
     VmaAllocator allocator;
+    PFN_vkGetPhysicalDeviceExternalBufferProperties get_external_buffer_properties{};
     PFN_vkGetMemoryHostPointerPropertiesEXT get_properties{};
     u64 min_alignment{};
 };

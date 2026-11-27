@@ -33,6 +33,7 @@ void SetupDirtyVertexBuffers(Maxwell3D::DirtyState::Tables& tables) {
 
 void SetupIndexBuffer(Maxwell3D::DirtyState::Tables& tables) {
     FillBlock(tables[0], OFF(index_buffer), NUM(index_buffer), IndexBuffer);
+    FillBlock(tables[0], OFF(native_index_buffer_size), NUM(native_index_buffer_size), IndexBuffer);
 }
 
 void SetupDirtyDescriptors(Maxwell3D::DirtyState::Tables& tables) {

@@ -21,6 +21,8 @@
 
 namespace Vulkan {
 
+class Device;
+
 using Maxwell = Tegra::Engines::Maxwell3D::Regs;
 
 struct DynamicFeatures {
@@ -36,7 +38,6 @@ struct DynamicFeatures {
     bool has_dynamic_state3_logic_op_enable;
     bool has_dynamic_state3_line_stipple_enable;
     bool has_dynamic_vertex_input;
-    bool has_static_vertex_repack;
     bool has_color_write_enable;
     bool has_provoking_vertex;
     bool has_provoking_vertex_first_mode;
@@ -218,6 +219,8 @@ struct FixedPipelineState {
         BitField<20, 1, u32> color_write_enable_dynamic;
 
         BitField<21, 1, u32> attachment0_dual_source_blend;
+        BitField<22, 1, u32> static_vertex_stride;
+        BitField<23, 1, u32> vertex_repack_layout_v2;
 
         BitField<24, 4, Maxwell::PrimitiveTopology> topology;
         BitField<28, 4, Tegra::Texture::MsaaMode> msaa_mode;
@@ -267,7 +270,8 @@ struct FixedPipelineState {
     static void SetupDirtyRegisters(Tegra::Engines::Maxwell3D& maxwell3d,
                                     const DynamicFeatures& features);
 
-    void Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFeatures& features);
+    bool Refresh(Tegra::Engines::Maxwell3D& maxwell3d, const DynamicFeatures& features,
+                 const Device& device);
 
     size_t Hash() const noexcept;
 
@@ -275,6 +279,10 @@ struct FixedPipelineState {
 
     bool operator!=(const FixedPipelineState& rhs) const noexcept {
         return !operator==(rhs);
+    }
+
+    bool UsesDynamicVertexBindingStride() const noexcept {
+        return extended_dynamic_state && !dynamic_vertex_input && !static_vertex_stride;
     }
 
     size_t Size() const noexcept {
@@ -289,8 +297,7 @@ struct FixedPipelineState {
             // Exclude dynamic state
             return offsetof(FixedPipelineState, attributes);
         }
-        if (extended_dynamic_state) {
-            // Exclude dynamic state
+        if (UsesDynamicVertexBindingStride()) {
             return offsetof(FixedPipelineState, vertex_strides);
         }
         // Default

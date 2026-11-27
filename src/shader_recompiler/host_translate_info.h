@@ -28,7 +28,6 @@ struct HostTranslateInfo {
     u32 max_descriptor_set_uniform_buffers{};
     u32 max_descriptor_set_uniform_buffers_dynamic{};
     u32 max_descriptor_set_storage_buffers{};
-    u32 max_descriptor_set_storage_buffers_dynamic{};
     u32 max_descriptor_set_sampled_images{};
     u32 max_descriptor_set_storage_images{};
     u32 max_descriptor_set_input_attachements{};
@@ -98,7 +97,6 @@ struct HostTranslateInfo {
         ApplyDescriptorLimitFallback(max_descriptor_set_uniform_buffers);
         ApplyDescriptorLimitFallback(max_descriptor_set_uniform_buffers_dynamic);
         ApplyDescriptorLimitFallback(max_descriptor_set_storage_buffers);
-        ApplyDescriptorLimitFallback(max_descriptor_set_storage_buffers_dynamic);
         ApplyDescriptorLimitFallback(max_descriptor_set_sampled_images);
         ApplyDescriptorLimitFallback(max_descriptor_set_storage_images);
         ApplyDescriptorLimitFallback(max_descriptor_set_input_attachements);

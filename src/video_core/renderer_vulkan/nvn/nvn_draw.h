@@ -153,16 +153,19 @@ public:
     /// Transitions the whole image (outside a render pass only).
     virtual void HostTransition(Storage& storage, VkImageLayout layout) = 0;
     /// The same for several images in one barrier call; records nothing when all are in layout
-    /// (the caller flushes the pending barrier itself).
+    /// (the caller flushes the pending barrier itself). Attachment levels correspond to the first
+    /// images in the batch and narrow feedback invalidation for those writes.
     virtual void HostTransitionMany(std::span<const std::pair<Storage*, VkImageLayout>> images,
-                                    bool track_writes = true) = 0;
+                                    bool track_writes = true,
+                                    std::span<const u32> attachment_levels = {}) = 0;
     virtual void HostNoteImageWrite(Storage& storage) = 0;
     virtual void HostNoteTouched(const std::shared_ptr<Storage>& storage) = 0;
     /// Creates the image and loads the guest contents on first use (outside a render pass only).
     /// False: the image could not be created (the op must be dropped).
     virtual bool HostEnsureContents(Storage& storage, bool will_overwrite,
                                     const char* caller = "DrawOrDispatch") = 0;
-    virtual bool HostEnsureAttachmentContents(Storage& storage) = 0;
+    /// LOAD or partial clear must preserve the pixels outside the attached/cleared region.
+    virtual bool HostEnsureAttachmentContents(Storage& storage, bool whole_clear) = 0;
     virtual bool HostUpgradeImageCaps(Storage& storage, bool need_storage,
                                       bool need_unrestricted_formats) = 0;
     [[nodiscard]] virtual bool HostIsCpuReadablePool(const Storage& storage) const = 0;
@@ -179,7 +182,7 @@ public:
     /// the newer image, the guest-sized one is made from it (outside a pass).
     virtual void HostMakeNativeCurrent(Storage& storage) = 0;
     virtual bool HostResolvePoolRange(u64 address, u64 size, Pool*& pool, u64& offset,
-                                      std::string_view op) = 0;
+                                      std::string_view op, bool bounded_storage = false) = 0;
     /// Mirror pools: copies the guest pages of the range that changed since the mirror last saw
     /// them (nothing when none did) into the mirror, before the GPU reads them (outside a pass).
     virtual void HostUploadRange(Pool& pool, u64 offset, u64 size) = 0;
@@ -221,15 +224,20 @@ public:
     [[nodiscard]] virtual bool HostConditional() const {
         return false;
     }
+    [[nodiscard]] virtual bool HostOcclusionCounting() const {
+        return false;
+    }
     /// Ends an open conditional-rendering region before the draw path changes render passes
     /// (true if one was open) and starts it again afterwards.
     virtual bool HostSuspendCondition() {
         return false;
     }
     virtual void HostResumeCondition() {}
-    /// SAMPLES_PASSED with in-pass queries (CounterEngine::InPassQueries): a draw is about to be
-    /// recorded inside the open pass (a query is begun when the draw counts and none is open).
-    virtual void HostBeforeDraw() {}
+    /// Starts queries that span passes and ends active queries before draws that discard
+    /// primitives before rasterization. Called with the render condition suspended.
+    virtual void HostPrepareOcclusion(bool rasterizes) {}
+    /// Starts an in-pass SAMPLES_PASSED query when the draw can contribute samples.
+    virtual void HostBeforeDraw(bool rasterizes) {}
     /// The open pass is about to end: a query begun inside it ends here.
     virtual void HostPassEnding() {}
     /// The pass ended: the counter reports of the pass are written now.
@@ -284,10 +292,12 @@ public:
     }
     /// Mid-batch upload submission: true when enough piece time has elapsed outside passes and
     /// shadows to flush completed uploads to the GPU while subsequent uploads are recorded.
-    [[nodiscard]] virtual bool HostUploadEarlySubmitDue() const {
+    [[nodiscard]] virtual bool HostUploadEarlySubmitDue() {
         return false;
     }
     virtual void HostSubmitUploadPiece() {}
+    /// Let the GPU run commands already recorded before replay blocks on a pipeline.
+    virtual void HostSubmitBeforePipelineWait() {}
 };
 
 /// Where a buffer range ended up.
@@ -310,6 +320,7 @@ struct MeshDraw {
 struct PreparedDraw {
     GraphicsPipeline* pipeline{};
     BufferRef mesh_draw_args;
+    BufferRef quad_draw_args;
     u32 mesh_vertex_count{};
     u32 host_topology{}; ///< NVNdrawPrimitive the host draws (after quad/loop conversion)
     bool quad_list{};    ///< QUADS: draw triangles from generated indices
@@ -323,6 +334,8 @@ struct IndexRange {
     u32 type{}; ///< NVNindexType
     /// The caller already refreshed the range (mirror pools): the draw does not upload it again.
     bool uploaded{};
+    // Direct quad indices that must be read from their current GPU backing.
+    const VC::DrawIndexedPayload* gpu_quad{};
 };
 
 struct HostIndex {
@@ -374,9 +387,7 @@ public:
 
     /// Binds pipeline, dynamic state, descriptors, vertex buffers (and the index buffer when
     /// `index` is given) for a draw and leaves the render pass open. False = the draw must be
-    /// skipped (the reason is counted/logged). `element_count`: the vertices or indices of a direct
-    /// draw, 0 for indirect and mesh draws (it decides whether the draw may skip a pipeline that is
-    /// still compiling, MaySkipUnbuiltDraw).
+    /// skipped (the reason is counted/logged). `element_count` is 0 for indirect and mesh draws.
     bool PrepareDraw(u32 mode, u32 element_count, const IndexRange* index, PreparedDraw& out,
                      HostIndex& host_index, const MeshDraw* mesh_draw = nullptr);
 
@@ -384,6 +395,9 @@ public:
     /// stages. Compute dispatches use it too (`bind_point` COMPUTE). Must be called outside a
     /// render pass or, for graphics, inside the pass the draw runs in.
     bool BindDescriptors(PipelineBase& pipeline, VkPipelineBindPoint bind_point);
+
+    /// Allocates a descriptor set from the current submission's pools.
+    VkDescriptorSet AllocateSet(VkDescriptorSetLayout layout, bool propagate_error = false);
 
     [[nodiscard]] const StageBindings& Bindings(u32 stage) const {
         return stages[stage];
@@ -430,7 +444,7 @@ public:
     enum class ShadowPolicy { Flush, Defer, Ignore };
     /// Resolves a GPU address range to a host buffer (null buffer + `false` when unmapped).
     bool ResolveBuffer(u64 address, u64 size, bool write, BufferRef& out,
-                       ShadowPolicy policy = ShadowPolicy::Flush);
+                       ShadowPolicy policy = ShadowPolicy::Flush, bool bounded_storage = false);
 
     /// Copies every live storage shadow back to its pool and forgets it (ends the pass when it is
     /// open). The recorder calls it before a command buffer ends.
@@ -516,8 +530,15 @@ private:
                                 bool has_count, BufferRef* index);
     void DrawIndirect(const VC::DrawPayload& p);
     void DrawIndexedIndirect(const VC::DrawIndexedPayload& p);
-    bool GenerateIndices(const PreparedDraw& prepared, const IndexRange* source, u32 first,
-                         u32 count, s32 base_vertex, HostIndex& out, u32& out_count);
+    [[nodiscard]] BufferRef WidenIndices(const BufferRef& source, VkIndexType source_type,
+                                        u64 source_bytes, std::optional<u32> restart_marker);
+    /// Source must contain the current GPU indices. Record outside the render pass and condition.
+    [[nodiscard]] bool AssembleGpuQuads(const BufferRef& source,
+                                       const VC::DrawIndexedPayload& draw, u32 instances,
+                                       BufferRef& output_indices, BufferRef& output_command);
+    const u8* CurrentIndexData(const IndexRange& source);
+    bool GenerateIndices(const PreparedDraw& prepared, const u8* indices, u32 index_type,
+                         u32 first, u32 count, HostIndex& out, u32& out_count);
     void DrawIndexed(const VC::DrawIndexedPayload& p);
     /// Every nvnCommandBufferDrawMeshTasks* entry (nvn_draw_mesh.cpp).
     void DrawMeshTasks(const VC::DrawMeshTasksPayload& p);
@@ -620,6 +641,16 @@ private:
     /// when available) and forgets the entries. Outside a pass only.
     void WriteBackMirrorEntries(std::span<const Shadow> entries, std::atomic<u64> DrawCounters::*cause);
     std::vector<Shadow> shadows;
+    struct ShadowBounds {
+        const Pool* pool{};
+        u64 epoch{};
+        u64 begin{};
+        u64 end{};
+    };
+    std::array<ShadowBounds, 16> shadow_bounds{};
+    u64 shadow_bounds_epoch{1};
+    void ClearShadows();
+    [[nodiscard]] bool ShadowBoundsMayOverlap(const Pool& pool, u64 begin, u64 end);
     /// Ranges the next draw or dispatch reads outside its descriptors (NoteExtraRead).
     std::vector<DrawPlan::RangeUse> extra_uses;
     std::set<std::tuple<u64, u64, u64>> shadow_logged; ///< EDEN_NX2_NVN_SHADOW_LOG only
@@ -759,7 +790,7 @@ private:
     /// view `key` also covers (a real feedback loop); false when they are disjoint subresources.
     [[nodiscard]] bool TargetOverlapsView(const Storage& storage, const ViewKey& key) const;
     /// Records the copies of render targets that the draw samples (outside the pass).
-    void RecordFeedbackCopies(DrawPlan& plan);
+    bool RecordFeedbackCopies(DrawPlan& plan);
     /// Drops the feedback copies of the plan whose scratch already holds the source (see the
     /// DESIGN.md paragraph "Feedback copies per target epoch").
     void PruneFreshFeedback(DrawPlan& plan);
@@ -790,16 +821,12 @@ private:
     [[nodiscard]] std::string DescribeUnusableTargets() const;
 
     // ---- pipeline and state (nvn_draw.cpp) ----
-    /// The pipeline of the next draw. Null with `awaiting_async` set: its compile runs on a worker
-    /// (PipelineCacheOptions::async_compile) and the draw may be skipped (MaySkipUnbuiltDraw);
-    /// such a draw that may not be skipped waits for the compile. Null without it: it cannot be
-    /// built.
+    /// A required draw waits for its pipeline. A lookahead may queue a speculative build.
     struct PipelineLookahead {
         u64 skip_key;
         RenderPassKey targets;
     };
-    std::shared_ptr<GraphicsPipeline> ResolvePipeline(u32 mode, u32 element_count,
-                                                      bool& awaiting_async,
+    std::shared_ptr<GraphicsPipeline> ResolvePipeline(u32 mode,
                                                       const PipelineLookahead* lookahead = nullptr);
     void PrefetchUpcomingGraphics(u32 current_mode, u64 current_key, u64 skip_compute_hash = 0);
     void ApplyDynamicState(const GraphicsPipeline& pipeline);
@@ -907,12 +934,15 @@ private:
         u64 prime_seq{~u64{0}};
         u64 prime_bytes{};
         u32 prime_count{};
+        u64 prime_limit_bytes{};
+        u32 prime_limit_count{};
         std::vector<u32> unprimed_slots;
         std::vector<u8> unprimed_queued;
         u32 requested_types_mask{0};
         bool types_mask_dirty{false};
         u32 prime_paused_logs{0};
         u32 primed_total{};
+        bool logged_unprimed_other{false};
     } bindless;
     /// Creates the table on first use; false when the device cannot hold it.
     bool BindlessReady();
@@ -934,7 +964,6 @@ private:
     /// image infos (the images exist and are in layout by now).
     void FinishImages(DrawPlan& plan);
     bool PushPlan(PipelineBase& pipeline, DrawPlan& plan, VkPipelineBindPoint bind_point);
-    VkDescriptorSet AllocateSet(VkDescriptorSetLayout layout);
     /// The handle word of `ref` in global descriptor ids: words of the bind commands were
     /// rebased by the recorder, words read from a uniform buffer are rebased here with the
     /// texture / sampler pools bound when the draw runs (`kind`: which ids the word holds).
@@ -1436,6 +1465,7 @@ private:
     [[nodiscard]] std::string DebugTargetKey() const;
     void DebugOnPassBegin();
     void DebugOnPassEnd();
+    void DebugSurveyPass(Debug::Survey& survey, const std::filesystem::path& directory);
     void DebugOnDraw(u32 mode);
     /// Draw log of an indirect draw: the `IND=` words of its line are guest memory at record time,
     /// before the GPU ran the culling that writes them. This copies the first record (`bytes`) and

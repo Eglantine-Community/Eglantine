@@ -34,6 +34,7 @@ UNIFORM(4) uint x_shift;
 UNIFORM(5) uint block_height;
 UNIFORM(6) uint block_height_mask;
 UNIFORM(7) uint native_tiling;
+UNIFORM(8) uvec2 decode_extent;
 END_PUSH_CONSTANTS
 
 struct EncodingData {
@@ -1153,15 +1154,15 @@ int FindLayout(uint mode) {
 }
 
 
-void FillError(ivec3 coord) {
-    for (uint j = 0; j < block_dims.y; j++) {
-        for (uint i = 0; i < block_dims.x; i++) {
+void FillError(ivec3 coord, uvec2 write_size) {
+    for (uint j = 0; j < write_size.y; j++) {
+        for (uint i = 0; i < write_size.x; i++) {
             imageStore(dest_image, coord + ivec3(i, j, 0), vec4(0.0, 0.0, 0.0, 0.0));
         }
     }
 }
 
-void FillVoidExtentLDR(ivec3 coord) {
+void FillVoidExtentLDR(ivec3 coord, uvec2 write_size) {
     SkipBits(52);
     const uint r_u = StreamBits(16);
     const uint g_u = StreamBits(16);
@@ -1171,8 +1172,8 @@ void FillVoidExtentLDR(ivec3 coord) {
     const float r = float(r_u) / 65535.0f;
     const float g = float(g_u) / 65535.0f;
     const float b = float(b_u) / 65535.0f;
-    for (uint j = 0; j < block_dims.y; j++) {
-        for (uint i = 0; i < block_dims.x; i++) {
+    for (uint j = 0; j < write_size.y; j++) {
+        for (uint i = 0; i < write_size.x; i++) {
             imageStore(dest_image, coord + ivec3(i, j, 0), vec4(r, g, b, a));
         }
     }
@@ -1255,31 +1256,31 @@ uint DecodeMaxWeight(uint mode) {
     return weight_index + 1;
 }
 
-void DecompressBlock(ivec3 coord) {
+void DecompressBlock(ivec3 coord, uvec2 write_size) {
     uint mode = StreamBits(11);
     if (IsError(mode)) {
-        FillError(coord);
+        FillError(coord, write_size);
         return;
     }
     if ((mode & 0x1ff) == 0x1fc) {
         // params.void_extent_ldr = true;
-        FillVoidExtentLDR(coord);
+        FillVoidExtentLDR(coord, write_size);
         return;
     }
     const uvec2 size_params = DecodeBlockSize(mode);
     if ((size_params.x > block_dims.x) || (size_params.y > block_dims.y)) {
-        FillError(coord);
+        FillError(coord, write_size);
         return;
     }
     const uint num_partitions = StreamBits(2) + 1;
     const uint mode_layout = FindLayout(mode);
     const bool dual_plane = (mode_layout != 9) && ((mode & 0x400) != 0);
     if (num_partitions > 4 || (num_partitions == 4 && dual_plane)) {
-        FillError(coord);
+        FillError(coord, write_size);
         return;
     }
     if (GetNumWeightValues(size_params, dual_plane) > MAX_WEIGHT_VALUES) {
-        FillError(coord);
+        FillError(coord, write_size);
         return;
     }
     uint partition_index = 1;
@@ -1297,7 +1298,7 @@ void DecompressBlock(ivec3 coord) {
     const uint max_weight = DecodeMaxWeight(mode);
     const uint weight_bits = GetPackedBitSize(size_params, dual_plane, max_weight);
     if (weight_bits < 24 || weight_bits > 96) {
-        FillError(coord);
+        FillError(coord, write_size);
         return;
     }
     uint remaining_bits = 128 - weight_bits - total_bitsread;
@@ -1314,7 +1315,7 @@ void DecompressBlock(ivec3 coord) {
             extra_cem_bits += 8;
             break;
         default:
-            FillError(coord);
+            FillError(coord, write_size);
             return;
         }
     }
@@ -1324,7 +1325,7 @@ void DecompressBlock(ivec3 coord) {
     if (remaining_bits > 128) {
         // Bad data, more remaining bits than 4 bytes
         // return early
-        FillError(coord);
+        FillError(coord, write_size);
         return;
     }
     // Read color data...
@@ -1415,8 +1416,8 @@ void DecompressBlock(ivec3 coord) {
     const uint p0_cem = color_endpoint_mode[0];
     const uvec4 p0_ep0 = endpoints0[0];
     const uvec4 p0_ep1 = endpoints1[0];
-    for (uint j = 0; j < block_dims.y; j++) {
-        for (uint i = 0; i < block_dims.x; i++) {
+    for (uint j = 0; j < write_size.y; j++) {
+        for (uint i = 0; i < write_size.x; i++) {
             uint local_partition = 0;
             if (!single_partition) {
                 local_partition = Select2DPartition(partition_setup, i, j);
@@ -1472,6 +1473,12 @@ uint SwizzleOffset(uvec2 pos) {
 }
 
 void main() {
+    const ivec3 coord = ivec3(gl_GlobalInvocationID * uvec3(block_dims, 1));
+    const ivec3 bounds = min(imageSize(dest_image), ivec3(decode_extent, 0x7fffffff));
+    if (any(greaterThanEqual(coord, bounds))) {
+        return;
+    }
+    const uvec2 write_size = min(block_dims, uvec2(bounds.xy - coord.xy));
     uvec3 pos = gl_GlobalInvocationID;
     pos.x <<= BYTES_PER_BLOCK_LOG2;
     uint swizzle = SwizzleOffset(pos.xy);
@@ -1489,10 +1496,9 @@ void main() {
     offset += (pos.x >> GOB_SIZE_X_SHIFT) << x_shift;
     offset += swizzle;
 
-    const ivec3 coord = ivec3(gl_GlobalInvocationID * uvec3(block_dims, 1));
-    if (any(greaterThanEqual(coord, imageSize(dest_image)))) {
+    if (offset / 16 >= uint(astc_data.length())) {
         return;
     }
     local_buff = astc_data[offset / 16];
-    DecompressBlock(coord);
+    DecompressBlock(coord, write_size);
 }

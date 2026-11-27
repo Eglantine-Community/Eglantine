@@ -18,6 +18,11 @@
 #include "video_core/vulkan_common/vma.h"
 
 namespace Vulkan::Nvn {
+namespace {
+
+constexpr auto HOST_ALLOCATION = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+
+} // Anonymous namespace
 
 void HostImporter::MakeResident(const u8* ptr, VkDeviceSize size) {
     constexpr VkDeviceSize PageSize = 4096;
@@ -55,6 +60,13 @@ HostImporter::HostImporter(const Device& device_, VmaAllocator allocator_)
         return;
     }
     const auto& dld = device.GetDispatchLoader();
+    get_external_buffer_properties =
+        reinterpret_cast<PFN_vkGetPhysicalDeviceExternalBufferProperties>(
+            dld.vkGetInstanceProcAddr(device.GetInstance(),
+                                     "vkGetPhysicalDeviceExternalBufferProperties"));
+    if (!get_external_buffer_properties) {
+        return;
+    }
     get_properties = reinterpret_cast<PFN_vkGetMemoryHostPointerPropertiesEXT>(
         dld.vkGetDeviceProcAddr(*device.GetLogical(), "vkGetMemoryHostPointerPropertiesEXT"));
     if (!get_properties) {
@@ -78,6 +90,35 @@ HostImporter::HostImporter(const Device& device_, VmaAllocator allocator_)
     }
 }
 
+VkResult HostImporter::CheckBufferImport(const VkBufferCreateInfo& buffer,
+                                         std::string& error) const {
+    if (!Available()) {
+        error = "VK_EXT_external_memory_host is not available";
+        return VK_ERROR_EXTENSION_NOT_PRESENT;
+    }
+    const VkPhysicalDeviceExternalBufferInfo info{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO,
+        .flags = buffer.flags,
+        .usage = buffer.usage,
+        .handleType = HOST_ALLOCATION,
+    };
+    VkExternalBufferProperties properties{.sType = VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES};
+    get_external_buffer_properties(device.GetPhysical(), &info, &properties);
+    const auto& external = properties.externalMemoryProperties;
+    if ((external.compatibleHandleTypes & HOST_ALLOCATION) == 0 ||
+        (external.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) == 0) {
+        error = fmt::format("host allocation import unsupported (buffer flags {:#x}, usage {:#x})",
+                            buffer.flags, buffer.usage);
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+    // VUID-VkMemoryAllocateInfo-pNext-02806 disallows dedicating a host pointer import.
+    if (external.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT) {
+        error = "external buffer requires a dedicated allocation";
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+    return VK_SUCCESS;
+}
+
 bool HostImporter::IsAligned(const void* ptr, u64 size) const noexcept {
     if (!Available() || size == 0) {
         return false;
@@ -96,26 +137,10 @@ VkResult HostImporter::Import(void* ptr, VkDeviceSize size, VkBufferUsageFlags u
                             min_alignment);
         return VK_ERROR_INITIALIZATION_FAILED;
     }
-    const auto& dld = device.GetDispatchLoader();
-    const VkDevice logical = *device.GetLogical();
-    MakeResident(static_cast<const u8*>(ptr), size);
-
-    VkMemoryHostPointerPropertiesEXT pointer_properties{
-        .sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT,
-        .pNext = nullptr,
-        .memoryTypeBits = 0,
-    };
-    VkResult result = get_properties(
-        logical, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, ptr, &pointer_properties);
-    if (result != VK_SUCCESS) {
-        error = "vkGetMemoryHostPointerPropertiesEXT failed";
-        return result;
-    }
-
     const VkExternalMemoryBufferCreateInfo external_info{
         .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
         .pNext = nullptr,
-        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+        .handleTypes = HOST_ALLOCATION,
     };
     const VkBufferCreateInfo buffer_ci{
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -127,6 +152,26 @@ VkResult HostImporter::Import(void* ptr, VkDeviceSize size, VkBufferUsageFlags u
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = nullptr,
     };
+    VkResult result = CheckBufferImport(buffer_ci, error);
+    if (result != VK_SUCCESS) {
+        return result;
+    }
+    const auto& dld = device.GetDispatchLoader();
+    const VkDevice logical = *device.GetLogical();
+    MakeResident(static_cast<const u8*>(ptr), size);
+
+    VkMemoryHostPointerPropertiesEXT pointer_properties{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT,
+        .pNext = nullptr,
+        .memoryTypeBits = 0,
+    };
+    result = get_properties(
+        logical, HOST_ALLOCATION, ptr, &pointer_properties);
+    if (result != VK_SUCCESS) {
+        error = "vkGetMemoryHostPointerPropertiesEXT failed";
+        return result;
+    }
+
     VkBuffer raw_buffer{};
     result = dld.vkCreateBuffer(logical, &buffer_ci, nullptr, &raw_buffer);
     if (result != VK_SUCCESS) {
@@ -175,7 +220,7 @@ VkResult HostImporter::Import(void* ptr, VkDeviceSize size, VkBufferUsageFlags u
     const VkImportMemoryHostPointerInfoEXT import_info{
         .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
         .pNext = (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0 ? &address_flags : nullptr,
-        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+        .handleType = HOST_ALLOCATION,
         .pHostPointer = ptr,
     };
     const VkMemoryAllocateInfo allocate_info{
@@ -219,6 +264,26 @@ VkResult HostImporter::ImportChunk(u8* ptr, VkDeviceSize size, VkBufferUsageFlag
                             min_alignment);
         return VK_ERROR_INITIALIZATION_FAILED;
     }
+    // Buffer memory requirements do not depend on the size for type bits: probe with a small one.
+    const VkExternalMemoryBufferCreateInfo external_info{
+        .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+        .pNext = nullptr,
+        .handleTypes = HOST_ALLOCATION,
+    };
+    const VkBufferCreateInfo probe_ci{
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .pNext = &external_info,
+        .flags = 0,
+        .size = min_alignment,
+        .usage = usage,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = 0,
+        .pQueueFamilyIndices = nullptr,
+    };
+    VkResult result = CheckBufferImport(probe_ci, error);
+    if (result != VK_SUCCESS) {
+        return result;
+    }
     const auto& dld = device.GetDispatchLoader();
     const VkDevice logical = *device.GetLogical();
     auto begin = Clock::now();
@@ -232,8 +297,8 @@ VkResult HostImporter::ImportChunk(u8* ptr, VkDeviceSize size, VkBufferUsageFlag
         .memoryTypeBits = 0,
     };
     begin = Clock::now();
-    VkResult result = get_properties(
-        logical, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, ptr, &pointer_properties);
+    result = get_properties(
+        logical, HOST_ALLOCATION, ptr, &pointer_properties);
     if (timing) {
         timing->props_ns = ns_since(begin);
     }
@@ -241,22 +306,6 @@ VkResult HostImporter::ImportChunk(u8* ptr, VkDeviceSize size, VkBufferUsageFlag
         error = "vkGetMemoryHostPointerPropertiesEXT failed";
         return result;
     }
-    // Buffer memory requirements do not depend on the size for type bits: probe with a small one.
-    const VkExternalMemoryBufferCreateInfo external_info{
-        .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
-        .pNext = nullptr,
-        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
-    };
-    const VkBufferCreateInfo probe_ci{
-        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .pNext = &external_info,
-        .flags = 0,
-        .size = min_alignment,
-        .usage = usage,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-        .queueFamilyIndexCount = 0,
-        .pQueueFamilyIndices = nullptr,
-    };
     VkBuffer raw_probe{};
     result = dld.vkCreateBuffer(logical, &probe_ci, nullptr, &raw_probe);
     if (result != VK_SUCCESS) {
@@ -291,7 +340,7 @@ VkResult HostImporter::ImportChunk(u8* ptr, VkDeviceSize size, VkBufferUsageFlag
     const VkImportMemoryHostPointerInfoEXT import_info{
         .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
         .pNext = (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0 ? &address_flags : nullptr,
-        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+        .handleType = HOST_ALLOCATION,
         .pHostPointer = ptr,
     };
     const VkMemoryAllocateInfo allocate_info{
@@ -326,7 +375,7 @@ VkResult HostImporter::CreateBufferInChunk(const ImportedChunk& chunk, VkDeviceS
     const VkExternalMemoryBufferCreateInfo external_info{
         .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
         .pNext = nullptr,
-        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+        .handleTypes = HOST_ALLOCATION,
     };
     const VkBufferCreateInfo buffer_ci{
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -338,8 +387,12 @@ VkResult HostImporter::CreateBufferInChunk(const ImportedChunk& chunk, VkDeviceS
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = nullptr,
     };
+    VkResult result = CheckBufferImport(buffer_ci, error);
+    if (result != VK_SUCCESS) {
+        return result;
+    }
     VkBuffer raw_buffer{};
-    VkResult result = dld.vkCreateBuffer(logical, &buffer_ci, nullptr, &raw_buffer);
+    result = dld.vkCreateBuffer(logical, &buffer_ci, nullptr, &raw_buffer);
     if (result != VK_SUCCESS) {
         error = "vkCreateBuffer failed";
         return result;

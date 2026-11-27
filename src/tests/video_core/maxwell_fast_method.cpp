@@ -8,6 +8,8 @@
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <exception>
+#include <limits>
 #include <memory>
 #include <random>
 #include <vector>
@@ -26,7 +28,9 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
+#include "video_core/macro.h"
 #include "video_core/memory_manager.h"
+#include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_null/null_rasterizer.h"
 
 namespace VideoCommon {
@@ -75,6 +79,8 @@ constexpr u32 CbData = MAXWELL3D_REG_INDEX(const_buffer.buffer);
 constexpr u32 DrawBegin = MAXWELL3D_REG_INDEX(draw.begin);
 constexpr u32 DrawEnd = MAXWELL3D_REG_INDEX(draw.end);
 constexpr u32 ShadowControl = MAXWELL3D_REG_INDEX(shadow_ram_control);
+constexpr u32 AmpereIndexSizeHigh = 0x238 / sizeof(u32);
+constexpr u32 AmpereIndexSizeLow = 0x23c / sizeof(u32);
 
 // Executable methods without memory or macro effects a null rasterizer cannot take.
 constexpr std::array<u32, 16> executable_methods{
@@ -101,14 +107,15 @@ struct Fixture {
     Core::System system;
     Core::DeviceMemory physical;
     Tegra::MaxwellDeviceMemoryManager device_memory{physical};
-    Tegra::MemoryManager memory{system, device_memory, 32, 1ULL << 31};
+    Tegra::MemoryManager memory;
     Tegra::GPU gpu{system, false, false};
     Null::RasterizerNull rasterizer{gpu};
     Maxwell3D slow{memory};
     Maxwell3D fast{memory};
     std::vector<u32> state_methods;
 
-    Fixture() {
+    explicit Fixture(u32 address_space_bits = 32)
+        : memory{system, device_memory, address_space_bits, 1ULL << (address_space_bits - 1)} {
         slow.fast_maxwell3d = false;
         fast.fast_maxwell3d = true;
         for (auto* engine : {&slow, &fast}) {
@@ -175,6 +182,80 @@ struct Fixture {
         REQUIRE(fast.root_tables.selected == slow.root_tables.selected);
         REQUIRE(fast.root_tables.offset == slow.root_tables.offset);
     }
+};
+
+class DrawCapture final : public VideoCore::RasterizerInterface {
+public:
+    using IndexFormat = Maxwell3D::Regs::IndexFormat;
+    using Topology = Maxwell3D::Regs::PrimitiveTopology;
+
+    struct Snapshot {
+        bool indexed;
+        Topology topology;
+        u32 first;
+        u32 count;
+        u32 base_vertex;
+        u32 base_instance;
+        u32 instances;
+        IndexFormat index_format{};
+
+        bool operator==(const Snapshot&) const = default;
+    };
+
+    explicit DrawCapture(const Maxwell3D& engine_) : engine{engine_} {}
+
+    void Draw(bool indexed, u32 instances) override {
+        const auto& state = engine.draw_manager.draw_state;
+        draws.push_back({
+            .indexed = indexed,
+            .topology = state.topology,
+            .first = indexed ? state.index_buffer.first : state.vertex_buffer.first,
+            .count = state.draw_element_count,
+            .base_vertex = indexed ? state.base_index : 0,
+            .base_instance = state.base_instance,
+            .instances = instances,
+            .index_format = indexed ? state.index_buffer.format : IndexFormat{},
+        });
+    }
+
+    void DrawTexture() override {}
+    void Clear(u32) override {}
+    void DispatchCompute() override {}
+    void ResetCounter(VideoCommon::QueryType) override {}
+    void Query(GPUVAddr, VideoCommon::QueryType, VideoCommon::QueryPropertiesFlags, u32,
+               u32) override {}
+    void BindGraphicsUniformBuffer(size_t, u32, GPUVAddr, u32) override {}
+    void DisableGraphicsUniformBuffer(size_t, u32) override {}
+    void SignalFence(std::function<void()>&&, bool) override {}
+    void SyncOperation(std::function<void()>&&) override {}
+    void SignalSyncPoint(u32) override {}
+    void SignalReference() override {}
+    void ReleaseFences(bool) override {}
+    void FlushAll() override {}
+    void FlushRegion(DAddr, u64, VideoCommon::CacheType) override {}
+    bool MustFlushRegion(DAddr, u64, VideoCommon::CacheType) override { return false; }
+    VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override {
+        return {addr, addr + size, false};
+    }
+    void InvalidateRegion(DAddr, u64, VideoCommon::CacheType) override {}
+    void OnCacheInvalidation(DAddr, u64) override {}
+    bool OnCPUWrite(DAddr, u64) override { return false; }
+    void InvalidateGPUCache() override {}
+    void UnmapMemory(DAddr, u64) override {}
+    void ModifyGPUMemory(size_t, GPUVAddr, u64) override {}
+    void FlushAndInvalidateRegion(DAddr, u64, VideoCommon::CacheType) override {}
+    void WaitForIdle() override {}
+    void FragmentBarrier() override {}
+    void TiledCacheBarrier() override {}
+    void FlushCommands() override {}
+    void TickFrame() override {}
+    Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() override { std::terminate(); }
+    void AccelerateInlineToMemory(GPUVAddr, size_t, std::span<const u8>) override {}
+
+    std::vector<Snapshot> draws;
+
+private:
+    const Maxwell3D& engine;
 };
 
 u32 RandomArgument(std::mt19937& rng, u32 method, const Maxwell3D& engine) {
@@ -273,6 +354,209 @@ TEST_CASE("Maxwell3D fast method dispatch issues deferred instanced draws as Cal
     f.Call(MAXWELL3D_REG_INDEX(global_base_instance_index), 9, true);
     f.Compare();
     REQUIRE_FALSE(f.fast.draw_manager.HasDeferredDraw());
+}
+
+TEST_CASE("Turing and Ampere direct begin-end methods issue draws on each count write",
+          "[video_core][maxwell_fast_method][native_draw]") {
+    // C597 and C797 use byte offsets in the class header and word offsets on CallMethod.
+    constexpr u32 draw_control_a = 0x260 / sizeof(u32);
+    constexpr u32 draw_control_b = 0x264 / sizeof(u32);
+    constexpr u32 indexed_first = 0x268 / sizeof(u32);
+    constexpr u32 indexed_count = 0x26c / sizeof(u32);
+    constexpr u32 arrays_start = 0x270 / sizeof(u32);
+    constexpr u32 arrays_count = 0x274 / sizeof(u32);
+    constexpr u32 iterate_instances = 1u << 9;
+    constexpr u32 ignore_global_base_vertex = 1u << 10;
+    constexpr u32 ignore_global_base_instance = 1u << 11;
+
+    using IndexFormat = DrawCapture::IndexFormat;
+    using Topology = DrawCapture::Topology;
+    constexpr u32 base_vertex = 0xfffffff3u;
+    constexpr u32 base_instance = 21;
+    constexpr u32 first = 0x1'0023;
+    constexpr u32 start = 0x2'0046;
+    constexpr u32 count = 0x1'0005;
+
+    Fixture f;
+    for (auto* engine : {&f.slow, &f.fast}) {
+        CAPTURE(engine->fast_maxwell3d);
+        DrawCapture rasterizer{*engine};
+        engine->BindRasterizer(&rasterizer);
+        SCOPE_EXIT { engine->BindRasterizer(&f.rasterizer); };
+        engine->SetNativeTuringMacroMode(true);
+        const auto write = [&](u32 method, u32 value, bool last = true) {
+            engine->CallMethod(f.system, method, value, last);
+        };
+
+        write(MAXWELL3D_REG_INDEX(global_base_vertex_index), base_vertex);
+        write(MAXWELL3D_REG_INDEX(global_base_instance_index), base_instance);
+        write(MAXWELL3D_REG_INDEX(index_buffer.format), static_cast<u32>(IndexFormat::UnsignedShort));
+        write(draw_control_a, static_cast<u32>(Topology::TriangleStrip) | iterate_instances);
+        write(draw_control_b, 3);
+        write(indexed_first, first);
+        write(arrays_start, start);
+        CHECK(rasterizer.draws.empty());
+
+        const DrawCapture::Snapshot indexed{true, Topology::TriangleStrip, first, count,
+                                           base_vertex, base_instance, 3, IndexFormat::UnsignedShort};
+        write(indexed_count, count, false);
+        REQUIRE(rasterizer.draws.size() == 1);
+        CHECK(rasterizer.draws.back() == indexed);
+        write(indexed_count, count);
+        REQUIRE(rasterizer.draws.size() == 2);
+        CHECK(rasterizer.draws.back() == indexed);
+
+        write(draw_control_a, static_cast<u32>(Topology::Lines) | iterate_instances |
+                                  ignore_global_base_vertex | ignore_global_base_instance);
+        write(draw_control_b, 2);
+        write(arrays_count, count);
+        REQUIRE(rasterizer.draws.size() == 3);
+        const DrawCapture::Snapshot arrays{false, Topology::Lines, start, count, 0, 0, 2};
+        CHECK(rasterizer.draws.back() == arrays);
+        write(arrays_count, count);
+        REQUIRE(rasterizer.draws.size() == 4);
+        CHECK(rasterizer.draws.back() == arrays);
+
+        write(draw_control_b, 0);
+        write(indexed_first, first + 1);
+        write(arrays_start, start + 1);
+        write(indexed_count, count);
+        write(arrays_count, count);
+        CHECK(rasterizer.draws.size() == 4);
+
+        write(MAXWELL3D_REG_INDEX(index_buffer.format), static_cast<u32>(IndexFormat::UnsignedInt));
+        write(draw_control_a, static_cast<u32>(Topology::Points) | iterate_instances |
+                                  ignore_global_base_vertex);
+        write(draw_control_b, 5);
+        write(indexed_count, 0);
+        write(arrays_count, 0);
+        CHECK(rasterizer.draws.size() == 4);
+        write(indexed_count, count);
+        REQUIRE(rasterizer.draws.size() == 5);
+        const DrawCapture::Snapshot next{true, Topology::Points, first + 1, count, 0,
+                                        base_instance, 5, IndexFormat::UnsignedInt};
+        CHECK(rasterizer.draws.back() == next);
+
+        write(draw_control_a, static_cast<u32>(Topology::LineStrip) | ignore_global_base_instance);
+        write(draw_control_b, 1);
+        write(indexed_count, count);
+        REQUIRE(rasterizer.draws.size() == 6);
+        const DrawCapture::Snapshot independent{true, Topology::LineStrip, first + 1, count,
+                                               base_vertex, 0, 1, IndexFormat::UnsignedInt};
+        CHECK(rasterizer.draws.back() == independent);
+
+        write(DrawBegin, static_cast<u32>(Topology::Triangles));
+        write(MAXWELL3D_REG_INDEX(index_buffer.first), 2);
+        write(MAXWELL3D_REG_INDEX(index_buffer.count), 3);
+        write(DrawEnd, 0);
+        REQUIRE(rasterizer.draws.size() == 7);
+        const DrawCapture::Snapshot legacy{true, Topology::Triangles, 2, 3, base_vertex,
+                                          base_instance, 1, IndexFormat::UnsignedInt};
+        CHECK(rasterizer.draws.back() == legacy);
+    }
+}
+
+TEST_CASE("HLE draw arrays indirect delivers procedural quads without vertex streams",
+          "[video_core][maxwell_fast_method][macro]") {
+    Fixture f;
+    auto& engine = f.fast;
+    DrawCapture rasterizer{engine};
+    engine.BindRasterizer(&rasterizer);
+    SCOPE_EXIT { engine.BindRasterizer(&f.rasterizer); };
+    REQUIRE(std::ranges::none_of(engine.regs.vertex_streams,
+                                 [](const auto& stream) { return stream.IsEnabled(); }));
+
+    using Topology = Maxwell3D::Regs::PrimitiveTopology;
+    constexpr u32 instance_mask_register = 0xd1b;
+    engine.regs.reg_array[instance_mask_register] = 0b0111;
+    const std::array<u32, 5> args{static_cast<u32>(Topology::Quads), 8, 0b1011, 4, 11};
+    Tegra::HLE_DrawArraysIndirect macro{true};
+    macro.Execute(f.system, engine, args, 0);
+
+    REQUIRE(rasterizer.draws.size() == 1);
+    const DrawCapture::Snapshot expected{false, Topology::Quads, 4, 8, 0, 11, 3};
+    CHECK(rasterizer.draws.front() == expected);
+}
+
+TEST_CASE("Ampere index buffer size is independent of address and dirties indexed draws",
+          "[video_core][maxwell_fast_method][index_buffer]") {
+    Fixture f;
+    for (auto* engine : {&f.slow, &f.fast}) {
+        engine->SetNativeTuringMacroMode(true);
+    }
+    f.Call(MAXWELL3D_REG_INDEX(index_buffer.start_addr_high), 0x12, true);
+    f.Call(MAXWELL3D_REG_INDEX(index_buffer.start_addr_low), 0x345670, true);
+    f.Call(MAXWELL3D_REG_INDEX(index_buffer.limit_addr_high), 0x12, true);
+    f.Call(MAXWELL3D_REG_INDEX(index_buffer.limit_addr_low), 0x345793, true);
+    const auto set_size = [&](u32 method, u32 value) {
+        f.slow.dirty.flags.reset();
+        f.fast.dirty.flags.reset();
+        f.Call(method, value, true);
+        CHECK(f.slow.dirty.flags[VideoCommon::Dirty::IndexBuffer]);
+        CHECK(f.fast.dirty.flags[VideoCommon::Dirty::IndexBuffer]);
+    };
+    set_size(AmpereIndexSizeHigh, 0x12345002);
+    set_size(AmpereIndexSizeLow, 0x1234);
+
+    using Regs = Maxwell3D::Regs;
+    f.Call(MAXWELL3D_REG_INDEX(index_buffer.format),
+           static_cast<u32>(Regs::IndexFormat::UnsignedShort), true);
+    f.Call(DrawBegin, static_cast<u32>(Regs::PrimitiveTopology::Triangles), true);
+    constexpr u32 first = (std::numeric_limits<u32>::max)() - 1;
+    f.Call(MAXWELL3D_REG_INDEX(index_buffer.first), first, true);
+    f.Call(MAXWELL3D_REG_INDEX(index_buffer.count), 5, true);
+    f.Call(DrawEnd, 0, true);
+    for (const auto* engine : {&f.slow, &f.fast}) {
+        const auto& index = engine->draw_manager.draw_state.index_buffer;
+        CHECK(index.StartAddress() == 0x12'00345670ull);
+        CHECK(index.EndAddress() == 0x12'00345793ull);
+        CHECK(index.IndexStart() == 0x12'00345670ull + 2ull * first);
+        CHECK(engine->regs.IndexBufferSizeBytes(index, true) == 0x2'00001234ull);
+        CHECK(engine->regs.IndexBufferSizeBytes(index, false) == 0x124);
+        CHECK(index.DrawSizeBytes(index.count) == 0x2'00000006ull);
+    }
+}
+
+TEST_CASE("Ampere index estimate uses the byte range without vertex streams",
+          "[video_core][maxwell_fast_method][index_buffer]") {
+    Fixture f{33};
+    constexpr GPUVAddr gpu_address = 0x100000;
+    constexpr DAddr device_address = 0x10000000;
+    f.memory.BindRasterizer(&f.rasterizer);
+    f.memory.Map(gpu_address, device_address, 0x3000, Tegra::PTEKind::PITCH, false);
+    auto& engine = f.fast;
+    engine.SetNativeTuringMacroMode(true);
+    REQUIRE(std::ranges::none_of(engine.regs.vertex_streams,
+                                 [](const auto& stream) { return stream.IsEnabled(); }));
+    const auto call = [&](u32 method, u32 value) { engine.CallMethod(f.system, method, value, true); };
+    using Format = Maxwell3D::Regs::IndexFormat;
+    call(MAXWELL3D_REG_INDEX(index_buffer.start_addr_low), gpu_address + 4);
+    call(MAXWELL3D_REG_INDEX(index_buffer.limit_addr_low), gpu_address + 0x3000);
+    call(MAXWELL3D_REG_INDEX(index_buffer.format), static_cast<u32>(Format::UnsignedShort));
+    CHECK(engine.EstimateIndexBufferSize() == 0);
+
+    call(AmpereIndexSizeLow, 0x21);
+    CHECK(engine.EstimateIndexBufferSize() == 0x10);
+    call(AmpereIndexSizeHigh, 2);
+    call(MAXWELL3D_REG_INDEX(index_buffer.format), static_cast<u32>(Format::UnsignedInt));
+    CHECK(engine.EstimateIndexBufferSize() == 0x2ffc / sizeof(u32));
+
+    constexpr GPUVAddr unmapped_address = gpu_address + 0x3000;
+    call(MAXWELL3D_REG_INDEX(index_buffer.start_addr_low), unmapped_address);
+    CHECK(engine.EstimateIndexBufferSize() == 0);
+
+    // A PTE kind change or a discontinuity in physical pages does not end the index binding.
+    f.memory.Map(unmapped_address, device_address + 0x5000, 0x1000,
+                 Tegra::PTEKind::GENERIC_16BX2, false);
+    call(MAXWELL3D_REG_INDEX(index_buffer.start_addr_low), gpu_address + 4);
+    CHECK(engine.EstimateIndexBufferSize() == 0x3ffc / sizeof(u32));
+
+    constexpr GPUVAddr large_address = 0x10000000;
+    constexpr u64 large_size = 0x1'0001'0000ull;
+    f.memory.Map(large_address, device_address, large_size, Tegra::PTEKind::PITCH, true);
+    REQUIRE(f.memory.GetMemoryLayoutSize(large_address, large_size) == large_size);
+    call(MAXWELL3D_REG_INDEX(index_buffer.start_addr_low), large_address);
+    CHECK(engine.EstimateIndexBufferSize() == (std::numeric_limits<u32>::max)() / sizeof(u32));
 }
 
 TEST_CASE("Maxwell3D constant buffer word runs match single CallMethod writes",
@@ -389,6 +673,9 @@ TEST_CASE("GpuSplit CB batching respects device remaps within GPU big pages",
     f.device_memory.Map(0x10000, 0x4000, 0x10000, asid);
     f.memory.BindRasterizer(&f.rasterizer);
     f.memory.Map(0x100000, 0x10000, 0x10000, Tegra::PTEKind::PITCH, true);
+    REQUIRE(f.memory.IsGranularRange(0x100fff, 2));
+    REQUIRE(f.memory.IsGranularRange(0x10fffe, 2));
+    REQUIRE_FALSE(f.memory.IsGranularRange(0x10fffe, 3));
     f.device_memory.Unmap(0x11000, 0x1000);
     f.device_memory.Map(0x11000, 0x20000, 0x1000, asid);
     REQUIRE(f.memory.GetPointer(0x100ffc) == backing + 0xffc);

@@ -18,6 +18,7 @@
 #include "video_core/surface.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
+#include <vulkan/utility/vk_format_utils.h>
 
 namespace Vulkan::MaxwellToVK {
 
@@ -387,7 +388,7 @@ VkPrimitiveTopology PrimitiveTopology([[maybe_unused]] const Device& device,
 }
 
 VkFormat VertexFormat(const Device& device, Maxwell::VertexAttribute::Type type,
-                      Maxwell::VertexAttribute::Size size) {
+                      Maxwell::VertexAttribute::Size size, bool report_invalid) {
     if (device.MustEmulateScaledFormats()) {
         if (type == Maxwell::VertexAttribute::Type::SScaled) {
             type = Maxwell::VertexAttribute::Type::SInt;
@@ -399,7 +400,9 @@ VkFormat VertexFormat(const Device& device, Maxwell::VertexAttribute::Type type,
     const VkFormat format{([&]() {
         switch (type) {
         case Maxwell::VertexAttribute::Type::UnusedEnumDoNotUseBecauseItWillGoAway:
-            ASSERT_MSG(false, "Invalid vertex attribute type!");
+            if (report_invalid) {
+                ASSERT_MSG(false, "Invalid vertex attribute type!");
+            }
             break;
         case Maxwell::VertexAttribute::Type::UNorm:
             switch (size) {
@@ -608,11 +611,19 @@ VkFormat VertexFormat(const Device& device, Maxwell::VertexAttribute::Type type,
     })()};
 
     if (format == VK_FORMAT_UNDEFINED) {
-        UNIMPLEMENTED_MSG("Unimplemented vertex format of type={} and size={}", type, size);
+        if (report_invalid) {
+            UNIMPLEMENTED_MSG("Unimplemented vertex format of type={} and size={}", type, size);
+        }
+        return VK_FORMAT_UNDEFINED;
     }
 
     return device.GetSupportedFormat(format, VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT,
                                      FormatType::Buffer);
+}
+
+u32 VertexFormatSize(const Device& device, Maxwell::VertexAttribute::Type type,
+                     Maxwell::VertexAttribute::Size size) {
+    return vkuFormatTexelBlockSize(VertexFormat(device, type, size, false));
 }
 
 VkCompareOp ComparisonOp(Maxwell::ComparisonOp comparison) {

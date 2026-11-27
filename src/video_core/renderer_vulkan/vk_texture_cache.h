@@ -71,6 +71,8 @@ public:
 
     StagingBufferRef DownloadStagingBuffer(size_t size, bool deferred = false);
 
+    void InvalidateDownloadStagingBuffer(const StagingBufferRef& ref);
+
     void FreeDeferredStagingBuffer(StagingBufferRef& ref);
 
     void TickFrame();
@@ -114,6 +116,14 @@ public:
 
     void ReleaseMsaaScratchImage(VkImage image);
 
+    // The single-sample image is restored to GENERAL. The caller supplies valid packed
+    // buffer regions in texels of format and a buffer distinct from the runtime's scratch.
+    void CopyDepthStencilStaging(VkImage image, VkFormat host_format, PixelFormat format,
+                                 VkBuffer staging, VkDeviceSize offset,
+                                 std::span<const VideoCommon::BufferImageCopy> copies,
+                                 bool download,
+                                 VkImageLayout initial_layout = VK_IMAGE_LAYOUT_GENERAL);
+
     void BlitImage(Framebuffer* dst_framebuffer, ImageView& dst, ImageView& src,
                    const Region2D& dst_region, const Region2D& src_region,
                    Tegra::Engines::Fermi2D::Filter filter,
@@ -154,6 +164,8 @@ public:
 
     bool ShouldReinterpret(Image& dst, Image& src);
 
+    bool CanConvertImageWithShader(const Image& dst, const Image& src) const;
+
     void ReinterpretImage(Image& dst, Image& src, std::span<const VideoCommon::ImageCopy> copies);
 
     void ConvertImage(Framebuffer* dst, ImageView& dst_view, ImageView& src_view);
@@ -190,28 +202,6 @@ public:
     }
 
     [[nodiscard]] VkBuffer GetTemporaryBuffer(size_t needed_size);
-
-    struct ResolveShadow {
-        vk::Image image;
-        vk::ImageView view;
-        VkFormat format = VK_FORMAT_UNDEFINED;
-        VkExtent2D extent{};
-        u32 layers = 0;
-        VkImageAspectFlags aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT;
-        bool up_to_date = false;
-    };
-
-    [[nodiscard]] VkImageView GetOrCreateResolveShadow(VkImage msaa_image, VkFormat format,
-                                                       VkExtent2D extent, u32 layers,
-                                                       VkImageAspectFlags aspect_mask);
-
-    [[nodiscard]] const ResolveShadow* GetValidResolveShadow(VkImage msaa_image) const;
-
-    void InvalidateResolveShadow(VkImage msaa_image);
-
-    void MarkResolveShadowUpToDate(VkImage msaa_image);
-
-    void EraseResolveShadow(VkImage msaa_image);
 
     std::span<const VkFormat> ViewFormats(PixelFormat format) {
         return view_formats[static_cast<std::size_t>(format)];
@@ -301,6 +291,7 @@ public:
 
     std::optional<BlockLinearUnswizzle3DPass> bl3d_unswizzle_pass;
     std::optional<PlainUnswizzlePass> plain_unswizzle_pass;
+    std::optional<DepthStencilStagingPass> depth_stencil_staging_pass;
     VkBuffer DispatchPlainUnswizzle(const VideoCommon::PlainUnswizzleParameters& parameters,
                                    const StagingBufferRef& source);
     const Settings::ResolutionScalingInfo& resolution;
@@ -335,8 +326,6 @@ public:
     u64 allocation_pool_frames{};
     u32 allocation_pool_pressure_events{};
     u32 allocation_pool_pressure_frames{};
-    ::Common::unordered_map<VkImage, ResolveShadow> resolve_shadows;
-    std::vector<std::pair<u64, ResolveShadow>> pending_resolve_shadows;
 };
 
 class Framebuffer {
@@ -371,9 +360,7 @@ public:
         return render_pass_key;
     }
 
-    [[nodiscard]] VkRenderPass RenderPassVariant(u32 color_clear_mask, bool depth_stencil_clear,
-                                                 u32 color_discard_mask,
-                                                 bool depth_stencil_discard) const;
+    [[nodiscard]] VkRenderPass RenderPassVariant(u32 color_clear_mask, bool depth_stencil_clear) const;
 
     [[nodiscard]] VkExtent2D RenderArea() const noexcept {
         return render_area;
@@ -415,18 +402,6 @@ public:
         return is_rescaled;
     }
 
-    [[nodiscard]] bool DiscardsMsaaColor() const noexcept {
-        return discard_msaa_color;
-    }
-
-    [[nodiscard]] bool DiscardsMsaaDepthStencil() const noexcept {
-        return discard_msaa_depth_stencil;
-    }
-
-    /// Records that a render pass has begun, so its resolve attachments will hold valid contents
-    /// once it ends.
-    void MarkResolveShadowsUpToDate() const;
-
 private:
     static constexpr size_t NUM_MEMOIZED_RENDER_PASS_VARIANTS = 8;
 
@@ -442,13 +417,8 @@ private:
     bool has_depth{};
     bool has_stencil{};
     bool is_rescaled{};
-    std::array<VkImage, 9> resolve_shadow_images{};
-    u32 num_resolve_shadows = 0;
-    TextureCacheRuntime* runtime_ptr{nullptr};
     RenderPassKey render_pass_key{};
     RenderPassCache* render_pass_cache{nullptr};
-    bool discard_msaa_color{};
-    bool discard_msaa_depth_stencil{};
     mutable std::array<u32, NUM_MEMOIZED_RENDER_PASS_VARIANTS> variant_keys{};
     mutable std::array<VkRenderPass, NUM_MEMOIZED_RENDER_PASS_VARIANTS> variant_render_passes{};
     mutable u32 num_memoized_variants{};
@@ -460,7 +430,7 @@ public:
                    VAddr cpu_addr);
     explicit Image(const VideoCommon::NullImageParams&);
 
-    ~Image();
+    ~Image() = default;
 
     Image(const Image&) = delete;
     Image& operator=(const Image&) = delete;
@@ -665,8 +635,8 @@ private:
     /// Binds one zeroed block to every block of a SparseTiles image (and memory to its mip tail).
     bool BindZeroBlock();
 
-    /// Records a clear of the whole image to zero.
-    void ClearTiles();
+    /// Records a clear of all layers, starting at the specified mip level.
+    void ClearTiles(u32 base_mip_level = 0);
 
     vk::Image original_image;
     vk::Image scaled_image;

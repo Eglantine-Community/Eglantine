@@ -125,7 +125,9 @@ struct ImageBase {
     u64 scale_tick = 0;
     bool has_scaled = false;
 
-    size_t channel = 0;
+    /// Address space and whether the registered GPU range maps directly to cpu_addr.
+    size_t address_space_id = 0;
+    bool device_backing_contiguous = false;
 
     ImageFlagBits flags = ImageFlagBits::CpuModified;
 

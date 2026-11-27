@@ -7,9 +7,12 @@
 #include <bit>
 #include <chrono>
 #include <cstdlib>
+#include <new>
+#include <ranges>
 #include <tuple>
 #include <utility>
 
+#include "common/assert.h"
 #include "common/logging.h"
 #include "video_core/nx2.h"
 #include "video_core/renderer_vulkan/nvn/nvn_sparse.h"
@@ -24,19 +27,74 @@ constexpr u64 MIN_SPARSE_STORAGE_BYTES = u64{8} << 20;
 /// Tiles one `NextVerifyTile` call looks at before giving up.
 constexpr u32 VERIFY_SCAN_LIMIT = 4096;
 
+using SparseClock = std::chrono::steady_clock;
+constexpr auto SLOW_SPARSE_PHASE = std::chrono::milliseconds{10};
+
+struct SparseAllocationTiming {
+    u64 calls{};
+    SparseClock::duration elapsed{};
+};
+thread_local SparseAllocationTiming sparse_allocations;
+
+bool SparseTimingEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_NVN_SPARSE_TIMING");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
+
+double SparseMs(SparseClock::duration duration) {
+    return std::chrono::duration<double, std::milli>(duration).count();
+}
+
+void LogSparsePhase(const Storage& storage, const char* phase, SparseClock::duration duration) {
+    if (duration >= SLOW_SPARSE_PHASE) {
+        LOG_INFO(Render_Vulkan, "[nvn] sparse timing: {} {:.1f} ms, pool {}+{:#x} {}x{} fmt {:#x}",
+                 phase, SparseMs(duration), storage.pool_serial, storage.pool_offset,
+                 storage.extent.width, storage.extent.height, storage.desc.format);
+    }
+}
+
+void LogSparseBind(const Storage& storage, const VkBindSparseInfo& info, u64 timeline_value,
+                   SparseClock::duration lock_wait, SparseClock::duration bind) {
+    if (lock_wait + bind >= SLOW_SPARSE_PHASE) {
+        const u32 image_binds = info.imageBindCount ? info.pImageBinds[0].bindCount : 0;
+        const u32 opaque_binds = info.imageOpaqueBindCount ? info.pImageOpaqueBinds[0].bindCount : 0;
+        LOG_INFO(Render_Vulkan,
+                 "[nvn] sparse timing: vkQueueBindSparse {:.1f} ms after mutex {:.1f} ms, "
+                 "timeline {}, pool {}+{:#x} {}x{} fmt {:#x}, {} image binds, {} opaque binds",
+                 SparseMs(bind), SparseMs(lock_wait), timeline_value, storage.pool_serial,
+                 storage.pool_offset, storage.extent.width, storage.extent.height,
+                 storage.desc.format, image_binds, opaque_binds);
+    }
+}
+
 u32 CeilDiv(u32 value, u32 divisor) {
     return (value + divisor - 1) / divisor;
 }
 
 } // Anonymous namespace
 
-// Row batching follows mkw-recomp's 30af22de9062367d3831d3787d136a6f43ebe275
-// (runtime/gfx/vk/tex/vk_sparse.c). Vulkan lays out the blocks of a bind x first.
+// A larger unbind removes exactly the same blocks, and Vulkan ignores its memoryOffset.
 void CompactSparseImageBinds(std::vector<VkSparseImageMemoryBind>& binds, u32 granule_x,
                              u32 granule_y) {
     if (binds.size() < 2 || granule_x == 0 || granule_y == 0) {
         return;
     }
+    const auto is_unbind = [](const VkSparseImageMemoryBind& bind) {
+        return bind.memory == VK_NULL_HANDLE;
+    };
+    const auto first = std::ranges::find_if(binds, is_unbind);
+    if (first == binds.end() || std::find_if(first + 1, binds.end(), is_unbind) == binds.end()) {
+        return;
+    }
+
+    // Order only the unbinds. A batch already requires disjoint image regions.
+    // Keep all binds with backing individual: the region API does not specify a block order.
+    const auto unbinds = std::partition(first, binds.end(), [&](const auto& bind) {
+        return !is_unbind(bind);
+    });
     const auto position = [](const VkSparseImageMemoryBind& bind) {
         return std::tuple{bind.subresource.aspectMask,
                           bind.subresource.arrayLayer,
@@ -45,11 +103,14 @@ void CompactSparseImageBinds(std::vector<VkSparseImageMemoryBind>& binds, u32 gr
                           bind.offset.y,
                           bind.offset.x};
     };
-    std::ranges::sort(binds, {}, position);
-    size_t count = 0;
-    for (const VkSparseImageMemoryBind bind : binds) {
-        if (count != 0) {
-            auto& previous = binds[count - 1];
+    const auto region = std::ranges::subrange(unbinds, binds.end());
+    if (!std::ranges::is_sorted(region, {}, position)) {
+        std::ranges::sort(region, {}, position);
+    }
+    auto out = unbinds;
+    for (const VkSparseImageMemoryBind bind : region) {
+        if (out != unbinds) {
+            auto& previous = *(out - 1);
             const bool same_row =
                 previous.subresource.aspectMask == bind.subresource.aspectMask &&
                 previous.subresource.arrayLayer == bind.subresource.arrayLayer &&
@@ -59,22 +120,29 @@ void CompactSparseImageBinds(std::vector<VkSparseImageMemoryBind>& binds, u32 gr
                 previous.extent.height <= granule_y && previous.extent.depth == 1 &&
                 bind.extent.depth == 1 && previous.extent.width % granule_x == 0 &&
                 static_cast<s64>(previous.offset.x) + previous.extent.width == bind.offset.x;
-            const bool same_memory =
-                previous.memory == bind.memory && previous.flags == bind.flags &&
-                (bind.memory == VK_NULL_HANDLE ||
-                 previous.memoryOffset + (previous.extent.width / granule_x) * SPARSE_TILE_BYTES ==
-                     bind.memoryOffset);
-            if (same_row && same_memory) {
+            if (same_row && previous.flags == bind.flags &&
+                bind.extent.width <= ~u32{0} - previous.extent.width) {
                 previous.extent.width += bind.extent.width;
                 continue;
             }
         }
-        binds[count++] = bind;
+        *out++ = bind;
     }
-    binds.resize(count);
+    binds.erase(out, binds.end());
 }
 
 // ---- SparsePagePool ---------------------------------------------------------------------------
+
+u64 SparsePagePool::DefaultBudget(u64 heap_budget) {
+    const u64 target = (std::clamp)(heap_budget / 5 * 2, u64{1} << 30, u64{12} << 30);
+    return (std::min)(heap_budget, target);
+}
+
+u32 SparsePagePool::CachedBlockTarget(u64 budget, u64 used, u64 slack) {
+    const u64 unused = budget - (std::min)(budget, used);
+    const u64 headroom = unused - (std::min)(unused, slack);
+    return budget != 0 && headroom < PageBytes * PagesPerBlock ? 0 : CachedBlockLimit;
+}
 
 SparsePagePool::SparsePagePool(const MemoryAllocator& allocator, u64 budget_bytes)
     : allocator_{allocator}, budget_{budget_bytes} {}
@@ -85,16 +153,21 @@ SparsePagePool::~SparsePagePool() {
     }
 }
 
-u32 SparsePagePool::Allocate(u32 memory_type_bits) {
+u32 SparsePagePool::Allocate(u32 memory_type_bits, std::optional<u64>* allocator_failure) {
     std::scoped_lock lock{mutex_};
-    return AllocateLocked(memory_type_bits);
+    return AllocateLocked(memory_type_bits, allocator_failure);
 }
 
 u32 SparsePagePool::AcquireShared(const SparseAliasKey& key, u32 memory_type_bits, u64 epoch,
-                                  bool& reused, bool allow_alloc) {
+                                  bool& reused, bool allow_alloc,
+                                  std::optional<u64>* allocator_failure) {
     std::scoped_lock lock{mutex_};
     if (const auto found = by_key_.find(key); found != by_key_.end()) {
         const u32 page = found->second;
+        if ((memory_type_bits & (1u << blocks_[page / PagesPerBlock].memory_type)) == 0) {
+            reused = false;
+            return NoPage;
+        }
         ++refs_[page];
         ++shared_extra_refs_;
         reused = epoch_[page] < epoch && stale_[page] == 0;
@@ -104,7 +177,7 @@ u32 SparsePagePool::AcquireShared(const SparseAliasKey& key, u32 memory_type_bit
     if (!allow_alloc) {
         return NoPage;
     }
-    const u32 page = AllocateLocked(memory_type_bits);
+    const u32 page = AllocateLocked(memory_type_bits, allocator_failure);
     if (page != NoPage) {
         by_key_.emplace(key, page);
         key_of_.emplace(page, key);
@@ -145,28 +218,26 @@ void SparsePagePool::ClearSharedStale(u32 page) {
     }
 }
 
-u32 SparsePagePool::AllocateLocked(u32 memory_type_bits) {
+u32 SparsePagePool::AllocateLocked(u32 memory_type_bits,
+                                   std::optional<u64>* allocator_failure) {
     if (used_ + PageBytes > budget_) {
         return NoPage;
     }
-    // A block was allocated for one mask of allowed memory types and the allocator picked one of
-    // them (it does not say which): only an image with the same mask is sure to accept it.
-    const auto usable = [&](u32 page) {
-        return blocks_[page / PagesPerBlock].type_bits == memory_type_bits;
-    };
-    for (size_t i = free_.size(); i-- > 0;) {
-        if (usable(free_[i])) {
-            const u32 page = free_[i];
-            free_[i] = free_.back();
-            free_.pop_back();
-            if (blocks_[page / PagesPerBlock].used_pages++ == 0) {
-                --empty_blocks_;
-            }
-            used_ += PageBytes;
-            refs_[page] = 1;
-            stale_[page] = 0;
-            return page;
+    if (const u32 compatible = free_type_mask_ & memory_type_bits; compatible != 0) {
+        const u32 type = std::countr_zero(compatible);
+        auto& available = free_[type];
+        const u32 page = available.back();
+        available.pop_back();
+        if (available.empty()) {
+            free_type_mask_ &= ~(1u << type);
         }
+        if (blocks_[page / PagesPerBlock].used_pages++ == 0) {
+            --empty_blocks_;
+        }
+        used_ += PageBytes;
+        refs_[page] = 1;
+        stale_[page] = 0;
+        return page;
     }
     const VkMemoryRequirements requirements{
         .size = PageBytes * PagesPerBlock,
@@ -174,12 +245,33 @@ u32 SparsePagePool::AllocateLocked(u32 memory_type_bits) {
         .memoryTypeBits = memory_type_bits,
     };
     Block block;
-    block.allocation =
-        allocator_.AllocateSparseMemory(requirements, block.where.memory, block.where.offset);
+    VmaAllocationInfo info{};
+    const bool timing = SparseTimingEnabled();
+    u64 release_generation{};
+    const auto allocate = [&]() {
+        const auto start = timing ? SparseClock::now() : SparseClock::time_point{};
+        release_generation = allocator_.DeviceMemoryReleaseGeneration();
+        block.allocation = allocator_.AllocateSparseMemory(requirements, info);
+        if (timing) {
+            ++sparse_allocations.calls;
+            sparse_allocations.elapsed += SparseClock::now() - start;
+        }
+    };
+    allocate();
+    if (block.allocation == VK_NULL_HANDLE && TrimUnusedBlocksLocked(0) != 0) {
+        allocate();
+    }
     if (block.allocation == VK_NULL_HANDLE) {
+        if (!retry_at_) {
+            retry_at_ = SparseClock::now() + std::chrono::seconds{1};
+        }
+        if (allocator_failure) {
+            *allocator_failure = release_generation;
+        }
         return NoPage;
     }
-    block.type_bits = memory_type_bits;
+    block.where = {info.deviceMemory, info.offset};
+    block.memory_type = info.memoryType;
     block.used_pages = 1;
     const auto vacant = std::ranges::find_if(
         blocks_, [](const Block& candidate) { return candidate.allocation == VK_NULL_HANDLE; });
@@ -190,13 +282,16 @@ u32 SparsePagePool::AllocateLocked(u32 memory_type_bits) {
     } else {
         *vacant = block;
     }
+    auto& available = free_[block.memory_type];
     for (u32 i = PagesPerBlock; i-- > 1;) {
-        free_.push_back(first + i);
+        available.push_back(first + i);
     }
-    if (refs_.size() < blocks_.size() * PagesPerBlock) {
-        refs_.resize(blocks_.size() * PagesPerBlock, 0);
-        epoch_.resize(blocks_.size() * PagesPerBlock, 0);
-        stale_.resize(blocks_.size() * PagesPerBlock, 0);
+    free_type_mask_ |= 1u << block.memory_type;
+    const size_t slots = blocks_.size() * PagesPerBlock;
+    if (refs_.size() < slots) {
+        refs_.resize(slots, 0);
+        epoch_.resize(slots, 0);
+        stale_.resize(slots, 0);
     }
     refs_[first] = 1;
     stale_[first] = 0;
@@ -204,7 +299,7 @@ u32 SparsePagePool::AllocateLocked(u32 memory_type_bits) {
     return first;
 }
 
-void SparsePagePool::Free(u32 page) {
+void SparsePagePool::Free(u32 page, bool notify) {
     if (page == NoPage) {
         return;
     }
@@ -220,35 +315,66 @@ void SparsePagePool::Free(u32 page) {
         by_key_.erase(found->second);
         key_of_.erase(found);
     }
-    free_.push_back(page);
-    if (--blocks_[page / PagesPerBlock].used_pages == 0) {
+    Block& block = blocks_[page / PagesPerBlock];
+    free_[block.memory_type].push_back(page);
+    free_type_mask_ |= 1u << block.memory_type;
+    if (--block.used_pages == 0) {
         ++empty_blocks_;
     }
     used_ -= PageBytes;
-    ++free_generation_;
+    if (notify) {
+        free_generation_.fetch_add(1, std::memory_order_release);
+    }
 }
 
-void SparsePagePool::TrimUnusedBlocks() {
+u64 SparsePagePool::TrimUnusedBlocks(u32 keep_empty) {
     std::scoped_lock lock{mutex_};
-    if (empty_blocks_ <= CachedBlockLimit) {
-        return;
+    return TrimUnusedBlocksLocked(keep_empty);
+}
+
+u64 SparsePagePool::TrimUnusedBlocks(const Device& device) {
+    std::scoped_lock lock{mutex_};
+    if (empty_blocks_ == 0) {
+        return 0;
     }
+    const auto memory = device.CanReportMemoryUsage()
+                            ? device.GetDeviceMemoryBudgetSnapshot()
+                            : Device::DeviceMemoryBudget{};
+    return TrimUnusedBlocksLocked(CachedBlockTarget(memory.budget, memory.usage, memory.slack));
+}
+
+u64 SparsePagePool::TrimUnusedBlocksLocked(u32 keep_empty) {
+    if (empty_blocks_ <= keep_empty) {
+        return 0;
+    }
+    const u32 release_count = empty_blocks_ - keep_empty;
     u32 kept = 0;
+    u32 trimmed_types = 0;
     for (Block& block : blocks_) {
         if (block.allocation == VK_NULL_HANDLE || block.used_pages != 0) {
             continue;
         }
-        if (kept++ < CachedBlockLimit) {
+        if (kept++ < keep_empty) {
             continue;
         }
+        trimmed_types |= 1u << block.memory_type;
         allocator_.FreeSparseMemory(block.allocation);
         block = {};
         --empty_blocks_;
     }
-    std::erase_if(free_, [&](u32 page) {
-        return blocks_[page / PagesPerBlock].allocation == VK_NULL_HANDLE;
-    });
-    ++free_generation_; // a failed allocation may fit after releasing another format's blocks
+    for (; trimmed_types != 0; trimmed_types &= trimmed_types - 1) {
+        const u32 type = std::countr_zero(trimmed_types);
+        auto& available = free_[type];
+        std::erase_if(available, [&](u32 page) {
+            return blocks_[page / PagesPerBlock].allocation == VK_NULL_HANDLE;
+        });
+        if (available.empty()) {
+            free_type_mask_ &= ~(1u << type);
+        }
+    }
+    // A failed allocation may fit after releasing another format's blocks.
+    free_generation_.fetch_add(1, std::memory_order_release);
+    return u64{release_count} * PageBytes * PagesPerBlock;
 }
 
 SparsePagePool::Where SparsePagePool::Get(u32 page) const {
@@ -272,6 +398,14 @@ u64 SparsePagePool::ReservedBytes() const {
 bool SparsePagePool::HasRoom() const {
     std::scoped_lock lock{mutex_};
     return used_ + PageBytes <= budget_;
+}
+
+void SparsePagePool::WakeAllocationRetries(std::chrono::steady_clock::time_point now) {
+    std::scoped_lock lock{mutex_};
+    if (retry_at_ && now >= *retry_at_) {
+        retry_at_.reset();
+        free_generation_.fetch_add(1, std::memory_order_release);
+    }
 }
 
 // ---- SparseBacking ----------------------------------------------------------------------------
@@ -333,7 +467,7 @@ SparseBacking::~SparseBacking() {
     pool_->TrimUnusedBlocks();
 }
 
-bool SparseBacking::Attach(Context::Impl& impl, const Storage& s, const char*& reason) {
+bool SparseBacking::Attach(Context::Impl& impl, const Storage& s, bool shared_tiles, const char*& reason) {
     const auto requirements = impl.device.GetLogical().GetImageSparseMemoryRequirements(*s.image);
     const VkImageAspectFlags wanted_aspect =
         s.host.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
@@ -389,7 +523,7 @@ bool SparseBacking::Attach(Context::Impl& impl, const Storage& s, const char*& r
     // Tiles of the same guest bytes decode to the same texels when everything that shapes the
     // decode and the host block layout matches: guest and host formats, the stand-in, the tile and
     // host block shape, and the image's flags, usage and memory types.
-    share_ = impl.SparseShareEnabled();
+    share_ = shared_tiles;
     {
         u64 h = 0xCBF29CE484222325ULL;
         const auto mix = [&h](u64 value) {
@@ -451,24 +585,12 @@ bool SparseBacking::Attach(Context::Impl& impl, const Storage& s, const char*& r
         return false;
     }
     if (!impl.sparse_pages) {
-        const auto properties = impl.device.GetPhysical().GetMemoryProperties().memoryProperties;
-        u64 local = 0;
-        for (u32 i = 0; i < properties.memoryHeapCount; ++i) {
-            const auto& heap = properties.memoryHeaps[i];
-            if (heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
-                local += heap.size;
-            }
+        u64 device_budget = 0;
+        if (impl.options.sparse_device_budget_bytes) {
+            device_budget = *impl.options.sparse_device_budget_bytes;
+        } else {
+            device_budget = SparsePagePool::DefaultBudget(impl.device.GetMainHeapAllocationBudget());
         }
-        // MKW also respects the usable budget and simulated heap limit. Keep physical memory
-        // as the fallback on devices without VK_EXT_memory_budget.
-        if (impl.mario_kart_world) {
-            const u64 budget = impl.device.GetDeviceMemoryBudget();
-            if (budget != 0) {
-                local = (std::min)(local, budget);
-            }
-        }
-        const u64 device_budget = impl.options.sparse_device_budget_bytes.value_or(
-            (std::clamp)(local / 5 * 2, u64{1} << 30, u64{12} << 30));
         impl.sparse_pages = std::make_shared<SparsePagePool>(*impl.allocator, device_budget);
     }
     pool_ = impl.sparse_pages;
@@ -677,10 +799,6 @@ bool SparseBacking::BindUnit(Context::Impl& impl, const Storage& s, bool tail, u
         slots = host_per_x_ * host_per_y_;
         pages = &tile_pages_[static_cast<size_t>(id) * slots];
     }
-    const auto release = [&](u32 index) {
-        pool_->Free(pages[index]);
-        pages[index] = SparsePagePool::NoPage;
-    };
     if (bind) {
         // Tiles mapped to the same guest bytes share a page, as they share memory on the console.
         u64 source = 0;
@@ -694,11 +812,14 @@ bool SparseBacking::BindUnit(Context::Impl& impl, const Storage& s, bool tail, u
                     bool page_reused = false;
                     pages[index] = pool_->AcquireShared(KeyOf(source, index, width, height),
                                                         memory_type_bits_, epoch, page_reused,
-                                                        allow_alloc);
+                                                        allow_alloc,
+                                                        &starved_allocator_generation_);
                     all_reused = all_reused && page_reused;
                 } else {
-                    pages[index] = allow_alloc ? pool_->Allocate(memory_type_bits_)
-                                               : SparsePagePool::NoPage;
+                    if (allow_alloc) {
+                        pages[index] = pool_->Allocate(memory_type_bits_,
+                                                       &starved_allocator_generation_);
+                    }
                 }
             } else {
                 all_reused = false;
@@ -717,7 +838,9 @@ bool SparseBacking::BindUnit(Context::Impl& impl, const Storage& s, bool tail, u
         }
         if (!ok) {
             for (u32 i = 0; i < slots; ++i) {
-                release(i);
+                // These pages were never bound, so undoing their reservation adds no capacity.
+                pool_->Free(pages[i], false);
+                pages[i] = SparsePagePool::NoPage;
             }
             return false;
         }
@@ -758,10 +881,231 @@ bool SparseBacking::BindUnit(Context::Impl& impl, const Storage& s, bool tail, u
     return true;
 }
 
-bool SparseBacking::Prepare(Context::Impl& impl, const Storage& s, Uploads& uploads) {
+VkResult Context::Impl::SubmitSparseBind(VkBindSparseInfo info, PendingSparseBind pending) {
+    if (!sparse_timeline) {
+        const VkSemaphoreTypeCreateInfo type{
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+            .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
+        };
+        try {
+            sparse_timeline = device.GetLogical().CreateSemaphore({
+                .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+                .pNext = &type,
+            });
+        } catch (const vk::Exception& exception) {
+            return exception.GetResult();
+        }
+    }
+    std::array<VkSemaphore, 2> waits{};
+    std::array<u64, 2> wait_values{};
+    u32 count = 0;
+    // A sparse bind must follow earlier memory accesses even on the graphics queue itself.
+    if (last_submit_semaphore != VK_NULL_HANDLE) {
+        waits[count] = last_submit_semaphore;
+        wait_values[count++] = last_submit_value;
+    }
+    const VkSemaphore semaphore = *sparse_timeline;
+    if (sparse_bind_value != 0) {
+        waits[count] = semaphore;
+        wait_values[count++] = sparse_bind_value;
+    }
+    const u64 value = sparse_bind_value + 1;
+    const VkTimelineSemaphoreSubmitInfo timeline{
+        .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+        .waitSemaphoreValueCount = count,
+        .pWaitSemaphoreValues = wait_values.data(),
+        .signalSemaphoreValueCount = 1,
+        .pSignalSemaphoreValues = &value,
+    };
+    info.pNext = &timeline;
+    info.waitSemaphoreCount = count;
+    info.pWaitSemaphores = waits.data();
+    info.signalSemaphoreCount = 1;
+    info.pSignalSemaphores = &semaphore;
+    const std::shared_ptr<const Storage> storage = pending.storage;
+    pending.value = value;
+    pending_sparse_binds.push_back(std::move(pending));
+    const bool timing = storage && SparseTimingEnabled();
+    const auto lock_start = timing ? SparseClock::now() : SparseClock::time_point{};
+    SparseClock::duration lock_wait{}, bind_time{};
+    VkResult result;
+    {
+        std::scoped_lock lock{submit_mutex};
+        const auto bind_start = timing ? SparseClock::now() : SparseClock::time_point{};
+        result = queue.BindSparse(info, VK_NULL_HANDLE);
+        if (timing) {
+            bind_time = SparseClock::now() - bind_start;
+            lock_wait = bind_start - lock_start;
+        }
+        if (result == VK_SUCCESS) {
+            sparse_bind_value = value;
+            if (storage) {
+                stats.virtual_sparse_queued_batches.fetch_add(1, std::memory_order_relaxed);
+            }
+        } else {
+            pending_sparse_binds.pop_back();
+        }
+    }
+    if (timing) {
+        LogSparseBind(*storage, info, value, lock_wait, bind_time);
+    }
+    return result;
+}
+
+VkResult Context::Impl::RetireSparseBinds(u64 wait_value) {
+    if (sparse_pages) {
+        sparse_pages->WakeAllocationRetries(SparseClock::now());
+    }
+    if (pending_sparse_binds.empty()) {
+        return VK_SUCCESS;
+    }
+    if (device_lost.load(std::memory_order_acquire)) {
+        return VK_ERROR_DEVICE_LOST;
+    }
+    const VkSemaphore semaphore = *sparse_timeline;
+    u64 complete = 0;
+    if (wait_value != 0) {
+        const VkSemaphoreWaitInfo info{
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+            .semaphoreCount = 1,
+            .pSemaphores = &semaphore,
+            .pValues = &wait_value,
+        };
+        const bool timing = SparseTimingEnabled();
+        const auto start = timing ? SparseClock::now() : SparseClock::time_point{};
+        const VkResult result = dld.vkWaitSemaphores(logical, &info, UINT64_MAX);
+        if (timing) {
+            const auto wait = SparseClock::now() - start;
+            if (wait >= SLOW_SPARSE_PHASE) {
+                LOG_INFO(Render_Vulkan,
+                         "[nvn] sparse timing: vkWaitSemaphores {:.1f} ms, timeline {}, "
+                         "{} pending batches",
+                         SparseMs(wait), wait_value, pending_sparse_binds.size());
+            }
+        }
+        if (result != VK_SUCCESS) {
+            if (result == VK_ERROR_DEVICE_LOST) {
+                NoteDeviceLost("waiting for sparse bindings");
+            }
+            return result;
+        }
+    }
+    const VkResult result = dld.vkGetSemaphoreCounterValue(logical, semaphore, &complete);
+    if (result != VK_SUCCESS) {
+        if (result == VK_ERROR_DEVICE_LOST) {
+            NoteDeviceLost("retiring sparse bindings");
+        }
+        return result;
+    }
+    bool freed = false;
+    while (!pending_sparse_binds.empty() && pending_sparse_binds.front().value <= complete) {
+        for (const u32 page : pending_sparse_binds.front().old_pages) {
+            sparse_pages->Free(page);
+            freed = true;
+        }
+        pending_sparse_binds.pop_front();
+    }
+    if (freed) {
+        sparse_pages->TrimUnusedBlocks(device);
+    }
+    return VK_SUCCESS;
+}
+
+void Context::Impl::WaitForSparseImage(const Storage& storage) {
+    const auto bind = std::find_if(pending_sparse_binds.rbegin(), pending_sparse_binds.rend(),
+                                   [&](const auto& queued) { return queued.storage.get() == &storage; });
+    if (bind != pending_sparse_binds.rend()) {
+        vk::Check(RetireSparseBinds(bind->value));
+    }
+}
+
+VkResult Context::Impl::SubmitGraphics(std::span<VkSubmitInfo> submits, VkFence fence) {
+    if (submits.empty() || sparse_wait_submitted == sparse_bind_value) {
+        return queue.Submit(submits, fence);
+    }
+    // The first batch's wait also covers later commands on this Vulkan queue.
+    VkSubmitInfo& first = submits.front();
+    const VkSubmitInfo original = first;
+    const auto* previous = static_cast<const VkTimelineSemaphoreSubmitInfo*>(first.pNext);
+    VkTimelineSemaphoreSubmitInfo timeline{
+        .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+    };
+    if (previous) {
+        ASSERT(previous->sType == VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO);
+        timeline = *previous;
+    }
+    std::vector<VkSemaphore> semaphores;
+    std::vector<u64> values;
+    std::vector<VkPipelineStageFlags> stages;
+    for (u32 i = 0; i < first.waitSemaphoreCount; ++i) {
+        semaphores.push_back(first.pWaitSemaphores[i]);
+        values.push_back(i < timeline.waitSemaphoreValueCount ? timeline.pWaitSemaphoreValues[i]
+                                                             : 0);
+        stages.push_back(first.pWaitDstStageMask[i]);
+    }
+    semaphores.push_back(*sparse_timeline);
+    values.push_back(sparse_bind_value);
+    stages.push_back(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    std::vector<u64> binary_signals;
+    if (!previous && first.signalSemaphoreCount != 0) {
+        binary_signals.resize(first.signalSemaphoreCount);
+        timeline.signalSemaphoreValueCount = first.signalSemaphoreCount;
+        timeline.pSignalSemaphoreValues = binary_signals.data();
+    }
+    first.pNext = &timeline;
+    first.waitSemaphoreCount = static_cast<u32>(semaphores.size());
+    first.pWaitSemaphores = semaphores.data();
+    first.pWaitDstStageMask = stages.data();
+    timeline.waitSemaphoreValueCount = first.waitSemaphoreCount;
+    timeline.pWaitSemaphoreValues = values.data();
+    const VkResult result = queue.Submit(submits, fence);
+    first = original;
+    if (result == VK_SUCCESS) {
+        sparse_wait_submitted = sparse_bind_value;
+    }
+    return result;
+}
+
+void Context::Impl::NoteBindlessSparsePending(Storage& s) {
+    if (s.bindless_active_count != 0 && !s.bindless_sparse_queued && s.sparse &&
+        s.sparse->HasPendingUnits()) {
+        bindless_sparse_pending.push_back(s.weak_from_this());
+        s.bindless_sparse_queued = true;
+    }
+}
+
+bool SparseBacking::Prepare(Context::Impl& impl, const Storage& s, Uploads& uploads,
+                            bool allow_gpu_wait) {
+    const bool timing = SparseTimingEnabled();
+    static const bool use_queued_residency = [] {
+        const char* value = std::getenv("EDEN_NX2_NVN_GPU_SPARSE_NO_UPLOAD");
+        return value && value[0] == '1';
+    }();
+    const bool can_queue = allow_gpu_wait && impl.device.HasTimelineSemaphore();
+    const bool queue_all = can_queue && impl.gpu_sparse_wait;
+    const bool queue_residency = can_queue && use_queued_residency;
+    if (queue_all || queue_residency) {
+        if (impl.RetireSparseBinds() != VK_SUCCESS) {
+            return false;
+        }
+        // Keep the number of old allocations awaiting reuse bounded.
+        if (!impl.pending_sparse_binds.empty() &&
+            (impl.pending_sparse_binds.size() >= 2 || !pool_->HasRoom())) {
+            if (impl.RetireSparseBinds(impl.pending_sparse_binds.front().value) != VK_SUCCESS) {
+                return false;
+            }
+        }
+        if (impl.device_lost.load(std::memory_order_acquire)) {
+            return false;
+        }
+    }
+    const auto prepare_start = timing ? SparseClock::now() : SparseClock::time_point{};
+    const auto allocations_before = timing ? sparse_allocations : SparseAllocationTiming{};
     std::vector<VkSparseImageMemoryBind> image_binds;
     std::vector<VkSparseMemoryBind> opaque_binds;
     std::vector<std::pair<bool, u32>> bound_now;
+    std::vector<std::pair<bool, u32>> unbound_now;
+    const u64 previous_bound_pages = bound_pages_;
     struct ReboundTile {
         u32 id;
         std::vector<u32> old_pages;
@@ -769,10 +1113,12 @@ bool SparseBacking::Prepare(Context::Impl& impl, const Storage& s, Uploads& uplo
     std::vector<ReboundTile> rebound_now;
     u64 binds = 0;
     u64 unbinds = 0;
+    bool needs_zero_tail = false;
     // The first unit that finds no page ends the allocating of this call; the generation is read
     // first, so a page freed meanwhile makes the units worth trying again.
     bool exhausted = false;
     const u64 generation = pool_->FreeGeneration();
+    starved_allocator_generation_.reset();
     ++impl.sparse_prepare_epoch;
     const auto process = [&](bool tail, std::vector<u32>& pending, std::vector<u8>& flags_vector) {
         std::vector<u32> keep;
@@ -801,6 +1147,7 @@ bool SparseBacking::Prepare(Context::Impl& impl, const Storage& s, Uploads& uplo
                     std::copy(old.begin(), old.end(), pages);
                     BindUnit(impl, s, false, id, false, image_binds, opaque_binds);
                     flags &= static_cast<u8>(~Bound);
+                    unbound_now.emplace_back(false, id);
                     ++unbinds;
                     exhausted = true;
                     keep.push_back(id);
@@ -826,9 +1173,11 @@ bool SparseBacking::Prepare(Context::Impl& impl, const Storage& s, Uploads& uplo
                 flags |= Bound;
                 bound_now.emplace_back(tail, id);
                 ++binds;
+                needs_zero_tail |= tail && persistent_tails_ && !mapped;
             } else if (!want && have) {
                 BindUnit(impl, s, tail, id, false, image_binds, opaque_binds);
                 flags &= static_cast<u8>(~Bound);
+                unbound_now.emplace_back(tail, id);
                 ++unbinds;
             }
             flags &= static_cast<u8>(~Queued);
@@ -855,13 +1204,33 @@ bool SparseBacking::Prepare(Context::Impl& impl, const Storage& s, Uploads& uplo
     starved_ = static_cast<u32>(pending_tiles_.size() + pending_tails_.size());
     starved_only_ = starved_ != 0;
     starved_generation_ = generation;
-    if (!image_binds.empty() || !opaque_binds.empty()) {
-        // Flush any queued replay draws before binding sparse memory so `mkw_last_submit_*`
-        // covers every prior draw that may sample this atlas.
-        impl.FlushSubmitBatch();
-        if (impl.mario_kart_world) {
-            CompactSparseImageBinds(image_binds, granule_x_, granule_y_);
+    const bool has_binds = !image_binds.empty() || !opaque_binds.empty();
+    // Unbinds and clean page aliases need no staging. Keep released pages until the queue
+    // retires the bind, and keep upload batches on the existing synchronous path.
+    const bool needs_upload = needs_zero_tail || !uploads.tiles.empty() || !uploads.tails.empty();
+    const bool gpu_wait = queue_all || (queue_residency && !needs_upload);
+    if (timing && has_binds && !needs_upload && impl.mario_kart_world) {
+        LOG_INFO(Render_Vulkan, "[nvn] sparse residency without upload: {} binds, {} unbinds, {}",
+                 binds, unbinds, gpu_wait ? "queued" : "host fence");
+    }
+    if (unbinds != 0) {
+        CompactSparseImageBinds(image_binds, granule_x_, granule_y_);
+    }
+    if (timing) {
+        const auto elapsed = SparseClock::now() - prepare_start;
+        if (elapsed >= SLOW_SPARSE_PHASE) {
+            LOG_INFO(Render_Vulkan,
+                     "[nvn] sparse timing: prepare mappings {:.1f} ms, pool {}+{:#x} {}x{} "
+                     "fmt {:#x}; {} allocations in {:.1f} ms; {:.1f} MiB used, {:.1f} MiB reserved",
+                     SparseMs(elapsed), s.pool_serial, s.pool_offset, s.extent.width,
+                     s.extent.height, s.desc.format,
+                     sparse_allocations.calls - allocations_before.calls,
+                     SparseMs(sparse_allocations.elapsed - allocations_before.elapsed),
+                     static_cast<double>(pool_->UsedBytes()) / (1 << 20),
+                     static_cast<double>(pool_->ReservedBytes()) / (1 << 20));
         }
+    }
+    if (has_binds) {
         const VkSparseImageMemoryBindInfo image_info{
             .image = *s.image,
             .bindCount = static_cast<u32>(image_binds.size()),
@@ -872,56 +1241,106 @@ bool SparseBacking::Prepare(Context::Impl& impl, const Storage& s, Uploads& uplo
             .bindCount = static_cast<u32>(opaque_binds.size()),
             .pBinds = opaque_binds.data(),
         };
-        // On MKW, the GPU can still be reading the atlas while the guest streams new tiles.
-        // Wait for earlier work before changing residency, then wait for this bind below.
-        const bool wait_for_atlas_use =
-            impl.mario_kart_world && impl.mkw_last_submit_semaphore != VK_NULL_HANDLE;
-        const VkTimelineSemaphoreSubmitInfo timeline{
-            .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
-            .waitSemaphoreValueCount = 1,
-            .pWaitSemaphoreValues = &impl.mkw_last_submit_value,
-        };
-        const VkBindSparseInfo info{
+        VkBindSparseInfo info{
             .sType = VK_STRUCTURE_TYPE_BIND_SPARSE_INFO,
-            .pNext = wait_for_atlas_use ? &timeline : nullptr,
-            .waitSemaphoreCount = wait_for_atlas_use ? 1u : 0u,
-            .pWaitSemaphores = wait_for_atlas_use ? &impl.mkw_last_submit_semaphore : nullptr,
-            .bufferBindCount = 0,
-            .pBufferBinds = nullptr,
             .imageOpaqueBindCount = opaque_binds.empty() ? 0U : 1U,
             .pImageOpaqueBinds = opaque_binds.empty() ? nullptr : &opaque_info,
             .imageBindCount = image_binds.empty() ? 0U : 1U,
             .pImageBinds = image_binds.empty() ? nullptr : &image_info,
-            .signalSemaphoreCount = 0,
-            .pSignalSemaphores = nullptr,
         };
-        vk::Fence fence = impl.device.GetLogical().CreateFence(VkFenceCreateInfo{
-            .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-            .pNext = nullptr,
-            .flags = 0,
-        });
         VkResult result;
-        {
-            std::scoped_lock lock{impl.submit_mutex};
-            result = impl.queue.BindSparse(info, *fence);
-        }
-        if (result == VK_SUCCESS) {
-            const auto begin = std::chrono::steady_clock::now();
-            result = fence.Wait();
-            const auto wait = std::chrono::steady_clock::now() - begin;
-            if (impl.mario_kart_world && wait >= std::chrono::milliseconds{20}) {
-                LOG_INFO(Render_Vulkan,
-                         "[nvn] sparse residency fence: {:.1f} ms, {} image binds, {} opaque binds",
-                         std::chrono::duration<double, std::milli>(wait).count(), image_binds.size(),
-                         opaque_binds.size());
+        try {
+            // Include the latest submitted atlas reads in the bind's wait.
+            const auto batch_start = timing ? SparseClock::now() : SparseClock::time_point{};
+            impl.FlushSubmitBatch();
+            if (timing) {
+                LogSparsePhase(s, "flush submit batch", SparseClock::now() - batch_start);
             }
+            if (gpu_wait) {
+                std::vector<u32> old_pages = deferred_free_;
+                for (const auto& rebound : rebound_now) {
+                    old_pages.insert(old_pages.end(), rebound.old_pages.begin(),
+                                     rebound.old_pages.end());
+                }
+                result = impl.SubmitSparseBind(info, {.storage = s.shared_from_this(),
+                                                      .old_pages = std::move(old_pages)});
+            } else {
+                std::array<VkSemaphore, 2> waits{};
+                std::array<u64, 2> wait_values{};
+                u32 wait_count = 0;
+                // The fence only orders the bind before later host work.
+                if (impl.last_submit_semaphore != VK_NULL_HANDLE) {
+                    waits[wait_count] = impl.last_submit_semaphore;
+                    wait_values[wait_count++] = impl.last_submit_value;
+                }
+                if (!impl.pending_sparse_binds.empty()) {
+                    waits[wait_count] = *impl.sparse_timeline;
+                    wait_values[wait_count++] = impl.sparse_bind_value;
+                }
+                const VkTimelineSemaphoreSubmitInfo timeline{
+                    .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+                    .waitSemaphoreValueCount = wait_count,
+                    .pWaitSemaphoreValues = wait_values.data(),
+                };
+                if (wait_count != 0) {
+                    info.pNext = &timeline;
+                    info.waitSemaphoreCount = wait_count;
+                    info.pWaitSemaphores = waits.data();
+                }
+                vk::Fence fence = impl.device.GetLogical().CreateFence(
+                    {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO});
+                const auto lock_start = timing ? SparseClock::now() : SparseClock::time_point{};
+                SparseClock::duration lock_wait{}, bind_time{};
+                {
+                    std::scoped_lock lock{impl.submit_mutex};
+                    const auto bind_start = timing ? SparseClock::now() : SparseClock::time_point{};
+                    result = impl.queue.BindSparse(info, *fence);
+                    if (timing) {
+                        bind_time = SparseClock::now() - bind_start;
+                        lock_wait = bind_start - lock_start;
+                    }
+                }
+                if (timing) {
+                    LogSparseBind(s, info, 0, lock_wait, bind_time);
+                }
+                if (result == VK_SUCCESS) {
+                    const auto begin = std::chrono::steady_clock::now();
+                    result = fence.Wait();
+                    const auto wait = std::chrono::steady_clock::now() - begin;
+                    if (timing) {
+                        LogSparsePhase(s, "host fence wait", wait);
+                    }
+                    if (impl.mario_kart_world && wait >= std::chrono::milliseconds{20}) {
+                        LOG_INFO(Render_Vulkan,
+                                 "[nvn] sparse residency fence: {:.1f} ms, {} image binds, {} opaque binds",
+                                 std::chrono::duration<double, std::milli>(wait).count(),
+                                 image_binds.size(), opaque_binds.size());
+                    }
+                }
+            }
+        } catch (const vk::Exception& exception) {
+            result = exception.GetResult();
+        } catch (const std::bad_alloc&) {
+            result = VK_ERROR_OUT_OF_HOST_MEMORY;
         }
         if (result != VK_SUCCESS) {
             LOG_ERROR(Render_Vulkan, "[nvn] sparse texture {}x{}x{}: binding {} blocks failed ({})",
                       s.extent.width, s.extent.height, layout_.layers,
                       image_binds.size() + opaque_binds.size(), static_cast<int>(result));
-            // Nothing can be said about what is bound: give the new tiles' memory back, the
-            // units are tried again at the next use.
+            const u32 slots = host_per_x_ * host_per_y_;
+            size_t offset = 0;
+            for (const auto& [tail, id] : unbound_now) {
+                u8& flags = tail ? tail_flags_[id] : tile_flags_[id];
+                const size_t count = tail ? tail_pages_[id].size() : slots;
+                u32* pages = tail ? tail_pages_[id].data()
+                                  : &tile_pages_[static_cast<size_t>(id) * slots];
+                std::copy_n(deferred_free_.begin() + offset, count, pages);
+                offset += count;
+                flags |= Bound;
+                Queue(flags, id, tail);
+            }
+            deferred_free_.clear();
+            // New pages were never installed. Requeue the units for their next use.
             for (const auto& [tail, id] : bound_now) {
                 u8& flags = tail ? tail_flags_[id] : tile_flags_[id];
                 flags &= static_cast<u8>(~Bound);
@@ -933,7 +1352,6 @@ bool SparseBacking::Prepare(Context::Impl& impl, const Storage& s, Uploads& uplo
                 std::vector<VkSparseMemoryBind> unused_opaque;
                 BindUnit(impl, s, tail, id, false, unused_image, unused_opaque);
             }
-            const u32 slots = host_per_x_ * host_per_y_;
             for (const ReboundTile& rebound : rebound_now) {
                 u32* const pages = &tile_pages_[static_cast<size_t>(rebound.id) * slots];
                 for (u32 i = 0; i < slots; ++i) {
@@ -943,27 +1361,41 @@ bool SparseBacking::Prepare(Context::Impl& impl, const Storage& s, Uploads& uplo
                 tile_flags_[rebound.id] |= Dirty;
                 Queue(tile_flags_[rebound.id], rebound.id, false);
             }
+            for (const u32 id : uploads.tiles) {
+                Queue(tile_flags_[id], id, false);
+            }
+            for (const u32 id : uploads.tails) {
+                Queue(tail_flags_[id], id, true);
+            }
             uploads.tiles.clear();
             uploads.tails.clear();
             for (const u32 page : deferred_free_) {
                 pool_->Free(page);
             }
             deferred_free_.clear();
+            bound_pages_ = previous_bound_pages;
+            if (result == VK_ERROR_DEVICE_LOST) {
+                impl.NoteDeviceLost("sparse texture binding");
+            }
             return false;
         }
         impl.stats.virtual_sparse_binds.fetch_add(image_binds.size() + opaque_binds.size(),
                                                   std::memory_order_relaxed);
     }
-    for (const ReboundTile& rebound : rebound_now) {
-        for (const u32 page : rebound.old_pages) {
+    if (!gpu_wait) {
+        for (const ReboundTile& rebound : rebound_now) {
+            for (const u32 page : rebound.old_pages) {
+                pool_->Free(page);
+            }
+        }
+        for (const u32 page : deferred_free_) {
             pool_->Free(page);
         }
-    }
-    for (const u32 page : deferred_free_) {
-        pool_->Free(page);
+        if (!rebound_now.empty() || !deferred_free_.empty()) {
+            pool_->TrimUnusedBlocks(impl.device);
+        }
     }
     deferred_free_.clear();
-    pool_->TrimUnusedBlocks();
     for (const auto& [tail, id] : bound_now) {
         if (tail && persistent_tails_ && (tail_flags_[id] & Mapped) == 0) {
             uploads.zero_tails.push_back(id);

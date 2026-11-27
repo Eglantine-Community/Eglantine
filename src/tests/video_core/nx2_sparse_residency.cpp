@@ -251,3 +251,117 @@ TEST_CASE("Sparse atlas ranges split at layer boundaries", "[nx2_memory]") {
     CHECK(std::ranges::any_of(rects, [](const auto& rect) { return rect.layer == 1 && rect.level == 0; }));
     CHECK(std::ranges::all_of(rects, [](const auto& rect) { return rect.layer < 2; }));
 }
+
+TEST_CASE("Pitch-linear writeback preserves row padding and mapped backing",
+          "[nx2_memory][texture_writeback]") {
+    using namespace VideoCommon;
+    ScopedSystemTestContext context;
+    Core::System system;
+    system.Initialize();
+    Kernel::KProcess process{system.Kernel()};
+    SCOPE_EXIT { system.Kernel().UnregisterKernelObject(&process); };
+    auto& table = process.GetPageTable().GetImpl();
+    table.Resize(24, 12);
+    Tegra::MaxwellDeviceMemoryManager device_memory{system.DeviceMemory()};
+    const auto asid = device_memory.RegisterProcess(&process.GetMemory());
+    SCOPE_EXIT { device_memory.UnregisterProcess(asid); };
+    Tegra::GPU gpu{system, false, false};
+    Null::RasterizerNull rasterizer{gpu};
+    device_memory.BindInterface(&rasterizer);
+
+    constexpr GPUVAddr gpu_address = 0x100000;
+    constexpr DAddr device_address = 0x10000;
+    constexpr VAddr virtual_address = 0x20000;
+    constexpr size_t page_size = 4096;
+    constexpr size_t backing_size = 2 * page_size;
+    constexpr u8 guard = 0xa5;
+    auto* const backing = system.DeviceMemory().GetPointerFromRaw<u8>(0x10000);
+    for (size_t offset = 0; offset < backing_size; offset += page_size) {
+        table.entries.GetAndFault((virtual_address + offset) >> 12)
+            .Store(false, Common::PageType::Memory, 1,
+                   reinterpret_cast<uintptr_t>(backing) - virtual_address);
+    }
+    process.GetMemory().SetCurrentPageTable(process);
+    device_memory.Map(device_address, virtual_address, backing_size, asid);
+    SCOPE_EXIT { device_memory.Unmap(device_address, backing_size); };
+    CHECK_FALSE(device_memory.HasCpuBacking(device_address - page_size, page_size));
+    CHECK(device_memory.HasCpuBacking(device_address - page_size, page_size + 1));
+    Common::ScratchBuffer<u8> scratch;
+
+    ImageInfo info;
+    info.type = ImageType::Linear;
+    info.format = PixelFormat::A8B8G8R8_UNORM;
+    info.resources = {1, 1};
+    info.pitch = 64;
+    const auto source = [&](std::span<u8> bytes) {
+        for (size_t i = 0; i < bytes.size(); ++i) {
+            bytes[i] = static_cast<u8>(i % guard);
+        }
+    };
+    for (const u32 width : {16, 13}) {
+        CAPTURE(width);
+        info.size = {width, 4, 1};
+        const auto copies = FullDownloadCopies(info);
+        std::vector<u8> staging(CalculateUnswizzledSizeBytes(info));
+        source(staging);
+        std::ranges::fill_n(backing, backing_size, guard);
+
+        constexpr size_t offset = 19;
+        SwizzleImage(device_memory, device_address + offset, info, copies, staging, scratch);
+        auto expected = std::vector<u8>(backing_size, guard);
+        for (size_t row = 0; row < info.size.height; ++row) {
+            std::ranges::copy_n(staging.data() + row * info.pitch, width * 4,
+                                expected.data() + offset + row * info.pitch);
+        }
+        CHECK(std::ranges::equal(std::span{backing, backing_size}, expected));
+    }
+
+    info.size = {13, 69, 1};
+    const auto copies = FullDownloadCopies(info);
+    std::vector<u8> staging(CalculateUnswizzledSizeBytes(info));
+    source(staging);
+    std::ranges::fill_n(backing, backing_size, guard);
+    const ImageMapView first{gpu_address, device_address + page_size - 40, 40, {}};
+    const ImageMapView second{gpu_address + page_size + 40, device_address + page_size, page_size,
+                              {}};
+    const std::array ranges{&first, &second};
+    SwizzleImage(device_memory, gpu_address, ranges, info, copies, staging, scratch);
+    auto expected = std::vector<u8>(backing_size, guard);
+    for (const auto* range : ranges) {
+        for (size_t byte = 0; byte < range->size; ++byte) {
+            const size_t offset = range->gpu_addr - gpu_address + byte;
+            if (offset < staging.size() && offset % info.pitch < info.size.width * 4) {
+                expected[range->cpu_addr - device_address + byte] = staging[offset];
+            }
+        }
+    }
+    CHECK(std::ranges::equal(std::span{backing, backing_size}, expected));
+
+    info.format = PixelFormat::BC1_RGBA_UNORM;
+    info.size = {9, 7, 1};
+    info.pitch = 32;
+    const auto compressed_copies = FullDownloadCopies(info);
+    REQUIRE(compressed_copies.size() == 1);
+    CHECK(compressed_copies[0].buffer_row_length == 16);
+    CHECK(compressed_copies[0].buffer_image_height == 8);
+    CHECK(compressed_copies[0].buffer_size == 64);
+    staging.resize(CalculateUnswizzledSizeBytes(info));
+    source(staging);
+    std::ranges::fill_n(backing, backing_size, guard);
+    std::ranges::fill(expected, guard);
+    SwizzleImage(device_memory, device_address, info, compressed_copies, staging, scratch);
+    std::ranges::copy_n(staging.data(), 24, expected.data());
+    std::ranges::copy_n(staging.data() + 32, 24, expected.data() + 32);
+    CHECK(std::ranges::equal(std::span{backing, backing_size}, expected));
+
+    auto partial = compressed_copies.front();
+    partial.buffer_offset = 8;
+    partial.buffer_row_length = 0;
+    partial.image_offset = {4, 4, 0};
+    partial.image_extent = {5, 3, 1};
+    std::ranges::fill_n(backing, backing_size, guard);
+    std::ranges::fill(expected, guard);
+    SwizzleImage(device_memory, device_address, info, std::span{&partial, 1}, staging, scratch);
+    std::ranges::copy_n(staging.data() + 8, 16, expected.data() + 40);
+    CHECK(std::ranges::equal(std::span{backing, backing_size}, expected));
+}

@@ -41,9 +41,6 @@ public:
         Gather = 1,  ///< window -> tight texels
     };
 
-    /// Push descriptors and storage buffers with 8-bit access (the shader only moves bytes).
-    [[nodiscard]] static bool Supported(const Device& device);
-
     explicit AliasTransferGpu(const Device& device);
     ~AliasTransferGpu();
 
@@ -52,8 +49,14 @@ public:
         return max_scratch;
     }
 
-    /// Binds the pipeline and the scratch buffer (`size` bytes from its start).
-    void Begin(vk::CommandBuffer cmd, VkBuffer scratch, u64 size) const;
+    /// For devices without push descriptors, allocate and populate a set before recording copies.
+    [[nodiscard]] VkDescriptorSetLayout LayoutForAllocation() const {
+        return push_descriptors ? VK_NULL_HANDLE : *set_layout;
+    }
+    void UpdateScratchSet(VkDescriptorSet set, VkBuffer scratch, u64 size) const;
+
+    /// Binds the pipeline and scratch buffer, using the allocated set or pushing descriptors.
+    void Begin(vk::CommandBuffer cmd, VkBuffer scratch, u64 size, VkDescriptorSet set) const;
 
     /// One piece, `window_size` bytes of window at `window_offset` in the scratch buffer.
     void Dispatch(vk::CommandBuffer cmd, Mode mode, u32 window_offset, u32 window_size,
@@ -61,6 +64,7 @@ public:
 
 private:
     const Device& device;
+    const bool push_descriptors;
     vk::DescriptorSetLayout set_layout;
     vk::PipelineLayout pipeline_layout;
     vk::ShaderModule module;

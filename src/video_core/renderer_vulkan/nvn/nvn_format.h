@@ -61,6 +61,28 @@ struct HostFormat {
     bool storage_alias{};
 };
 
+/// A combined depth/stencil texture view selects a single aspect. Without an explicit view mode
+/// it inherits the texture builder's mode. The raw NVN modes are 0 for depth and 1 for stencil.
+[[nodiscard]] constexpr VkImageAspectFlags TextureViewAspect(VkImageAspectFlags storage_aspect,
+                                                            bool builder_stencil,
+                                                            bool has_view_mode, u8 view_mode) {
+    if (storage_aspect != (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
+        return storage_aspect;
+    }
+    constexpr u8 STENCIL_MODE = 1;
+    const bool stencil = has_view_mode ? view_mode == STENCIL_MODE : builder_stencil;
+    return stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
+}
+
+/// Shader-visible format of a sampled texture. Stencil is one unsigned 8-bit component even
+/// when the storage also contains floating-point or normalized depth.
+[[nodiscard]] constexpr VideoCore::Surface::PixelFormat TextureSampleFormat(
+    VideoCore::Surface::PixelFormat format, VkImageAspectFlags view_aspect) {
+    return view_aspect == VK_IMAGE_ASPECT_STENCIL_BIT
+               ? VideoCore::Surface::PixelFormat::R8_UINT
+               : format;
+}
+
 /// The unsigned integer colour format with `bytes` per texel (R8/R16/R32/R32G32/R32G32B32A32
 /// UINT), VK_FORMAT_UNDEFINED for any other size. Every uncompressed colour format of that size
 /// is in its Vulkan compatibility class.

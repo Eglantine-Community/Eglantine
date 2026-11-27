@@ -150,6 +150,29 @@ public:
     // New batch API to update multiple ranges with a single lock acquisition.
     void UpdatePagesCachedBatch(std::span<const std::pair<DAddr, size_t>> ranges, s32 delta);
 
+    /// Whether at least one device page is mapped to guest CPU memory.
+    [[nodiscard]] bool HasCpuBacking(DAddr addr, size_t size) {
+        if (size == 0 || addr >= device_as_size || size > device_as_size - addr) {
+            return false;
+        }
+        const size_t last_page = (addr + size - 1) >> page_bits;
+        std::shared_lock lock{mapping_guard};
+        for (size_t page = addr >> page_bits; page <= last_page; ++page) {
+            if (tracked_entries[page].compressed_physical_ptr != 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// A slow CPU read may reuse its last clean range until the GPU dirties memory again.
+    u64 InvalidateCachedReadAreas() {
+        return gpu_write_generation.fetch_add(1, std::memory_order_release) + 1;
+    }
+    [[nodiscard]] u64 GpuWriteGeneration() const {
+        return gpu_write_generation.load(std::memory_order_acquire);
+    }
+
     /// Traps the next guest CPU read of these pages, to learn which GPU writes the CPU reads.
     void ArmReadTraps(DAddr addr, size_t size);
 
@@ -220,6 +243,7 @@ private:
 
     std::unique_ptr<DeviceMemoryManagerAllocator<Traits>> impl;
 
+    std::atomic<u64> gpu_write_generation{};
     const uintptr_t physical_base;
     const DeviceMemory* device_memory_ptr;
     DeviceInterface* device_inter;

@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: Copyright 2026 Vortex727 (FUKKO)
+// SPDX-FileCopyrightText: Copyright 2026 the ScarletNX contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 // Storage shadows: device-local copies that stand in for written storage ranges of imported pools.
@@ -42,10 +43,12 @@
 // (vk_memory.c: VRAM mirror of buffer-bound pools, write-back merge).
 
 #include <algorithm>
+#include <bit>
 
 #include <fmt/format.h>
 
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "video_core/renderer_vulkan/nvn/nvn_draw.h"
 #include "video_core/renderer_vulkan/nvn/nvn_write_back.h"
 
@@ -67,6 +70,29 @@ constexpr u64 MONITOR_MAX_ENTRY_BYTES = u64{32} << 20;
 }
 
 } // namespace
+
+void DrawContext::ClearShadows() {
+    if (!shadows.empty()) {
+        shadows.clear();
+        ++shadow_bounds_epoch;
+    }
+}
+
+bool DrawContext::ShadowBoundsMayOverlap(const Pool& pool, u64 begin, u64 end) {
+    ShadowBounds& bounds = shadow_bounds[pool.serial % shadow_bounds.size()];
+    if (bounds.epoch != shadow_bounds_epoch || bounds.pool != &pool) {
+        bounds = {&pool, shadow_bounds_epoch, ~u64{0}, 0};
+        for (const Shadow& shadow : shadows) {
+            if (shadow.pool == &pool) {
+                bounds.begin = (std::min)(bounds.begin, shadow.begin);
+                bounds.end = (std::max)(bounds.end, shadow.end);
+            }
+        }
+    }
+    // ScarletNX 1b6f70a52dc4, src/nx/gpu/vk/buffer.c (backing_overlap):
+    // disjoint bounds reject a range; bounds that meet still require the exact check.
+    return Overlaps(begin, end, bounds.begin, bounds.end);
+}
 
 DrawContext::ShadowDecision DrawContext::ClassifyShadows(const DrawPlan& plan) {
     ShadowDecision decision;
@@ -90,11 +116,15 @@ DrawContext::ShadowDecision DrawContext::ClassifyShadows(const DrawPlan& plan) {
         decision.any = true;
         return decision;
     }
+    const bool use_bounds = shadows.size() >= 4 && Debug::Get().shadow_bounds;
     for (const DrawPlan::RangeUse& use : plan.ranges) {
         if (use.pool->backing != Pool::Backing::Imported) {
             continue;
         }
         const u64 use_end = use.offset + use.size;
+        if (use_bounds && !ShadowBoundsMayOverlap(*use.pool, use.offset, use_end)) {
+            continue;
+        }
         for (size_t i = 0; i < shadows.size(); ++i) {
             const Shadow& shadow = shadows[i];
             if (shadow.pool != use.pool || !Overlaps(use.offset, use_end, shadow.begin, shadow.end)) {
@@ -251,6 +281,7 @@ void DrawContext::ApplyMirrors(DrawPlan& plan, bool allow_create) {
             }
             shadows.push_back({pool, 0, pool->size, *mirror->buffer, 0, true, snapshot,
                                snapshot_offset, true});
+            ++shadow_bounds_epoch;
             ++counters.shadow_creates;
             counters.shadow_bytes_in += pool->size;
             impl.stats.vram_write_ranges.fetch_add(1, std::memory_order_relaxed);
@@ -351,6 +382,7 @@ void DrawContext::ApplyMirrors(DrawPlan& plan, bool allow_create) {
         }
         shadows.push_back({use.pool, use.offset, use_end, *mirror->buffer, use.offset, true,
                            snapshot, snapshot_offset, true});
+        ++shadow_bounds_epoch;
         ++counters.shadow_creates;
         counters.shadow_bytes_in += use.size;
         impl.stats.vram_write_ranges.fetch_add(1, std::memory_order_relaxed);
@@ -462,15 +494,30 @@ void DrawContext::ApplyMirrors(DrawPlan& plan, bool allow_create) {
         }
     }
     host->HostBeginBufferOp(accesses);
+    // The snapshots read from mirrors and write disjoint slices of the shadow chunks.
+    const vk::CommandBuffer cmd = host->HostCmd();
+    VkBuffer source{};
+    VkBuffer destination{};
+    mirror_regions.clear();
     for (Shadow& entry : shadows) {
         if (!entry.snapshot_pending) {
             continue;
         }
         entry.snapshot_pending = false;
-        const VkBufferCopy region{.srcOffset = entry.begin,
+        if (source != entry.buffer || destination != entry.snapshot) {
+            if (!mirror_regions.empty()) {
+                cmd.CopyBuffer(source, destination, mirror_regions);
+                mirror_regions.clear();
+            }
+            source = entry.buffer;
+            destination = entry.snapshot;
+        }
+        mirror_regions.push_back({.srcOffset = entry.begin,
                                   .dstOffset = entry.snapshot_offset,
-                                  .size = entry.end - entry.begin};
-        host->HostCmd().CopyBuffer(entry.buffer, entry.snapshot, region);
+                                  .size = entry.end - entry.begin});
+    }
+    if (!mirror_regions.empty()) {
+        cmd.CopyBuffer(source, destination, mirror_regions);
     }
     host->HostEndBufferOp();
 }
@@ -565,17 +612,39 @@ void DrawContext::PrefetchMirrors() {
     if (!impl.ubo_mirror && (impl.vtxcov & (VTXCOV_INPASS | VTXCOV_SHADER_WRITES)) == 0) {
         return;
     }
-    for (const auto& entry : impl.vram_prefetch_mirrors) {
+    const auto collect = [&](Pool& pool) {
+        mirror_runs.clear();
+        impl.MirrorTakeStaleWanted(pool, mirror_runs);
+        for (const auto& [begin, end] : mirror_runs) {
+            mirror_copies.push_back({&pool, begin, end});
+        }
+    };
+    for (const auto& group : impl.vram_prefetch_groups) {
+        if (group.pending->load(std::memory_order_acquire) == 0) {
+            continue;
+        }
+        // Clear before collecting. Concurrent guest writes remain pending for the next pass.
+        u64 pending = group.pending->exchange(0, std::memory_order_acq_rel);
+        SCOPE_EXIT {
+            if (pending != 0) {
+                group.pending->fetch_or(pending, std::memory_order_relaxed);
+            }
+        };
+        while (pending != 0) {
+            const auto bit = static_cast<size_t>(std::countr_zero(pending));
+            if (Pool* const pool = group.pools[bit]) {
+                collect(*pool);
+            }
+            pending &= pending - 1;
+        }
+    }
+    for (const auto& entry : impl.vram_prefetch_poll) {
         if (entry.write_epoch != nullptr &&
             entry.write_epoch->load(std::memory_order_acquire) == entry.mirror->epoch_clean &&
             !entry.mirror->wanted_dirty) {
             continue;
         }
-        mirror_runs.clear();
-        impl.MirrorTakeStaleWanted(*entry.pool, mirror_runs);
-        for (const auto& [begin, end] : mirror_runs) {
-            mirror_copies.push_back({entry.pool, begin, end});
-        }
+        collect(*entry.pool);
     }
     // Before the barrier flush of the pass begin: its barrier orders the copies before the draws'
     // uniform reads.
@@ -653,6 +722,7 @@ bool DrawContext::CreateShadow(DrawPlan& plan, const DrawPlan::RangeUse& use) {
     host->HostCmd().CopyBuffer(use.pool->Handle(), buffer, region);
     EndShadowCopy();
     shadows.push_back({use.pool, use.offset, use.offset + use.size, buffer, offset});
+    ++shadow_bounds_epoch;
     ++counters.shadow_creates;
     counters.shadow_bytes_in += use.size;
     if (Debug::Get().shadow_log && shadow_logged.size() < MAX_LOGGED_SHADOWS &&
@@ -714,6 +784,7 @@ void DrawContext::OnCpuWrite(Pool& pool, u64 offset, u64 size) {
 void DrawContext::FlushShadow(size_t index, std::atomic<u64> DrawCounters::*cause) {
     const Shadow shadow = shadows[index];
     shadows.erase(shadows.begin() + static_cast<std::ptrdiff_t>(index));
+    ++shadow_bounds_epoch;
     if (shadow.mirror) {
         WriteBackMirrorEntries({&shadow, 1}, cause);
         return;
@@ -836,7 +907,8 @@ void DrawContext::WriteBackMirrorEntries(std::span<const Shadow> entries,
                 add_range(run.begin, run.end, run.lines);
             }
         }
-        merge->Record(host->HostCmd(), ranges);
+        merge->Record(host->HostCmd(), ranges,
+                      [this](VkDescriptorSetLayout layout) { return AllocateSet(layout); });
     } else {
         // No merge shader: the whole ranges go back (the storage shadows' behaviour).
         for (const Shadow& entry : entries) {
@@ -889,7 +961,9 @@ void DrawContext::FlushShadows() {
             entries.push_back(shadow);
         }
     }
-    std::erase_if(shadows, [](const Shadow& shadow) { return shadow.mirror; });
+    if (std::erase_if(shadows, [](const Shadow& shadow) { return shadow.mirror; }) != 0) {
+        ++shadow_bounds_epoch;
+    }
     WriteBackMirrorEntries(entries, &DrawCounters::shadow_flush_segment);
     const ShadowCopyBatch batch{*this};
     while (!shadows.empty()) {

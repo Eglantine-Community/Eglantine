@@ -9,15 +9,16 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <type_traits>
 #include <vector>
-#include <queue>
 
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
@@ -38,6 +39,11 @@ class StatefulThreadWorker {
     using Task =
         std::conditional_t<with_state, UniqueFunction<void, StateType*>, UniqueFunction<void>>;
     using StateMaker = std::conditional_t<with_state, std::function<StateType()>, DummyCallable>;
+
+    struct Request {
+        Task task;
+        const void* key;
+    };
 
 public:
     explicit StatefulThreadWorker(size_t num_workers, std::string name, StateMaker func = {},
@@ -73,8 +79,8 @@ public:
                         if (stop_token.stop_requested()) {
                             break;
                         }
-                        task = std::move(requests.front());
-                        requests.pop();
+                        task = std::move(requests.front().task);
+                        requests.pop_front();
                     }
                     if constexpr (with_state) {
                         task(&state);
@@ -102,10 +108,10 @@ public:
     StatefulThreadWorker& operator=(StatefulThreadWorker&&) = delete;
     StatefulThreadWorker(StatefulThreadWorker&&) = delete;
 
-    void QueueWork(Task work) {
+    void QueueWork(Task work, const void* key = nullptr) {
         {
             std::unique_lock lock{queue_mutex};
-            requests.emplace(std::move(work));
+            requests.emplace_back(std::move(work), key);
             ++work_scheduled;
         }
         condition.notify_one();
@@ -129,21 +135,27 @@ public:
                work_done.load(std::memory_order_relaxed);
     }
 
-    /// Runs one queued task on the calling thread, if there is one: for a thread that would
-    /// otherwise idle until other work finishes. Stateless workers only.
-    bool TryRunOne() {
+    /// Runs the first queued task matching key, or the front task if no key is supplied.
+    /// Stateless workers only.
+    bool TryRunOne(const void* key = nullptr) {
         static_assert(!with_state, "TryRunOne has no state to give the task");
         Task task;
         {
             std::scoped_lock lock{queue_mutex};
-            if (requests.empty()) {
+            const auto it = key == nullptr
+                                ? requests.begin()
+                                : std::ranges::find(requests, key, &Request::key);
+            if (it == requests.end()) {
                 return false;
             }
-            task = std::move(requests.front());
-            requests.pop();
+            task = std::move(it->task);
+            requests.erase(it);
         }
         task();
-        ++work_done;
+        {
+            std::scoped_lock lock{queue_mutex};
+            ++work_done;
+        }
         wait_condition.notify_all();
         return true;
     }
@@ -152,11 +164,11 @@ public:
     void ClearRequests() {
         std::scoped_lock lock{queue_mutex};
         work_scheduled -= requests.size();
-        requests = std::queue<Task>{};
+        requests.clear();
     }
 
 private:
-    std::queue<Task> requests;
+    std::deque<Request> requests;
     std::mutex queue_mutex;
     std::condition_variable_any condition;
     std::condition_variable wait_condition;

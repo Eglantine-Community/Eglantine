@@ -184,6 +184,33 @@ struct SmartEncode {
     bool keep_blocks{};           ///< fill GpuEncodeResult::blocks
 };
 
+AllocateComputeSet TestComputeSetAllocator(const Vulkan::Device& device, u32 count) {
+    const std::array sizes{
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, count * 2},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, count},
+        VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, count * 2},
+    };
+    const auto pool =
+        std::make_shared<Vulkan::vk::DescriptorPool>(device.GetLogical().CreateDescriptorPool({
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .maxSets = count,
+            .poolSizeCount = static_cast<u32>(sizes.size()),
+            .pPoolSizes = sizes.data(),
+        }));
+    return [&device, pool](VkDescriptorSetLayout layout) {
+        const VkDescriptorSetAllocateInfo info{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool = **pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &layout,
+        };
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        Vulkan::vk::Check(device.GetDispatchLoader().vkAllocateDescriptorSets(
+            *device.GetLogical(), &info, &set));
+        return set;
+    };
+}
+
 /// Runs `levels` through the recorder's BC upload sequence (Recorder::UploadBcFromStaging and
 /// RecordBcUpload: RGBA8 copied into the scratch a chunk of layers at a time, encoded, the blocks
 /// copied into the level of a BC image), reads the image back and decodes it on the CPU. BC4 and
@@ -216,6 +243,7 @@ GpuEncodeResult EncodeOnGpu(const Vulkan::Device& device, std::span<const Rgba8L
     {
         MemoryAllocator allocator(device, vma);
         const BcGpuEncoder encoder(device, bc7, smart.spirv);
+        const auto allocate_set = TestComputeSetAllocator(device, level_count * layers);
         u32 scratch_layers = 1;
         for (const BcChunk& chunk : SplitBcLayers(0, 0, layers, width, height)) {
             scratch_layers = (std::max)(scratch_layers, chunk.layers);
@@ -390,14 +418,15 @@ GpuEncodeResult EncodeOnGpu(const Vulkan::Device& device, std::span<const Rgba8L
                 const u64 blocks_size =
                     BcBlocksSize(chunk.width, chunk.height, chunk.layers, block_bytes);
                 if (bc7) {
-                    encoder.RecordBc7(cmd, *scratch->view, chunk.width, chunk.height,
-                                      chunk.layers, quality, *scratch->modes,
-                                      BcBlocksSize(chunk.width, chunk.height, chunk.layers, 8),
-                                      *scratch->blocks, blocks_size);
+                    REQUIRE(encoder.RecordBc7(
+                        cmd, *scratch->view, chunk.width, chunk.height, chunk.layers, quality,
+                        *scratch->modes, BcBlocksSize(chunk.width, chunk.height, chunk.layers, 8),
+                        *scratch->blocks, blocks_size, allocate_set));
                 } else {
-                    encoder.Record(cmd, *scratch->view, chunk.width, chunk.height, chunk.layers,
-                                   BcBlocksOf(kind, smart.smart), smart.refine, *scratch->blocks,
-                                   blocks_size);
+                    REQUIRE(encoder.Record(cmd, *scratch->view, chunk.width, chunk.height,
+                                           chunk.layers, BcBlocksOf(kind, smart.smart),
+                                           smart.refine, *scratch->blocks, blocks_size,
+                                           allocate_set));
                 }
                 const VkMemoryBarrier blocks_written{
                     .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -755,6 +784,7 @@ TEST_CASE("NVN ASTC stand-in: block-linear ASTC decodes and re-encodes into a BC
     constexpr u32 HEIGHT = 45;
     constexpr u32 LEVELS = 4;
     constexpr u32 LAYERS = 3;
+    constexpr u16 COPY_COLOR = 0x8080;
     TextureLayoutDesc desc{
         .target = static_cast<s32>(TexTarget::Dim2DArray),
         .format = FORMAT,
@@ -796,9 +826,13 @@ TEST_CASE("NVN ASTC stand-in: block-linear ASTC decodes and re-encodes into a BC
                             std::vector<u8>(size_t{width} * height * 4)};
             for (u32 row = 0; row < rows; ++row) {
                 for (u32 column = 0; column < columns; ++column) {
-                    const std::array<u16, 4> color{
+                    std::array<u16, 4> color{
                         static_cast<u16>(random()), static_cast<u16>(random()),
                         static_cast<u16>(random()), static_cast<u16>(random())};
+                    if (level == 0 && layer == 0 && row == 0 && column < 2) {
+                        const u16 gray = column ? COPY_COLOR : 0;
+                        color = {gray, gray, gray, 65535};
+                    }
                     const auto encoded = VoidExtentBlock(color);
                     std::memcpy(&linear[(size_t{row} * columns + column) * 16], encoded.data(), 16);
                     for (u32 y = row * 4; y < (std::min)(row * 4 + 4, height); ++y) {
@@ -819,8 +853,8 @@ TEST_CASE("NVN ASTC stand-in: block-linear ASTC decodes and re-encodes into a BC
         levels.push_back({
             .level = 0, // the scratch's level
             .layers = LAYERS,
-            .columns = columns,
-            .rows = rows,
+            .width = width,
+            .height = height,
             .offset = TextureLevelOffset(desc, level),
             .layer_stride = static_cast<u32>(layout.layer_size),
             .block_width = 4,
@@ -830,8 +864,17 @@ TEST_CASE("NVN ASTC stand-in: block-linear ASTC decodes and re-encodes into a BC
         });
     }
 
+    // Copy one gray pixel into the first black block without changing its neighbors or
+    // linearizing the color in the sRGB texture.
+    std::fill_n(expected.front().texels.begin() + (WIDTH + 1) * 4, 3, ToUnorm8(COPY_COLOR));
+    const bool swiftshader = device.GetDriverID() == VK_DRIVER_ID_GOOGLE_SWIFTSHADER;
     for (const bool bc3 : {true, false}) {
-        INFO((bc3 ? "BC3" : "BC1"));
+        const VkFormat view_format =
+            bc3 ? VK_FORMAT_BC3_UNORM_BLOCK : VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+        // SwiftShader samples the decompressed image's format instead of the UNORM view.
+        const VkFormat image_format =
+            !bc3 && !swiftshader ? VK_FORMAT_BC1_RGBA_SRGB_BLOCK : view_format;
+        INFO((bc3 ? "BC3" : swiftshader ? "BC1 UNORM" : "BC1 sRGB"));
         const u32 block_bytes = bc3 ? 16 : 8;
         VmaAllocator vma = device.CreateThreadSafeAllocator();
         SCOPE_EXIT {
@@ -840,7 +883,8 @@ TEST_CASE("NVN ASTC stand-in: block-linear ASTC decodes and re-encodes into a BC
         {
             MemoryAllocator allocator(device, vma);
             const AstcGpuDecoder decoder(device);
-            const BcGpuEncoder encoder(device);
+            BcGpuEncoder encoder(device);
+            const auto allocate_set = TestComputeSetAllocator(device, LEVELS * 2 + 2);
             const std::shared_ptr<BcScratch> scratch =
                 MakeBcScratch(device, allocator, WIDTH, HEIGHT, LAYERS);
 
@@ -865,7 +909,7 @@ TEST_CASE("NVN ASTC stand-in: block-linear ASTC decodes and re-encodes into a BC
                 .pNext = nullptr,
                 .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
                 .imageType = VK_IMAGE_TYPE_2D,
-                .format = bc3 ? VK_FORMAT_BC3_UNORM_BLOCK : VK_FORMAT_BC1_RGBA_UNORM_BLOCK,
+                .format = image_format,
                 .extent = {WIDTH, HEIGHT, 1},
                 .mipLevels = LEVELS,
                 .arrayLayers = LAYERS,
@@ -962,11 +1006,8 @@ TEST_CASE("NVN ASTC stand-in: block-linear ASTC decodes and re-encodes into a BC
                 };
                 cmd.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                     VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, reuse, {}, to_general);
-                for (vk::ImageView& view :
-                     decoder.Record(cmd, *input, 0, guest.size(), *scratch->image,
-                                    std::span{&levels[level], 1})) {
-                    views.push_back(std::move(view));
-                }
+                REQUIRE(decoder.Record(cmd, *input, 0, guest.size(), *scratch->image,
+                                       std::span{&levels[level], 1}, views, allocate_set));
                 const VkMemoryBarrier texels_written{
                     .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
                     .pNext = nullptr,
@@ -975,9 +1016,10 @@ TEST_CASE("NVN ASTC stand-in: block-linear ASTC decodes and re-encodes into a BC
                 };
                 cmd.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, texels_written);
-                encoder.Record(cmd, *scratch->view, width, height, LAYERS,
-                               bc3 ? BcBlocks::Bc3 : BcBlocks::Bc1, false, *scratch->blocks,
-                               BcBlocksSize(width, height, LAYERS, block_bytes));
+                REQUIRE(encoder.Record(cmd, *scratch->view, width, height, LAYERS,
+                                       bc3 ? BcBlocks::Bc3 : BcBlocks::Bc1, false, *scratch->blocks,
+                                       BcBlocksSize(width, height, LAYERS, block_bytes),
+                                       allocate_set));
                 const VkMemoryBarrier blocks_written{
                     .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
                     .pNext = nullptr,
@@ -997,6 +1039,76 @@ TEST_CASE("NVN ASTC stand-in: block-linear ASTC decodes and re-encodes into a BC
                 cmd.CopyBufferToImage(*scratch->blocks, *image,
                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
             }
+
+            const VkImageSubresourceRange first_layer{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            const auto first_view = logical.CreateImageView({
+                .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                .image = *image,
+                .viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY,
+                .format = view_format,
+                .subresourceRange = first_layer,
+            });
+            VkImageMemoryBarrier partial = to_dst;
+            partial.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            partial.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+            partial.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            partial.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            partial.subresourceRange = first_layer;
+            const VkMemoryBarrier reuse_scratch{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+            };
+            cmd.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                0, reuse_scratch, {}, partial);
+            if (swiftshader) {
+                // SwiftShader preprocesses compressed texels for blits and draws. Prime its
+                // decompression cache before verifying descriptor binding on a compute dispatch.
+                const VkImageBlit prime{
+                    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                    .srcOffsets = {{0, 0, 0}, {4, 4, 1}},
+                    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                    .dstOffsets = {{0, 0, 0}, {4, 4, 1}},
+                };
+                cmd.BlitImage(*image, VK_IMAGE_LAYOUT_GENERAL, *scratch->image,
+                              VK_IMAGE_LAYOUT_GENERAL, prime, VK_FILTER_NEAREST);
+                const VkMemoryBarrier blit_written{
+                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                };
+                cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, blit_written);
+            }
+            REQUIRE(encoder.RecordCopy(cmd, *first_view, *first_view, *scratch->view, {4, 0},
+                                       {1, 1}, {0, 0}, {1, 1}, {4, 4}, 1, allocate_set));
+            const VkMemoryBarrier copied{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+            };
+            cmd.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, copied);
+            REQUIRE(encoder.Record(cmd, *scratch->view, 4, 4, 1, bc3 ? BcBlocks::Bc3 : BcBlocks::Bc1,
+                                   true, *scratch->blocks, block_bytes, allocate_set));
+            const VkMemoryBarrier block_encoded{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            };
+            partial.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            partial.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            partial.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            partial.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            cmd.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                0, block_encoded, {}, partial);
+            cmd.CopyBufferToImage(*scratch->blocks, *image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                  VkBufferImageCopy{
+                                      .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                      .imageExtent = {4, 4, 1},
+                                  });
+
             VkImageMemoryBarrier to_src = to_dst;
             to_src.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;

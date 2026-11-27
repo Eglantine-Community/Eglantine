@@ -679,6 +679,33 @@ private:
     [[nodiscard]] std::optional<IR::Value> TryFold(IR::Block& block, IR::Inst& inst) {
         const IR::Opcode op = inst.GetOpcode();
         switch (op) {
+        case IR::Opcode::ConvertF32S32:
+        case IR::Opcode::ConvertF32U32: {
+            auto control = inst.Flags<IR::FpControl>();
+            if (!control.require_rounding) {
+                return std::nullopt;
+            }
+            const IR::Value src = inst.Arg(0);
+            const KnownBits bits = GetKnownBits(src);
+            const bool is_signed = op == IR::Opcode::ConvertF32S32;
+            constexpr u32 sign = 0x80000000U;
+            // FP32 keeps 24 significant bits. For a nonnegative integer, only bits between
+            // the possible leading and trailing ones matter. [-2^24, -1] is also exact.
+            const u32 possible_ones = ~bits.zeros;
+            const bool exact_nonnegative =
+                (!is_signed || (bits.zeros & sign) != 0U) &&
+                static_cast<int>(std::bit_width(possible_ones)) <=
+                    24 + std::countr_zero(possible_ones);
+            const bool exact_negative = is_signed && (bits.ones & 0xff000000U) == 0xff000000U;
+            if (exact_nonnegative || exact_negative) {
+                control.require_rounding = false;
+                control.rounding = IR::FpRounding::DontCare;
+                inst.SetFlags(control);
+                return std::nullopt;
+            }
+            IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(inst)};
+            return ir.ConvertI32ToF32Rounded(IR::U32{src}, is_signed, control.rounding);
+        }
         case IR::Opcode::BitCastU32F32: {
             const IR::Value x = inst.Arg(0).Resolve();
             if (x.IsImmediate()) {
