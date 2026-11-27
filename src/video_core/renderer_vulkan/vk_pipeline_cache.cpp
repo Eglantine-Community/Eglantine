@@ -4177,12 +4177,22 @@ vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::
         file.read(cache_data.data(), cache_size);
 
         LOG_INFO(Render_Vulkan,
-                 "Loaded Vulkan driver pipeline cache: ", Common::FS::PathToUTF8String(filename));
+                 "Loaded Vulkan driver pipeline cache: {}", Common::FS::PathToUTF8String(filename));
 
         return create_pipeline_cache(cache_size, cache_data.data());
 
     } catch (const std::ios_base::failure& e) {
         LOG_ERROR(Common_Filesystem, "{}", e.what());
+        if (!Common::FS::RemoveFile(filename)) {
+            LOG_ERROR(Common_Filesystem, "Failed to delete Vulkan driver pipeline cache file {}",
+                      Common::FS::PathToUTF8String(filename));
+        }
+
+        return create_pipeline_cache(0, nullptr);
+    } catch (const vk::Exception& e) {
+        LOG_WARNING(Render_Vulkan,
+                    "Driver rejected Vulkan pipeline cache {} ({}), deleting and creating empty cache",
+                    Common::FS::PathToUTF8String(filename), e.what());
         if (!Common::FS::RemoveFile(filename)) {
             LOG_ERROR(Common_Filesystem, "Failed to delete Vulkan driver pipeline cache file {}",
                       Common::FS::PathToUTF8String(filename));

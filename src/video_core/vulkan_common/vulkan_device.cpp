@@ -964,7 +964,15 @@ void Device::LoadStaticPipelineCache() {
         create(0, nullptr);
         return;
     }
-    create(data.size(), data.empty() ? nullptr : data.data());
+    try {
+        create(data.size(), data.empty() ? nullptr : data.data());
+    } catch (const vk::Exception& e) {
+        LOG_WARNING(Render_Vulkan,
+                    "Driver rejected static pipeline cache {} ({}), deleting and creating empty cache",
+                    Common::FS::PathToUTF8String(filename), e.what());
+        Common::FS::RemoveFile(filename);
+        create(0, nullptr);
+    }
 }
 
 void Device::SaveStaticPipelineCache() const {
