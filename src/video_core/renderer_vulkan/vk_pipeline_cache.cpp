@@ -94,7 +94,7 @@ using VideoCommon::GraphicsEnvironment;
 // translated again at boot and written back under the new one. Bump MIN_COMPATIBLE_CACHE_VERSION
 // too only when the record layout (environment or key serialization) changes, which deletes older
 // caches. 36 replaces Maxwell-lowered native blobs with direct native Ampere streams.
-constexpr u32 CACHE_VERSION = 37; // 37: native Ampere programs can request workgroup HMMA
+constexpr u32 CACHE_VERSION = 38; // 38: remove the title-specific native depth override
 static_assert(CACHE_VERSION == VideoCommon::ShaderWarm::WarmCacheVersion,
               "Shader precache files use the pipeline cache version");
 constexpr u32 MIN_COMPATIBLE_CACHE_VERSION = 36;

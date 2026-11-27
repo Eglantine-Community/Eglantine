@@ -2809,7 +2809,8 @@ TEST_CASE("VTX-HLE clears the title shader caches once after emulated GPU use",
     std::ofstream(driver) << "driver";
     std::ofstream(unrelated) << "notes";
     std::ofstream(other / "vulkan.bin") << "other";
-    CHECK(ClearShaderCachesForNvn(title, true) == NvnCacheTransition::Unchanged);
+    std::ofstream(title / "vulkan.bin.v36") << "other build";
+    CHECK(ClearShaderCachesForNvn(title) == NvnCacheTransition::Unchanged);
     CHECK(std::filesystem::exists(portable));
     CHECK(std::filesystem::exists(driver));
 
@@ -2817,19 +2818,47 @@ TEST_CASE("VTX-HLE clears the title shader caches once after emulated GPU use",
         std::ofstream(legacy / name) << "legacy";
     }
     std::ofstream(title / "opengl.bin") << "gl";
-    CHECK(ClearShaderCachesForNvn(title, true) == NvnCacheTransition::Cleared);
+    CHECK(ClearShaderCachesForNvn(title) == NvnCacheTransition::Cleared);
     CHECK_FALSE(std::filesystem::exists(portable));
     CHECK_FALSE(std::filesystem::exists(driver));
     CHECK_FALSE(std::filesystem::exists(title / "opengl.bin"));
     CHECK(std::filesystem::is_empty(legacy));
     CHECK(std::filesystem::exists(unrelated));
     CHECK(std::filesystem::exists(other / "vulkan.bin"));
+    CHECK(std::filesystem::exists(title / "vulkan.bin.v36"));
 
     std::ofstream(portable) << "fresh NVN cache";
-    CHECK(ClearShaderCachesForNvn(title, true) == NvnCacheTransition::Unchanged);
+    CHECK(ClearShaderCachesForNvn(title) == NvnCacheTransition::Unchanged);
     CHECK(std::filesystem::exists(portable));
-    CHECK(ClearShaderCachesForNvn(directory.path / "missing", false) ==
+    CHECK(ClearShaderCachesForNvn(directory.path / "missing") ==
           NvnCacheTransition::Unchanged);
+}
+
+TEST_CASE("Shader cache transition refuses a legacy directory symlink",
+          "[nvn][vtxhle][shader-cache-transition]") {
+    using namespace VideoCommon;
+    TempDirectory directory;
+    const auto title = directory.path / "title";
+    const auto outside = directory.path / "outside";
+    std::filesystem::create_directories(title);
+    std::filesystem::create_directories(outside);
+    std::ofstream(outside / "vulkan.bin.v37") << "keep";
+    std::error_code ec;
+    std::filesystem::create_directory_symlink(outside, title / MKW_EMULATED_CACHE_SUBDIR, ec);
+    if (ec) {
+        SKIP("directory symlinks unavailable");
+    }
+    CHECK(ClearShaderCachesForNvn(title) == NvnCacheTransition::Failed);
+    CHECK(std::filesystem::exists(outside / "vulkan.bin.v37"));
+}
+
+TEST_CASE("Emulated cache cleanup recognizes only numeric version backups",
+          "[nvn][vtxhle][shader-cache-transition]") {
+    using namespace VideoCommon;
+    CHECK(IsVulkanPipelineCacheFile("vulkan.mythos.bin.v37"));
+    CHECK(IsVulkanPipelineCacheFile("vulkan.bin.v36"));
+    CHECK_FALSE(IsVulkanPipelineCacheFile("vulkan.bin.v"));
+    CHECK_FALSE(IsVulkanPipelineCacheFile("vulkan.bin.v37.notes"));
 }
 
 TEST_CASE("Graphics lookahead builds the next pipeline without skipping a draw",

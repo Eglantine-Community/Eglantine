@@ -250,7 +250,8 @@ void RemoveTransferableShaderCache(u64 program_id, GameListRemoveTarget target) 
     const auto title_cache_dir = shader_cache_dir / fmt::format("{:016x}", program_id);
     std::vector<std::filesystem::path> files;
     const auto collect_from = [&](const std::filesystem::path& dir) {
-        if (!Common::FS::Exists(dir)) {
+        std::error_code ec;
+        if (!std::filesystem::is_directory(std::filesystem::symlink_status(dir, ec)) || ec) {
             return;
         }
         Common::FS::IterateDirEntries(
@@ -267,12 +268,10 @@ void RemoveTransferableShaderCache(u64 program_id, GameListRemoveTarget target) 
             Common::FS::DirEntryFilter::File);
     };
     collect_from(title_cache_dir);
-    if (target == GameListRemoveTarget::VkShaderCache) {
-        const auto vk_cache_dir =
-            Common::FS::GetVulkanPipelineCacheDir(shader_cache_dir, program_id);
-        if (vk_cache_dir != title_cache_dir) {
-            collect_from(vk_cache_dir);
-        }
+    std::error_code ec;
+    if (target == GameListRemoveTarget::VkShaderCache &&
+        std::filesystem::is_directory(std::filesystem::symlink_status(title_cache_dir, ec)) && !ec) {
+        collect_from(title_cache_dir / VideoCommon::MKW_EMULATED_CACHE_SUBDIR);
     }
 
     if (files.empty()) {

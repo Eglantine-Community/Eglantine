@@ -11,8 +11,8 @@ namespace Shader::Ampere {
 namespace {
 
 void TranslateRange(TranslatorVisitor& visitor, std::span<const Instruction> code, u32 begin_offset,
-                    u32 range_end_offset, u32 block_end_offset, TensorMode tensor_mode) {
-    for (u32 offset = begin_offset; offset < range_end_offset; offset += sizeof(Instruction)) {
+                    u32 end_offset, TensorMode tensor_mode) {
+    for (u32 offset = begin_offset; offset < end_offset; offset += sizeof(Instruction)) {
         const u32 index = (offset - AmpereLocationBase) / static_cast<u32>(sizeof(Instruction));
         if (index >= code.size()) {
             break;
@@ -250,7 +250,7 @@ void TranslateRange(TranslatorVisitor& visitor, std::span<const Instruction> cod
             break;
         case 0xfae: {
             const bool load_global =
-                (block_end_offset == offset + 8U) ||
+                (end_offset == offset + 8U) ||
                 ((insn.Bits(87, 3) | (insn.Bits(70, 1) << 3)) == 7U);
             visitor.LDGSTS(insn, load_global);
             break;
@@ -347,7 +347,7 @@ void TranslateRange(TranslatorVisitor& visitor, std::span<const Instruction> cod
 void TranslateBlock(Environment& env, IR::Block* block, std::span<const Instruction> code,
                     u32 begin_offset, u32 end_offset, const LoweringOptions& options,
                     bool uses_async_copy, u32& required_texture_buffer,
-                    const std::vector<u8>* branch_targets, bool mkw_zero_depth_fallback) {
+                    const std::vector<u8>* branch_targets) {
     if (begin_offset >= end_offset || begin_offset < AmpereLocationBase) {
         return;
     }
@@ -368,23 +368,7 @@ void TranslateBlock(Environment& env, IR::Block* block, std::span<const Instruct
         }
         return;
     }
-    if (mkw_zero_depth_fallback) {
-        constexpr u32 fallback_byte_offset = 0x2d0;
-        const u32 fallback_offset =
-            AmpereLocationBase + fallback_byte_offset + instruction_byte_offset;
-        if (begin_offset <= fallback_offset && fallback_offset < end_offset &&
-            fallback_byte_offset < code.size_bytes()) {
-            TranslateRange(visitor, code, begin_offset, fallback_offset, end_offset, tensor_mode);
-            // Set the empty-pair flag before translating the instruction at the missing height map.
-            const IR::U32 both_zero = visitor.ir.BitwiseOr(visitor.R(8U), visitor.R(9U));
-            const IR::U1 is_empty = visitor.ir.IEqual(both_zero, visitor.ir.Imm32(0U));
-            const IR::U32 fallback = IR::U32{
-                visitor.ir.Select(is_empty, visitor.ir.Imm32(0x3f800000U), visitor.ir.Imm32(0U))};
-            visitor.R(4U, visitor.ir.BitwiseOr(visitor.R(4U), fallback));
-            begin_offset = fallback_offset;
-        }
-    }
-    TranslateRange(visitor, code, begin_offset, end_offset, end_offset, tensor_mode);
+    TranslateRange(visitor, code, begin_offset, end_offset, tensor_mode);
 }
 
 } // namespace Shader::Ampere

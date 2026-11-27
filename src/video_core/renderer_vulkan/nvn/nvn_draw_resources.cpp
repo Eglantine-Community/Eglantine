@@ -21,7 +21,7 @@
 #include "video_core/sampler_overrides.h"
 
 VideoCommon::NvnCacheTransition VideoCommon::ClearShaderCachesForNvn(
-    const std::filesystem::path& title_dir, bool mario_kart_world) {
+    const std::filesystem::path& title_dir) {
     namespace fs = std::filesystem;
     std::error_code ec;
     const auto title_status = fs::symlink_status(title_dir, ec);
@@ -42,21 +42,19 @@ VideoCommon::NvnCacheTransition VideoCommon::ClearShaderCachesForNvn(
         return NvnCacheTransition::Failed;
     }
     const auto collect_vulkan = [&](const fs::path& directory) {
+        const auto status = fs::symlink_status(directory, ec);
+        if (status.type() == fs::file_type::not_found) {
+            ec.clear();
+            return true;
+        }
+        if (ec || !fs::is_directory(status)) {
+            return false;
+        }
         return std::ranges::all_of(EMULATED_VULKAN_CACHE_FILES,
                                    [&](auto name) { return collect(directory / name); });
     };
-    if (!collect_vulkan(title_dir)) {
+    if (!collect_vulkan(title_dir) || !collect_vulkan(title_dir / MKW_EMULATED_CACHE_SUBDIR)) {
         return NvnCacheTransition::Failed;
-    }
-    if (mario_kart_world) {
-        const auto subdir = title_dir / MKW_EMULATED_CACHE_SUBDIR;
-        if (fs::exists(subdir, ec)) {
-            if (fs::is_symlink(subdir, ec) || ec || !collect_vulkan(subdir)) {
-                return NvnCacheTransition::Failed;
-            }
-        } else if (ec) {
-            return NvnCacheTransition::Failed;
-        }
     }
     if (legacy_files.empty()) {
         return NvnCacheTransition::Unchanged;
@@ -269,7 +267,7 @@ void DrawResources::OpenCache(u64 title_id) {
     const auto transition =
         title_id != 0 && !isolated_cache && !shader_refresh &&
                 Settings::values.use_disk_shader_cache.GetValue()
-            ? VideoCommon::ClearShaderCachesForNvn(title_dir, impl.mario_kart_world)
+            ? VideoCommon::ClearShaderCachesForNvn(title_dir)
             : VideoCommon::NvnCacheTransition::Unchanged;
     if (transition == VideoCommon::NvnCacheTransition::Cleared) {
         LOG_INFO(Render_Vulkan, "[nvn] cleared shader caches for {:016x} on the switch from "

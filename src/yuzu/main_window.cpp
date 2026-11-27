@@ -204,7 +204,6 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 
 // Video Core //
 #include "video_core/gpu.h"
-#include "video_core/pipeline_cache_backups.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_notify.h"
 #include "video_core/shader_warm/shader_warm_builder.h"
@@ -3187,11 +3186,6 @@ void MainWindow::OnGameListRemoveFile(u64 program_id, QtCommon::Game::GameListRe
         std::error_code ec;
         std::filesystem::remove(ShaderWarm::WarmMarkerPath(ShaderWarm::ComputeWarmPath(program_id)),
                                 ec);
-        // Caches other builds set aside would otherwise come back at the next boot.
-        VideoCommon::RemovePipelineCacheVersionBackups(
-            Common::FS::GetVulkanPipelineCacheDir(
-                Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir), program_id) /
-            "vulkan.mythos.bin");
         [[fallthrough]];
     }
     case QtCommon::Game::GameListRemoveTarget::GlShaderCache:
