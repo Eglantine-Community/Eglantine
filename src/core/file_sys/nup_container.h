@@ -206,6 +206,18 @@ public:
         return files.size();
     }
 
+    /// Visits every entry under a package root in TOC order, each directory before its
+    /// contents. `path` holds the names from below the package root down to the entry;
+    /// `file_index` is set for member files (see OpenFile) and empty for directories.
+    using TreeVisitor = std::function<void(std::span<const std::string> path,
+                                           std::optional<std::size_t> file_index)>;
+    void WalkPackageTree(std::size_t package_index, const TreeVisitor& visit) const;
+
+    /// SHA-256 of a member file's uncompressed contents, as the TOC records it.
+    const std::array<u8, 0x20>& GetFileSha256(std::size_t file_index) const {
+        return files[file_index].sha256;
+    }
+
 private:
     struct DirNode {
         std::string name;
@@ -236,6 +248,7 @@ private:
     std::optional<std::size_t> FindStandIn(std::size_t damaged,
                                            std::span<const std::size_t> siblings) const;
     VirtualDir BuildPackageDir(u32 dir_index, bool serve_stand_ins);
+    void WalkDir(u32 dir_index, std::vector<std::string>& path, const TreeVisitor& visit) const;
     std::vector<u8> ReadExtentRaw(const FileNode& node) const;
 
     VirtualFile file;

@@ -1682,36 +1682,43 @@ void CheckedName(const std::string& name) {
     }
 }
 
-void WriteDir(const FileSys::VirtualDir& dir, const fs::path& dest, PackProgress& progress,
-              const std::function<void(const PackProgress&)>& progress_cb,
-              const std::atomic_bool* cancel, u64& last_report) {
-    if (dir == nullptr) {
-        return;
-    }
+// Writes one package under `dest`, hashing each file as it is written so a damaged extent
+// fails the extraction instead of leaving a file that only looks complete.
+void WritePackage(FileSys::NupContainer& nup, size_t package_index, const fs::path& dest,
+                  const fs::path& out_dir, PackProgress& progress,
+                  const std::function<void(const PackProgress&)>& progress_cb,
+                  const std::atomic_bool* cancel, u64& last_report) {
     std::error_code ec;
     fs::create_directories(dest, ec);
     if (ec) {
         throw ExtractError(ExtractResult::IoError, "cannot create " + ToUtf8(dest));
     }
-    for (const auto& sub : dir->GetSubdirectories()) {
-        if (cancel && cancel->load()) {
-            throw ExtractError(ExtractResult::Cancelled, "cancelled");
-        }
-        CheckedName(sub->GetName());
-        WriteDir(sub, dest / FromUtf8(sub->GetName()), progress, progress_cb, cancel,
-                 last_report);
-    }
     std::vector<u8> buffer(ReadBufferSize);
-    for (const auto& file : dir->GetFiles()) {
+    Sha256 hash;
+    nup.WalkPackageTree(package_index, [&](std::span<const std::string> path,
+                                           std::optional<size_t> file_index) {
         if (cancel && cancel->load()) {
             throw ExtractError(ExtractResult::Cancelled, "cancelled");
         }
-        CheckedName(file->GetName());
-        const auto out_path = dest / FromUtf8(file->GetName());
+        fs::path out_path = dest;
+        for (const auto& name : path) {
+            CheckedName(name);
+            out_path /= FromUtf8(name);
+        }
+        if (!file_index) {
+            fs::create_directories(out_path, ec);
+            if (ec) {
+                throw ExtractError(ExtractResult::IoError, "cannot create " + ToUtf8(out_path));
+            }
+            return;
+        }
+        const auto label = ToUtf8(out_path.lexically_relative(out_dir));
+        const auto file = nup.OpenFile(*file_index);
         Common::FS::IOFile out{out_path, Common::FS::FileAccessMode::Write};
         if (!out.IsOpen()) {
             throw ExtractError(ExtractResult::IoError, "cannot write " + ToUtf8(out_path));
         }
+        hash.Reset();
         const u64 size = file->GetSize();
         u64 offset = 0;
         while (offset < size) {
@@ -1722,9 +1729,9 @@ void WriteDir(const FileSys::VirtualDir& dir, const fs::path& dest, PackProgress
                 static_cast<size_t>(std::min<u64>(buffer.size(), size - offset));
             const size_t got = file->Read(buffer.data(), chunk, static_cast<size_t>(offset));
             if (got == 0) {
-                throw ExtractError(ExtractResult::IoError,
-                                   "short read of " + file->GetName());
+                throw ExtractError(ExtractResult::IoError, "short read of " + label);
             }
+            hash.Update(buffer.data(), got);
             if (out.WriteSpan(std::span<const u8>{buffer.data(), got}) != got) {
                 throw ExtractError(ExtractResult::IoError,
                                    "write failed, the disk may be full");
@@ -1739,11 +1746,19 @@ void WriteDir(const FileSys::VirtualDir& dir, const fs::path& dest, PackProgress
             }
         }
         out.Close();
+        const auto digest = hash.Final();
+        const auto& expected = nup.GetFileSha256(*file_index);
+        if (!std::ranges::equal(digest, expected)) {
+            throw ExtractError(ExtractResult::InvalidSource,
+                               "SHA-256 mismatch in " + label + ": expected " + ToHex(expected) +
+                                   ", got " + ToHex(digest) +
+                                   ". The NUP is damaged; get a fresh copy of it.");
+        }
         ++progress.files_done;
         if (progress_cb) {
             progress_cb(progress);
         }
-    }
+    });
 }
 
 } // namespace
@@ -1864,7 +1879,7 @@ ExtractResult ExtractNup(const std::filesystem::path& archive, const std::filesy
         }
         u64 last_report = 0;
         for (const auto& [index, dest] : targets) {
-            WriteDir(nup.GetPackageDir(index), dest, progress, progress_cb, cancel, last_report);
+            WritePackage(nup, index, dest, out_dir, progress, progress_cb, cancel, last_report);
         }
         return ExtractResult::Success;
     } catch (const ExtractError& e) {
