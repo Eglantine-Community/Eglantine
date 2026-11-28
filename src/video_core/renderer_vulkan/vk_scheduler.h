@@ -166,10 +166,13 @@ public:
     }
 
     /// A guest wait-for-idle while the render pass is active: its barrier is recorded when the
-    /// pass ends instead of ending it now. Draws of the pass are ordered with each other by
-    /// rasterization order already; only work outside the pass needs the barrier.
+    /// pass ends instead of ending it now, unless a later draw in the pass writes storage.
     void DeferWaitForIdle(VkPipelineStageFlags stages) {
         deferred_wfi_stages |= stages;
+    }
+
+    [[nodiscard]] bool HasDeferredWaitForIdle() const {
+        return deferred_wfi_stages != 0;
     }
 
     /// Returns true when a render pass is currently active in the scheduler state.
