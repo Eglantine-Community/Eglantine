@@ -2476,7 +2476,10 @@ void TextureCacheRuntime::CopyImageMSAA(Image& dst, Image& src,
                                         std::span<const VideoCommon::ImageCopy> copies) {
     const bool msaa_to_non_msaa = src.info.num_samples > 1 && dst.info.num_samples == 1;
     const u32 num_samples = msaa_to_non_msaa ? src.info.num_samples : dst.info.num_samples;
-    if (ENABLE_MSAA_RESOLVE_CONSUME && msaa_to_non_msaa && copies.size() == 1 &&
+    const VkImageAspectFlags dst_aspect_mask = dst.AspectMask();
+    const bool copies_stencil =
+        (src.AspectMask() & dst_aspect_mask & VK_IMAGE_ASPECT_STENCIL_BIT) != 0;
+    if (ENABLE_MSAA_RESOLVE_CONSUME && !copies_stencil && msaa_to_non_msaa && copies.size() == 1 &&
         src.info.format == dst.info.format) {
         const VideoCommon::ImageCopy& copy = copies.front();
         const ResolveShadow* const shadow = GetValidResolveShadow(src.Handle());
@@ -2592,10 +2595,7 @@ void TextureCacheRuntime::CopyImageMSAA(Image& dst, Image& src,
             return;
         }
     }
-    const VkImageAspectFlags dst_aspect_mask = dst.AspectMask();
     if ((dst_aspect_mask & VK_IMAGE_ASPECT_DEPTH_BIT) != 0) {
-        const bool copies_stencil = (dst_aspect_mask & VK_IMAGE_ASPECT_STENCIL_BIT) != 0 &&
-                                    device.IsExtShaderStencilExportSupported();
         blit_image_helper.CopyMSAADepth(render_pass_cache, dst.Handle(), dst.info.format,
                                         src.Handle(), src.info.format, num_samples, copies,
                                         copies_stencil, msaa_to_non_msaa);
@@ -4880,7 +4880,8 @@ void Framebuffer::CreateFramebuffer(TextureCacheRuntime& runtime,
         samples != VK_SAMPLE_COUNT_1_BIT && num_colors > 0 && runtime.device.IsTiler();
     renderpass_key.resolve_color = do_resolve_color;
 
-    const bool do_resolve_depth_stencil = ENABLE_MSAA_TILER_RESOLVE &&
+    // A later stencil copy can read any sample, so retain the multisample attachment.
+    const bool do_resolve_depth_stencil = ENABLE_MSAA_TILER_RESOLVE && !has_stencil &&
         samples != VK_SAMPLE_COUNT_1_BIT && depth_image != VK_NULL_HANDLE &&
         runtime.device.IsTiler() &&
         SupportsDepthStencilResolve(runtime.device, renderpass_key.depth_format);
