@@ -93,6 +93,12 @@ private:
 
 class FakeRasterizer {
 public:
+    /// The upload walk hashes hot pages through this; the tests have no guest memory to read.
+    template <typename T>
+    T* GetPointer(DAddr) {
+        return nullptr;
+    }
+
     void UpdatePagesCachedCount(DAddr addr, size_t size, s32 delta) {
         calls.emplace_back(addr, size, delta);
     }

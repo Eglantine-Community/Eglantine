@@ -3298,9 +3298,12 @@ void BufferCache<P>::BindMemoNote(BindMemo& memo, BufferId buffer_id, DAddr devi
                                   u64 cpu_epoch_before) {
     if constexpr (!IS_OPENGL) {
         // A walk of the range leaves it clean unless something marked it meanwhile; a deduped
-        // sync did not walk it, so check.
+        // sync did not walk it, so check. Hot pages stay CPU-modified after a walk, and CPU writes
+        // to them don't move the CPU epoch: a memo over them would skip the next walk, and with it
+        // the check that uploads a hot page rewritten within the frame (HotIntraFrameCheck).
+        const bool check_modified = last_sync_deduped || (HotPagesEnabled() && HotIntraFrameCheck());
         if (memory_tracker.CpuEpoch() != cpu_epoch_before ||
-            (last_sync_deduped && memory_tracker.IsRegionCpuModified(device_addr, size))) {
+            (check_modified && memory_tracker.IsRegionCpuModified(device_addr, size))) {
             memo.valid = false;
             return;
         }
