@@ -1490,10 +1490,12 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         }
         case 0x3a8: { // ATOMG.E.STRONG.GPU U32 at a 64-bit register address plus an offset.
             // The operation (bits 87-90) is numbered as in Maxwell ATOM (52-55): ADD..XOR, EXCH (8).
-            // Yoshi and the Mysterious Book exchanges (Orchid fe1ee6d9b7).
+            // Yoshi and the Mysterious Book exchanges (Orchid fe1ee6d9b7). INC (3) and DEC (4) stay
+            // refused: the Maxwell translator turns a U32 ATOM INC/DEC into a plain load.
             const u32 address = insn.Bits(24, 8), operation = insn.Bits(87, 4);
             const s32 offset = static_cast<s32>(insn.Bits(40, 24) << 8) >> 8;
-            if ((insn.words[2] & ~0x07800000U) != 0x001ee100 || operation > 8 || (address & 1) ||
+            if ((insn.words[2] & ~0x07800000U) != 0x001ee100 || operation > 8 || operation == 3 ||
+                operation == 4 || (address & 1) ||
                 address >= 246 || offset < -0x80000 || offset > 0x7ffff)
                 return fail(index, "native global atomic register mode");
             emit(0xed00000000000000ULL | predicate | dest | (u64{address} << 8) |
@@ -2577,7 +2579,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             for (u32 i = 0; i < components; ++i) {
                 const u32 target = !split || i < 2 ? (dest == 255 ? 255U : static_cast<u32>(dest) + i)
                                                   : second_dest + (i - 2);
-                if (target != 255) copy(target, 250 + i);
+                // Without a second destination only the first two components are written.
+                if (target != 255 && (split || i < 2)) copy(target, 250 + i);
             }
             break;
         }
@@ -2641,7 +2644,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                             (op & 0x1ff) == 0x00c || (op & 0x1ff) == 0x00b) {
                             continue;
                         }
-                        if (op == 0xb63) {
+                        if (op == 0xb63 || op == 0x364) {
                             const u32 count = static_cast<u32>(std::popcount(def.Bits(72, 4)));
                             const u32 high = def.Bits(64, 8);
                             const bool packed = def.Bits(79, 1) != 0;

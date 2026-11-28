@@ -40,8 +40,10 @@ public:
             // EXIT/RET rules below can't see. Only used when the capture then runs into an
             // invalid branch (FallbackEnd): ending every capture there broke Donkey Kong Bananza's
             // level loading.
+            // Not BRA.DIV (mode 2): the lowering drops it, so it doesn't end anything.
             if (opcode == 0x947 && instruction.Bits(12, 4) == 7 && instruction.Bits(87, 4) == 7 &&
-                target == s64{index} * 16 && index >= last_forward_target &&
+                instruction.Bits(32, 2) != 2 && target == s64{index} * 16 &&
+                index >= last_forward_target &&
                 index >= last_call_target && fallback_end == 0)
                 fallback_end = index + 1;
         }

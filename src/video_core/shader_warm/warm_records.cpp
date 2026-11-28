@@ -70,6 +70,13 @@ std::optional<std::string> LowerProgram(std::span<const u8> program, LoweredCode
     bool complete = false;
     for (u32 index = 0; index < native.size(); ++index) {
         const auto result = capture.Observe(native[index], index);
+        if (result == Shader::Ampere::ProgramCaptureState::Result::InvalidTarget &&
+            capture.FallbackEnd() != 0) {
+            // As LowerNativeCode: the program ended at its closing self-branch.
+            native.resize(capture.FallbackEnd());
+            complete = true;
+            break;
+        }
         if (result == Shader::Ampere::ProgramCaptureState::Result::InvalidTarget) {
             return "Native allocation has an out-of-range branch target";
         }
@@ -78,6 +85,11 @@ std::optional<std::string> LowerProgram(std::span<const u8> program, LoweredCode
             complete = true;
             break;
         }
+    }
+    // A runtime capture LowerNativeCode cut at the closing self-branch ends there without a
+    // Complete result.
+    if (!complete && capture.FallbackEnd() == native.size()) {
+        complete = true;
     }
     if (!complete) {
         return "Native allocation lacks a complete runtime capture";
