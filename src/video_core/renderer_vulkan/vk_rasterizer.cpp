@@ -7,6 +7,8 @@
 // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/cityhash.h"
+#include "video_core/nx2_resource_trace.h"
 #include <algorithm>
 #include <map>
 #include <array>
@@ -463,6 +465,7 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
 }
 
 RasterizerVulkan::~RasterizerVulkan() {
+    VideoCommon::ResourceTrace::Stop();
     VideoCommon::GpuSplit::Get().SetIdleHook(nullptr, nullptr);
     // The channels are gone by now, and submitting invalidates the state tracker's flags.
     state_tracker.ClearChannel();
@@ -666,7 +669,7 @@ bool RasterizerVulkan::TryNx2IndirectReset() {
             std::scoped_lock lock{texture_cache.mutex};
             for (const auto& run : runs) {
                 if (run.uploaded || !defer) {
-                    texture_cache.WriteMemory(run.cpu_addr, run.count * sizeof(record));
+                    texture_cache.WriteMemory(run.cpu_addr, run.count * sizeof(record), "TryNx2IndirectReset");
                 }
             }
         }
@@ -876,6 +879,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
 
     const char* diag_outcome = "drawn";
     const auto report_failure = [&](std::string_view reason) {
+        TraceNormalTarget(reason == "no pipeline" ? pipeline_cache.GraphicsMissReason() : reason);
         diag_outcome = reason == "no pipeline" ? pipeline_cache.GraphicsMissReason()
                        : reason == "configure failed" ? "configure-failed" : "mesh-disabled";
         static std::set<std::tuple<u64, u64, std::string_view>> seen;
@@ -1109,11 +1113,17 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         report_failure("configure failed");
         return;
     }
+    if (VideoCommon::ResourceTrace::Sampling() &&
+        VideoCommon::ResourceTrace::BeginDraw(
+            pipeline_cache.GraphicsNativeKeys(pipeline->ShaderHashes()))) {
+        TraceTerrainDraw(*pipeline);
+    }
     if (frame_dump.Capturing()) {
         const auto& shader_hashes = pipeline->ShaderHashes();
         frame_dump.NoteKeys(shader_hashes, pipeline_cache.GraphicsNativeKeys(shader_hashes));
         FrameDumpPass(texture_cache.GetFramebuffer());
-        frame_dump.NoteDraw(shader_hashes);
+        frame_dump.NoteDraw(shader_hashes, pipeline->Handle(), pipeline->LinkedFromParts(),
+                            [pipeline] { return pipeline->StageDebugJson(); });
         bool recorded = false;
         if (frame_dump.CapturingSampled()) {
             boost::container::small_vector<FrameDump::Sampled, 16> sampled;
@@ -1126,6 +1136,16 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         if (frame_dump.CapturingBuffers()) {
             recorded |= FrameDumpBuffers(false, shader_hashes);
             recorded |= FrameDumpDrawInputs(is_indexed, shader_hashes);
+            if (VideoCommon::ResourceTrace::Enabled()) {
+                const auto keys = pipeline_cache.GraphicsNativeKeys(shader_hashes);
+                if (std::ranges::find(keys, 0x44c5c4f3fdaaf250ULL) != keys.end()) {
+                    for (const auto& descriptor : guest_descriptor_queue.TraceBuffers()) {
+                        recorded |= frame_dump.NoteHostBuffer(
+                            static_cast<u32>(descriptor.descriptor), descriptor.binding.buffer,
+                            descriptor.binding.offset, descriptor.binding.range);
+                    }
+                }
+            }
         }
         if (recorded) {
             scheduler.RequestRenderpass(texture_cache.GetFramebuffer());
@@ -1164,6 +1184,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         g_diag_query = diag_query;
     }
     submitted = true;
+    TraceNormalTarget("submitted", pipeline);
     static u32 native_capture_count{};
     if (maxwell3d->GetNativeMacroEngine().native_turing &&
         native_capture_count < 16 && [] {
@@ -1985,6 +2006,20 @@ void RasterizerVulkan::DispatchCompute() {
                                   indirect_address, indirect_grid);
         }
     }
+    if (VideoCommon::ResourceTrace::Enabled()) {
+        for (const auto id : pipeline->WrittenImages()) {
+            const auto& view = texture_cache.GetImageView(id);
+            if (view.format == VideoCore::Surface::PixelFormat::R8G8_UNORM &&
+                view.size.width <= 1024 && view.size.height <= 1024) {
+                const auto* image = view.BackingImage();
+                if (image && !image->trace_identity) image->trace_identity = VideoCommon::ResourceTrace::NewIdentity();
+                VideoCommon::ResourceTrace::NoteProducer("normal-compute-producer", fmt::format(
+                    R"("gpu":"{:#x}","key":"{:016x}","width":{},"height":{})",
+                    view.gpu_addr, native_key, view.size.width, view.size.height),
+                    image ? image->trace_identity : id.Value(), native_key);
+            }
+        }
+    }
     SCOPE_EXIT {
         if (!frame_dump.Capturing()) {
             return;
@@ -2341,7 +2376,7 @@ void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::Cache
     }
     if (True(which & VideoCommon::CacheType::TextureCache)) {
         std::scoped_lock lock{texture_cache.mutex};
-        texture_cache.WriteMemory(addr, size);
+        texture_cache.WriteMemory(addr, size, "InvalidateRegion");
     }
     if ((True(which & VideoCommon::CacheType::BufferCache))) {
         std::scoped_lock lock{buffer_cache.mutex};
@@ -2369,7 +2404,7 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
     if (any(texture_cache.page_filter)) {
         std::scoped_lock lock{texture_cache.mutex};
         for (const auto& [addr, size] : sequences) {
-            texture_cache.WriteMemory(addr, size);
+            texture_cache.WriteMemory(addr, size, "InnerInvalidation");
         }
     }
     // Cached textures must observe GPU-side copies even when the remaining invalidations are skipped.
@@ -2443,7 +2478,7 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
         if (spikes) {
             lock_wait += SpikeClock::now() - lock_start;
         }
-        texture_cache.WriteMemory(addr, size);
+        texture_cache.WriteMemory(addr, size, "OnCPUWrite");
     }
     pipeline_cache.InvalidateRegion(addr, size);
     finish();
@@ -2457,7 +2492,7 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
 
     {
         std::scoped_lock lock{texture_cache.mutex};
-        texture_cache.WriteMemory(addr, size);
+        texture_cache.WriteMemory(addr, size, "OnCacheInvalidation");
     }
     {
         std::scoped_lock lock{buffer_cache.mutex};
@@ -2483,7 +2518,7 @@ void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64
         std::scoped_lock lock{texture_cache.mutex};
         for (const auto& [addr, size] : ranges) {
             if (addr != 0 && size != 0) {
-                texture_cache.WriteMemory(addr, size);
+                texture_cache.WriteMemory(addr, size, "OnCacheInvalidations");
             }
         }
     }
@@ -2503,7 +2538,7 @@ bool RasterizerVulkan::TryCacheInvalidation(DAddr addr, u64 size) {
         const DAddr page_begin = Common::AlignDown(addr, Core::DEVICE_PAGESIZE);
         const DAddr page_end = Common::AlignUp(addr + size, Core::DEVICE_PAGESIZE);
         if (buffer_cache.IsRegionGpuModified(page_begin, page_end - page_begin)) return false;
-        texture_cache.WriteMemory(addr, size);
+        texture_cache.WriteMemory(addr, size, "TryCacheInvalidation");
         buffer_cache.WriteMemory(addr, size);
     }
     pipeline_cache.InvalidateRegion(addr, size);
@@ -2648,6 +2683,7 @@ void RasterizerVulkan::FlushCommands() {
 }
 
 void RasterizerVulkan::TickFrame() {
+    VideoCommon::ResourceTrace::TickFrame();
     draw_counter = 0;
     // Debug server requests (docs/nx2/debug-mcp.md), taken between frames on the owning thread.
     if (VideoCore::Nx2Debug::HasRequests()) {
@@ -3127,7 +3163,7 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
     }
     {
         std::scoped_lock lock{texture_cache.mutex};
-        texture_cache.WriteMemory(*cpu_addr, copy_size);
+        texture_cache.WriteMemory(*cpu_addr, copy_size, "AccelerateInlineToMemory");
     }
     pipeline_cache.InvalidateRegion(*cpu_addr, copy_size);
 }
@@ -3182,6 +3218,145 @@ namespace {
 // Cap on guest bytes recorded per buffer, so one oversized binding cannot blow up the dump.
 constexpr u32 BUFFER_CAP = 4U << 20;
 } // namespace
+
+void RasterizerVulkan::TraceNormalTarget(std::string_view outcome,
+                                        const GraphicsPipeline* pipeline) {
+    namespace Trace = VideoCommon::ResourceTrace;
+    if (!Trace::Enabled()) return;
+    const auto& regs = maxwell3d->regs;
+    for (u32 index = 0; index < (std::min<u32>)(regs.rt_control.count, 8); ++index) {
+        const u32 slot = regs.rt_control.Map(index);
+        const auto& target = regs.rt[slot];
+        if (target.format != Tegra::RenderTargetFormat::R8G8_UNORM ||
+            target.width > 1024 || target.height > 1024) continue;
+        std::array<u64, 6> keys{};
+        if (pipeline) keys = pipeline_cache.GraphicsNativeKeys(pipeline->ShaderHashes());
+        Trace::Note("normal-producer", fmt::format(
+            R"("outcome":"{}","gpu":"{:#x}","slot":{},"width":{},"height":{},"depth_bound":{},"depth_test":{},"vertices":{},"vs":"{:016x}","fs":"{:016x}","vs_address":"{:#x}","fs_address":"{:#x}")",
+            outcome, target.Address(), slot, target.width, target.height, regs.zeta_enable != 0,
+            regs.depth_test_enable != 0, maxwell3d->draw_manager.draw_state.draw_element_count,
+            keys[1], keys[5],
+            (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1],
+            (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1]), true);
+    }
+}
+
+void RasterizerVulkan::TraceTerrainDraw(const GraphicsPipeline& pipeline) {
+    namespace Trace = VideoCommon::ResourceTrace;
+    const auto& state = maxwell3d->draw_manager.draw_state;
+    Trace::Note(
+        "draw",
+        fmt::format(
+            R"("draw":{},"address_space":{},"map_serial":{},"base_instance":{},"base_vertex":{},"index_count":{},"pipeline":"{}"{})",
+            draw_counter, gpu_memory->GetID(), gpu_memory->GetMapSerial(), state.base_instance,
+            state.base_index, state.index_buffer.count, fmt::ptr(pipeline.Handle()),
+            pipeline.StageDebugJson()));
+    for (const auto& sampled : pipeline.SampledImages()) {
+        const auto& view = texture_cache.GetImageView(sampled.id);
+        const auto* image = view.BackingImage();
+        if (!image)
+            continue;
+        if (!image->trace_identity)
+            image->trace_identity = Trace::NewIdentity();
+        Trace::Image("sample", *image, view.image_id.Value());
+        const auto& swizzle = view.Swizzle();
+        Tegra::Texture::TICEntry tic{};
+        const auto tic_address =
+            maxwell3d->regs.tex_header.Address() + u64{sampled.tic} * sizeof(tic);
+        const bool tic_mapped = gpu_memory->IsFullyMappedRange(tic_address, sizeof(tic));
+        if (tic_mapped)
+            gpu_memory->ReadBlockUnsafe(tic_address, &tic, sizeof(tic));
+        std::array<u8, 4096> prefix{};
+        const u32 prefix_size =
+            static_cast<u32>((std::min<u64>)(image->guest_size_bytes, prefix.size()));
+        const bool source_mapped = gpu_memory->IsFullyMappedRange(image->gpu_addr, prefix_size);
+        if (source_mapped && prefix_size) {
+            gpu_memory->ReadBlockUnsafe(image->gpu_addr, prefix.data(), prefix_size);
+            Trace::Note(
+                "texture-guest-prefix",
+                fmt::format(
+                    R"("draw":{},"image_id":{},"size":{},"hash":"{:016x}","gpu_modified":{})",
+                    draw_counter, image->trace_identity, prefix_size,
+                    Common::CityHash64(reinterpret_cast<const char*>(prefix.data()), prefix_size),
+                    True(image->flags & VideoCommon::ImageFlagBits::GpuModified)));
+        }
+        const auto& tsc = texture_cache.GetSampler(sampled.sampler).Descriptor();
+        const auto words = [](const auto& descriptor) {
+            std::array<u32, 8> data{};
+            static_assert(sizeof(data) == sizeof(descriptor));
+            std::memcpy(data.data(), &descriptor, sizeof(data));
+            std::string result;
+            for (auto word : data)
+                result += fmt::format("{}\"{:08x}\"", result.empty() ? "" : ",", word);
+            return result;
+        };
+        Trace::Note(
+            "texture-binding",
+            fmt::format(
+                R"("draw":{},"stage":{},"tic":{},"view_slot":{},"image_id":{},"image_slot":{},"gpu":"{:#x}","host_image":"{}","view_image":"{}","host_format":{},"view_format":{},"view_type":{},"base_level":{},"levels":{},"base_layer":{},"layers":{},"swizzle":[{},{},{},{}],"tic_mapped":{},"tic_words":[{}],"tsc_words":[{}])",
+                draw_counter, sampled.stage, sampled.tic, sampled.id.Value(), image->trace_identity,
+                view.image_id.Value(), image->gpu_addr, fmt::ptr(image->Handle()),
+                fmt::ptr(view.ImageHandle()), static_cast<u32>(image->HostFormat()),
+                static_cast<u32>(view.format), static_cast<u32>(view.type), view.range.base.level,
+                view.range.extent.levels, view.range.base.layer, view.range.extent.layers,
+                static_cast<u32>(swizzle.r), static_cast<u32>(swizzle.g),
+                static_cast<u32>(swizzle.b), static_cast<u32>(swizzle.a), tic_mapped, words(tic),
+                words(tsc)));
+    }
+    // The shader's current constant banks, including texture handles, not compile-time reads.
+    for (u32 stage : {0U, 4U}) {
+        const auto& bank = maxwell3d->state.shader_stages[stage].const_buffers[2];
+        if (!bank.enabled)
+            continue;
+        std::array<u32, 48> handles{};
+        const auto size = (std::min<size_t>)(bank.size, sizeof(handles));
+        if (!gpu_memory->IsFullyMappedRange(bank.address, size))
+            continue;
+        gpu_memory->ReadBlockUnsafe(bank.address, handles.data(), size);
+        std::string values;
+        for (size_t i = 0; i < size / sizeof(u32); ++i) {
+            values += fmt::format("{}\"{:08x}\"", values.empty() ? "" : ",", handles[i]);
+        }
+        Trace::Note("texture-handles",
+                    fmt::format(R"("draw":{},"stage":{},"gpu":"{:#x}","size":{},"words":[{}])",
+                                draw_counter, stage, bank.address, size, values));
+    }
+    buffer_cache.ForEachBoundBuffer(false, [&](u32 stage, bool storage, u32 index, bool written,
+                                               const auto& binding, u32 size, const auto* host,
+                                               u32 host_offset) {
+        Trace::WatchBuffer(binding.device_addr, size);
+        if (host && !host->trace_identity)
+            host->trace_identity = Trace::NewIdentity();
+        const bool gpu_modified = buffer_cache.IsRegionGpuModified(binding.device_addr, size);
+        std::array<u8, 65536> bytes{};
+        const u32 count = (std::min<u32>)(size, storage ? 4096U : bytes.size());
+        device_memory.ReadBlockUnsafe(binding.device_addr, bytes.data(), count);
+        const u64 hash = Common::CityHash64(reinterpret_cast<const char*>(bytes.data()), count);
+        Trace::Note(
+            "buffer-binding",
+            fmt::format(
+                R"("draw":{},"stage":{},"storage":{},"index":{},"written":{},"gpu":"{:#x}","device":"{:#x}","map_serial":{},"size":{},"gpu_modified":{},"cache_id":{},"cache_slot":{},"cache_host":"{}","cache_offset":{},"guest_prefix_size":{},"guest_prefix_hash":"{:016x}")",
+                draw_counter, stage, storage, index, written, binding.gpu_addr, binding.device_addr,
+                binding.map_serial, size, gpu_modified, host ? host->trace_identity : 0,
+                binding.buffer_id.Value(),
+                host ? fmt::ptr(host->Handle()) : fmt::ptr(static_cast<const void*>(nullptr)),
+                host_offset, count, hash));
+    });
+    for (const auto& descriptor : guest_descriptor_queue.TraceBuffers()) {
+        const auto& binding = descriptor.binding;
+        const u32 count = static_cast<u32>((std::min<size_t>)(descriptor.mapped.size(), 65536));
+        const u64 hash =
+            count
+                ? Common::CityHash64(reinterpret_cast<const char*>(descriptor.mapped.data()), count)
+                : 0;
+        Trace::Note(
+            "host-buffer-binding",
+            fmt::format(
+                R"("draw":{},"descriptor":{},"host":"{}","offset":{},"size":{},"mapped_prefix_size":{},"mapped_prefix_hash":"{:016x}")",
+                draw_counter, descriptor.descriptor, fmt::ptr(binding.buffer), binding.offset,
+                binding.range, count, hash));
+    }
+}
 
 bool RasterizerVulkan::FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes) {
     std::vector<FrameDump::BoundBuffer> buffers;
@@ -3326,7 +3501,9 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
             colors[slot] = &texture_cache.GetImageView(ids[slot]);
         }
     }
-    if (frame_dump.BeginPass(framebuffer, colors)) {
+    const auto depth_id = texture_cache.GetRenderTargets().depth_buffer_id;
+    ImageView* const depth_stencil = depth_id ? &texture_cache.GetImageView(depth_id) : nullptr;
+    if (frame_dump.BeginPass(framebuffer, colors, depth_stencil)) {
         scheduler.RequestRenderpass(framebuffer);
     }
 }

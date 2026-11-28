@@ -25,6 +25,8 @@ enum : u8 {
                        ///< frame's commands (and the previous fence), not for this frame's fence
     HostImport = 10,   ///< EDEN_NX2_HOST_IMPORT=1: 64 KiB native uniform banks read the guest's pages in place (no copy)
     NanSafeMinMax = 11, ///< EDEN_NX2_NAN_SAFE_MIN_MAX (on unless 0): see NanSafeMinMaxOn
+    FreshBuffers = 12,  ///< Off by default: see FreshBuffersOn
+    TerrainTrace = 13,  ///< Bounded emulated-GPU terrain resource history
 };
 
 /// `start_value` is what the environment chose; the knob inverts it.
@@ -41,6 +43,13 @@ enum : u8 {
         return value == nullptr || value[0] != '0';
     }();
     return Live(start, NanSafeMinMax);
+}
+
+/// Debugging stale host buffers: every bound uniform, storage, vertex and index range the GPU has
+/// not written is uploaded again from guest memory, past the bind memo, the uniform stream reuse
+/// and host import. Slow; set with debug knob 12 while a suspected stale-data bug shows.
+[[nodiscard]] inline bool FreshBuffersOn() {
+    return Live(false, FreshBuffers);
 }
 
 } // namespace VideoCommon::Nx2Knob

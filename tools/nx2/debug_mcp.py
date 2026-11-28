@@ -89,7 +89,7 @@ TOOLS = [
                        "counts (kind: launch). 'sampled_max_mib' lists larger sampled "
                        "textures (skipped: size) without reading them back, so the capture "
                        "stays under the 2 GiB cap. 'sampled_tics' filters sampled captures and "
-                       "includes raw host BC mip levels for the listed descriptors. Returns "
+                       "includes raw host BC mip levels and array layers for the listed descriptors. Returns "
                        "the directory, summary, entry counts and the first manifest entries. "
                        "'index' builds index.html with frame_dump_index.py.",
         "inputSchema": {

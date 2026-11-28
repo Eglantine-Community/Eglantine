@@ -3209,6 +3209,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     // (and so the library parts compiled from them): built after every stage is emitted.
     const bool share_modules = library_cache && !mesh_emulation;
     std::array<std::vector<u32>, Maxwell::MaxShaderStage> stage_code;
+    std::array<GraphicsPipeline::StageDebug, Maxwell::MaxShaderStage> stage_debug{};
 
     const Shader::IR::Program* previous_stage{};
     Shader::Backend::Bindings binding;
@@ -3318,6 +3319,20 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         device.SaveShader(code);
         emit_timer.reset();
+        {
+            // Frame dump "pipeline" entries: the SPIR-V and the environment reads it came from,
+            // to tell a pipeline rebuilt at run time from the one built at boot.
+            GraphicsPipeline::StageDebug& debug = stage_debug[stage_index];
+            debug.spirv_hash = Common::CityHash64(reinterpret_cast<const char*>(code.data()),
+                                                  code.size() * sizeof(u32));
+            debug.source = translation == nullptr ? 0 : reused[index] ? 2 : 1;
+            if (translation != nullptr) {
+                debug.reads.reserve(translation->reads.size());
+                for (const auto& read : translation->reads) {
+                    debug.reads.push_back({read.kind, read.a, read.b, read.c, read.value});
+                }
+            }
+        }
         if (share_modules) {
             stage_code[stage_index] = code;
         } else {
@@ -3364,7 +3379,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     }
     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
     PhaseTimer object_timer{BuildPhase::Object, build_in_parallel};
-    return std::make_unique<GraphicsPipeline>(
+    auto pipeline = std::make_unique<GraphicsPipeline>(
         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, &shader_notify, device,
         descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring, thread_worker, statistics,
         render_pass_cache, key, std::move(modules), infos,
@@ -3375,6 +3390,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::SharedPipelineLayouts) ? &layout_cache
                                                                                   : nullptr,
         new_pipeline && library_cache);
+    pipeline->SetStageDebug(std::move(stage_debug));
+    return pipeline;
 
 } catch (const Shader::Exception& exception) {
     auto hash = key.Hash();

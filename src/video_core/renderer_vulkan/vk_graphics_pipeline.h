@@ -18,6 +18,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -274,6 +275,38 @@ public:
         return is_built.load(std::memory_order::relaxed);
     }
 
+    /// The host pipeline, null until built (frame dump "pipeline" entries).
+    [[nodiscard]] VkPipeline Handle() const noexcept {
+        return is_built.load(std::memory_order::acquire) ? *pipeline : VK_NULL_HANDLE;
+    }
+
+    /// Whether the pipeline was linked from graphics pipeline library parts, not compiled whole.
+    [[nodiscard]] bool LinkedFromParts() const noexcept {
+        return is_built.load(std::memory_order::acquire) && linked_from_parts;
+    }
+
+    /// What a stage was built from, for frame dump "pipeline" entries.
+    struct StageDebug {
+        /// One environment read its translation made (StageCache::Translation::Read).
+        struct Read {
+            u8 kind;
+            u32 a, b, c;
+            u64 value;
+        };
+        u64 spirv_hash{};
+        /// 0: no stage cache translation, 1: translated for this pipeline, 2: reused from the
+        /// stage cache.
+        u8 source{};
+        std::vector<Read> reads;
+    };
+
+    void SetStageDebug(std::array<StageDebug, NUM_STAGES> stage_debug_) {
+        stage_debug = std::move(stage_debug_);
+    }
+
+    /// The stages as a JSON field (`,"stages":[...]`) for the frame dump.
+    [[nodiscard]] std::string StageDebugJson() const;
+
     template <typename Spec>
     static auto MakeConfigureSpecFunc() {
         return [](GraphicsPipeline* pl, bool is_indexed) { return pl->ConfigureImpl<Spec>(is_indexed); };
@@ -334,6 +367,9 @@ private:
     bool fill_library_parts{};
     /// Set by MakePipeline when it compiled whole a pipeline that could link from parts.
     bool compiled_whole_for_library{};
+    /// Set by MakePipeline when the pipeline was linked from library parts.
+    bool linked_from_parts{};
+    std::array<StageDebug, NUM_STAGES> stage_debug{};
     /// A queued QueueLibraryParts task checks `cancelled` under `mutex`: the destructor sets it,
     /// waiting for a task that runs.
     struct LibraryPartsTask {

@@ -101,6 +101,7 @@ public:
         return cpu_addr;
     }
 
+    mutable u64 trace_identity{}; ///< Diagnostic identity, retained across slot-vector moves.
     DAddr cpu_addr_cached = 0;
 
     u64 upload_clean_epoch{};

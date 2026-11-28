@@ -11,6 +11,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -194,6 +195,9 @@ public:
     /// to run not yet seen for their shader. Returns true when copies were recorded.
     bool NoteBuffers(bool compute, std::span<const u64> shader_hashes,
                      std::span<BoundBuffer> buffers);
+    /// Actual descriptor payload, including stream/imported uniforms. Diagnostic terrain captures
+    /// use this in addition to the buffer cache's guest binding descriptions.
+    bool NoteHostBuffer(u32 descriptor, VkBuffer host, u64 offset, u64 size);
     /// Records the current draw's arguments ("draw_args") and its index and vertex buffers not yet
     /// seen this frame, each as guest bytes and, when cached, host bytes. Returns true when copies
     /// were recorded.
@@ -208,8 +212,13 @@ public:
 
     /// Starts a pass when the framebuffer changes and captures the previous one.
     /// Returns true when copies were recorded, which ends the current render pass.
-    bool BeginPass(const void* framebuffer, std::span<ImageView* const> colors);
-    void NoteDraw(std::span<const u64> shader_hashes);
+    bool BeginPass(const void* framebuffer, std::span<ImageView* const> colors,
+                   ImageView* depth_stencil = nullptr);
+    /// Counts a draw. `pipeline` (null while not built) is listed once per capture as a
+    /// "pipeline" entry saying whether it was linked from library parts, with the JSON fields
+    /// `details` returns (called only for that first listing).
+    void NoteDraw(std::span<const u64> shader_hashes, VkPipeline pipeline, bool linked,
+                  const std::function<std::string()>& details);
     /// Captures the current pass; returns true when copies were recorded.
     bool EndPass();
     void CaptureDispatch(u64 shader_hash, std::span<ImageView* const> written);
@@ -224,7 +233,8 @@ public:
              size_t sampled_max_bytes = 0, std::vector<u32> sampled_tics = {});
 
 private:
-    enum class DepthEncoding { None, Unorm16, Unorm24, Float32 };
+    /// Stencil8: the stencil aspect of a depth-stencil image, one byte a pixel.
+    enum class DepthEncoding { None, Unorm16, Unorm24, Float32, Stencil8 };
 
     struct Target {
         u32 slot;
@@ -266,7 +276,7 @@ private:
         bool truncated{};
     };
 
-    std::optional<Target> MakeTarget(ImageView& view, u32 slot) const;
+    std::optional<Target> MakeTarget(ImageView& view, u32 slot, bool stencil = false) const;
     /// "shaders":[...],"keys":[...] for these hashes.
     std::string ShaderList(std::span<const u64> hashes) const;
     /// The native program key of a shader hash as 16 hex digits, or "" when unknown.
@@ -315,8 +325,11 @@ private:
     /// bytes last recorded for it (0 for host-read buffers).
     using SeenBuffer = std::pair<std::tuple<u64, bool, u32, u64, u32>, u64>;
     std::vector<SeenBuffer> seen_buffers;
+    std::vector<std::tuple<VkBuffer, u64, u64>> seen_host_buffers;
     /// (device address, size) of the index and vertex buffers already recorded this frame.
     std::vector<std::pair<u64, u32>> seen_vertex_inputs;
+    /// Host pipelines already listed this capture.
+    std::vector<VkPipeline> seen_pipelines;
     /// Content hashes of the buffer files written; writer thread only.
     std::vector<u64> written_buffers;
     /// (shader hash, native program key) of the shaders seen this capture.

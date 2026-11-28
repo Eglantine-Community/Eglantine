@@ -16,6 +16,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <type_traits>
 // TODO: find out which don't require stable iters
 #include <unordered_map>
@@ -355,7 +356,7 @@ public:
     }
 
     /// Mark images in a range as modified from the CPU
-    void WriteMemory(DAddr cpu_addr, size_t size);
+    void WriteMemory(DAddr cpu_addr, size_t size, std::string_view source = "unspecified");
 
     /// Download contents of host images to guest memory in a region
     void DownloadMemory(DAddr cpu_addr, size_t size);
@@ -578,6 +579,8 @@ private:
 
     /// Mark an image as modified from the GPU
     void MarkModification(ImageBase& image) noexcept;
+
+    void ArmImageReadTraps(ImageBase& image);
 
     /// Synchronize image aliases, copying data if needed
     void SynchronizeAliases(ImageId image_id);

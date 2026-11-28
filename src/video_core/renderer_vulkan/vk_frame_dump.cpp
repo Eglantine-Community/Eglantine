@@ -296,7 +296,9 @@ void FrameDump::Arm(std::filesystem::path directory_, bool sampled, bool buffers
     pass_framebuffer = nullptr;
     dispatch_sampled.clear();
     seen_buffers.clear();
+    seen_host_buffers.clear();
     seen_vertex_inputs.clear();
+    seen_pipelines.clear();
     written_buffers.clear();
     shader_keys.clear();
     pass_index = 0;
@@ -307,7 +309,7 @@ void FrameDump::Arm(std::filesystem::path directory_, bool sampled, bool buffers
     }
 }
 
-std::optional<FrameDump::Target> FrameDump::MakeTarget(ImageView& view, u32 slot) const {
+std::optional<FrameDump::Target> FrameDump::MakeTarget(ImageView& view, u32 slot, bool stencil) const {
     using namespace VideoCore::Surface;
     const Image* const image = view.BackingImage();
     if (!image) {
@@ -322,7 +324,20 @@ std::optional<FrameDump::Target> FrameDump::MakeTarget(ImageView& view, u32 slot
         return std::nullopt;
     }
     DepthEncoding depth_encoding = DepthEncoding::None;
-    if (type != SurfaceType::ColorTexture) {
+    if (stencil) {
+        // The stencil aspect copies as one byte a pixel, whatever the depth part is.
+        switch (
+            MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, false, info.format).format) {
+        case VK_FORMAT_D16_UNORM_S8_UINT:
+        case VK_FORMAT_D24_UNORM_S8_UINT:
+        case VK_FORMAT_D32_SFLOAT_S8_UINT:
+        case VK_FORMAT_S8_UINT:
+            depth_encoding = DepthEncoding::Stencil8;
+            break;
+        default:
+            return std::nullopt;
+        }
+    } else if (type != SurfaceType::ColorTexture) {
         // The depth aspect copies in the host format's layout, which may differ from the guest's.
         switch (
             MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, false, info.format).format) {
@@ -373,6 +388,8 @@ u32 FrameDump::TexelBytes(const Target& target) {
         return VideoCore::Surface::BytesPerBlock(target.format);
     case DepthEncoding::Unorm16:
         return 2;
+    case DepthEncoding::Stencil8:
+        return 1;
     default:
         return 4;
     }
@@ -399,11 +416,15 @@ int FrameDump::Decode(const Target& target, const u8* pixel, std::array<float, 4
     case DepthEncoding::Float32:
         out = {Load<float>(pixel, 0), 0.0f, 0.0f, 1.0f};
         return 1;
+    case DepthEncoding::Stencil8:
+        out = {static_cast<float>(pixel[0]) / 255.0f, 0.0f, 0.0f, 1.0f};
+        return 1;
     }
     return 0;
 }
 
-bool FrameDump::BeginPass(const void* framebuffer, std::span<ImageView* const> colors) {
+bool FrameDump::BeginPass(const void* framebuffer, std::span<ImageView* const> colors,
+                          ImageView* depth_stencil) {
     if (framebuffer == pass_framebuffer) {
         return false;
     }
@@ -415,6 +436,15 @@ bool FrameDump::BeginPass(const void* framebuffer, std::span<ImageView* const> c
             continue;
         }
         if (const auto target = MakeTarget(*colors[slot], slot)) {
+            pass_targets.push_back(*target);
+        }
+    }
+    // The depth-stencil attachment as rt8 (depth) and rt9 (stencil), at the end of the pass.
+    if (depth_stencil) {
+        if (const auto target = MakeTarget(*depth_stencil, 8)) {
+            pass_targets.push_back(*target);
+        }
+        if (const auto target = MakeTarget(*depth_stencil, 9, true)) {
             pass_targets.push_back(*target);
         }
     }
@@ -479,34 +509,45 @@ bool FrameDump::RecordSampled(const Sampled& texture, u32 index, std::string nam
         (image.UsageFlags() & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0) {
         if (const auto host_blocks = HostBcFormat(image.HostFormat())) {
             const auto& range = texture.view->range;
-            const s32 end_level = std::min(range.base.level + range.extent.levels,
-                                           info.resources.levels);
+            const s32 end_level =
+                std::min(range.base.level + range.extent.levels, info.resources.levels);
+            const s32 end_layer =
+                std::min(range.base.layer + range.extent.layers, info.resources.layers);
             const auto view_tags = fmt::format(
                 R"({},"view_base_level":{},"view_levels":{},"view_base_layer":{},"view_layers":{})",
                 tags, range.base.level, range.extent.levels, range.base.layer, range.extent.layers);
             bool recorded = false;
             for (s32 level = range.base.level; level < end_level; ++level) {
-                const Target target{
-                    .slot = index,
-                    .image = image.Handle(),
-                    .format = texture.view->format,
-                    .width = std::max(1U, info.size.width >> level),
-                    .height = std::max(1U, info.size.height >> level),
-                    .depth = 1,
-                    .level = level,
-                    .layer = range.base.layer,
-                    .gpu_addr = image.gpu_addr,
-                    .rescaled = false,
-                    .msaa = false,
-                    .depth_encoding = DepthEncoding::None,
-                    .host_blocks = host_blocks,
-                    .view_image = texture.view->ImageHandle(),
-                    .view_mip_count = range.extent.levels,
-                };
-                if (sampled_max_bytes != 0 && ImageBytes(target) > sampled_max_bytes) {
-                    continue;
+                for (s32 layer = range.base.layer; layer < end_layer; ++layer) {
+                    const Target target{
+                        .slot = index,
+                        .image = image.Handle(),
+                        .format = texture.view->format,
+                        .width = std::max(1U, info.size.width >> level),
+                        .height = std::max(1U, info.size.height >> level),
+                        .depth = 1,
+                        .level = level,
+                        .layer = layer,
+                        .gpu_addr = image.gpu_addr,
+                        .rescaled = false,
+                        .msaa = false,
+                        .depth_encoding = DepthEncoding::None,
+                        .host_blocks = host_blocks,
+                        .view_image = texture.view->ImageHandle(),
+                        .view_mip_count = range.extent.levels,
+                    };
+                    if (sampled_max_bytes != 0 && ImageBytes(target) > sampled_max_bytes) {
+                        continue;
+                    }
+                    recorded |= Record(target, fmt::format("{}_mip{}_layer{}", name, level, layer),
+                                       view_tags);
+                    if (truncated) {
+                        break;
+                    }
                 }
-                recorded |= Record(target, fmt::format("{}_mip{}", name, level), view_tags);
+                if (truncated) {
+                    break;
+                }
             }
             if (recorded || truncated) {
                 return recorded;
@@ -615,6 +656,19 @@ bool FrameDump::NoteBuffers(bool compute, std::span<const u64> shader_hashes,
     return recorded;
 }
 
+bool FrameDump::NoteHostBuffer(u32 descriptor, VkBuffer host, u64 offset, u64 size) {
+    if (!host || !size || size == VK_WHOLE_SIZE || offset > std::numeric_limits<u32>::max()) {
+        return false;
+    }
+    const auto key = std::tuple{host, offset, size};
+    if (std::ranges::find(seen_host_buffers, key) != seen_host_buffers.end()) return false;
+    seen_host_buffers.push_back(key);
+    const u32 bytes = static_cast<u32>((std::min<u64>)(size, 16U << 20));
+    return RecordBuffer(host, static_cast<u32>(offset), bytes, fmt::format(
+        R"("kind":"host_descriptor","pass":{},"draw":{},"descriptor":{},"host":"{}","offset":{},"bound_size":{},"size":{},"source":"host_descriptor")",
+        pass_index, draws - 1, descriptor, fmt::ptr(host), offset, size, bytes));
+}
+
 bool FrameDump::NoteDrawInputs(std::span<const u64> shader_hashes, const DrawArgs& args,
                                std::span<VertexInput> inputs) {
     const auto pairs = [](std::span<const std::pair<u32, u32>> values) {
@@ -711,8 +765,18 @@ std::string FrameDump::ShaderList(std::span<const u64> hashes) const {
     return fmt::format(R"("shaders":[{}],"keys":[{}])", shaders, keys);
 }
 
-void FrameDump::NoteDraw(std::span<const u64> shader_hashes) {
+void FrameDump::NoteDraw(std::span<const u64> shader_hashes, VkPipeline pipeline, bool linked,
+                         const std::function<std::string()>& details) {
     ++draws;
+    if (std::ranges::find(seen_pipelines, pipeline) == seen_pipelines.end()) {
+        seen_pipelines.push_back(pipeline);
+        Enqueue({.tags = fmt::format(
+                     R"({{"kind":"pipeline","pass":{},"draw":{},{},"handle":"{:#x}","build":"{}"{}}})",
+                     pass_index, draws - 1, ShaderList(shader_hashes),
+                     std::bit_cast<u64>(pipeline),
+                     pipeline == VK_NULL_HANDLE ? "pending" : linked ? "linked" : "whole",
+                     details ? details() : std::string{})});
+    }
     for (const u64 hash : shader_hashes) {
         if (hash != 0 && pass_hashes.size() < 32 &&
             std::ranges::find(pass_hashes, hash) == pass_hashes.end()) {
@@ -793,6 +857,8 @@ bool FrameDump::Record(const Target& target, std::string name, std::string tags)
         .imageSubresource{
             .aspectMask = target.depth_encoding == DepthEncoding::None
                               ? VkImageAspectFlags{VK_IMAGE_ASPECT_COLOR_BIT}
+                          : target.depth_encoding == DepthEncoding::Stencil8
+                              ? VkImageAspectFlags{VK_IMAGE_ASPECT_STENCIL_BIT}
                               : VkImageAspectFlags{VK_IMAGE_ASPECT_DEPTH_BIT},
             .mipLevel = static_cast<u32>(target.level),
             .baseArrayLayer = static_cast<u32>(target.layer),

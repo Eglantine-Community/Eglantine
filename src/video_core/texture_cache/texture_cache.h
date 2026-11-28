@@ -33,6 +33,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_resource_trace.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/texture_cache/memory_budget.h"
 #include "video_core/texture_cache/samples_helper.h"
@@ -212,6 +213,7 @@ void TextureCache<P>::RunGarbageCollector() {
             return false;
         }
         if (must_download) {
+            ResourceTrace::Image("gc-download", image, image_id.Value());
             auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
             const auto copies = FullDownloadCopies(image.info);
             image.DownloadMemory(map, copies);
@@ -1320,8 +1322,19 @@ FramebufferId TextureCache<P>::GetFramebufferId(const RenderTargets& key) {
 }
 
 template <class P>
-void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
-    ForEachImageInRegion(cpu_addr, size, [this, cpu_addr, size](ImageId image_id, Image& image) {
+void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size, std::string_view source) {
+    ForEachImageInRegion(cpu_addr, size, [this, cpu_addr, size, source](ImageId image_id, Image& image) {
+        ResourceTrace::Image("cpu-write", image, image_id.Value());
+        if (ResourceTrace::Enabled() &&
+            image.info.format == PixelFormat::R8G8_UNORM && image.info.size.width == 260 &&
+            True(image.flags & ImageFlagBits::GpuModified) &&
+            False(image.flags & ImageFlagBits::CpuModified)) {
+            ResourceTrace::Note("normal-invalidation", fmt::format(
+                R"("id":{},"gpu":"{:#x}","source":"{}","write_device":"{:#x}","write_size":{},"image_device":"{:#x}","image_size":{},"covers_image":{})",
+                image.trace_identity, image.gpu_addr, source, cpu_addr, size, image.cpu_addr,
+                image.guest_size_bytes, cpu_addr <= image.cpu_addr &&
+                    size >= image.cpu_addr_end - cpu_addr), true);
+        }
         if (True(image.flags & ImageFlagBits::UnwrittenSparse)) {
             // Written at last: a backed image replaces it where it is used next.
             image.flags |= ImageFlagBits::CpuModified | ImageFlagBits::Remapped;
@@ -1370,6 +1383,7 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
         if (!IsDownloadable(image)) {
             return;
         }
+        ResourceTrace::Image("download", image, image_id.Value());
         image.flags &= ~ImageFlagBits::GpuModified;
         images.push_back(image_id);
     });
@@ -1401,6 +1415,7 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
             Image& image = slot_images[entry.image_id];
             SwizzleImage(*gpu_memory, image.gpu_addr, image.info, entry.copies,
                          entry.map.mapped_span, swizzle_data_buffer);
+            ResourceTrace::Image("download-complete", image, entry.image_id.Value());
         }
         pending.clear();
         pending_bytes = 0;
@@ -1451,6 +1466,7 @@ void TextureCache<P>::UnmapMemory(DAddr cpu_addr, size_t size) {
     ForEachImageInRegion(cpu_addr, size, [&](ImageId id, Image&) { deleted_images.push_back(id); });
     for (const ImageId id : deleted_images) {
         Image& image = slot_images[id];
+        ResourceTrace::Image("device-unmap", image, id.Value());
         if constexpr (requires { &Image::ResetTiles; }) {
             // A Switch 2 game unmapping one tile of a large sparse texture (title 1's 16384x16384
             // R8 pair, ~160 times a session) deleted the whole image, and re-creating it (a sparse
@@ -1476,6 +1492,7 @@ void TextureCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t siz
                             [&](ImageId id, Image&) { deleted_images.push_back(id); });
     for (const ImageId id : deleted_images) {
         Image& image = slot_images[id];
+        ResourceTrace::Image("gpu-unmap", image, id.Value());
         if (True(image.flags & ImageFlagBits::Unbacked) &&
             False(image.flags & (ImageFlagBits::SparseLayers | ImageFlagBits::UnwrittenSparse))) {
             continue;
@@ -2262,6 +2279,7 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
 
+    ResourceTrace::Image("upload-begin", image, image_id.Value());
     image.flags &= ~ImageFlagBits::CpuModified;
     image.flags &= ~ImageFlagBits::GpuModified;
     // Aliases the GPU wrote after this data was written stay newer, so they are copied over it.
@@ -4175,6 +4193,7 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
     ImageBase& image = slot_images[image_id];
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
+    ResourceTrace::Image("register", image, image_id.Value());
     image.flags |= ImageFlagBits::Registered;
     total_used_memory += ImageMemoryBytes(slot_images[image_id]);
     image.lru_index = lru_cache.Insert(image_id, frame_tick);
@@ -4303,6 +4322,9 @@ void TextureCache<P>::TrackImage(ImageBase& image, ImageId image_id) {
     if (False(image.flags & ImageFlagBits::Sparse)) {
         if (image.cpu_addr < ~(1ULL << 40)) {
             device_memory.UpdatePagesCachedCount(image.cpu_addr, image.guest_size_bytes, 1);
+            if (True(image.flags & ImageFlagBits::GpuModified)) {
+                ArmImageReadTraps(image);
+            }
         }
         return;
     }
@@ -4349,6 +4371,7 @@ void TextureCache<P>::UntrackImage(ImageBase& image, ImageId image_id) {
 template <class P>
 void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     ImageBase& image = slot_images[image_id];
+    ResourceTrace::Image("delete", image, image_id.Value());
     ++images_deleted;
     // Drop every decode still queued for it, whatever IsDecoding says: an image re-decoded while
     // a decode was in flight has two, and the first to finish clears the flag. A decode left
@@ -4515,8 +4538,26 @@ void TextureCache<P>::RemoveFramebuffers(std::span<const ImageViewId> removed_vi
 
 template <class P>
 void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
+    const bool was_modified = True(image.flags & ImageFlagBits::GpuModified);
     image.flags |= ImageFlagBits::GpuModified;
     image.modification_tick = ++modification_tick;
+    if (!was_modified) {
+        ArmImageReadTraps(image);
+    }
+    ResourceTrace::Image("gpu-write", image, ~u32{0});
+}
+
+template <class P>
+void TextureCache<P>::ArmImageReadTraps(ImageBase& image) {
+    if (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed) ||
+        Settings::values.use_reactive_flushing.GetValue() || image.info.forced_flushed ||
+        False(image.flags & ImageFlagBits::Tracked) ||
+        True(image.flags & ImageFlagBits::Sparse) || !IsDownloadable(image)) {
+        return;
+    }
+    // CPU copies must see the generated texels before invalidating or relocating the image.
+    device_memory.ArmReadTraps(image.cpu_addr, image.guest_size_bytes);
+    ResourceTrace::Image("read-trap-arm", image, ~u32{0});
 }
 
 template <class P>
@@ -4560,6 +4601,9 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
     });
     const auto& resolution = Settings::values.resolution_info;
     for (const AliasedImage* const aliased : aliased_images) {
+        auto& source = slot_images[aliased->id];
+        ResourceTrace::Image("alias-source", source, aliased->id.Value());
+        ResourceTrace::Image("alias-copy", image, image_id.Value(), source.trace_identity);
         if (!resolution.active || !any_rescaled) {
             CopyImage(image_id, aliased->id, aliased->copies);
             continue;

@@ -109,6 +109,7 @@ struct ImageBase {
         return has_scaled;
     }
 
+    mutable u64 trace_identity{}; ///< Diagnostic identity, retained across slot-vector moves.
     ImageInfo info;
 
     u64 guest_size_bytes = 0;

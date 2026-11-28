@@ -28,6 +28,7 @@
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_driver_build_report.h"
 #include "video_core/renderer_vulkan/vk_frame_dump.h"
+#include "video_core/nx2_resource_trace.h"
 #include "video_core/nx2_draw_stats.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_pipeline_library.h"
@@ -801,7 +802,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
                                      Spec::has_images);
     }
-    if (RecordingSampledTextures()) {
+    if (RecordingSampledTextures() || VideoCommon::ResourceTrace::Sampling()) {
         sampled_images.clear();
         size_t view_index{};
         size_t sampler_index{};
@@ -2118,6 +2119,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass, bool parts_only) {
         return;
     }
     const bool linked = static_cast<bool>(pipeline);
+    linked_from_parts = linked;
     const bool can_fill_parts = !linked && fill_library_parts && library_cache && shader_set &&
                                 library_part_workers && !mesh_emulation;
     // Parts are keyed by the shader set, so a set no other pipeline uses would compile four
@@ -2144,6 +2146,36 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass, bool parts_only) {
         );
         GPU::Logging::GPULogger::GetInstance().LogPipelineStateChange(pipeline_info);
     }
+}
+
+std::string GraphicsPipeline::StageDebugJson() const {
+    // Names of StageCache's ReadKind (stage_cache.cpp), in its order.
+    static constexpr std::array<const char*, 8> kinds{
+        "cbuf",           "storage_pointer", "indirect_storage_pointer", "texture_type",
+        "texture_format", "texture_integer", "viewport_transform",       "replacement",
+    };
+    static constexpr std::array<const char*, 3> sources{"none", "translated", "stage_cache"};
+    std::string out{R"(,"stages":[)"};
+    bool first_stage = true;
+    for (size_t stage = 0; stage < stage_debug.size(); ++stage) {
+        const StageDebug& debug = stage_debug[stage];
+        if (debug.spirv_hash == 0) {
+            continue;
+        }
+        out += fmt::format(R"({}{{"stage":{},"spirv":"{:016x}","source":"{}","reads":[)",
+                           first_stage ? "" : ",", stage, debug.spirv_hash,
+                           sources[std::min<size_t>(debug.source, sources.size() - 1)]);
+        first_stage = false;
+        for (size_t index = 0; index < debug.reads.size(); ++index) {
+            const StageDebug::Read& read = debug.reads[index];
+            const char* const kind = read.kind < kinds.size() ? kinds[read.kind] : "unknown";
+            out += fmt::format(R"({}["{}",{},{},{},"{:#x}"])", index == 0 ? "" : ",", kind,
+                               read.a, read.b, read.c, read.value);
+        }
+        out += "]}";
+    }
+    out += "]";
+    return out;
 }
 
 void GraphicsPipeline::Validate() {

@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include "video_core/nx2_resource_trace.h"
 #include <algorithm>
 #include <chrono>
 #include <string>
@@ -1706,7 +1707,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             gpu_memory->UsesNativeTiling() &&
             (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000 &&
             VideoCommon::Nx2Knob::Live(import_start, VideoCommon::Nx2Knob::HostImport) &&
-            !is_gpu_modified()) {
+            !Nx2Knob::FreshBuffersOn() && !is_gpu_modified()) {
             static std::atomic<u64> imported{0}, copied{0}, no_span{0}, no_import{0};
             const u8* const host_ptr = device_memory.GetSpan(device_addr, size);
             const bool bound = [&] {
@@ -1913,7 +1914,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
             // The same bytes as this slot's previous bind, in the same command buffer: bind that
             // stream allocation again instead of allocating and copying (uniform_stream_reuse.h).
             // EDEN_NX2_UBOREUSE=0 turns it off.
-            if (VideoCommon::UniformStreamReuseEnabled()) {
+            if (VideoCommon::UniformStreamReuseEnabled() && !Nx2Knob::FreshBuffersOn()) {
                 VideoCommon::Nx2Hazard::CheckRead(VideoCommon::Nx2Hazard::Site::UniformReuse,
                                                   device_addr, size);
                 streamed = VideoCommon::BindSmallUniformReusing(
@@ -2209,7 +2210,7 @@ void BufferCache<P>::BindHostComputeUniformBuffers() {
             if (use_fast_buffer) {
                 bool streamed = false;
                 if constexpr (VideoCommon::StreamUniformReusable<Runtime>) {
-                    if (VideoCommon::UniformStreamReuseEnabled()) {
+                    if (VideoCommon::UniformStreamReuseEnabled() && !Nx2Knob::FreshBuffersOn()) {
                         streamed = VideoCommon::BindSmallComputeUniformReusing(
                             runtime, device_memory, index, binding_index, binding.device_addr,
                             size);
@@ -3198,11 +3199,25 @@ BufferId BufferCache<P>::CreateBuffer(DAddr device_addr, u32 wanted_size, bool s
 
 template <class P>
 void BufferCache<P>::Register(BufferId buffer_id) {
+    const auto& buffer = slot_buffers[buffer_id];
+    if (ResourceTrace::WatchesBuffer(buffer.CpuAddr(), buffer.SizeBytes())) {
+        if (!buffer.trace_identity) buffer.trace_identity = ResourceTrace::NewIdentity();
+        ResourceTrace::Note("buffer-event", fmt::format(
+            R"("event":"register","id":{},"slot":{},"device":"{:#x}","size":{})",
+            buffer.trace_identity, buffer_id.Value(), buffer.CpuAddr(), buffer.SizeBytes()));
+    }
     ChangeRegister<true>(buffer_id);
 }
 
 template <class P>
 void BufferCache<P>::Unregister(BufferId buffer_id) {
+    const auto& buffer = slot_buffers[buffer_id];
+    if (ResourceTrace::WatchesBuffer(buffer.CpuAddr(), buffer.SizeBytes())) {
+        if (!buffer.trace_identity) buffer.trace_identity = ResourceTrace::NewIdentity();
+        ResourceTrace::Note("buffer-event", fmt::format(
+            R"("event":"unregister","id":{},"slot":{},"device":"{:#x}","size":{})",
+            buffer.trace_identity, buffer_id.Value(), buffer.CpuAddr(), buffer.SizeBytes()));
+    }
     ChangeRegister<false>(buffer_id);
 }
 
@@ -3236,7 +3251,7 @@ void BufferCache<P>::ChangeRegister(BufferId buffer_id) {
 template <class P>
 bool BufferCache<P>::BindMemoEnabled() {
     static const bool enabled = !IS_OPENGL && Nx2Perf::On(Nx2Perf::Opt::BindMemo);
-    return enabled;
+    return enabled && !Nx2Knob::FreshBuffersOn();
 }
 
 template <class P>
@@ -3318,6 +3333,9 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
     last_sync_deduped = false;
     if (size == 0) {
         return true;
+    }
+    if (Nx2Knob::FreshBuffersOn() && !memory_tracker.IsRegionGpuModified(device_addr, size)) {
+        memory_tracker.MarkRegionAsCpuModified(device_addr, size);
     }
     const DAddr range_end = device_addr + size;
     static constexpr bool reuse_clean = true;
@@ -3417,6 +3435,11 @@ bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 si
             });
             total_size_bytes += range_size;
             largest_copy = (std::max)(largest_copy, range_size);
+            if (ResourceTrace::WatchesBuffer(start, range_size)) {
+                ResourceTrace::Note("buffer-event", fmt::format(
+                    R"("event":"upload","id":{},"device":"{:#x}","size":{})",
+                    buffer.trace_identity, start, range_size));
+            }
         };
         for_each_upload_range([&](u64 device_addr_out, u64 range_size) {
             DAddr upload_start = device_addr_out;

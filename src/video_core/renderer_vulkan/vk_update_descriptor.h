@@ -12,9 +12,12 @@
 #include <array>
 #include <cstdlib>
 #include <memory>
+#include <span>
 #include <variant>
 #include <vector>
 #include "video_core/vulkan_common/vulkan_wrapper.h"
+#include "video_core/nx2_resource_trace.h"
+#include "video_core/renderer_vulkan/vk_frame_dump.h"
 
 namespace Vulkan {
 
@@ -68,6 +71,7 @@ public:
     void TickFrame();
     void Acquire(Scheduler& scheduler, size_t required_entries = 0,
                  bool use_descriptor_buffer_ = false) {
+        trace_buffers.clear();
         use_descriptor_buffer = supports_descriptor_buffer && use_descriptor_buffer_;
         static constexpr size_t DEFAULT_REQUIRED_ENTRIES = 0x400;
         const size_t reserve = required_entries > 0 ? required_entries : DEFAULT_REQUIRED_ENTRIES;
@@ -92,6 +96,7 @@ public:
     }
 
     void AddBuffer(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size) {
+        TraceBufferBinding(buffer, offset, size);
         *(payload_cursor++) = VkDescriptorBufferInfo{
             .buffer = buffer,
             .offset = offset,
@@ -105,6 +110,7 @@ public:
             AddBuffer(buffer, offset, size);
             return;
         }
+        TraceBufferBinding(buffer, offset, size);
         *(payload_cursor++) = DescriptorAddress{
             .address = base_address == 0 ? 0 : base_address + offset,
             .range = base_address == 0 ? VK_WHOLE_SIZE : size,
@@ -129,7 +135,32 @@ public:
         };
     }
 
+    struct TraceBuffer {
+        size_t descriptor;
+        VkDescriptorBufferInfo binding;
+        std::span<const u8> mapped;
+    };
+
+    std::span<const TraceBuffer> TraceBuffers() const { return trace_buffers; }
+    void TraceMappedBuffer(std::span<const u8> mapped) {
+        if (TraceBindings() && !trace_buffers.empty()) {
+            trace_buffers.back().mapped = mapped;
+        }
+    }
+
 private:
+    static bool TraceBindings() {
+        return VideoCommon::ResourceTrace::Sampling() ||
+               (VideoCommon::ResourceTrace::Enabled() && RecordingWrittenImages());
+    }
+    void TraceBufferBinding(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size) {
+        if (TraceBindings()) {
+            trace_buffers.push_back({static_cast<size_t>(payload_cursor - upload_start),
+                                     {buffer, offset, size}, {}});
+        }
+    }
+    std::vector<TraceBuffer> trace_buffers;
+
     void AddImageInfo(VkImageView image_view, VkSampler sampler) {
         static constexpr bool direct = true;
         if (direct) {

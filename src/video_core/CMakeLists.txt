@@ -176,6 +176,8 @@ add_library(video_core STATIC
     nx2.h
     nx2_debug_control.cpp
     nx2_debug_control.h
+    nx2_resource_trace.cpp
+    nx2_resource_trace.h
     nx2_diag.h
     nx2_gpu_latency.h
     nx2_profile.h

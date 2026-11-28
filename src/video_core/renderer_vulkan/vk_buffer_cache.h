@@ -185,6 +185,7 @@ public:
         VkBuffer buffer;
         VkDeviceAddress device_address; // base of `buffer`, 0 without buffer device address
         u32 offset;
+        const u8* mapped{};
     };
 
     std::span<u8> BindMappedUniformBuffer([[maybe_unused]] size_t stage,
@@ -195,6 +196,7 @@ public:
             .buffer = ref.buffer,
             .device_address = ref.device_address,
             .offset = static_cast<u32>(ref.offset),
+            .mapped = ref.mapped_span.data(),
         };
         RebindStreamUniform(last_stream_uniform, size);
         return ref.mapped_span;
@@ -230,6 +232,7 @@ public:
             return false;
         }
         guest_descriptor_queue.AddBuffer(ref.buffer, ref.address, ref.offset, size);
+        guest_descriptor_queue.TraceMappedBuffer({host_ptr, size});
         return true;
     }
 
@@ -244,6 +247,7 @@ public:
     /// it and the GPU has not even started on it.
     void RebindStreamUniform(const StreamUniformRef& ref, u32 size) {
         guest_descriptor_queue.AddBuffer(ref.buffer, ref.device_address, ref.offset, size);
+        if (ref.mapped) guest_descriptor_queue.TraceMappedBuffer({ref.mapped, size});
     }
 
     [[nodiscard]] VkDeviceSize SparseAlignmentFor(bool sparse_compatible) const noexcept {

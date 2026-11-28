@@ -7,6 +7,7 @@
 // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/nx2_resource_trace.h"
 #include <algorithm>
 #include <cstdlib>
 #include <vector>
@@ -317,7 +318,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                      state.first, state.second});
             }
         }
-        if (RecordingWrittenImages()) {
+        if (RecordingWrittenImages() || VideoCommon::ResourceTrace::Enabled()) {
             written_images.clear();
             size_t image_index{Shader::NumDescriptors(info.texture_buffer_descriptors) +
                                Shader::NumDescriptors(info.image_buffer_descriptors) +
@@ -371,7 +372,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         PushImageDescriptors(texture_cache, guest_descriptor_queue, info, rescaling, samplers_it,
                              views_it);
     } else {
-        if (RecordingWrittenImages()) {
+        if (RecordingWrittenImages() || VideoCommon::ResourceTrace::Enabled()) {
             written_images.clear();
         }
         buffer_cache.UnbindComputeTextureBuffers();
