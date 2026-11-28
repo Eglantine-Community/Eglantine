@@ -256,6 +256,13 @@ std::shared_ptr<const LoweredNvnProgram> LowerNvnProgram(const NvnProgramBinary&
         }
         native.push_back(instruction);
         const auto status = capture.Observe(instruction, index);
+        if (status == Capture::Result::InvalidTarget && capture.FallbackEnd() != 0) {
+            // As LowerNativeCode: data past the program's closing self-branch decoded as a branch,
+            // so the program ended there.
+            native.resize(capture.FallbackEnd());
+            complete = true;
+            break;
+        }
         if (status == Capture::Result::InvalidTarget) {
             result->error_offset = index * static_cast<u32>(sizeof(Instruction));
             result->failed_instruction = index;

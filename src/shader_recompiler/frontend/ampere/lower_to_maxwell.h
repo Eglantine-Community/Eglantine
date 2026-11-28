@@ -1488,15 +1488,19 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 (u64{insn.Bits(73, 1)} << 28) | (u64{offset >> 2} << 30) | (u64{operation} << 52));
             break;
         }
-        case 0x3a8: { // ATOMG.E.ADD.STRONG.GPU U32 at a 64-bit register address plus an offset.
-            const u32 address = insn.Bits(24, 8);
+        case 0x3a8: { // ATOMG.E.STRONG.GPU U32 at a 64-bit register address plus an offset.
+            // The operation (bits 87-90) is numbered as in Maxwell ATOM (52-55): ADD..XOR, EXCH (8).
+            // Yoshi and the Mysterious Book exchanges (Orchid fe1ee6d9b7). INC (3) and DEC (4) stay
+            // refused: the Maxwell translator turns a U32 ATOM INC/DEC into a plain load.
+            const u32 address = insn.Bits(24, 8), operation = insn.Bits(87, 4);
             const s32 offset = static_cast<s32>(insn.Bits(40, 24) << 8) >> 8;
-            if (insn.words[2] != 0x001ee100 || (address & 1) || address >= 246 ||
-                offset < -0x80000 || offset > 0x7ffff)
+            if ((insn.words[2] & ~0x07800000U) != 0x001ee100 || operation > 8 || operation == 3 ||
+                operation == 4 || (address & 1) ||
+                address >= 246 || offset < -0x80000 || offset > 0x7ffff)
                 return fail(index, "native global atomic register mode");
             emit(0xed00000000000000ULL | predicate | dest | (u64{address} << 8) |
                 (u64{insn.Bits(32, 8)} << 20) | (u64{static_cast<u32>(offset) & 0xfffff} << 28) |
-                (u64{1} << 48));
+                (u64{1} << 48) | (u64{operation} << 52));
             break;
         }
         case 0x9a8: { // ATOMG.E.ADD.STRONG.GPU U32 through a uniform pointer plus an offset.
@@ -1514,13 +1518,14 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const u32 binding = insn.Bits(54, 5), offset = insn.Bits(40, 14);
             const u32 coordinate = insn.Bits(24, 8);
             const u32 channels = insn.Bits(72, 4);
-            // Maxwell's codes: 0 = 1D, 3 = 2D, 4 = 2D_ARRAY, 5 = 3D. (Hookshot 88b554e572) 1D, one
-            // coordinate register: 17 of OoT's compute programs stopped here (1D_BUFFER and
-            // 1D_ARRAY, 1 and 2, stay refused).
+            // Maxwell's codes: 0 = 1D, 1 = 1D_BUFFER, 3 = 2D, 4 = 2D_ARRAY, 5 = 3D. (Hookshot
+            // 88b554e572) 1D, one coordinate register: 17 of OoT's compute programs stopped here.
+            // 1D_BUFFER, one coordinate register as well: Yoshi and the Mysterious Book's compute
+            // passes read buffer surfaces (Orchid fe1ee6d9b7). 1D_ARRAY (2) stays refused.
             const u32 dimension = insn.Bits(61, 3);
-            if ((insn.words[2] & ~0xf00U) != 0x001e0000 || channels == 0 || (dimension != 0 && dimension < 3) ||
+            if ((insn.words[2] & ~0xf00U) != 0x001e0000 || channels == 0 || dimension == 2 ||
                 dimension > 5 || binding >= 18 || offset > 0x1fff || insn.Bits(59, 2) || dest == 255 ||
-                coordinate > (dimension >= 4 ? 252U : dimension == 0 ? 254U : 253U))
+                coordinate > (dimension >= 4 ? 252U : dimension <= 1 ? 254U : 253U))
                 return fail(index, "native formatted surface load mode");
             if (result.required_texture_buffer != ~0U && result.required_texture_buffer != binding)
                 return fail(index, "native surface descriptor buffer conflict");
@@ -1529,15 +1534,20 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 (u64{channels} << 20) | (u64{dimension} << 33) | (u64{offset} << 36) | (u64{1} << 51));
             break;
         }
-        case 0xb9b: { // SUST.P.2D/3D.IGN, direct descriptor, channel mask at 72-75.
+        case 0xb9b: { // SUST.P.1D_BUFFER/2D/2D_ARRAY/3D.IGN, direct descriptor, channel mask at 72-75.
             const u32 binding = insn.Bits(54, 5), offset = insn.Bits(40, 14);
             const u32 data = insn.Bits(32, 8), coordinate = insn.Bits(24, 8);
             const u32 dimension = insn.Bits(61, 3);
             const u32 channels = insn.Bits(72, 4);
             const u32 mode = insn.words[2] & ~0xf00U;
             const bool strong = mode == 0x0010a000; // .STRONG.SM: fenced on both sides
-            if ((mode != 0x00100000 && !strong) || channels == 0 || dimension < 3 || dimension > 5 ||
-                binding >= 18 || offset > 0x1fff || insn.Bits(59, 2) || data > 252 || coordinate > (dimension >= 4 ? 252U : 253U))
+            // 1D_BUFFER (1): one coordinate register. Yoshi and the Mysterious Book's compute
+            // passes write buffer surfaces (Orchid fe1ee6d9b7); rejecting them left its title
+            // background unbuilt and the game reading data they never wrote.
+            if ((mode != 0x00100000 && !strong) || channels == 0 ||
+                (dimension != 1 && (dimension < 3 || dimension > 5)) || binding >= 18 ||
+                offset > 0x1fff || insn.Bits(59, 2) || data > 252 ||
+                coordinate > (dimension >= 4 ? 252U : dimension == 1 ? 254U : 253U))
                 return fail(index, "native formatted surface store mode");
             // A second descriptor buffer: SUST.B with the handle, loaded from that buffer, in R250.
             const bool bindless = !bind_texture_buffer(binding);
@@ -1551,14 +1561,16 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             if (strong) emit(0xef98000000000000ULL | predicate | (u64{1} << 8));
             break;
         }
-        case 0x593: { // SUATOM.D.2D/3D.ADD/OR.STRONG.GPU.IGN U32, returning the old value.
+        case 0x593: { // SUATOM.D.1D/1D_BUFFER/2D/2D_ARRAY/3D.ADD/OR.STRONG.GPU.IGN U32, returning the old value.
             const u32 binding = insn.Bits(54, 5), offset = insn.Bits(40, 14);
             const u32 data = insn.Bits(32, 8), coordinate = insn.Bits(24, 8);
             const u32 dimension = insn.Bits(61, 3);
             const u32 operation = insn.Bits(87, 3);
+            // Maxwell's codes as SULD: 1D and 1D_BUFFER take one coordinate register, 2D two,
+            // 2D_ARRAY and 3D three. Yoshi and the Mysterious Book adds to buffer surfaces.
             if ((insn.words[2] & ~0x03800000U) != 0x001ee000U || (operation != 0 && operation != 6) ||
-                (dimension != 3 && dimension != 5) || binding >= 18 ||
-                offset > 0x1fff || insn.Bits(59, 2) || coordinate > (dimension == 5 ? 252U : 253U))
+                dimension == 2 || dimension > 5 || binding >= 18 || offset > 0x1fff || insn.Bits(59, 2) ||
+                coordinate > (dimension >= 4 ? 252U : dimension <= 1 ? 254U : 253U))
                 return fail(index, "native surface reduction mode");
             if (result.required_texture_buffer != ~0U && result.required_texture_buffer != binding)
                 return fail(index, "native surface descriptor buffer conflict");
@@ -1612,6 +1624,18 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 load_shift();
                 emit(base(0x5c28000000000000ULL) | (u64{high} << 8) | (u64{shift} << 20) |
                      (u64{1} << 48) | (u64{insn.Bits(75, 1)} << 39));
+                break;
+            }
+            // SHF.L.U32.HI over a zero low word: the upper word of (high:0) << count is
+            // high << count, a plain left shift; .W masks the count to 5 bits as SHL.W does, and
+            // without it a count of 32 or more gives 0 in both. Yoshi and the Mysterious Book
+            // shifts by a constant buffer amount this way (Orchid's SHF.L.W.U32.HI lowering).
+            if (!right && high_result && low == 255 && insn.Bits(73, 2) == 3 && shift != ~0U &&
+                shift_operand &&
+                (insn.words[2] & ~(0x000118ffU | (opcode == 0xc19 ? 0x08000000U : 0U))) == 0x00000600U) {
+                load_shift();
+                emit(base(0x5c48000000000000ULL) | (u64{high} << 8) | (u64{shift} << 20) |
+                     (u64{insn.Bits(75, 1)} << 39));
                 break;
             }
             // SHF.R.U32 of the low word with a zero high word: a plain logical right shift.
@@ -2528,6 +2552,38 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             }
             break;
         }
+        case 0x364: { // TLD4.B (gather) with the handle in a register: 2D, (x, y) in Ra, handle in Rb.
+            // As TEX 0x361 the handle follows the coordinates. No offsets, depth compare or F16.
+            // Yoshi and the Mysterious Book gathers this way (Orchid's 0x364 lowering).
+            const u32 mask = insn.Bits(72, 4), second_dest = insn.Bits(64, 8);
+            const u32 source_a = insn.Bits(24, 8), source_b = insn.Bits(32, 8);
+            const u32 components = static_cast<u32>(std::popcount(mask));
+            const bool split = second_dest != 255;
+            const u32 low_count = split ? (std::min)(components, 2U) : components;
+            if (insn.Bits(40, 19) || !insn.Bits(59, 1) || !insn.Bits(60, 1) || insn.Bits(61, 3) != 1 ||
+                insn.Bits(76, 5) || insn.Bits(81, 3) != 7 || insn.Bits(89, 1) || insn.Bits(91, 1) ||
+                mask == 0 || source_a == 255 || source_a + 2 > 246 || source_b >= 246 ||
+                (dest != 255 && static_cast<u32>(dest) + low_count > 246) ||
+                (split && (components <= 2 || second_dest + components - 2 > 246)))
+                return fail(index, "native bindless texture gather mode");
+            const auto copy = [&](u32 target, u32 source) {
+                emit(0x5c98000000000000ULL | predicate | target | (u64{15} << 39) | (u64{source} << 20));
+            };
+            copy(250, source_a);
+            copy(251, source_a + 1);
+            copy(246, source_b);
+            // Maxwell TLD4.B: coordinates in Ra, the handle in Rb, component at 38.
+            emit(0xdec0000000000000ULL | predicate | 250 | (u64{250} << 8) | (u64{246} << 20) |
+                 (u64{2} << 28) | (u64{mask} << 31) | (u64{insn.Bits(87, 2)} << 38) |
+                 (u64{insn.Bits(90, 1)} << 49) | (u64{7} << 51));
+            for (u32 i = 0; i < components; ++i) {
+                const u32 target = !split || i < 2 ? (dest == 255 ? 255U : static_cast<u32>(dest) + i)
+                                                  : second_dest + (i - 2);
+                // Without a second destination only the first two components are written.
+                if (target != 255 && (split || i < 2)) copy(target, 250 + i);
+            }
+            break;
+        }
         case 0xb63: case 0xf63: { // TLD4 (gather), 2D or 2D array; component at bits 87-88.
             // 0xf63: the handle in a uniform register (bit 91), Maxwell TLD4.B with the handle in Rb.
             const bool bindless = opcode == 0xf63;
@@ -2548,7 +2604,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const u32 in_b = meta ? meta : coordinates - in_a;
             if ((insn.Bits(61, 3) != 1 && !array) || offset_mode == 3 || insn.Bits(79, 1) ||
                 insn.Bits(81, 3) != 7 || insn.Bits(59, 1) ||
-                (bindless && (offset_mode || depth)) ||
+                (bindless && (offset_mode == 2 || depth)) ||
                 (offset_mode && source_b == 255) ||
                 (source_a != 255 &&
                  source_a + in_a > ((array || meta) ? shadow_boundary : 246U)) || (source_b != 255 && source_b + in_b > 246) ||
@@ -2588,7 +2644,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                             (op & 0x1ff) == 0x00c || (op & 0x1ff) == 0x00b) {
                             continue;
                         }
-                        if (op == 0xb63) {
+                        if (op == 0xb63 || op == 0x364) {
                             const u32 count = static_cast<u32>(std::popcount(def.Bits(72, 4)));
                             const u32 high = def.Bits(64, 8);
                             const bool packed = def.Bits(79, 1) != 0;
@@ -2627,7 +2683,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                         break;
                     }
                 }
-                const u32 meta_reg = 246 + (second_buffer ? 1U : 0U) + i;
+                // TLD4.B lists the handle first (R246), then the offsets.
+                const u32 meta_reg = 246 + ((second_buffer || bindless) ? 1U : 0U) + i;
                 if (imm) {
                     emit(0x010000000007f000ULL | meta_reg | (u64{*imm} << 20));
                 } else {
@@ -2641,10 +2698,12 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                      (u64{insn.Bits(87, 2)} << 38) | (u64{insn.Bits(90, 1)} << 49) |
                      (u64{depth} << 50) | (u64{7} << 51));
             } else if (bindless) {
+                // AOFFI as for a second descriptor buffer: the packed offset follows the handle.
+                // Yoshi and the Mysterious Book gathers with an offset (Orchid 0xf63 lowering).
                 emit(0x5c98000000000000ULL | predicate | 246 | (u64{15} << 39) | (u64{handle} << 20));
                 emit(0xdec0000000000000ULL | predicate | 250 | (u64{250} << 8) | (u64{246} << 20) |
-                     (u64{array ? 3U : 2U} << 28) | (u64{mask} << 31) | (u64{insn.Bits(87, 2)} << 38) |
-                     (u64{insn.Bits(90, 1)} << 49) | (u64{7} << 51));
+                     (u64{array ? 3U : 2U} << 28) | (u64{mask} << 31) | (u64{offset_mode} << 36) |
+                     (u64{insn.Bits(87, 2)} << 38) | (u64{insn.Bits(90, 1)} << 49) | (u64{7} << 51));
             } else {
             emit(0xc800000000000000ULL | predicate | 250 | (u64{250} << 8) |
                  (u64{meta ? 246U : 255U} << 20) | (u64{array ? 3U : 2U} << 28) | (u64{mask} << 31) |
