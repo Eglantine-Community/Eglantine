@@ -616,7 +616,7 @@ private:
             LOG_DEBUG(Service, "nx2:gpu 102 destroy handle={} [{:#x}, +{:#x}] slot={}", handle,
                       address, size, w[3]);
             if (size != 0) {
-                Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Unmap(address, size);
+                Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Unregister(address, size);
             }
             if (size == 0x2000) {
                 Tegra::Nx2RemoveSemaphoreRegion(address);

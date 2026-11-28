@@ -79,6 +79,13 @@ public:
         }
     }
 
+    // DestroyGpuMemory ends the identity mapping and its cached SMMU backing. The process can
+    // reuse this virtual range with different physical pages before registering it again.
+    void Unregister(u64 address, u64 size) {
+        Unmap(address, size);
+        ReleaseBacking(address, size);
+    }
+
     // Backing memory [cpu_address, +size) is about to be freed (its GPU mappings are gone): each
     // address space drops its SMMU mapping of it, in GPU-thread order.
     void ReleaseBacking(u64 cpu_address, u64 size) {
