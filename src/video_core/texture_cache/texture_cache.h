@@ -755,7 +755,26 @@ void TextureCache<P>::ReplaceColorFeedbackViews(std::span<ImageViewInOut> views)
     // A draw that samples its own colour target reads it while the host writes it, a feedback
     // loop: RADV reads compressed tiles back as garbage (DK Bananza's video panel came out in
     // tiles). Maxwell reads the texel before the draw's write lands, so sample a copy instead.
+    //
+    // EDEN_NX2_FEEDBACK_BARRIER=1: for huge colour targets, skip the shadow CopyImage and leave
+    // the view on the RT so CheckFeedbackLoop / BarrierFeedbackLoop can synchronise instead.
+    // EDEN_NX2_FEEDBACK_BARRIER_MIN=<side>: both width and height must be >= this (default 4096)
+    // so only atlas-sized targets (e.g. Raiders 6400²) take the barrier path; 1080p still copies.
+    static const bool feedback_barrier = [] {
+        const char* value = std::getenv("EDEN_NX2_FEEDBACK_BARRIER");
+        return value != nullptr && value[0] == '1';
+    }();
+    static const u32 feedback_barrier_min_side = [] {
+        const char* value = std::getenv("EDEN_NX2_FEEDBACK_BARRIER_MIN");
+        if (value == nullptr || value[0] == '\0') {
+            return 4096U;
+        }
+        const unsigned long parsed = std::strtoul(value, nullptr, 10);
+        return parsed == 0 ? 4096U : static_cast<u32>(parsed);
+    }();
     std::vector<ImageId> used_shadows;
+    // Same source RT sampled more than once in this draw: one CopyImage, reuse the shadow view.
+    boost::container::small_vector<std::pair<ImageId, ImageViewId>, 4> copied_sources;
     const auto& regs = maxwell3d->regs;
     for (ImageViewInOut& view : views) {
         if (view.id == NULL_IMAGE_VIEW_ID || view.blacklist) {
@@ -776,6 +795,27 @@ void TextureCache<P>::ReplaceColorFeedbackViews(std::span<ImageViewInOut> views)
         // it.
         if (!is_target || True(slot_images[image_id].flags & ImageFlagBits::Rescaled) ||
             slot_images[image_id].info.num_samples != 1) {
+            continue;
+        }
+        const ImageInfo& target_info = slot_images[image_id].info;
+        if (feedback_barrier && target_info.size.width >= feedback_barrier_min_side &&
+            target_info.size.height >= feedback_barrier_min_side) {
+            static bool logged{};
+            if (!logged) {
+                LOG_INFO(HW_GPU,
+                         "EDEN_NX2_FEEDBACK_BARRIER: skipping shadow copy for colour targets "
+                         ">={}x{} (first {}x{} format {})",
+                         feedback_barrier_min_side, feedback_barrier_min_side,
+                         target_info.size.width, target_info.size.height,
+                         static_cast<u32>(target_info.format));
+                logged = true;
+            }
+            continue;
+        }
+        if (const auto reused = std::ranges::find_if(
+                copied_sources, [&](const auto& entry) { return entry.first == image_id; });
+            reused != copied_sources.end()) {
+            view.id = reused->second;
             continue;
         }
         const auto same_shape = [&](const FeedbackShadow& entry) {
@@ -810,6 +850,7 @@ void TextureCache<P>::ReplaceColorFeedbackViews(std::span<ImageViewInOut> views)
         const ImageViewInfo view_info =
             image.image_view_infos[std::distance(image.image_view_ids.begin(), view_it)];
         view.id = FindOrEmplaceImageView(shadow_id, view_info);
+        copied_sources.emplace_back(image_id, view.id);
     }
 }
 
@@ -4525,11 +4566,47 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
                 image.SparseTilesShareZeroBlock()) {
                 // The render would write the zeroed block all empty blocks share: each gets memory
                 // of its own first, and the parts that hold data are loaded again.
+                //
+                // EDEN_NX2_SPARSE_RT_LAZY=1: after backing, skip the CPU unswizzle upload when the
+                // guest has no sparse data mapped yet (the GPU is about to fill the image). Still
+                // TransitionImageLayout — skipping that left AMD waiting forever on semaphores.
+                // =2: only consider the skip when width*height >= 1024*1024.
+                static const int sparse_rt_lazy = [] {
+                    const char* value = std::getenv("EDEN_NX2_SPARSE_RT_LAZY");
+                    if (value == nullptr) {
+                        return 0;
+                    }
+                    if (value[0] == '2') {
+                        return 2;
+                    }
+                    return value[0] == '1' ? 1 : 0;
+                }();
                 LOG_INFO(HW_GPU, "GPU write into sparse tiled image {:#x}; backing it whole",
                          image.gpu_addr);
                 if (BackSparseTilesWhole(image)) {
                     image.dirty_ranges.clear();
-                    RefreshSparseTiles(image);
+                    const u64 area = u64{image.info.size.width} * u64{image.info.size.height};
+                    const bool want_lazy =
+                        sparse_rt_lazy == 1 || (sparse_rt_lazy == 2 && area >= 1024ULL * 1024ULL);
+                    if (want_lazy) {
+                        const auto ranges =
+                            Tegra::Nx2SparseDataRanges(image.gpu_addr, image.guest_size_bytes);
+                        const auto rects = SparseTileRects(
+                            image.info, ranges, image.SparseTileWidth(), image.SparseTileHeight(),
+                            image.SparseTailLevel());
+                        if (rects.empty()) {
+                            LOG_INFO(HW_GPU,
+                                     "EDEN_NX2_SPARSE_RT_LAZY: skipping sparse upload for {:#x} "
+                                     "({}x{}), transitioning layout only",
+                                     image.gpu_addr, image.info.size.width,
+                                     image.info.size.height);
+                            runtime.TransitionImageLayout(image);
+                        } else {
+                            RefreshSparseTiles(image);
+                        }
+                    } else {
+                        RefreshSparseTiles(image);
+                    }
                 } else {
                     LOG_ERROR(HW_GPU,
                               "Sparse tiled image {:#x}: out of memory backing it whole, the GPU "
